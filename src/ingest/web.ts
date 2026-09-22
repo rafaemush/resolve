@@ -1,5 +1,6 @@
 import type { Env } from "../env";
 import type { WatchRow, FetchOutcome } from "./types";
+import { ruleToRegex } from "./robots";
 
 const MAX_BYTES = 512 * 1024;
 const MAX_TEXT = 64 * 1024;
@@ -54,6 +55,10 @@ export async function fetchWeb(env: Env, watch: WatchRow, botUa: string): Promis
   };
 }
 
+/** Minimal robots.txt check")).join(".*");
+  return new RegExp("^" + body + (endAnchored ? "$" : ""));
+}
+
 /** Minimal robots.txt check for our UA and '*'. Disallowed => the market registers as unsupported_source. */
 export async function robotsAllows(url: string, botUa: string): Promise<{ allowed: boolean; reason: string }> {
   let u: URL;
@@ -81,7 +86,7 @@ export async function robotsAllows(url: string, botUa: string): Promise<{ allowe
   const g = groups.find((x) => x.agents.some((a) => a === botName)) ?? groups.find((x) => x.agents.includes("*"));
   if (!g) return { allowed: true, reason: "no matching group" };
   const path = u.pathname + u.search;
-  const matches = (rule: string) => rule !== "" && path.startsWith(rule.replace(/\*.*$/, ""));
+  const matches = (rule: string) => rule !== "" && ruleToRegex(rule).test(path);
   const dis = g.disallow.filter(matches).sort((a, b) => b.length - a.length)[0];
   const al = g.allow.filter(matches).sort((a, b) => b.length - a.length)[0];
   if (dis && (!al || al.length < dis.length)) return { allowed: false, reason: `robots.txt disallows ${dis} for ${g.agents.join(",")}` };

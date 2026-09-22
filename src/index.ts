@@ -6,6 +6,12 @@ import { runTick } from "./jobs/tick";
 import { safeEqual, bearer } from "./api/admin";
 import { internal } from "./api/internal";
 import { v1 } from "./api/v1";
+import { webhooks } from "./api/webhooks";
+import { pub } from "./api/public";
+import { drainWebhooks } from "./webhooks/deliver";
+import { scanDeposits } from "./jobs/deposits";
+import { runReconcile } from "./jobs/reconcile";
+import openapi from "./generated/openapi.json";
 
 type Vars = { requestId: string; schemaVersion: string };
 export const app = new Hono<{ Bindings: Env; Variables: Vars }>();
@@ -47,7 +53,10 @@ app.post("/internal/tick", async (c) => {
   return ok(c, r, r.inserted ? 200 : 500);
 });
 
+app.get("/openapi.json", (c) => c.json(openapi));
+app.route("/", pub);            // public: /v1/track-record, /echo (registered before the authenticated /v1 router)
 app.route("/internal", internal);
+v1.route("/webhooks", webhooks);
 app.route("/v1", v1);
 
 app.notFound((c) => err(c, "not_found", `no route ${c.req.method} ${c.req.path}`, 404));
@@ -55,8 +64,21 @@ app.notFound((c) => err(c, "not_found", `no route ${c.req.method} ${c.req.path}`
 export default {
   fetch: app.fetch,
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
-    ctx.waitUntil(runTick(env, event.cron).then((r) => {
+    ctx.waitUntil((async () => {
+      const r = await runTick(env, event.cron);
       if (r.error) console.error(JSON.stringify({ level: "error", job: "tick", cron: event.cron, error: r.error }));
-    }));
+      if (event.cron === "*/10 * * * *") {
+        const rc = await runReconcile(env).catch((e) => ({ error: String(e) }));
+        console.log(JSON.stringify({ job: "reconcile", ...rc }));
+        return;
+      }
+      const wh = await drainWebhooks(env, 10).catch((e) => ({ error: String(e) }));
+      if ((wh as { claimed?: number }).claimed) console.log(JSON.stringify({ job: "webhooks", ...wh }));
+      if (new Date(event.scheduledTime).getUTCMinutes() % 5 === 0) {
+        const cfg = parseConfig(env);
+        const dep = await scanDeposits(env, cfg);
+        if (dep.found || !dep.scanned) console.log(JSON.stringify({ job: "deposits", ...dep }));
+      }
+    })());
   },
 };

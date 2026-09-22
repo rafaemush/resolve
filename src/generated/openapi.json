@@ -1,0 +1,1314 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Resolve API",
+    "version": "1.0.0-beta",
+    "description": "Automated resolution infrastructure for long-tail prediction markets. Verdicts are contract-validated; UNRESOLVED always carries a caveat; a non-observation is never a negative verdict. Percentages in the track record appear only after 100 reconciled markets per platform."
+  },
+  "servers": [
+    {
+      "url": "https://resolve.rafaemush.workers.dev"
+    }
+  ],
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer"
+      },
+      "apiKeyAuth": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Api-Key"
+      }
+    },
+    "schemas": {
+      "MarketRegistration": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "platform": {
+            "default": "custom",
+            "type": "string",
+            "enum": [
+              "polymarket",
+              "limitless",
+              "custom"
+            ]
+          },
+          "external_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "condition": {
+            "type": "string",
+            "minLength": 8,
+            "maxLength": 4000
+          },
+          "event_statement": {
+            "type": "string",
+            "minLength": 8,
+            "maxLength": 1000
+          },
+          "option_a": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 300
+          },
+          "option_b": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 300
+          },
+          "positive_option": {
+            "type": "string",
+            "enum": [
+              "OPTION_A",
+              "OPTION_B"
+            ]
+          },
+          "anchors": {
+            "minItems": 1,
+            "maxItems": 10,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 2,
+              "maxLength": 200
+            }
+          },
+          "sources": {
+            "minItems": 1,
+            "maxItems": 10,
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "github_api",
+                    "github_events",
+                    "base_log",
+                    "solana_log",
+                    "web_fetch",
+                    "web_render"
+                  ]
+                },
+                "ref": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 2048
+                }
+              },
+              "required": [
+                "kind",
+                "ref"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "open_at": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+          },
+          "deadline_utc": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+          },
+          "grace_seconds": {
+            "default": 3600,
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 2592000
+          },
+          "resolver": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "const": "github_pr_merged"
+                  },
+                  "repo": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9_.-]+\\/[A-Za-z0-9_.-]+$"
+                  },
+                  "pr": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0,
+                    "maximum": 9007199254740991
+                  }
+                },
+                "required": [
+                  "kind",
+                  "repo",
+                  "pr"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "const": "github_release_published"
+                  },
+                  "repo": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9_.-]+\\/[A-Za-z0-9_.-]+$"
+                  },
+                  "tag": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": [
+                  "kind",
+                  "repo",
+                  "tag"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "const": "github_issue_closed"
+                  },
+                  "repo": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9_.-]+\\/[A-Za-z0-9_.-]+$"
+                  },
+                  "issue": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0,
+                    "maximum": 9007199254740991
+                  }
+                },
+                "required": [
+                  "kind",
+                  "repo",
+                  "issue"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "const": "evm_log_present"
+                  },
+                  "chain": {
+                    "type": "string",
+                    "const": "base"
+                  },
+                  "address": {
+                    "type": "string",
+                    "pattern": "^0x[0-9a-fA-F]+$"
+                  },
+                  "topic0": {
+                    "type": "string",
+                    "pattern": "^0x[0-9a-fA-F]+$"
+                  },
+                  "topics": {
+                    "maxItems": 3,
+                    "type": "array",
+                    "items": {
+                      "anyOf": [
+                        {
+                          "type": "string",
+                          "pattern": "^0x[0-9a-fA-F]+$"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    }
+                  }
+                },
+                "required": [
+                  "kind",
+                  "chain",
+                  "address",
+                  "topic0"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "const": "solana_sig_present"
+                  },
+                  "account": {
+                    "type": "string",
+                    "minLength": 32,
+                    "maxLength": 64
+                  },
+                  "discriminator": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "account"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "const": "numeric_threshold"
+                  },
+                  "path": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "op": {
+                    "type": "string",
+                    "enum": [
+                      ">=",
+                      "<=",
+                      ">",
+                      "<",
+                      "=="
+                    ]
+                  },
+                  "value": {
+                    "type": "number"
+                  },
+                  "unit": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "path",
+                  "op",
+                  "value"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          },
+          "negative_rule": {
+            "default": "absence_after_deadline",
+            "type": "string",
+            "enum": [
+              "absence_after_deadline",
+              "explicit_negative"
+            ]
+          },
+          "allow_prerelease": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "platform",
+          "external_id",
+          "condition",
+          "event_statement",
+          "option_a",
+          "option_b",
+          "positive_option",
+          "anchors",
+          "sources",
+          "open_at",
+          "deadline_utc",
+          "grace_seconds",
+          "negative_rule",
+          "allow_prerelease"
+        ],
+        "additionalProperties": false
+      },
+      "Verdict": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "market_id": {
+            "type": "string"
+          },
+          "resolution_status": {
+            "type": "string",
+            "enum": [
+              "RESOLVED",
+              "UNRESOLVED",
+              "ERROR"
+            ]
+          },
+          "winning_outcome": {
+            "type": "string",
+            "enum": [
+              "OPTION_A",
+              "OPTION_B",
+              "NONE"
+            ]
+          },
+          "confidence_score": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 0.99
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "INSUFFICIENT_DATA",
+                  "SOURCE_MISMATCH",
+                  "UNSAFE_INPUT",
+                  "UPSTREAM_UNAVAILABLE"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "error_reason": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "INJECTION_SUSPECTED",
+                  "SUBJECT_MISMATCH",
+                  "SOURCE_REF_MISMATCH",
+                  "NO_ANCHOR",
+                  "OUT_OF_WINDOW",
+                  "CORRUPT_INPUT",
+                  "TOO_SHORT",
+                  "NO_STATEMENT",
+                  "AMBIGUOUS_VALUE",
+                  "COVERAGE_GAP",
+                  "MODEL_UNAVAILABLE",
+                  "BUDGET_EXCEEDED",
+                  "SOURCE_UNREACHABLE",
+                  "RENDER_BUDGET_EXHAUSTED",
+                  "BILLING_UNAVAILABLE",
+                  "PAID_JEV_DISABLED"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "caveats": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "determination_basis": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "structured",
+                  "jev"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "evidence": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "raw_sha256": {
+                    "type": "string"
+                  },
+                  "canonical_sha256": {
+                    "type": "string"
+                  },
+                  "source_url": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "source_kind": {
+                    "type": "string",
+                    "enum": [
+                      "github_api",
+                      "github_events",
+                      "base_log",
+                      "solana_log",
+                      "web_fetch",
+                      "web_render",
+                      "tenant_supplied"
+                    ]
+                  },
+                  "observed_at": {
+                    "type": "string",
+                    "format": "date-time",
+                    "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                  },
+                  "claimed_at": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "format": "date-time",
+                        "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "quote": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "raw_sha256",
+                  "canonical_sha256",
+                  "source_url",
+                  "source_kind",
+                  "observed_at",
+                  "claimed_at",
+                  "quote"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "checks": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "pass": {
+                  "type": "boolean"
+                },
+                "detail": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "name",
+                "pass"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "jev_model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "thresholds_version": {
+            "type": "string"
+          },
+          "latency_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          }
+        },
+        "required": [
+          "market_id",
+          "resolution_status",
+          "winning_outcome",
+          "confidence_score",
+          "error_code",
+          "error_reason",
+          "caveats",
+          "determination_basis",
+          "evidence",
+          "checks",
+          "jev_model",
+          "thresholds_version",
+          "latency_ms"
+        ],
+        "additionalProperties": false
+      },
+      "StrictV0Verdict": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "market_id": {
+            "type": "string"
+          },
+          "resolution_status": {
+            "type": "string",
+            "enum": [
+              "RESOLVED",
+              "UNRESOLVED",
+              "ERROR"
+            ]
+          },
+          "winning_outcome": {
+            "type": "string",
+            "enum": [
+              "OPTION_A",
+              "OPTION_B",
+              "NONE"
+            ]
+          },
+          "confidence_score": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 0.99
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "INSUFFICIENT_DATA",
+                  "SOURCE_MISMATCH"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "market_id",
+          "resolution_status",
+          "winning_outcome",
+          "confidence_score",
+          "error_code"
+        ],
+        "additionalProperties": false
+      },
+      "InlineEvidence": {
+        "type": "object",
+        "properties": {
+          "source_kind": {
+            "type": "string",
+            "enum": [
+              "tenant_supplied",
+              "github_api",
+              "base_log",
+              "solana_log",
+              "web_fetch"
+            ],
+            "default": "tenant_supplied"
+          },
+          "source_url": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string",
+            "maxLength": 200000
+          },
+          "structured": {},
+          "observed_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "SuccessEnvelope": {
+        "type": "object",
+        "required": [
+          "ok",
+          "data",
+          "request_id",
+          "schema_version"
+        ],
+        "properties": {
+          "ok": {
+            "const": true
+          },
+          "data": {},
+          "request_id": {
+            "type": "string"
+          },
+          "schema_version": {
+            "type": "string"
+          }
+        }
+      },
+      "ErrorEnvelope": {
+        "type": "object",
+        "required": [
+          "ok",
+          "error",
+          "request_id",
+          "schema_version"
+        ],
+        "properties": {
+          "ok": {
+            "const": false
+          },
+          "error": {
+            "type": "object",
+            "required": [
+              "code",
+              "message"
+            ],
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          },
+          "request_id": {
+            "type": "string"
+          },
+          "schema_version": {
+            "type": "string"
+          },
+          "remaining": {
+            "type": "integer"
+          },
+          "resets_at": {
+            "type": "string"
+          },
+          "retry_after_seconds": {
+            "type": "integer"
+          },
+          "how_to_proceed": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  },
+  "paths": {
+    "/v1/resolve": {
+      "post": {
+        "summary": "Resolve a market from stored or inline evidence (bill-then-run; Idempotency-Key supported)",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "market_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "market": {
+                    "$ref": "#/components/schemas/MarketRegistration"
+                  },
+                  "evidence": {
+                    "$ref": "#/components/schemas/InlineEvidence"
+                  },
+                  "fetch": {
+                    "type": "boolean",
+                    "default": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Verdict (or StrictV0Verdict for strict_v0 tenants) plus request_id, credits_charged, credits_refunded, balance, route",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/SuccessEnvelope"
+                    },
+                    {
+                      "properties": {
+                        "data": {
+                          "$ref": "#/components/schemas/Verdict"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Idempotent replay of a request still in flight",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "validation_error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "auth_required | invalid_key | key_expired",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "insufficient_credits (price_credits, balance, route at top level)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "strict_v0 tenants: UNSAFE_INPUT with no verdict body",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "rate_limited | daily_cap_reached with remaining, resets_at, retry_after_seconds, how_to_proceed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "UPSTREAM_UNAVAILABLE (billing or model); no credits charged",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/markets": {
+      "post": {
+        "summary": "Register a market and its watches (robots and contract checks at registration)",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": []
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MarketRegistration"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "market_id, status (open | unsupported_source), reasons, watches",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "validation_error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "watch limit reached",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "summary": "List markets",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "markets[]",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/markets/{id}": {
+      "get": {
+        "summary": "Market with watches",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "market, watches",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not_found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Soft-delete a market and deactivate its watches",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/markets/{id}/resolutions": {
+      "get": {
+        "summary": "Resolution history for a market",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "resolutions[]",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/resolutions/{id}": {
+      "get": {
+        "summary": "One resolution by request_id",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "verdict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not_found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/account": {
+      "get": {
+        "summary": "Tenant, plan, credits, key usage",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "tenant, key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/usage": {
+      "get": {
+        "summary": "Credits by reason and resolutions by route over a window",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "days",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 30
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "usage",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/payments/address": {
+      "get": {
+        "summary": "USDC (Base) receiving address, credits per USDC, confirmation policy (safe tag)",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "payment instructions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "deposits not enabled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/keys/rotate": {
+      "post": {
+        "summary": "Mint a new key; the calling key expires in 24 h",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": []
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "key (shown once)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/webhooks": {
+      "post": {
+        "summary": "Register an https endpoint (secret shown once)",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": []
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "endpoint + secret",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "summary": "List endpoints",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "endpoints[]",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/webhooks/{id}": {
+      "delete": {
+        "summary": "Deactivate an endpoint",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/webhooks/deliveries": {
+      "get": {
+        "summary": "Delivery log (pending | delivering | delivered | dlq)",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "deliveries[]",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/webhooks/deliveries/{id}/replay": {
+      "post": {
+        "summary": "Replay a delivered or dead-lettered event",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "replayed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/track-record": {
+      "get": {
+        "summary": "Public track record rendered from v_track_record (60 s cache)",
+        "responses": {
+          "200": {
+            "description": "rows[] per platform and week",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "summary": "Liveness + one database read",
+        "responses": {
+          "200": {
+            "description": "service status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -9,6 +9,8 @@ import { appendWindow, summarizeCoverage, type WatchRow, type MarketRow, type Fe
 import { canonicalize, sha256Hex } from "../resolve/text";
 import { resolveWithRuntime, JevUnavailableError } from "../resolve/runtime";
 import type { EvidenceInput } from "../resolve/schema";
+import { commitVerdict } from "../bot/commit";
+import { enqueueEvent } from "../webhooks/deliver";
 
 export interface WatchRunSummary { watch_id: string; outcome: "success" | "no_op" | "failure" | "skipped"; rows_written: number; detail: string; verdict?: string; resolution_id?: string }
 
@@ -115,6 +117,14 @@ export async function runWatch(env: Env, cfg: Config, watchId: string): Promise<
       summary.verdict = `${rt.result.verdict.resolution_status}/${rt.result.verdict.winning_outcome}${rt.result.verdict.error_reason ? "/" + rt.result.verdict.error_reason : ""}`;
       summary.resolution_id = rt.resolutionId;
       if (evidenceId) await client.from("evidence").update({ windows: rt.result.pre.windows, injection_markers: rt.result.pre.markers }).eq("id", evidenceId);
+      const v = rt.result.verdict;
+      if (mode === "shadow") {
+        const cm = await commitVerdict(env, market, rt.resolutionId, v);
+        summary.detail += ` | commit: ${cm.reason}`;
+      } else if (market.tenant_id) {
+        const type = v.resolution_status === "RESOLVED" ? "market.resolved" : v.resolution_status === "ERROR" ? "market.error" : "market.unresolved_update";
+        await enqueueEvent(env, market.tenant_id, type, { market_id: market.id, external_id: market.external_id, request_id: rt.resolutionId, verdict: v });
+      }
     } catch (e) {
       summary.outcome = "failure"; summary.detail = `resolve: ${String(e).slice(0, 300)}`;
       update.consecutive_errors = (watch.consecutive_errors ?? 0) + 1; update.last_error = summary.detail;

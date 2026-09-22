@@ -10,6 +10,9 @@ import { db, rpc } from "../db/supabase";
 import { makeJevCaller } from "../jev/client";
 import { sha256Hex } from "../resolve/text";
 import { randomKeyBody } from "./v1";
+import { runReconcile } from "../jobs/reconcile";
+import { scanDeposits } from "../jobs/deposits";
+import { drainWebhooks } from "../webhooks/deliver";
 
 type Vars = { requestId: string; schemaVersion: string };
 export const internal = new Hono<{ Bindings: Env; Variables: Vars }>();
@@ -74,6 +77,10 @@ internal.post("/tenants", async (c) => {
   if (ke || !k) return err(c, "internal_error", ke?.message ?? "key insert failed", 500);
   return ok(c, { tenant_id: t.id, key_id: k.id, key: raw, note: "Shown once." }, 201);
 });
+
+internal.post("/reconcile", async (c) => { if (!isAdmin(c)) return err(c, "forbidden", "admin key required", 403); return ok(c, await runReconcile(c.env)); });
+internal.post("/deposits/scan", async (c) => { if (!isAdmin(c)) return err(c, "forbidden", "admin key required", 403); return ok(c, await scanDeposits(c.env, parseConfig(c.env))); });
+internal.post("/webhooks/drain", async (c) => { if (!isAdmin(c)) return err(c, "forbidden", "admin key required", 403); return ok(c, await drainWebhooks(c.env, 10)); });
 
 /** Read the R2 diagnostics the scheduled handler writes when an insert fails. */
 internal.get("/diag", async (c) => {
