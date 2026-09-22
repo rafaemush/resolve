@@ -4,6 +4,7 @@ import { db } from "./db/supabase";
 import { ok, err, requestId } from "./api/envelope";
 import { runTick } from "./jobs/tick";
 import { safeEqual, bearer } from "./api/admin";
+import { internal } from "./api/internal";
 
 type Vars = { requestId: string; schemaVersion: string };
 export const app = new Hono<{ Bindings: Env; Variables: Vars }>();
@@ -44,6 +45,8 @@ app.post("/internal/tick", async (c) => {
   const r = await runTick(c.env, c.req.query("cron") ?? "* * * * *");
   return ok(c, r, r.inserted ? 200 : 500);
 });
+
+app.route("/internal", internal);
 
 app.notFound((c) => err(c, "not_found", `no route ${c.req.method} ${c.req.path}`, 404));
 

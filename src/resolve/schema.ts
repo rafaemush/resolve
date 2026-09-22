@@ -79,6 +79,7 @@ export const EvidenceInput = z.object({
   observed_at: iso.optional(),
   fetched_at: iso,
   http_status: z.number().int().optional(),
+  etag: z.string().optional(),
   coverage: Coverage.optional(),
   provenance: z.record(z.string(), z.unknown()).optional(),
 });
