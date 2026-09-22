@@ -7,13 +7,24 @@ import { baseRpcUrl, getBlock, blockAtOrAfter, hasCode } from "../ingest/base";
 export interface RegisterResult { marketId: string; status: "open" | "unsupported_source"; reasons: string[]; watches: Array<{ id: string; source_kind: string }> }
 
 /** Validate, run registration-time source checks (robots, contract code), insert the market and one watch per source. */
-export async function registerMarket(env: Env, cfg: Config, input: unknown, tenantId: string | null): Promise<RegisterResult> {
+export async function registerMarket(env: Env, cfg: Config, input: unknown, tenantId: string | null, opts: { createWatches?: boolean } = {}): Promise<RegisterResult> {
   const reg: Reg = MarketRegistration.parse(input);
   const client = db(env);
+  // Idempotent registration: the same (tenant, platform, external_id) returns the existing market.
+  {
+    let q = client.from("markets").select("id, status, meta").eq("platform", reg.platform).eq("external_id", reg.external_id).is("deleted_at", null);
+    q = tenantId ? q.eq("tenant_id", tenantId) : q.is("tenant_id", null);
+    const { data: existing } = await q.maybeSingle();
+    if (existing) {
+      const { data: ws } = await client.from("watches").select("id, source_kind").eq("market_id", existing.id).is("deleted_at", null);
+      return { marketId: existing.id as string, status: existing.status as "open" | "unsupported_source", reasons: ((existing.meta as { registration_reasons?: string[] })?.registration_reasons) ?? [], watches: (ws ?? []).map((w) => ({ id: w.id as string, source_kind: w.source_kind as string })) };
+    }
+  }
   const reasons: string[] = [];
   let status: "open" | "unsupported_source" = "open";
   const watchSpecs: Array<{ source_kind: Reg["sources"][number]["kind"]; source_ref: Record<string, unknown>; cursor: Record<string, unknown> }> = [];
   for (const s of reg.sources) {
+    if (opts.createWatches === false) { watchSpecs.push({ source_kind: s.kind, source_ref: { ref: s.ref }, cursor: {} }); continue; }
     if (s.kind === "web_fetch" || s.kind === "web_render") {
       const r = await robotsAllows(s.ref, cfg.botUa);
       if (!r.allowed) { status = "unsupported_source"; reasons.push(`${s.ref}: ${r.reason}`); continue; }
@@ -46,7 +57,7 @@ export async function registerMarket(env: Env, cfg: Config, input: unknown, tena
   if (error || !m) throw new Error(`markets insert: ${error?.message ?? "no row"}`);
   const nearDeadline = Date.parse(reg.deadline_utc) - Date.now() < 24 * 3600 * 1000;
   const watches: RegisterResult["watches"] = [];
-  if (status === "open") {
+  if (status === "open" && opts.createWatches !== false) {
     for (const w of watchSpecs) {
       const { data, error: we } = await client.from("watches").insert({ market_id: m.id, source_kind: w.source_kind, source_ref: w.source_ref, cursor: w.cursor, poll_interval_s: nearDeadline ? 60 : 300, next_poll_at: new Date().toISOString() }).select("id, source_kind").single();
       if (we || !data) throw new Error(`watches insert: ${we?.message ?? "no row"}`);

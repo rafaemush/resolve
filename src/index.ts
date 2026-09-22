@@ -5,6 +5,7 @@ import { ok, err, requestId } from "./api/envelope";
 import { runTick } from "./jobs/tick";
 import { safeEqual, bearer } from "./api/admin";
 import { internal } from "./api/internal";
+import { v1 } from "./api/v1";
 
 type Vars = { requestId: string; schemaVersion: string };
 export const app = new Hono<{ Bindings: Env; Variables: Vars }>();
@@ -47,6 +48,7 @@ app.post("/internal/tick", async (c) => {
 });
 
 app.route("/internal", internal);
+app.route("/v1", v1);
 
 app.notFound((c) => err(c, "not_found", `no route ${c.req.method} ${c.req.path}`, 404));
 

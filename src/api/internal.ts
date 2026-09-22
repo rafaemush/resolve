@@ -8,6 +8,8 @@ import { runWatch } from "../ingest/watch";
 import { registerMarket } from "../markets/register";
 import { db, rpc } from "../db/supabase";
 import { makeJevCaller } from "../jev/client";
+import { sha256Hex } from "../resolve/text";
+import { randomKeyBody } from "./v1";
 
 type Vars = { requestId: string; schemaVersion: string };
 export const internal = new Hono<{ Bindings: Env; Variables: Vars }>();
@@ -56,6 +58,21 @@ internal.get("/markets/:id", async (c) => {
   ]);
   if (m.error) return err(c, "not_found", m.error.message, 404);
   return ok(c, { market: m.data, watches: w.data ?? [], evidence: e.data ?? [], resolutions: r.data ?? [], loop_runs: l.data ?? [] });
+});
+
+/** Founder-only tenant onboarding for the first 90 days: create a tenant and its first key (raw key shown once). */
+internal.post("/tenants", async (c) => {
+  if (!isAdmin(c)) return err(c, "forbidden", "admin key required", 403);
+  const b = (await c.req.json().catch(() => ({}))) as { display_name?: string; contact?: string; wallet_address?: string; plan?: string; credits?: number; environment?: "live" | "test"; strict_v0?: boolean; watch_limit?: number };
+  if (!b.display_name) return err(c, "validation_error", "display_name required", 400);
+  const client = db(c.env);
+  const { data: t, error } = await client.from("tenants").insert({ display_name: b.display_name, contact: b.contact ?? null, wallet_address: b.wallet_address ? b.wallet_address.toLowerCase() : null, plan: b.plan ?? "free", strict_v0: !!b.strict_v0, watch_limit: b.watch_limit ?? 5 }).select("id").single();
+  if (error || !t) return err(c, "validation_error", error?.message ?? "tenant insert failed", 400);
+  if (b.credits && b.credits > 0) await rpc(client, "grant_credits", { p_tenant: t.id, p_amount: b.credits, p_note: "onboarding grant" });
+  const raw = `rsl_${b.environment ?? "test"}_${randomKeyBody()}`;
+  const { data: k, error: ke } = await client.from("api_keys").insert({ tenant_id: t.id, key_hash: await sha256Hex(raw), key_prefix: raw.slice(0, 12) + "...", name: "initial", environment: b.environment ?? "test", daily_cap: 1000 }).select("id").single();
+  if (ke || !k) return err(c, "internal_error", ke?.message ?? "key insert failed", 500);
+  return ok(c, { tenant_id: t.id, key_id: k.id, key: raw, note: "Shown once." }, 201);
 });
 
 /** Read the R2 diagnostics the scheduled handler writes when an insert fails. */

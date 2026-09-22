@@ -21,7 +21,6 @@
     "node": ">=22"
   },
   "dependencies": {
-    "@hono/zod-openapi": "^1.6.3",
     "@supabase/supabase-js": "^2.117.0",
     "hono": "^4.13.8",
     "viem": "^2.56.8",

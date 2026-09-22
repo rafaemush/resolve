@@ -36,6 +36,15 @@ export interface ResolveResult {
   jev: { request: JevRequest; response: JevResponse | null; latencyMs: number; error?: string } | null;
 }
 
+/** Price-before-charge: which route a request would take, without spending. */
+export async function planRoute(input: Omit<ResolveInput, "jevBlocked">): Promise<{ route: "precheck" | "structured" | "jev"; pre: PrecheckResult }> {
+  const now = input.now ?? new Date();
+  const pre = await precheck(input.market, input.evidence, input.thresholds, input.spotlightSecret, now);
+  if (pre.early) return { route: "precheck", pre };
+  const s = decideStructured(input.market, input.evidence, pre, now);
+  return { route: s ? "structured" : "jev", pre };
+}
+
 export async function resolveMarket(input: ResolveInput, deps: { jev: JevCaller }): Promise<ResolveResult> {
   const t0 = Date.now();
   const now = input.now ?? new Date();
