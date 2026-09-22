@@ -1,0 +1,57 @@
+# Resolve CI (public repo => unlimited minutes). Actions holds exactly two secrets:
+# TYPESAFE_API_KEY (nightly live evals only) and EVAL_REPORT_KEY (insert-only reporting).
+# It never holds the Supabase service_role key or any Cloudflare token.
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 4 * * *"   # nightly live evals (cost-capped)
+  workflow_dispatch:
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: 9 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 24, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test
+      - name: frozen suite matches authored cases
+        run: pnpm eval:build --check
+      - name: failure-injection suite (replay; strict once Jev fixtures are recorded)
+        run: pnpm eval --mode replay --skip-missing
+      - name: mutation harness (every deterministic rail must turn the suite red)
+        run: pnpm eval:mutate --skip-missing
+  live-nightly:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
+      EVAL_REPORT_KEY: ${{ secrets.EVAL_REPORT_KEY }}
+      RESOLVE_PUBLIC_URL: https://resolve.rafaemush.workers.dev
+      EVAL_LIVE: "1"
+      EVAL_RUNNER_REGION: gh_actions_us
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: 9 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 24, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - name: live evals (skips cleanly until the key secret exists)
+        run: |
+          if [ -z "$TYPESAFE_API_KEY" ]; then echo "TYPESAFE_API_KEY secret not set; skipping live evals"; exit 0; fi
+          pnpm eval --mode live --max-cost-usd 0.05 --report

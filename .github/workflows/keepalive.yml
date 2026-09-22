@@ -1,0 +1,14 @@
+# Supabase Free pauses a project after 7 idle days; /health performs one REST read.
+name: keepalive
+on:
+  schedule:
+    - cron: "23 */12 * * *"
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - run: curl -fsS --max-time 20 https://resolve.rafaemush.workers.dev/health | head -c 300

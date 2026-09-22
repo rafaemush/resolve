@@ -9,6 +9,7 @@ import { buildJevRequest, parseJevResponse, JevContractError, type JevRequest, t
 import { postcheck } from "./postcheck";
 import { assembleVerdict } from "./verdict";
 import type { Thresholds } from "./thresholds";
+import { railEnabled } from "./rails";
 
 export class JevUnavailableError extends Error {
   constructor(message: string, public readonly reason: "MODEL_UNAVAILABLE" | "BUDGET_EXCEEDED" | "PAID_JEV_DISABLED" = "MODEL_UNAVAILABLE", public readonly status?: number) { super(message); }
@@ -91,7 +92,7 @@ export async function resolveMarket(input: ResolveInput, deps: { jev: JevCaller 
   let status = post.status, outcome = post.outcome;
   const caveats = [...post.caveats];
   // A positive verdict from evidence observed after the deadline is never a positive resolution.
-  if (status === "RESOLVED" && outcome === input.market.positive_option && !pre.usableForPositive) {
+  if (railEnabled("after_deadline_positive") && status === "RESOLVED" && outcome === input.market.positive_option && !pre.usableForPositive) {
     status = "UNRESOLVED"; outcome = "NONE"; caveats.push("evidence_after_deadline");
   }
   if (pre.claimedAt) caveats.push("source_timestamp_unverified");

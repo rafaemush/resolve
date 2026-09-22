@@ -5,6 +5,7 @@
  */
 import type { MarketRegistration, EvidenceInput, Coverage } from "./schema";
 import type { PrecheckResult } from "./precheck";
+import { railEnabled } from "./rails";
 
 export type Option = "OPTION_A" | "OPTION_B";
 export const other = (o: Option): Option => (o === "OPTION_A" ? "OPTION_B" : "OPTION_A");
@@ -174,6 +175,7 @@ function coverageProof(kind: string, cov: Coverage | undefined, market: MarketRe
 
 export function decideStructured(market: MarketRegistration, ev: EvidenceInput, pre: PrecheckResult, now: Date): StructuredDecision | null {
   const r = market.resolver;
+  if (!railEnabled("structured_router")) return null;
   if (!r || !resolverAppliesTo(market, ev)) return null;
   if (ev.structured === undefined && r.kind !== "numeric_threshold") return null;
   const pos = market.positive_option;
@@ -198,7 +200,7 @@ export function decideStructured(market: MarketRegistration, ev: EvidenceInput, 
   const afterDeadline = now.getTime() > deadline.getTime();
   if (!afterDeadline) return { status: "UNRESOLVED", outcome: "NONE", caveats: ["awaiting_deadline", ...caveats], detail: p.detail };
   if (market.negative_rule !== "absence_after_deadline") return { status: "UNRESOLVED", outcome: "NONE", caveats: ["negative_unproven", ...caveats], detail: p.detail };
-  const proof = coverageProof(r.kind, ev.coverage, market, deadline, pre.observedAt);
+  const proof = railEnabled("coverage_proof") ? coverageProof(r.kind, ev.coverage, market, deadline, pre.observedAt) : { ok: true, gap: "", caveats: [] as string[] };
   if (!proof.ok) return { status: "ERROR", outcome: "NONE", error_code: "INSUFFICIENT_DATA", error_reason: "COVERAGE_GAP", caveats, detail: proof.gap };
   return { status: "RESOLVED", outcome: neg, caveats: [...caveats, ...proof.caveats], detail: `absence proven: ${p.detail}` };
 }

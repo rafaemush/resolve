@@ -1,0 +1,8 @@
+import { type EvalCase, tvlMarket, web, NOW_IN } from "../lib/cases";
+
+const stats = (text: string) => web(text, { source_url: "https://blog.aurora-protocol.example/tvl-update" });
+export const cases: EvalCase[] = [
+  { id: "G-002", class: "G", title: "two competing numbers -> AMBIGUOUS_VALUE", market: tvlMarket(), evidence: stats("Aurora weekly update: TVL was $0.9B on Monday and reached $1.1B by Friday according to the dashboard. Aurora TVL figures exclude bridged assets."), now: NOW_IN, jev: "none", expect: { status: "ERROR", error_code: "INSUFFICIENT_DATA", error_reason: "AMBIGUOUS_VALUE", jev_calls: 0 } },
+  { id: "G-003", class: "G", title: "no number at all -> AMBIGUOUS_VALUE", market: tvlMarket(), evidence: stats("Aurora weekly update: TVL grew strongly this week according to the team, with several vault launches and record deposits. Aurora TVL milestones will be announced separately."), now: NOW_IN, jev: "none", expect: { status: "ERROR", error_code: "INSUFFICIENT_DATA", error_reason: "AMBIGUOUS_VALUE", jev_calls: 0 } },
+  { id: "G-004", class: "G", title: "counting phrasing is never delegated", market: tvlMarket({ anchors: ["Aurora", "validators"], event_statement: "Aurora has at least 5 validators live", resolver: { kind: "numeric_threshold", path: "validators", op: ">=", value: 5 } }), evidence: stats("Aurora status: 3 of 5 validators are live after the maintenance window; the remaining validators rejoin tomorrow. Aurora validators list is published on the status page."), now: NOW_IN, jev: "none", expect: { status: "ERROR", error_code: "INSUFFICIENT_DATA", error_reason: "AMBIGUOUS_VALUE", jev_calls: 0 } },
+];

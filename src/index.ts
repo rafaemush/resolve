@@ -2,6 +2,8 @@ import { Hono } from "hono";
 import { parseConfig, ConfigError, type Env } from "./env";
 import { db } from "./db/supabase";
 import { ok, err, requestId } from "./api/envelope";
+import { runTick } from "./jobs/tick";
+import { safeEqual, bearer } from "./api/admin";
 
 type Vars = { requestId: string; schemaVersion: string };
 export const app = new Hono<{ Bindings: Env; Variables: Vars }>();
@@ -35,23 +37,21 @@ app.get("/health", async (c) => {
   });
 });
 
+/** Admin: run one cron tick synchronously and return the insert outcome. */
+app.post("/internal/tick", async (c) => {
+  const key = bearer(c);
+  if (!key || !safeEqual(key, c.env.ADMIN_API_KEY)) return err(c, "forbidden", "admin key required", 403);
+  const r = await runTick(c.env, c.req.query("cron") ?? "* * * * *");
+  return ok(c, r, r.inserted ? 200 : 500);
+});
+
 app.notFound((c) => err(c, "not_found", `no route ${c.req.method} ${c.req.path}`, 404));
 
 export default {
   fetch: app.fetch,
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
-    const started = Date.now();
-    const client = db(env);
-    const loop = event.cron === "*/10 * * * *" ? "reconcile" : "worker_liveness";
-    // Handlers are attached as each subsystem lands (webhooks drain, reconcile). Liveness always writes a row.
-    ctx.waitUntil(
-      Promise.resolve(client.from("loop_runs").insert({
-        loop_name: loop,
-        outcome: "success",
-        rows_written: 1,
-        duration_ms: Date.now() - started,
-        meta: { cron: event.cron, scheduled_time: new Date(event.scheduledTime).toISOString() },
-      })).then(({ error }) => { if (error) console.error("loop_runs insert failed", error.message); }),
-    );
+    ctx.waitUntil(runTick(env, event.cron).then((r) => {
+      if (r.error) console.error(JSON.stringify({ level: "error", job: "tick", cron: event.cron, error: r.error }));
+    }));
   },
 };

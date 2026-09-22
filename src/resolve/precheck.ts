@@ -6,6 +6,7 @@
 import type { MarketRegistration, EvidenceInput, Check } from "./schema";
 import type { Thresholds } from "./thresholds";
 import { canonicalize, findAnchor, fuzzyIndex, windowsAround, sha256Hex, hmacHex, type AnchorHit } from "./text";
+import { railEnabled } from "./rails";
 
 export type EarlyStatus =
   | { kind: "ERROR"; error_code: "UNSAFE_INPUT" | "SOURCE_MISMATCH" | "INSUFFICIENT_DATA"; error_reason: string; caveats: string[] }
@@ -107,7 +108,7 @@ export async function precheck(market: MarketRegistration, ev: EvidenceInput, th
   if (canon.zeroWidthRemoved > th.hiddenZeroWidthMax) markers.push("hidden_zero_width");
   for (const [name, re] of MARKERS) if (re.test(canon.text) || re.test(rawText)) markers.push(name);
   checks.push({ name: "injection_markers", pass: markers.length === 0, detail: markers.length ? markers.join(",") : `zero_width=${canon.zeroWidthRemoved}` });
-  if (markers.length && !early) early = { kind: "ERROR", error_code: "UNSAFE_INPUT", error_reason: "INJECTION_SUSPECTED", caveats: [] };
+  if (railEnabled("injection_markers") && markers.length && !early) early = { kind: "ERROR", error_code: "UNSAFE_INPUT", error_reason: "INJECTION_SUSPECTED", caveats: [] };
 
   // 2. integrity --------------------------------------------------------------
   const text = canon.text;
@@ -115,8 +116,9 @@ export async function precheck(market: MarketRegistration, ev: EvidenceInput, th
   const repl = (text.match(/�/g) ?? []).length;
   const moji = (text.match(/Ã.|Â.|â€/g) ?? []).length;
   let integrity: string | null = null;
+  const structuredObj = isStructuredKind && ev.structured !== undefined && ev.structured !== null && typeof ev.structured === "object";
   if (text.length === 0) integrity = "TOO_SHORT";
-  else if (text.length < th.minAnchoredChars) integrity = "TOO_SHORT";
+  else if (!structuredObj && text.length < th.minAnchoredChars) integrity = "TOO_SHORT";
   else if (ctrl / text.length > 0.05) integrity = "CORRUPT_INPUT";
   else if (repl / text.length > 0.01) integrity = "CORRUPT_INPUT";
   else if (moji / text.length > 0.02) integrity = "CORRUPT_INPUT";
@@ -131,7 +133,7 @@ export async function precheck(market: MarketRegistration, ev: EvidenceInput, th
   // 3. source match -----------------------------------------------------------
   const src = sourceMatches(market, ev);
   checks.push({ name: "source_match", pass: src.pass, detail: src.detail });
-  if (!src.pass && !early) early = { kind: "ERROR", error_code: "SOURCE_MISMATCH", error_reason: "SOURCE_REF_MISMATCH", caveats: [] };
+  if (railEnabled("source_match") && !src.pass && !early) early = { kind: "ERROR", error_code: "SOURCE_MISMATCH", error_reason: "SOURCE_REF_MISMATCH", caveats: [] };
   if (ev.source_kind === "tenant_supplied") caveats.push("tenant_supplied_evidence");
 
   // 4. anchors + windows ------------------------------------------------------
@@ -143,7 +145,7 @@ export async function precheck(market: MarketRegistration, ev: EvidenceInput, th
     if (h) hits.push(h); else missing.push(a);
   }
   checks.push({ name: "anchor_localization", pass: missing.length === 0, detail: missing.length ? `missing: ${missing.join(" | ")}` : hits.map((h) => h.mode).join(",") });
-  if (missing.length && !early) early = { kind: "ERROR", error_code: "SOURCE_MISMATCH", error_reason: "NO_ANCHOR", caveats: [] };
+  if (railEnabled("anchors") && missing.length && !early) early = { kind: "ERROR", error_code: "SOURCE_MISMATCH", error_reason: "NO_ANCHOR", caveats: [] };
   let windows = windowsAround(hits, text).map((w) => text.slice(w.start, w.end));
   let total = windows.reduce((n, w) => n + w.length, 0);
   if (total > th.maxStateChars) {
@@ -170,12 +172,12 @@ export async function precheck(market: MarketRegistration, ev: EvidenceInput, th
   const usableForPositive = !beforeOpen && observedAt.getTime() <= deadline.getTime();
   const afterDeadline = now.getTime() > deadline.getTime();
   checks.push({ name: "time_window", pass: !beforeOpen, detail: beforeOpen ? `observed ${observedAt.toISOString()} before open_at` : usableForPositive ? "in window" : "after deadline+grace (negative paths only)" });
-  if (beforeOpen && !early) early = { kind: "ERROR", error_code: "SOURCE_MISMATCH", error_reason: "OUT_OF_WINDOW", caveats: [] };
+  if (railEnabled("time_window") && beforeOpen && !early) early = { kind: "ERROR", error_code: "SOURCE_MISMATCH", error_reason: "OUT_OF_WINDOW", caveats: [] };
 
   // 6. language ---------------------------------------------------------------
   const language = isStructuredKind ? "unknown" : detectLanguage(text);
   checks.push({ name: "language", pass: language !== "other", detail: language });
-  if (language === "other" && !early) early = { kind: "UNRESOLVED", caveats: ["non_english"] };
+  if (railEnabled("language") && language === "other" && !early) early = { kind: "UNRESOLVED", caveats: ["non_english"] };
 
   if (early && early.kind === "ERROR") early.caveats = caveats;
   if (early && early.kind === "UNRESOLVED") early.caveats = [...new Set([...early.caveats, ...caveats])];
