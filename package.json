@@ -1,0 +1,38 @@
+{
+  "name": "resolve",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Resolve — automated resolution infrastructure API for long-tail prediction markets (Cloudflare Workers + Supabase + TypeSafe Jev)",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "eval": "tsx evals/run.ts",
+    "eval:build": "tsx evals/build.ts",
+    "eval:mutate": "tsx evals/mutate.ts",
+    "bench": "tsx evals/bench.ts",
+    "openapi": "tsx scripts/openapi.ts",
+    "db:push": "supabase db push"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@hono/zod-openapi": "^1.6.3",
+    "@supabase/supabase-js": "^2.117.0",
+    "hono": "^4.13.8",
+    "viem": "^2.56.8",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260922.1",
+    "@types/node": "^26.6.2",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.1",
+    "wrangler": "^4.136.2"
+  }
+}

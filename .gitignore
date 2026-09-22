@@ -1,0 +1,23 @@
+# secrets — never committed
+.env
+.env.*
+!.env.example
+.dev.vars
+*.pem
+*.age.key
+
+# deps / build
+node_modules/
+dist/
+.wrangler/
+*.tsbuildinfo
+
+# eval outputs (fixtures and manifest ARE committed)
+evals/reports/
+evals/.cache/
+
+# os / editor
+.DS_Store
+.vscode/
+*.log
+coverage/
