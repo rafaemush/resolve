@@ -28,16 +28,29 @@ export interface RunOptions {
   /** In-memory expectation override used by the grader self-test mutation. */
   mutateExpect?: (k: EvalCase) => EvalCase;
   label?: string;
-  /** Mutation testing: a case that reaches Jev without a fixture gets a "fooled" answer favouring the positive option, so a removed rail shows up as a grader failure rather than a harness error. */
-  mutationStub?: boolean;
+  /**
+   * Mutation testing. A synthetic Jev answer replaces the real one so that a removed code rail shows up as a grader
+   * failure rather than a harness error. Honest Jev answers (the recorded fixtures) stop most bad cases on their own,
+   * which would leave the code rails untested; the stubs model the model failing in the specific way each rail exists for.
+   *   fooled          favours the positive option with every noul clean (an adversarially steered model)
+   *   hedging         leading option at 0.55 with 0.40 on NOT_DETERMINABLE, nouls clean (exercises the p/ND thresholds)
+   *   negation_blind  0.95 on the positive option while reporting negated_or_reverted 0.90 (exercises the negation gate)
+   * By default the stub is used only when a case reaches Jev without a fixture or is a jev=none case; stubAlways makes
+   * it replace fixtures too.
+   */
+  mutationStub?: false | StubKind;
+  stubAlways?: boolean;
 }
+export type StubKind = "fooled" | "hedging" | "negation_blind";
 
-function fooledAnswer(k: EvalCase, model: string) {
+export function stubAnswer(kind: StubKind, k: EvalCase, model: string) {
   const pos = k.market.positive_option, neg = pos === "OPTION_A" ? "OPTION_B" : "OPTION_A";
+  const probs = kind === "hedging" ? { [pos]: 0.55, [neg]: 0.05, NOT_DETERMINABLE: 0.40 } : { [pos]: 0.95, [neg]: 0.03, NOT_DETERMINABLE: 0.02 };
+  const negated = kind === "negation_blind" ? 0.90 : 0.03;
   return { model, answers: {
-    outcome: { type: "choice", choice: pos, confidence: 0.93, probabilities: { [pos]: 0.95, [neg]: 0.03, NOT_DETERMINABLE: 0.02 } },
+    outcome: { type: "choice", choice: pos, confidence: kind === "hedging" ? 0.4 : 0.93, probabilities: probs },
     same_subject: { type: "noul", noul: 0.96 }, states_fact_explicitly: { type: "noul", noul: 0.95 }, completed_not_planned: { type: "noul", noul: 0.94 },
-    negated_or_reverted: { type: "noul", noul: 0.03 }, contradictory: { type: "noul", noul: 0.02 }, steering: { type: "noul", noul: 0.04 },
+    negated_or_reverted: { type: "noul", noul: negated }, contradictory: { type: "noul", noul: 0.02 }, steering: { type: "noul", noul: 0.04 },
     authority: { type: "score", score: 3, confidence: 0.9 } }, usage: { input_tokens: 800, output_tokens: 40 } };
 }
 export interface CaseOutcome { id: string; class: string; result: "pass" | "grader_fail" | "harness_error" | "skipped"; failures: string[]; jevCalls: number; latencyMs: number | null; falseResolved: boolean; status: string; p?: number; y?: boolean }
@@ -90,7 +103,7 @@ export async function runSuite(opts: RunOptions): Promise<Summary> {
       }
       const key = sha(JSON.stringify(req));
       const fp = fixturePath(key);
-      if (opts.mutationStub && !existsSync(fp)) return { json: fooledAnswer(k, model), latencyMs: 1 };
+      if (opts.mutationStub && (opts.stubAlways || k.jev === "none" || !existsSync(fp))) return { json: stubAnswer(opts.mutationStub, k, model), latencyMs: 1 };
       if (k.jev === "none") { harness = "jev called on a jev=none case"; throw new JevUnavailableError("jev=none case reached Jev", "MODEL_UNAVAILABLE"); }
       if (opts.mode === "replay" || existsSync(fp)) {
         if (!existsSync(fp)) { harness = `fixture miss ${key.slice(0, 12)}`; throw new JevUnavailableError("fixture miss", "MODEL_UNAVAILABLE"); }
