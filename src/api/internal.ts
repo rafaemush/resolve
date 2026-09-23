@@ -104,6 +104,37 @@ internal.post("/eval-report", async (c) => {
 });
 
 /** Latency benchmark from this Worker's colo: N fixed 3k-token probes; writes bench_runs. */
+/**
+ * One-time Telegram wiring check, run from the Worker because api.telegram.org is unreachable from the founder's network.
+ * Sets the bot description, confirms the bot can post in the channel, sends one operator DM, and posts + pins the
+ * channel disclaimer (only when the channel has no pinned message yet). Idempotent; never prints the token.
+ */
+internal.post("/bot/setup", async (c) => {
+  if (!isAdmin(c)) return err(c, "forbidden", "admin key required", 403);
+  const tok = c.env.TELEGRAM_BOT_TOKEN, ch = c.env.TELEGRAM_CHANNEL_ID, op = c.env.TELEGRAM_OPERATOR_CHAT_ID;
+  if (!tok || !ch) return err(c, "config_error", "TELEGRAM_BOT_TOKEN / TELEGRAM_CHANNEL_ID unset", 400);
+  const api = async (m: string, body: Record<string, unknown> = {}) => {
+    const r = await fetch(`https://api.telegram.org/bot${tok}/${m}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(8000) });
+    return (await r.json()) as { ok: boolean; result?: any; description?: string };
+  };
+  const out: Record<string, unknown> = {};
+  const me = await api("getMe"); out.bot = me.ok ? `@${me.result.username}` : me.description;
+  if (!me.ok) return ok(c, out, 502);
+  const disc = "Automated shadow settlements for long-tail prediction markets. Every verdict is committed by hash before the official outcome and revealed after. Informational signal, not financial advice, not an oracle of record.";
+  out.description_set = (await api("setMyDescription", { description: disc })).ok;
+  out.short_description_set = (await api("setMyShortDescription", { short_description: "Commit-reveal shadow settlements for long-tail prediction markets. Not financial advice." })).ok;
+  const chat = await api("getChat", { chat_id: ch }); out.channel = chat.ok ? { title: chat.result.title, id: chat.result.id, pinned: chat.result.pinned_message?.message_id ?? null } : chat.description;
+  const adm = await api("getChatMember", { chat_id: ch, user_id: me.result.id }); out.bot_membership = adm.ok ? { status: adm.result.status, can_post: adm.result.can_post_messages ?? null } : adm.description;
+  if (op) { const dm = await api("sendMessage", { chat_id: op, text: "Resolve operator alerts are wired. One-time test from the settle-bot." }); out.operator_dm = dm.ok ? "sent" : dm.description; }
+  if (chat.ok && !chat.result.pinned_message) {
+    const text = `Resolve Settlement Feed\n\nThis channel publishes automated shadow settlements for long-tail prediction markets. Each verdict is posted first as a commitment hash before the market's official outcome, then revealed in a reply once the official resolution lands, so every call can be checked after the fact and none can be edited.\n\nInformational signal only. Not financial advice. Not an oracle of record.\n\nTrack record: ${c.env.RESOLVE_PUBLIC_URL ?? ""}/v1/track-record`;
+    const post = await api("sendMessage", { chat_id: ch, text, disable_web_page_preview: true });
+    out.disclaimer_post = post.ok ? post.result.message_id : post.description;
+    if (post.ok) out.pinned = (await api("pinChatMessage", { chat_id: ch, message_id: post.result.message_id, disable_notification: true })).ok;
+  }
+  return ok(c, out);
+});
+
 internal.post("/bench", async (c) => {
   if (!isAdmin(c)) return err(c, "forbidden", "admin key required", 403);
   const cfg = parseConfig(c.env);
