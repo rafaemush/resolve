@@ -18,6 +18,7 @@ export interface Env {
   CREDITS_PER_USDC: string;
   USDC_BASE_CONTRACT: string;
   BASE_FALLBACK_HTTP_URL: string;
+  BASE_LOGS_HTTP_URL?: string;        // eth_getLogs provider (never Alchemy Free: 10-block cap on Base)
   SOLANA_FALLBACK_HTTP_URL: string;
   RESOLVE_BOT_UA: string;
   // secrets
