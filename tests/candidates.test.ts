@@ -238,7 +238,7 @@ describe("Limitless: feed to entries", () => {
     const l = legs[0]!;
     expect(l.category).toBe("official_release");
     expect(l.checkability).toBe(4);
-    expect(l.registration.meta).toEqual({ slug: "25-bps-decrease-1", category: "official_release", condition_id: COND(51), group_id: "10013448", group_slug: "fed-decision-in-october-1" });
+    expect(l.registration.meta).toEqual({ slug: "25-bps-decrease-1", category: "official_release", condition_id: COND(51), group_id: "10013448", group_slug: "fed-decision-in-october-1", outcome_labels: ["Yes", "No"] });
     expect(l.registration.market).toMatchObject({ platform: "limitless", option_a: "Yes", option_b: "No", event_statement: "Fed Decision in October? — 25 bps decrease", deadline_utc: "2026-10-28T23:59:00.000Z", negative_rule: "explicit_negative" });
     expect(MarketRegistration.safeParse(l.registration.market).success).toBe(true);
     for (const e of b.entries) expect(e.needs_review.slice(0, 2)).toEqual(["anchors", "event_statement"]);
@@ -246,6 +246,20 @@ describe("Limitless: feed to entries", () => {
     const amm = b.entries.find((e) => e.registration.market.external_id === "amm-1")!;
     expect(amm).toMatchObject({ checkability: 0, category: "sports" });
     expect(amm.needs_review).toContain("options");
+  });
+
+  it("records the leg's own outcome labels (outcomeTokens first, as reconcile reads them); options no label matches need review", () => {
+    const own = (slug: string, outcomeTokens: string[]) => ({ id: slug, slug, title: "Will the ECB cut in October", automationType: "manual", marketType: "single", categories: ["Crypto"], expirationTimestamp: exp, createdAt: "2026-09-20T00:00:00Z", volumeFormatted: "10", conditionId: COND(9), tokens: { yes: "1", no: "2" }, outcomeTokens });
+    const r = buildLimitless([own("reversed-1", ["No", "Yes"]), own("up-down-1", ["Up", "Down"])], { now: NOW, days: 45, maxVolume: 50_000 });
+    const reversed = r.entries.find((e) => e.registration.market.external_id === "reversed-1")!;
+    expect(reversed.registration.meta).toMatchObject({ outcome_labels: ["No", "Yes"] });
+    expect(reversed.needs_review).not.toContain("options");
+    const upDown = r.entries.find((e) => e.registration.market.external_id === "up-down-1")!;
+    expect(upDown.registration.meta).toMatchObject({ outcome_labels: ["Up", "Down"] });
+    expect(upDown.needs_review).toContain("options");
+    expect(r.counts.unlabelled_amm_legs).toBe(0);
+    const amm = b.entries.find((e) => e.registration.market.external_id === "amm-1")!;
+    expect(amm.registration.meta).not.toHaveProperty("outcome_labels");
   });
 
   it("counts manual markets created since the previous scan", () => {

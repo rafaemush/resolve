@@ -25,6 +25,11 @@ export const MarketMeta = z.object({
   group_slug: text(300),
   event_id: platformId,
   category: text(100),
+  /**
+   * Limitless: the leg's outcome labels by winningOutcomeIndex at registration (limitlessLabels(): outcomeTokens, else
+   * [Yes, No] for tokens {yes, no}); the venue payload proposes an index over exactly these (src/shadow/venue.ts).
+   */
+  outcome_labels: z.array(text(100)).min(2).max(10),
 }).partial();
 export type MarketMeta = z.infer<typeof MarketMeta>;
 

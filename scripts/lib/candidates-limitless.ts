@@ -6,6 +6,7 @@
  * does the fetching.
  */
 import { z } from "zod";
+import { limitlessLabels, limitlessOutcomeIndex } from "../../src/markets/outcomes";
 import { conditionText, isPriceThreshold, officialReleaseKind, scanSources, sourceRefs, stripHtml, suggestAnchors, toIso, type CandidateEntry, type OfficialKind, type SourceScan } from "./candidates";
 
 const LimitlessLeg = z.object({
@@ -120,12 +121,8 @@ export interface LimitlessBuild {
 const zeroCats = (): Record<LimitlessCategory, number> => ({ official_release: 0, price: 0, sports: 0, politics: 0, specials: 0, pre_tge: 0, company_news: 0, other: 0 });
 
 const usd = (l: LimitlessLeg) => { const v = Number(l.volumeFormatted ?? 0); return Number.isFinite(v) ? Math.round(v * 100) / 100 : 0; };
-/**
- * Reconcile reads the labels from the registered market's own object (GET /markets/{slug}): outcomeTokens, or tokens
- * {yes, no} (src/markets/outcomes.ts limitlessLabels, shared with the venue payload). A group's outcomeTokens are not on
- * its legs, so they do not count.
- */
-const labelled = (leg: LimitlessLeg) => (leg.outcomeTokens?.length ?? 0) >= 2 || (!!leg.tokens && "yes" in leg.tokens && "no" in leg.tokens);
+/** The options every Limitless registration suggests: reconcile maps the official label to one by exact text. */
+const OPTIONS = { option_a: "Yes", option_b: "No" } as const;
 
 export function buildLimitless(raw: unknown[], w: LimitlessWindow): LimitlessBuild {
   const counts: LimitlessBuild["counts"] = {
@@ -161,7 +158,13 @@ export function buildLimitless(raw: unknown[], w: LimitlessWindow): LimitlessBui
       const desc = stripHtml(descHtml);
       const statement = group ? `${row.title} — ${leg.title}` : row.title;
       const scan = scanSources(`${row.title} ${leg.title}`, [descHtml]);
-      const hasLabels = labelled(leg);
+      // Reconcile reads the labels from the registered market's own object (GET /markets/{slug}) with limitlessLabels():
+      // outcomeTokens, or tokens {yes, no}. A group's outcomeTokens are not on its legs, so they do not count. The labels
+      // go into meta so the venue payload proposes an index over the same list; options that are not exactly one label
+      // each could never be read back, so they need review.
+      const labels = limitlessLabels(leg);
+      const hasLabels = labels !== null;
+      const optionsMap = hasLabels && limitlessOutcomeIndex("OPTION_A", OPTIONS, labels) !== null && limitlessOutcomeIndex("OPTION_B", OPTIONS, labels) !== null;
       const check = checkability(category, scan, hasLabels);
       if (scan.requiresX) counts.requires_x_legs++;
       if (!hasLabels) counts.unlabelled_amm_legs++;
@@ -173,12 +176,13 @@ export function buildLimitless(raw: unknown[], w: LimitlessWindow): LimitlessBui
       // (src/resolve/jev.ts), which the founder rewrites as a declarative, deadline-free statement.
       const needs = ["anchors", "event_statement"];
       if (!scan.tier || scan.bareDomain || scan.primary.some((c) => !c.url.startsWith("https://"))) needs.push("sources");
-      if (!hasLabels) needs.push("options");
+      if (!optionsMap) needs.push("options");
       if (cond.truncated) needs.push("condition");
       if (!leg.conditionId) needs.push("meta.condition_id");
       const meta: Record<string, unknown> = { slug: leg.slug, category };
       if (leg.conditionId) meta.condition_id = leg.conditionId;
       if (group) { meta.group_id = row.id; meta.group_slug = row.slug; }
+      if (labels) meta.outcome_labels = [...labels];
       entries.push({
         approved: false,
         needs_review: needs,
@@ -202,8 +206,7 @@ export function buildLimitless(raw: unknown[], w: LimitlessWindow): LimitlessBui
             condition: cond.condition,
             event_statement: statement.slice(0, 1000),
             // Reconcile maps the official label (outcomeTokens, or YES = 0 / NO = 1 from tokens) by exact text.
-            option_a: "Yes",
-            option_b: "No",
+            ...OPTIONS,
             positive_option: "OPTION_A",
             anchors: suggestAnchors(group ? row.title : leg.title, group ? leg.title : null),
             sources: sourceRefs(scan.primary),

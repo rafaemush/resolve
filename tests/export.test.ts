@@ -110,6 +110,32 @@ describe("exportRows, the query and the CSV", () => {
     expect(line!.split(",")).toHaveLength(EXPORT_COLUMNS.length);
     expect(end).toBe("");
   });
+  it("formula injection: a string cell a spreadsheet would evaluate is written as quoted text with a leading apostrophe", () => {
+    expect(csvField("=1+1")).toBe(`"'=1+1"`);
+    expect(csvField("+1")).toBe(`"'+1"`);
+    expect(csvField("-1+1")).toBe(`"'-1+1"`);
+    expect(csvField("@x")).toBe(`"'@x"`);
+    expect(csvField('=HYPERLINK("http://x","y")')).toBe(`"'=HYPERLINK(""http://x"",""y"")"`);
+    expect(csvField("\tcmd")).toBe(`"'\tcmd"`);
+    expect(csvField("\r=1")).toBe(`"'\r=1"`);
+    expect(csvField("  =1+1")).toBe(`"'  =1+1"`);
+    expect(csvField("\uFF1D1+1")).toBe(`"'\uFF1D1+1"`);
+    // numbers stay numbers; a hyphen or @ inside a value is not a formula
+    expect(csvField(-120)).toBe("-120");
+    expect(csvField(0)).toBe("0");
+    expect(csvField("fed-decision-in-october-1")).toBe("fed-decision-in-october-1");
+    expect(csvField("a@b")).toBe("a@b");
+    expect(csvField("2026-10-01T00:00:00.000Z")).toBe("2026-10-01T00:00:00.000Z");
+  });
+  it("formula injection through exportCsv: platform identifiers are neutralised, lead_seconds stays numeric", () => {
+    const csv = exportCsv(exportRows([viewRow(1, { external_id: "=cmd|' /C calc'!A0", venue_slug: "@SUM(A1)", event_key: "+evt", lead_seconds: -120, agreement: "agree" })], {}));
+    const line = csv.split("\r\n")[1]!;
+    expect(line).toContain(`"'=cmd|' /C calc'!A0"`);
+    expect(line).toContain(`"'@SUM(A1)"`);
+    expect(line).toContain(`"'+evt"`);
+    expect(line.endsWith(",agree,-120")).toBe(true);
+    for (const cell of line.split(",")) expect(cell).not.toMatch(/^[=+@]/);
+  });
   it("chunks of 100", () => {
     expect(chunks(Array.from({ length: 250 }, (_, i) => i)).map((c) => c.length)).toEqual([100, 100, 50]);
     expect(chunks([])).toEqual([]);
@@ -169,6 +195,29 @@ describe("GET /v1/shadow/export", () => {
     // 50 older follows fill the Builder cap: markets 1 and 2 (followed later) are above it
     expect(body.data.rows.map((x: Row) => x.market_id)).not.toContain(uuid(1));
     expect(body.data.rows.map((x: Row) => x.market_id)).not.toContain(uuid(2));
+  });
+
+  it("truncated only when a follow beyond the 1,000 read exists: exactly 1,000 is complete, 1,001 is not", async () => {
+    h.db.tables.tenants![0]!.plan = "platform";
+    const mfs = (from: number, n: number): Row[] => Array.from({ length: n }, (_, i) => ({ id: `g${String(from + i).padStart(5, "0")}`, tenant_id: "t1", market_id: uuid(1000 + from + i), created_at: at(1000 + from + i), deleted_at: null, markets: { platform: "polymarket", status: "open", deleted_at: null } }));
+    h.db.tables.market_follows = mfs(0, 1000);
+    const full = await call("/shadow/export?format=csv");
+    expect(full.headers.get("x-resolve-truncated")).toBe("false");
+    expect(JSON.parse((await call("/shadow/export")).text).data.truncated).toBe(false);
+    h.db.tables.market_follows.push(...mfs(1000, 1));
+    expect((await call("/shadow/export?format=csv")).headers.get("x-resolve-truncated")).toBe("true");
+    expect(JSON.parse((await call("/shadow/export")).text).data.truncated).toBe(true);
+  });
+
+  it("a created_at tie at the 1,000-row boundary keeps the follow follow_entitlements orders first: (created_at, id)", async () => {
+    h.db.tables.tenants![0]!.plan = "platform";
+    const mk = (id: string, n: number, minute: number): Row => ({ id, tenant_id: "t1", market_id: uuid(n), created_at: at(minute), deleted_at: null, markets: { platform: "polymarket", status: "open", deleted_at: null } });
+    // 999 older follows, then two at the same instant, stored with the larger id first
+    h.db.tables.market_follows = [...Array.from({ length: 999 }, (_, i) => mk(`g${String(i).padStart(5, "0")}`, 5000 + i, i)), mk("zz-late-id", 7001, 2000), mk("hh-early-id", 7002, 2000)];
+    h.db.tables.v_venue_report = [viewRow(7001), viewRow(7002)];
+    const body = JSON.parse((await call("/shadow/export")).text);
+    expect(body.data.rows.map((x: Row) => x.market_id)).toEqual([uuid(7002)]);
+    expect(body.data.truncated).toBe(true);
   });
 
   it("another tenant sees only its own follows; a tenant with none gets an empty export", async () => {

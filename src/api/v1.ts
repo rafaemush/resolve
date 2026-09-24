@@ -374,15 +374,18 @@ v1.get("/shadow/export", async (c) => {
   if (!q.success) return err(c, "validation_error", q.error.issues.map((i) => `${i.path.join(".") || "query"}: ${i.message}`).join("; ").slice(0, 400), 400);
   const auth = c.get("auth");
   const client = db(c.env);
-  const [plan, { data, error }] = await Promise.all([
+  const [plan, { data, error, count }] = await Promise.all([
     tenantPlan(client, auth.tenantId),
-    client.from("market_follows").select("id, market_id, created_at, markets(platform, status, deleted_at)")
-      .eq("tenant_id", auth.tenantId).is("deleted_at", null).order("created_at", { ascending: true }).limit(EXPORT_ROW_CAP),
+    // follow_entitlements' order, (created_at, id), so a created_at tie at the cap drops the same follow it would; the
+    // exact count says whether a newer follow was left out (a full page alone cannot: Supabase caps a page at 1,000)
+    client.from("market_follows").select("id, market_id, created_at, markets(platform, status, deleted_at)", { count: "exact" })
+      .eq("tenant_id", auth.tenantId).is("deleted_at", null).order("created_at", { ascending: true }).order("id", { ascending: true }).limit(EXPORT_ROW_CAP),
   ]);
   if (error || "error" in plan) return storeDown(c, "follow store");
   const follows = (data ?? []) as unknown as ExportFollow[];
   // The oldest EXPORT_ROW_CAP follows are read, so their entitlement is exact; a newer one is not exported, and says so.
-  const truncated = follows.length >= EXPORT_ROW_CAP;
+  // Without a count, a full page is reported as truncated: never a silent cut.
+  const truncated = typeof count === "number" ? count > follows.length : follows.length >= EXPORT_ROW_CAP;
   // An authenticated caller holds a live key: the evaluation rule is met for the calling tenant.
   const ids = entitledFollows(follows, plan.plan, true).filter((f) => !q.data.platform || f.markets?.platform === q.data.platform).map((f) => f.market_id);
   const reads = await Promise.all(chunks(ids).map((part) => client.from("v_venue_report").select(EXPORT_VIEW_COLUMNS.join(", ")).in("market_id", part)));

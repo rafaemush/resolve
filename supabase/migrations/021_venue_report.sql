@@ -8,29 +8,32 @@
 --   * determinable_at    resolutions.created_at of the market's first complete shadow verdict that is RESOLVED (003)
 --   * committed_at       bot_posts.created_at of the market's first commit (009; inserted first since 012)
 --   * posted_at          that commit's telegram_date (012): when it became public in the channel
---   * first_delivered_at the first shadow.committed webhook delivered to any follower (webhook_deliveries, 009)
 --   * official_*, agreement, lead_seconds  the final reconciliation (009, 012: final = the latest commit's)
 -- plus the latest commit's verdict and hashes (payload.committed since 012, else the resolutions row, like
 -- src/bot/commit.ts committedOf) for GET /v1/shadow/export, which reads this view for a tenant's followed markets
 -- (never the nonce or the preimage: the view has neither).
--- Read by scripts/venue-report.ts (with v_track_record, nothing else) and by the Worker's GET /v1/shadow/export.
+-- The time a verdict reached a venue is per tenant, so it is a second view, v_venue_deliveries: the first delivered
+-- shadow.committed webhook per (tenant, market) from webhook_deliveries (009). A report prepared for one venue reads
+-- only that venue's rows (scripts/venue-report.ts --tenant); a delivery to another follower is never in its report.
+-- Read by scripts/venue-report.ts (with v_track_record, nothing else) and by the Worker's GET /v1/shadow/export
+-- (v_venue_report only).
 --
 -- Compatibility with the Worker deployed before this migration (8d67d16; it keeps running until every migration is
 -- applied and the new Worker ships):
---   * Additive only: one new view and one new partial index on webhook_deliveries. No table, column, constraint,
---     function or existing view changes; the old Worker never reads the view. The index covers only delivered
+--   * Additive only: two new views and one new partial index on webhook_deliveries. No table, column, constraint,
+--     function or existing view changes; the old Worker never reads the views. The index covers only delivered
 --     shadow.committed rows, which the old Worker never writes (it has no such event), so its inserts and updates of
 --     webhook_deliveries pay nothing until the new Worker delivers one.
 -- Idempotent (create or replace view, create index if not exists). Nothing here is reachable by anon or authenticated
 -- (migration 010 explains why revoking from public alone is not enough on Supabase).
 begin;
 
--- 1. first delivery of shadow.committed per market ----------------------------------------------------------------------
-create index if not exists idx_webhook_deliveries_shadow_committed
-  on webhook_deliveries ((payload ->> 'market_id'), delivered_at)
+-- 1. first delivery of shadow.committed per tenant and market ---------------------------------------------------------
+create index if not exists idx_webhook_deliveries_shadow_committed_tenant
+  on webhook_deliveries (tenant_id, (payload ->> 'market_id'), delivered_at)
   where event_type = 'shadow.committed' and delivered_at is not null;
-comment on index idx_webhook_deliveries_shadow_committed is
-  'v_venue_report.first_delivered_at: the earliest delivered shadow.committed webhook of a market (payload.market_id), without scanning every delivery.';
+comment on index idx_webhook_deliveries_shadow_committed_tenant is
+  'v_venue_deliveries: the earliest delivered shadow.committed webhook of one tenant for a market (payload.market_id), without scanning every delivery.';
 
 -- 2. v_venue_report ---------------------------------------------------------------------------------------------------
 create or replace view public.v_venue_report with (security_invoker = true) as
@@ -43,7 +46,6 @@ select m.id as market_id,
        dr.created_at as determinable_at,
        fc.created_at as committed_at,
        fc.telegram_date as posted_at,
-       wd.first_delivered_at,
        rc.official_at,
        rc.official_at_source,
        rc.agreement,
@@ -89,16 +91,12 @@ select m.id as market_id,
      where r.market_id = m.id and r.mode = 'shadow' and r.status_row = 'complete' and r.resolution_status = 'RESOLVED'
      order by r.created_at, r.id
      limit 1) dr on true
-  left join lateral (
-    select min(d.delivered_at) as first_delivered_at
-      from webhook_deliveries d
-     where d.event_type = 'shadow.committed' and d.delivered_at is not null and d.payload ->> 'market_id' = m.id::text) wd on true
   left join reconciliations rc on rc.market_id = m.id and rc.final
  where m.tenant_id is null and not m.is_test
    -- a deleted registration drops out, unless it carries a commit: a public call never leaves the record
    and (m.deleted_at is null or fc.created_at is not null);
 comment on view public.v_venue_report is
-  'Venue reconciliation report rows (plan §17.3 P7-lite, §18.1 (e)): one row per public shadow market (tenant_id null, not is_test; a deleted market only if it has a commit), with the times a report quotes, all read from the tables of record: determinable_at (first complete shadow verdict that is RESOLVED), committed_at / posted_at (first commit, and when it reached the channel), first_delivered_at (first shadow.committed webhook delivered to any follower), and the final reconciliation (official_at, official_at_source, agreement, lead_seconds = official_at - the final commit''s posted time). determination_basis, committed_status / committed_outcome and the evidence hashes are the latest commit''s (payload.committed since migration 012, else its resolutions row). No title, criteria text, nonce or preimage. Read by scripts/venue-report.ts and GET /v1/shadow/export. security_invoker: readable by service_role only.';
+  'Venue reconciliation report rows (plan §17.3 P7-lite, §18.1 (e)): one row per public shadow market (tenant_id null, not is_test; a deleted market only if it has a commit), with the times a report quotes, all read from the tables of record: determinable_at (first complete shadow verdict that is RESOLVED), committed_at / posted_at (first commit, and when it reached the channel), and the final reconciliation (official_at, official_at_source, agreement, lead_seconds = official_at - the final commit''s posted time). determination_basis, committed_status / committed_outcome and the evidence hashes are the latest commit''s (payload.committed since migration 012, else its resolutions row). No title, criteria text, nonce or preimage, and no delivery time (per tenant: v_venue_deliveries). Read by scripts/venue-report.ts and GET /v1/shadow/export. security_invoker: readable by service_role only.';
 comment on column public.v_venue_report.market_id is 'markets.id.';
 comment on column public.v_venue_report.platform is 'markets.platform: polymarket | limitless | custom.';
 comment on column public.v_venue_report.event_key is 'markets.event_key (migration 017): the legs of one multi-outcome event share it; reports count events by it.';
@@ -108,7 +106,6 @@ comment on column public.v_venue_report.determination_basis is 'The latest commi
 comment on column public.v_venue_report.determinable_at is 'created_at of the market''s first complete shadow resolutions row whose verdict is RESOLVED (before the public floor); NULL when none.';
 comment on column public.v_venue_report.committed_at is 'created_at of the market''s first commit (bot_posts kind commit); NULL when never committed.';
 comment on column public.v_venue_report.posted_at is 'telegram_date of that first commit: when it reached the public channel; NULL while pending or never posted.';
-comment on column public.v_venue_report.first_delivered_at is 'Earliest delivered_at of a shadow.committed webhook for this market (any follower); NULL when none was delivered.';
 comment on column public.v_venue_report.official_at is 'Final reconciliation: the platform''s official time (see official_at_source).';
 comment on column public.v_venue_report.official_at_source is 'gamma_closed_time (a platform timestamp) | limitless_api_poll | first_observed_poll (the first poll that saw the outcome: an upper bound, so lead_seconds is too).';
 comment on column public.v_venue_report.agreement is 'Final reconciliation: agree | disagree | abstained | void | unresolved_by_platform; NULL before the platform resolves.';
@@ -128,5 +125,23 @@ comment on column public.v_venue_report.official_outcome is 'Final reconciliatio
 comment on column public.v_venue_report.reconciled_at is 'When the final reconciliation row was written.';
 revoke all on public.v_venue_report from public, anon, authenticated;
 grant select on public.v_venue_report to service_role;
+
+-- 3. v_venue_deliveries ------------------------------------------------------------------------------------------------
+create or replace view public.v_venue_deliveries with (security_invoker = true) as
+select d.tenant_id,
+       m.id as market_id,
+       min(d.delivered_at) as first_delivered_at
+  from webhook_deliveries d
+  join markets m on m.id::text = d.payload ->> 'market_id'
+ where d.event_type = 'shadow.committed' and d.delivered_at is not null
+   and m.tenant_id is null and not m.is_test
+ group by d.tenant_id, m.id;
+comment on view public.v_venue_deliveries is
+  'When a verdict first reached each follower (plan §18.1 (e) delivered_at): one row per tenant and public shadow market with at least one delivered shadow.committed webhook (webhook_deliveries, migration 009; payload.market_id names the market). Per tenant, so a report prepared for one venue shows only its own deliveries (scripts/venue-report.ts --tenant) and never another follower''s. security_invoker: readable by service_role only.';
+comment on column public.v_venue_deliveries.tenant_id is 'webhook_deliveries.tenant_id: the follower the webhook was delivered to.';
+comment on column public.v_venue_deliveries.market_id is 'markets.id of the public shadow market (payload.market_id of the shadow.committed event).';
+comment on column public.v_venue_deliveries.first_delivered_at is 'Earliest delivered_at of a shadow.committed webhook of this market to this tenant (any of its endpoints, any commit of the market); a row without delivered_at (pending, retrying or dead-lettered) does not count.';
+revoke all on public.v_venue_deliveries from public, anon, authenticated;
+grant select on public.v_venue_deliveries to service_role;
 
 commit;

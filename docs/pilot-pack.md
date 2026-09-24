@@ -7,14 +7,14 @@ Resolve checks whether the stated condition of a prediction market has happened,
 ### Design Partner: $750 a month
 
 - Custom sources for one platform: we register and maintain the sources for your markets.
-- Private early reveals for all of that platform's markets we shadow: each verdict reaches you by webhook when its commitment is recorded, before the public reveal.
+- Private early reveals for all of that platform's markets we shadow: each verdict reaches you by webhook when its commitment is recorded, before the public reveal. The account has no follow limit, so every one of those markets can be followed.
 - Webhooks in your platform's own identifiers (below).
 - The weekly reconciliation report for your markets.
 - Prepaid monthly in USDC, month to month. No SLA and no master agreement; it converts to a Platform agreement once Resolve's operating entity exists.
 
 ### 30-day venue pilot: $1,000
 
-- Private early reveals for every market you name, for 30 days.
+- Private early reveals for every market you name that Resolve shadows, for 30 days. The pilot account has no follow limit (the plan limits on the pricing page do not apply to it), so every named market can be followed.
 - Webhooks in your platform's own identifiers (below).
 - The weekly reconciliation report for your markets.
 - A named contact for the pilot.
@@ -33,14 +33,14 @@ Resolve is operated by its founder as an individual until its operating entity e
 
 A proposal is present only when the committed verdict is RESOLVED. When the evidence does not settle the market, the verdict is UNRESOLVED with its reasons and the proposal is `null`: Resolve abstains rather than guesses.
 
-**The weekly reconciliation report.** Per market: when a verdict first became determinable, when it was committed and posted, when the first webhook reached you, the platform's official time and where that time comes from, the agreement, and the lead time. Per venue: markets, distinct events, reconciled events, agreement counts, and lead time p50 and p90 once at least five distinct events have a measured lead. Markets are named by their platform ids only. Every number comes from Resolve's record, and every commitment can be checked at `GET /v1/track-record/verify?hash=<sha256>`.
+**The weekly reconciliation report.** Per market: when a verdict first became determinable, when it was committed and posted, when its first `shadow.committed` webhook was delivered to your account (your deliveries only), the platform's official time and where that time comes from, the agreement, and the lead time. Per venue: markets, distinct events, reconciled events, agreement counts, and lead time p50 and p90 once at least five distinct events have a measured lead. Markets are named by their platform ids only. Every number comes from Resolve's record, and every commitment can be checked at `GET /v1/track-record/verify?hash=<sha256>`.
 
 **An export.** `GET /v1/shadow/export?platform=&since=&format=csv` returns your followed markets as CSV or JSON: commitment, verdict, evidence hashes, and after the platform resolves, the official outcome, time, agreement and lead time.
 
 ## What it is not
 
 - Not financial advice and not an oracle of record. Your resolution process stays yours; Resolve is an independent check beside it. Resolve never trades.
-- No accuracy figure is quoted before 100 markets on your platform have been reconciled against your own outcomes, counted by distinct event (the legs of one multi-outcome event count once). Until then we quote only your own reconciled rows and the lead time measured on them.
+- No accuracy figure is quoted before 100 distinct events on your platform have been reconciled against your own outcomes (the legs of one multi-outcome event count once). Until then we quote only your own reconciled rows and the lead time measured on them.
 - No lead-time guarantee. Lead time is measured and reported, never promised.
 - No SLA during the pilot or the Design Partner term.
 - Structured verdicts (machine-readable sources such as official statistics releases and central-bank decisions, GitHub objects, on-chain logs) are what the paid offer covers today. Verdicts that read free-text web evidence run on the public record as best effort and are reported apart; a request that cannot be answered for an upstream reason is refunded.

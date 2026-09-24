@@ -42,7 +42,21 @@ describe("seed-shadow --check", () => {
 
   it("refuses a Polymarket entry without meta.condition_id", () => {
     expect(errorsOf(entry({ meta: { slug: "x" } }))).toEqual([expect.stringContaining("meta.condition_id is required")]);
-    expect(errorsOf(entry({ meta: { slug: "x" }, market: { platform: "limitless", external_id: "x-1" } }), "limitless")).toEqual([]);
+    expect(errorsOf(entry({ meta: { slug: "x", outcome_labels: ["Yes", "No"] }, market: { platform: "limitless", external_id: "x-1" } }), "limitless")).toEqual([]);
+  });
+
+  it("refuses a Limitless entry without the leg's outcome labels, with an option no label matches, or a group leg without its group slug", () => {
+    const lim = (meta: Record<string, unknown>, market: Record<string, unknown> = {}) => errorsOf(entry({ meta, market: { platform: "limitless", external_id: "x-1", ...market } }), "limitless");
+    expect(lim({ slug: "x" })).toEqual([expect.stringContaining("meta.outcome_labels is required for Limitless")]);
+    expect(lim({ slug: "x", outcome_labels: ["No", "Yes"] })).toEqual([]);
+    expect(lim({ slug: "x", outcome_labels: ["Up", "Down"] })).toEqual([
+      'market.option_a "Yes" is not exactly one of the outcome labels ["Up","Down"]: reconcile could not read that outcome',
+      'market.option_b "No" is not exactly one of the outcome labels ["Up","Down"]: reconcile could not read that outcome',
+    ]);
+    expect(lim({ slug: "x", outcome_labels: ["Up", "Down"] }, { option_a: "Up", option_b: "Down" })).toEqual([]);
+    // a candidate file generated before 2026-09-25: group_id without group_slug
+    expect(lim({ slug: "x", outcome_labels: ["Yes", "No"], group_id: 10013448 })).toEqual([expect.stringContaining("meta.group_slug is required with meta.group_id")]);
+    expect(lim({ slug: "x", outcome_labels: ["Yes", "No"], group_id: 10013448, group_slug: "fed-decision-in-october-1" })).toEqual([]);
   });
 
   it("enforces the $50k cap, is_test false, a future deadline and https sources", () => {
@@ -127,6 +141,12 @@ describe("seed-shadow read-back", () => {
     expect(verifyRow({ ...row, is_test: true, condition_id: null, meta: { registration_reasons: [] } }, 2, want)).toEqual([
       "is_test is not false", `condition_id null != ${CID}`, `meta.condition_id is undefined, expected "${CID}"`, 'meta.slug is undefined, expected "s"',
     ]);
+  });
+
+  it("compares list-valued meta (outcome_labels) by value, in order", () => {
+    const w = { ...want, meta: { ...want.meta, outcome_labels: ["Yes", "No"] } };
+    expect(verifyRow({ ...row, meta: { ...row.meta, outcome_labels: ["Yes", "No"] } }, 2, w)).toEqual([]);
+    expect(verifyRow({ ...row, meta: { ...row.meta, outcome_labels: ["No", "Yes"] } }, 2, w)).toEqual(['meta.outcome_labels is ["No","Yes"], expected ["Yes","No"]']);
   });
 
   it("names an open market left with fewer watches than sources (a registration that stopped part-way)", () => {

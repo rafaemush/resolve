@@ -31,13 +31,15 @@ describe("mergeMeta", () => {
     const r = mergeMeta({ condition_id: CID, slug: "s", group_id: 10014423, event_id: "60182", neg_risk: true, registration_reasons: ["forged"], volume: 12 });
     expect(r).toEqual({ ok: true, meta: { condition_id: CID.toLowerCase(), slug: "s", group_id: "10014423", event_id: "60182", neg_risk: true }, dropped: ["registration_reasons", "volume"] });
     expect(mergeMeta(undefined)).toEqual({ ok: true, meta: {}, dropped: [] });
-    expect(META_KEYS).toEqual(["condition_id", "slug", "question_id", "neg_risk", "limitless_slug", "group_id", "group_slug", "event_id", "category"]);
+    expect(META_KEYS).toEqual(["condition_id", "slug", "question_id", "neg_risk", "limitless_slug", "group_id", "group_slug", "event_id", "category", "outcome_labels"]);
+    expect(mergeMeta({ outcome_labels: ["No", "Yes"] })).toEqual({ ok: true, meta: { outcome_labels: ["No", "Yes"] }, dropped: [] });
   });
 
   it("refuses a whitelisted key of the wrong type and a non-object", () => {
     expect(mergeMeta({ condition_id: "0x12" })).toMatchObject({ ok: false });
     expect(mergeMeta({ neg_risk: "yes" })).toMatchObject({ ok: false });
     expect(mergeMeta(["slug"])).toMatchObject({ ok: false });
+    for (const bad of [["Yes"], "Yes,No", ["Yes", 1], ["Yes", ""]]) expect(mergeMeta({ outcome_labels: bad }), JSON.stringify(bad)).toMatchObject({ ok: false });
   });
 });
 

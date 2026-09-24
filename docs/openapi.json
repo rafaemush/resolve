@@ -2035,7 +2035,7 @@
     },
     "/bot": {
       "get": {
-        "summary": "What ResolveBot fetches and why, how it stays polite (declared user agent, robots.txt, per-host spacing, conditional requests) and how to opt out (public HTML, no auth)",
+        "summary": "What ResolveBot fetches and why, how it stays polite (declared user agent, robots.txt for web pages, per-page spacing, conditional requests) and how to opt out (robots.txt for web pages; an issue for official releases and public APIs) (public HTML, no auth)",
         "responses": {
           "200": {
             "description": "text/html",

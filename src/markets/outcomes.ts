@@ -55,8 +55,8 @@ export function limitlessOutcomeAt(index: number, labels: readonly string[], m: 
 /**
  * Write direction (the venue payload): the one winningOutcomeIndex that limitlessOutcomeAt() reads back as `outcome`
  * over the same labels; null when no index or more than one does (options that are not the market's own labels are
- * never proposed as a guess). Defaults to the tokens {yes, no} order every registrable Limitless leg carries
- * (scripts/lib/candidates-limitless.ts registers option_a "Yes", option_b "No").
+ * never proposed as a guess). The venue payload passes the leg's labels as recorded at registration
+ * (meta.outcome_labels, from the same limitlessLabels() reconcile uses); the default is the tokens {yes, no} order.
  */
 export function limitlessOutcomeIndex(outcome: Option, m: Options, labels: readonly string[] = LIMITLESS_YES_NO): number | null {
   const hits = labels.flatMap((_, i) => (limitlessOutcomeAt(i, labels, m) === outcome ? [i] : []));

@@ -1,19 +1,21 @@
 /**
- * Migration 021 (v_venue_report), rollback-only: everything runs inside one DO block that always raises at the end, so
- * nothing persists. It asserts, on rows written inside the block with fixed times:
+ * Migration 021 (v_venue_report, v_venue_deliveries), rollback-only: everything runs inside one DO block that always
+ * raises at the end, so nothing persists. It asserts, on rows written inside the block with fixed times:
  *   - one row per public shadow market: a test market, a tenant's market and a deleted market without a commit are not
  *     rows; a deleted market with a commit is (a public call never leaves the record);
  *   - determinable_at = the first complete shadow resolution that is RESOLVED (not an earlier UNRESOLVED one, not a
  *     tenant-mode or pending row); committed_at / posted_at = the first commit's created_at / telegram_date;
- *     first_delivered_at = the earliest delivered shadow.committed webhook of the market (not a pending one, not
- *     shadow.revealed, not another market's); official_at, official_at_source, agreement and lead_seconds = the final
- *     reconciliation, never an earlier commit's;
+ *     official_at, official_at_source, agreement and lead_seconds = the final reconciliation, never an earlier commit's;
+ *     v_venue_report has no delivery column;
+ *   - v_venue_deliveries: first_delivered_at per (tenant, market) = that tenant's earliest delivered shadow.committed
+ *     webhook of the market (not a pending one, not shadow.revealed, not another market's, and never another tenant's:
+ *     a second follower's earlier delivery stays in its own row); a test market's deliveries are not rows;
  *   - the latest commit's verdict and hashes from payload.committed, or from its resolutions row for a commit recorded
  *     before migration 012 (a legacy "n/a" hash is NULL); determination_basis is the latest commit's;
  *   - the identifiers: Limitless venue_slug (limitless_slug, then slug, then external_id), condition_id lower-cased
  *     from the column or meta;
- *   - least privilege: security_invoker, service_role reads it, anon and authenticated cannot; the view, every column
- *     and the new index are commented.
+ *   - least privilege on both views: security_invoker, service_role reads them, anon and authenticated cannot; the views,
+ *     every column and the new index are commented.
  * Refused unless SUPABASE_PROJECT_REF equals STAGING_SUPABASE_PROJECT_REF or RESOLVE_SELFTEST_NON_PRODUCTION=1 (with
  * --psql, only the latter); the target is printed first.
  *   RESOLVE_SELFTEST_NON_PRODUCTION=1 npx tsx scripts/selftest/venue.ts --psql postgresql://postgres@localhost:5561/resolve
@@ -30,13 +32,15 @@ do $$
 declare
   out jsonb := '{}'::jsonb;
   t0 constant timestamptz := '2026-01-01T00:00:00Z';
-  tnt uuid; ep uuid; m1 uuid; m2 uuid; m3 uuid; mt uuid; mten uuid; mdel uuid; mdelc uuid; mother uuid;
+  tnt uuid; ep uuid; tnt2 uuid; ep2 uuid; m1 uuid; m2 uuid; m3 uuid; mt uuid; mten uuid; mdel uuid; mdelc uuid; mother uuid;
   v record;
   mk text := $mk$insert into markets (platform, external_id, condition, event_statement, option_a, option_b, positive_option, open_at, deadline_utc, meta, condition_id, tenant_id)
               values ($1, $2, 'selftest condition', 'selftest statement', 'Yes', 'No', 'OPTION_A', '2025-12-01T00:00:00Z', '2026-01-02T00:00:00Z', $3, $4, $5) returning id$mk$;
 begin
   insert into tenants (display_name) values ('__selftest_venue_tenant__') returning id into tnt;
   insert into webhook_endpoints (tenant_id, url, secret, events) values (tnt, 'https://selftest.invalid/hook', 'whsec_selftest', '{shadow.committed,shadow.revealed}') returning id into ep;
+  insert into tenants (display_name) values ('__selftest_venue_tenant2__') returning id into tnt2;
+  insert into webhook_endpoints (tenant_id, url, secret, events) values (tnt2, 'https://selftest.invalid/hook2', 'whsec_selftest2', '{shadow.committed}') returning id into ep2;
 
   execute mk into m1 using 'polymarket', '__selftest_venue_m1__', '{"slug":"venue-m1","event_id":"__selftest_venue_ev__"}'::jsonb, '0x' || repeat('AB', 32), null::uuid;
   execute mk into m2 using 'limitless', '__selftest_venue_m2__', '{"limitless_slug":"venue-leg-a","slug":"venue-other","group_slug":"venue-group","condition_id":"0xCD"}'::jsonb, null::text, null::uuid;
@@ -69,13 +73,16 @@ begin
   insert into reconciliations (resolution_id, market_id, platform, official_outcome, official_at, official_at_source, agreement, lead_seconds, final, reconciled_at) values
     ('__selftest_venue_r1__', m1, 'polymarket', 'OPTION_A', t0 + interval '300 minutes', 'gamma_closed_time', 'abstained', 17340, false, t0 + interval '301 minutes'),
     ('__selftest_venue_r2__', m1, 'polymarket', 'OPTION_A', t0 + interval '300 minutes', 'gamma_closed_time', 'agree', 13800, true, t0 + interval '301 minutes');
-  -- deliveries: the earliest delivered shadow.committed of m1 is +12
+  -- deliveries: tnt's earliest delivered shadow.committed of m1 is +12; tnt2 got m1 earlier (+5), in its own row
   insert into webhook_deliveries (endpoint_id, tenant_id, event_type, payload, status, delivered_at) values
     (ep, tnt, 'shadow.committed', jsonb_build_object('market_id', m1), 'delivered', t0 + interval '80 minutes'),
     (ep, tnt, 'shadow.committed', jsonb_build_object('market_id', m1), 'delivered', t0 + interval '12 minutes'),
     (ep, tnt, 'shadow.committed', jsonb_build_object('market_id', m1), 'pending', null),
     (ep, tnt, 'shadow.revealed', jsonb_build_object('market_id', m1), 'delivered', t0 + interval '1 minute'),
-    (ep, tnt, 'shadow.committed', jsonb_build_object('market_id', mother), 'delivered', t0 + interval '2 minutes');
+    (ep, tnt, 'shadow.committed', jsonb_build_object('market_id', mother), 'delivered', t0 + interval '2 minutes'),
+    (ep, tnt, 'shadow.committed', jsonb_build_object('market_id', mt), 'delivered', t0 + interval '3 minutes'),
+    (ep2, tnt2, 'shadow.committed', jsonb_build_object('market_id', m1), 'delivered', t0 + interval '5 minutes'),
+    (ep2, tnt2, 'shadow.committed', jsonb_build_object('market_id', m2), 'dlq', null);
 
   -- m3: a commit recorded before migration 012 (no payload.committed): its resolutions row stands in
   insert into resolutions (id, market_id, mode, status_row, resolution_status, winning_outcome, confidence_score, determination_basis, caveats, thresholds_version, created_at)
@@ -100,7 +107,6 @@ begin
     'determinable_min', extract(epoch from v.determinable_at - t0)::integer / 60,
     'committed_min', extract(epoch from v.committed_at - t0)::integer / 60,
     'posted_min', extract(epoch from v.posted_at - t0)::integer / 60,
-    'first_delivered_min', extract(epoch from v.first_delivered_at - t0)::integer / 60,
     'official_min', extract(epoch from v.official_at - t0)::integer / 60,
     'official_at_source', v.official_at_source, 'agreement', v.agreement, 'lead_seconds', v.lead_seconds, 'official_outcome', v.official_outcome,
     'reconciled_min', extract(epoch from v.reconciled_at - t0)::integer / 60,
@@ -112,7 +118,7 @@ begin
   select * into v from v_venue_report where market_id = m2;
   out := out || jsonb_build_object('m2', jsonb_build_object(
     'venue_slug', v.venue_slug, 'condition_id', v.condition_id, 'n_commits', v.n_commits, 'committed_at', v.committed_at, 'posted_at', v.posted_at,
-    'determinable_at', v.determinable_at, 'first_delivered_at', v.first_delivered_at, 'agreement', v.agreement, 'determination_basis', v.determination_basis,
+    'determinable_at', v.determinable_at, 'agreement', v.agreement, 'determination_basis', v.determination_basis,
     'latest_commitment', v.latest_commitment_sha256, 'event_key', v.event_key));
 
   select * into v from v_venue_report where market_id = m3;
@@ -121,10 +127,20 @@ begin
     'raw', v.evidence_raw_sha256, 'canonical', v.evidence_canonical_sha256, 'posted_at', v.posted_at,
     'committed_min', extract(epoch from v.committed_at - t0)::integer / 60, 'determinable_min', extract(epoch from v.determinable_at - t0)::integer / 60));
 
-  -- least privilege and comments
+  out := out || jsonb_build_object('report_has_delivery_column', exists (select 1 from pg_attribute a where a.attrelid = 'public.v_venue_report'::regclass and a.attname = 'first_delivered_at' and not a.attisdropped));
+
+  -- v_venue_deliveries: one row per (tenant, public market) with a delivered shadow.committed
+  out := out || jsonb_build_object('deliveries', jsonb_build_object(
+    'tnt_m1_min', (select extract(epoch from d.first_delivered_at - t0)::integer / 60 from v_venue_deliveries d where d.tenant_id = tnt and d.market_id = m1),
+    'tnt2_m1_min', (select extract(epoch from d.first_delivered_at - t0)::integer / 60 from v_venue_deliveries d where d.tenant_id = tnt2 and d.market_id = m1),
+    'tnt_markets', (select coalesce(jsonb_agg(m.external_id order by m.external_id), '[]'::jsonb) from v_venue_deliveries d join markets m on m.id = d.market_id where d.tenant_id = tnt),
+    'tnt2_markets', (select coalesce(jsonb_agg(m.external_id order by m.external_id), '[]'::jsonb) from v_venue_deliveries d join markets m on m.id = d.market_id where d.tenant_id = tnt2)));
+
+  -- least privilege and comments, on both views
   begin
     set local role service_role;
-    out := out || jsonb_build_object('service_role_select', (select count(*) from v_venue_report where market_id = m1) = 1);
+    out := out || jsonb_build_object('service_role_select', (select count(*) from v_venue_report where market_id = m1) = 1
+                                                        and (select count(*) from v_venue_deliveries where market_id = m1) = 2);
     reset role;
   exception when others then out := out || jsonb_build_object('service_role_select', 'error: ' || sqlerrm);
   end;
@@ -132,17 +148,20 @@ begin
     set local role anon;
     begin perform 1 from v_venue_report limit 1; out := out || '{"anon_denied": false}';
     exception when insufficient_privilege then out := out || '{"anon_denied": true}'; end;
+    begin perform 1 from v_venue_deliveries limit 1; out := out || '{"anon_denied_deliveries": false}';
+    exception when insufficient_privilege then out := out || '{"anon_denied_deliveries": true}'; end;
     reset role;
   exception when others then out := out || jsonb_build_object('anon_denied', 'set role failed: ' || sqlerrm);
   end;
   out := out || jsonb_build_object(
-    'authenticated_denied', not has_table_privilege('authenticated', 'public.v_venue_report', 'select'),
-    'public_denied', not exists (select 1 from pg_class c, aclexplode(c.relacl) a where c.oid = 'public.v_venue_report'::regclass and a.grantee = 0),
-    'security_invoker', (select coalesce('security_invoker=true' = any(reloptions), false) from pg_class where oid = 'public.v_venue_report'::regclass),
-    'uncommented', (select count(*) from pg_attribute a where a.attrelid = 'public.v_venue_report'::regclass and a.attnum > 0 and not a.attisdropped
+    'authenticated_denied', not has_table_privilege('authenticated', 'public.v_venue_report', 'select') and not has_table_privilege('authenticated', 'public.v_venue_deliveries', 'select'),
+    'public_denied', not exists (select 1 from pg_class c, aclexplode(c.relacl) a where c.oid in ('public.v_venue_report'::regclass, 'public.v_venue_deliveries'::regclass) and a.grantee = 0),
+    'security_invoker', (select bool_and(coalesce('security_invoker=true' = any(reloptions), false)) from pg_class where oid in ('public.v_venue_report'::regclass, 'public.v_venue_deliveries'::regclass)),
+    'uncommented', (select count(*) from pg_attribute a where a.attrelid in ('public.v_venue_report'::regclass, 'public.v_venue_deliveries'::regclass) and a.attnum > 0 and not a.attisdropped
                       and col_description(a.attrelid, a.attnum) is null)
       + (case when obj_description('public.v_venue_report'::regclass, 'pg_class') is null then 1 else 0 end)
-      + (case when obj_description('public.idx_webhook_deliveries_shadow_committed'::regclass, 'pg_class') is null then 1 else 0 end));
+      + (case when obj_description('public.v_venue_deliveries'::regclass, 'pg_class') is null then 1 else 0 end)
+      + (case when obj_description('public.idx_webhook_deliveries_shadow_committed_tenant'::regclass, 'pg_class') is null then 1 else 0 end));
   raise exception '${TAG} %', out::text;
 end $$;`;
 
@@ -150,20 +169,22 @@ export const VENUE_EXPECT: Record<string, unknown> = {
   rows: ["__selftest_venue_delc__", "__selftest_venue_m1__", "__selftest_venue_m2__", "__selftest_venue_m3__", "__selftest_venue_other__"],
   m1: {
     platform: "polymarket", event_key: "polymarket:event:__selftest_venue_ev__", status: "open", determination_basis: "jev",
-    determinable_min: 60, committed_min: 10, posted_min: 11, first_delivered_min: 12, official_min: 300,
+    determinable_min: 60, committed_min: 10, posted_min: 11, official_min: 300,
     official_at_source: "gamma_closed_time", agreement: "agree", lead_seconds: 13800, official_outcome: "OPTION_A", reconciled_min: 301,
     venue_slug: "venue-m1", condition_id: `0x${"ab".repeat(32)}`, n_commits: 2, latest_min: 70, latest_commitment: H("2"),
     committed_status: "RESOLVED", committed_outcome: "OPTION_A", raw: H("c"), canonical: H("d"),
   },
   m2: {
-    venue_slug: "venue-leg-a", condition_id: "0xcd", n_commits: 0, committed_at: null, posted_at: null, determinable_at: null, first_delivered_at: null,
+    venue_slug: "venue-leg-a", condition_id: "0xcd", n_commits: 0, committed_at: null, posted_at: null, determinable_at: null,
     agreement: null, determination_basis: null, latest_commitment: null, event_key: "limitless:__selftest_venue_m2__",
   },
   m3: {
     venue_slug: "__selftest_venue_m3__", committed_status: "RESOLVED", committed_outcome: "OPTION_B", determination_basis: "structured",
     raw: null, canonical: H("e"), posted_at: null, committed_min: 31, determinable_min: 30,
   },
-  service_role_select: true, anon_denied: true, authenticated_denied: true, public_denied: true, security_invoker: true, uncommented: 0,
+  report_has_delivery_column: false,
+  deliveries: { tnt_m1_min: 12, tnt2_m1_min: 5, tnt_markets: ["__selftest_venue_m1__", "__selftest_venue_other__"], tnt2_markets: ["__selftest_venue_m1__"] },
+  service_role_select: true, anon_denied: true, anon_denied_deliveries: true, authenticated_denied: true, public_denied: true, security_invoker: true, uncommented: 0,
 };
 
 /** JSON with object keys sorted: jsonb orders keys its own way, so equal objects must compare equal. */

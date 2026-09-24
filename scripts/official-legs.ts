@@ -11,6 +11,7 @@ import { writeFileSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { loadEnv } from "./lib/env";
 import { buildLegRegistration, type LegGroup } from "../src/markets/official-legs";
+import { limitlessLabels, limitlessOutcomeIndex } from "../src/markets/outcomes";
 import { validateRegistration } from "../src/markets/register";
 import { UNSUPPORTED_OFFICIAL_SERIES, knownRelease } from "../src/resolve/official";
 import { OFFICIAL_UA } from "../src/ingest/official";
@@ -93,8 +94,14 @@ async function main() {
     if (!legs.length) notes.push(`${g.slug}: Limitless group returned no sub-markets`);
     for (const m of legs) {
       if (m.hidden === true) { skipped.push({ platform: "limitless", group: g.slug, label: String(m.title ?? ""), external_id: String(m.slug ?? ""), reason: "hidden sub-market" }); continue; }
+      // The labels reconcile reads this leg's winningOutcomeIndex with; the venue payload proposes over the same list.
+      const labels = limitlessLabels({ outcomeTokens: Array.isArray(m.outcomeTokens) && m.outcomeTokens.every((x) => typeof x === "string") ? (m.outcomeTokens as string[]) : null, tokens: m.tokens && typeof m.tokens === "object" ? (m.tokens as Record<string, unknown>) : null });
+      if (!labels || limitlessOutcomeIndex("OPTION_A", { option_a: "Yes", option_b: "No" }, labels) === null || limitlessOutcomeIndex("OPTION_B", { option_a: "Yes", option_b: "No" }, labels) === null) {
+        skipped.push({ platform: "limitless", group: g.slug, label: String(m.title ?? ""), external_id: String(m.slug ?? ""), reason: `outcome labels ${JSON.stringify(labels)} do not map Yes and No to one index each: reconcile could not read the outcome` });
+        continue;
+      }
       add("limitless", g, { external_id: String(m.slug ?? ""), label: String(m.title ?? ""), open_at: iso(m.createdAt), deadline_utc: iso(m.expirationTimestamp), criteria: String(m.description ?? lm.description ?? "") },
-        { limitless_slug: m.slug, group_slug: g.slug, ...(str(m.conditionId) ? { condition_id: m.conditionId } : {}), limitless_market_id: m.id ?? null, status: m.status ?? null });
+        { limitless_slug: m.slug, group_slug: g.slug, ...(str(m.conditionId) ? { condition_id: m.conditionId } : {}), outcome_labels: [...labels], limitless_market_id: m.id ?? null, status: m.status ?? null });
     }
     const meta = (lm.metadata ?? {}) as Obj;
     const ext = str(lm.externalSlug) ?? str(meta.externalSlug);

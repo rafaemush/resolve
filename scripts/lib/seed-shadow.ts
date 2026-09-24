@@ -6,6 +6,7 @@
 import { CandidateFile, type CandidateEntry, type CandidatePlatform } from "./candidates";
 import { MarketRegistration } from "../../src/resolve/schema";
 import { mergeMeta, type MarketMeta } from "../../src/markets/meta";
+import { limitlessOutcomeIndex } from "../../src/markets/outcomes";
 import { registrationPolicyIssues, webRenderRefusal } from "../../src/markets/policy";
 
 /** Plan §16.4 P5 step 3: shadow markets stay in the long tail (gamma volume_num_max, the same cap as candidates.ts). */
@@ -55,7 +56,8 @@ export interface FileCheck {
 /**
  * Pure. Every entry is checked (so the founder sees what an approval would run into); only approved entries can block.
  * Rules: the registration parses with MarketRegistration (the Worker's own schema) and names the file's platform; meta
- * holds only whitelisted keys of the right type (src/markets/meta.ts), and a Polymarket entry carries meta.condition_id;
+ * holds only whitelisted keys of the right type (src/markets/meta.ts), a Polymarket entry carries meta.condition_id, and a
+ * Limitless entry its outcome labels, both options among them, and a group leg its group slug (limitlessMetaProblems);
  * volume <= $50k; is_test is false; the deadline is in the future; event_statement is a declarative, deadline-free fact
  * (eventStatementProblem); every source passes the Worker's registration policy (src/markets/policy.ts: per-kind ref
  * grammar, resolver and sources on one subject, web sources public https URLs) and none is web_render, so --check
@@ -102,6 +104,27 @@ export function eventStatementProblem(statement: string): string | null {
   return null;
 }
 
+const REGENERATE = "regenerate the file with npx tsx scripts/candidates.ts limitless";
+
+/**
+ * Pure. What a Limitless entry's meta lacks for the venue payload (src/shadow/venue.ts): the leg's outcome labels by
+ * winningOutcomeIndex (the payload proposes an index over exactly these, the labels reconcile reads), with each option
+ * the text of exactly one label (else reconcile could never read that outcome); and for a group leg (meta.group_id) the
+ * group's slug. A candidate file generated before 2026-09-25 has neither, so its entries are refused rather than
+ * registered with a proposal over assumed labels or a null group_slug.
+ */
+export function limitlessMetaProblems(meta: MarketMeta, market: Pick<MarketRegistration, "option_a" | "option_b"> | null): string[] {
+  const out: string[] = [];
+  if (!meta.outcome_labels) out.push(`meta.outcome_labels is required for Limitless (the outcome labels by winningOutcomeIndex): ${REGENERATE}`);
+  else if (market) {
+    for (const [o, key] of [["OPTION_A", "option_a"], ["OPTION_B", "option_b"]] as const) {
+      if (limitlessOutcomeIndex(o, market, meta.outcome_labels) === null) out.push(`market.${key} "${market[key]}" is not exactly one of the outcome labels ${JSON.stringify(meta.outcome_labels)}: reconcile could not read that outcome`);
+    }
+  }
+  if (meta.group_id && !meta.group_slug) out.push(`meta.group_slug is required with meta.group_id (the venue payload's group_slug): ${REGENERATE}`);
+  return out;
+}
+
 function checkEntry(e: CandidateEntry, index: number, platform: CandidatePlatform, now: Date, seen: Map<string, number>): EntryCheck {
   const errors: string[] = [];
   const m = MarketRegistration.safeParse(e.registration.market);
@@ -122,6 +145,7 @@ function checkEntry(e: CandidateEntry, index: number, platform: CandidatePlatfor
   else {
     if (meta.dropped.length) errors.push(`meta keys outside the whitelist: ${meta.dropped.join(", ")}`);
     if (platform === "polymarket" && !meta.meta.condition_id) errors.push("meta.condition_id is required for Polymarket (on-chain corroboration of the official outcome)");
+    if (platform === "limitless") errors.push(...limitlessMetaProblems(meta.meta, m.success ? m.data : null));
   }
   if (e.volume_usd > SHADOW_VOLUME_CAP_USD) errors.push(`volume $${e.volume_usd} is over the $${SHADOW_VOLUME_CAP_USD} shadow cap`);
   if (e.registration.is_test !== false) errors.push("is_test must be false for a shadow market on the public record");
@@ -157,7 +181,8 @@ export function verifyRow(row: ShadowRow | null, activeWatches: number, want: Ex
   if (row.platform !== want.platform || row.external_id !== want.externalId) out.push(`row is ${row.platform}:${row.external_id}`);
   if (row.is_test !== false) out.push("is_test is not false");
   if ((want.meta.condition_id ?? null) !== (row.condition_id ?? null)) out.push(`condition_id ${row.condition_id ?? "null"} != ${want.meta.condition_id ?? "null"}`);
-  for (const [k, v] of Object.entries(want.meta)) if (row.meta?.[k] !== v) out.push(`meta.${k} is ${JSON.stringify(row.meta?.[k])}, expected ${JSON.stringify(v)}`);
+  // by value: meta.outcome_labels is a list, and jsonb returns a new one
+  for (const [k, v] of Object.entries(want.meta)) if (JSON.stringify(row.meta?.[k]) !== JSON.stringify(v)) out.push(`meta.${k} is ${JSON.stringify(row.meta?.[k])}, expected ${JSON.stringify(v)}`);
   const have = sourceKeys(row.sources), sent = sourceKeys(want.sources);
   if (have.join("\n") !== sent.join("\n")) out.push(`sources are [${have.join(", ")}], the entry lists [${sent.join(", ")}]`);
   if (row.status === "open" && activeWatches !== have.length) out.push(`open with ${activeWatches} active watch${activeWatches === 1 ? "" : "es"} for ${have.length} source${have.length === 1 ? "" : "s"}`);

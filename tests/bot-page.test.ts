@@ -33,6 +33,22 @@ describe("GET /bot", () => {
     const res = await app.request("/bot", { method: "GET" }, {} as unknown as Env);
     expect(await res.text()).toContain(RESOLVE_BOT_UA);
   });
+  it("says robots.txt covers registered web pages only, and that official releases and public APIs opt out by issue", () => {
+    const html = botPageHtml(RESOLVE_BOT_UA);
+    expect(html).toContain("<strong>robots.txt, for web pages.</strong> Read per RFC 9309 before a web page is registered as a source.");
+    expect(html).toContain("Official releases and public APIs (the second and third items above) are not checked against robots.txt.");
+    expect(html).toContain("<p>For web pages, add a group for ResolveBot to your robots.txt:</p>");
+    expect(html).toMatch(/it does not cover official releases or public APIs\. For those, [^<]*open an issue at <a href="https:\/\/github\.com\/rafaemush\/resolve\/issues">/);
+    expect(html).not.toMatch(/per-host|per host/i);
+  });
+  it("the OpenAPI summary of /bot claims only what the code does: per-page spacing, robots.txt for web pages", () => {
+    for (const p of ["docs/openapi.json", "src/generated/openapi.json"]) {
+      const summary = JSON.parse(readFileSync(join(ROOT, p), "utf8")).paths["/bot"].get.summary as string;
+      expect(summary, p).not.toMatch(/per-host|per host/i);
+      expect(summary, p).toContain("per-page spacing");
+      expect(summary, p).toContain("robots.txt for web pages");
+    }
+  });
   it("names no person, no email address and no model; claims no accuracy", () => {
     const html = botPageHtml(RESOLVE_BOT_UA);
     expect(html).not.toMatch(/@[a-z0-9-]+\.[a-z]/i);

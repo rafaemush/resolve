@@ -48,6 +48,24 @@ describe("customer-facing documents", () => {
     expect(texts["docs/templates/w8ben-notes.md"]).toMatch(/Not tax or legal advice/);
     expect(texts["docs/templates/w8ben-notes.md"]).toMatch(/Treaty claim: confirm with counsel/);
   });
+  it("the accuracy and lead-time gate is 100 distinct events, never a count of markets", () => {
+    for (const [p, t] of Object.entries(texts)) expect(t, p).not.toMatch(/100\s+(reconciled\s+)?markets|100 of your markets/i);
+    expect(texts["docs/pilot-pack.md"]).toMatch(/before 100 distinct events on your platform have been reconciled/);
+    expect(texts["docs/templates/pilot-letter.md"]).toMatch(/no accuracy figure before 100 distinct events on your platform are reconciled/);
+    expect(texts["docs/pricing.md"]).toMatch(/no lead-time guarantee before 100 reconciled distinct events/);
+  });
+  it("the venue offers state that the account has no follow limit (a PAYG credit alone would cap follows at 50)", () => {
+    expect(texts["docs/pilot-pack.md"]).toMatch(/The pilot account has no follow limit/);
+    expect(texts["docs/pilot-pack.md"]).toMatch(/The account has no follow limit, so every one of those markets can be followed/);
+    expect(texts["docs/templates/pilot-letter.md"]).toMatch(/Account `<tenant id>` has no follow limit for this period/);
+    expect(texts["docs/pricing.md"]).toMatch(/the pilot account has no follow limit/);
+    expect(read("docs/runbooks/venue-pilot.md")).toMatch(/update tenants set plan = 'platform' where id = '<tenant id>';/);
+  });
+  it("the report's delivery time is the reader's own: never another follower's", () => {
+    expect(texts["docs/pilot-pack.md"]).toMatch(/was delivered to your account \(your deliveries only\)/);
+    expect(texts["docs/templates/pilot-letter.md"]).toMatch(/first delivered to your account/);
+    expect(texts["docs/pilot-pack.md"]).not.toMatch(/when the first webhook reached you/);
+  });
   it("the pilot letter fits one page (under 650 words)", () => {
     expect(texts["docs/templates/pilot-letter.md"]!.split(/\s+/).filter(Boolean).length).toBeLessThan(650);
   });

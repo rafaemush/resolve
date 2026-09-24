@@ -1,6 +1,6 @@
 /**
  * In-memory stand-in for the PostgREST query shapes the commit/reconcile code uses: select (eq on a column or an
- * embedded "a.b" path, in, lt, lte, gte, is null, order, limit, single, maybeSingle, head count), insert (+ select().single()),
+ * embedded "a.b" path, in, lt, lte, gte, is null, order (repeatable), limit, single, maybeSingle, head count), insert (+ select().single()),
  * upsert (on onConflict, else the table's primary key: FakeDbOptions.primaryKey, default "id"; ignoreDuplicates skips,
  * otherwise the row is merged like ON CONFLICT DO UPDATE), update (+ select() returns the updated rows), and rpc()
  * through test-supplied stand-ins. Unique columns and partial
@@ -34,7 +34,8 @@ class Query implements PromiseLike<{ data: any; error: any; count?: number | nul
   private payload: Row[] = [];
   private patch: Row = {};
   private filters: Filter[] = [];
-  private orderBy: { col: string; asc: boolean } | null = null;
+  /** Every order() call, applied in turn like PostgREST's order=a,b (the first is the primary key of the sort). */
+  private orderBy: Array<{ col: string; asc: boolean }> = [];
   private max: number | null = null;
   private head = false;
   private count = false;
@@ -60,7 +61,7 @@ class Query implements PromiseLike<{ data: any; error: any; count?: number | nul
   lte(col: string, v: string) { this.filters.push((r) => String(path(r, col)) <= v); return this; }
   gte(col: string, v: string) { this.filters.push((r) => String(path(r, col)) >= v); return this; }
   is(col: string, v: null) { this.filters.push((r) => (path(r, col) ?? null) === v); return this; }
-  order(col: string, opts?: { ascending?: boolean }) { this.orderBy = { col, asc: opts?.ascending !== false }; return this; }
+  order(col: string, opts?: { ascending?: boolean }) { this.orderBy.push({ col, asc: opts?.ascending !== false }); return this; }
   limit(n: number) { this.max = n; return this; }
   single() { return Promise.resolve(this.exec(true)); }
   maybeSingle() { return Promise.resolve(this.exec(true)); }
@@ -114,7 +115,15 @@ class Query implements PromiseLike<{ data: any; error: any; count?: number | nul
     }
     if (this.head) return { data: null, error: null, count: matched.length };
     let out = [...matched];
-    if (this.orderBy) { const { col, asc } = this.orderBy; out.sort((a, b) => (String(path(a, col)) < String(path(b, col)) ? -1 : String(path(a, col)) > String(path(b, col)) ? 1 : 0) * (asc ? 1 : -1)); }
+    if (this.orderBy.length) {
+      out.sort((a, b) => {
+        for (const { col, asc } of this.orderBy) {
+          const x = String(path(a, col)), y = String(path(b, col));
+          if (x !== y) return (x < y ? -1 : 1) * (asc ? 1 : -1);
+        }
+        return 0;
+      });
+    }
     if (this.max !== null) out = out.slice(0, this.max);
     return { data: one ? structuredClone(out[0] ?? null) : structuredClone(out), error: null, ...(this.count ? { count: matched.length } : {}) };
   }

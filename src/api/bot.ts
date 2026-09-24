@@ -1,8 +1,10 @@
 /**
  * GET /bot (plan §17.3 P6 "/bot"): the page ResolveBot's user agent points at. What the bot fetches and why, how it
  * stays polite, and how a site opts out. Public, no auth, static apart from the configured UA. Every statement here is
- * what the code does: the UA (src/ops/ua.ts), robots.txt per RFC 9309 at registration (src/ingest/robots.ts), the poll
- * cadence (src/markets/source-checks.ts: 300 s, 60 s in the last 24 h before a deadline), conditional requests and
+ * what the code does: the UA (src/ops/ua.ts), robots.txt per RFC 9309 when a web page is registered (src/ingest/robots.ts,
+ * called by src/markets/source-checks.ts for web_fetch and web_render only: official releases and public APIs are never
+ * checked against robots.txt, so their opt-out is the issues link), the poll cadence per page
+ * (src/markets/source-checks.ts: 300 s, 60 s in the last 24 h before a deadline; there is no per-host limit), conditional requests and
  * Retry-After (src/ingest/web.ts, src/ingest/http.ts), the official-release burst (src/ingest/official-watch.ts), and the
  * web caps (512 KB, 5 checked redirects, 8 s). Pure: botPageHtml renders it.
  */
@@ -58,7 +60,7 @@ export function botPageHtml(ua: string): string {
 <h2>How it stays polite</h2>
 <ul>
   <li><strong>Declared user agent.</strong> The string above, with a link back to this page.</li>
-  <li><strong>robots.txt.</strong> Read per RFC 9309 before a page is registered. If your robots.txt disallows the page for <code>${BOT_TOKEN}</code> (or for all agents), the page is not registered and never fetched. A robots.txt that cannot be read (a server error or a timeout) counts as a disallow.</li>
+  <li><strong>robots.txt, for web pages.</strong> Read per RFC 9309 before a web page is registered as a source. If your robots.txt disallows the page for <code>${BOT_TOKEN}</code> (or for all agents), the page is not registered and never fetched. A robots.txt that cannot be read (a server error or a timeout) counts as a disallow. Official releases and public APIs (the second and third items above) are not checked against robots.txt.</li>
   <li><strong>Spacing.</strong> A registered page is fetched at most once every 5 minutes, and at most once a minute in the last 24 hours before its market's deadline. An official release is not requested before its scheduled time; one fetcher serves every market that depends on it, with at most 10 requests in the half minute after the release, then at most one a minute.</li>
   <li><strong>Conditional requests.</strong> When your server sends an <code>ETag</code>, ResolveBot sends <code>If-None-Match</code>, so an unchanged page costs a <code>304</code>.</li>
   <li><strong>Back-off.</strong> A <code>Retry-After</code> header pushes the next fetch back (up to an hour).</li>
@@ -66,10 +68,10 @@ export function botPageHtml(ua: string): string {
 </ul>
 
 <h2>How to opt out</h2>
-<p>Add a group for ResolveBot to your robots.txt:</p>
+<p>For web pages, add a group for ResolveBot to your robots.txt:</p>
 <pre>User-agent: ${BOT_TOKEN}
 Disallow: /</pre>
-<p>robots.txt is read when a page is registered. If a page of yours is already being fetched, or you want it stopped sooner, open an issue at <a href="${OPT_OUT_ISSUES_URL}">${OPT_OUT_ISSUES_URL}</a> with the host or URL, and the fetching is stopped.</p>
+<p>robots.txt is read when a web page is registered, and it does not cover official releases or public APIs. For those, for a page of yours that is already being fetched, or to have fetching stopped sooner, open an issue at <a href="${OPT_OUT_ISSUES_URL}">${OPT_OUT_ISSUES_URL}</a> with the host or URL, and the fetching is stopped.</p>
 
 <footer>Resolve publishes an informational signal: not financial advice, and not an oracle of record.</footer>
 </main>

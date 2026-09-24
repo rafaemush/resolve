@@ -14,6 +14,7 @@ import { limitlessOfficial, polymarketOfficial } from "../src/jobs/reconcile";
 import { LIMITLESS_YES_NO, limitlessLabels, limitlessOutcomeAt, limitlessOutcomeIndex } from "../src/markets/outcomes";
 import { proposedOption, venuePayload, type VenueMarket } from "../src/shadow/venue";
 import { shadowCommittedPayload, shadowRevealedPayload } from "../src/shadow/events";
+import { buildLimitless } from "../scripts/lib/candidates-limitless";
 import { buildPreimage, committedFields, type CommittedVerdict, type OfficialRecord } from "../src/bot/commit";
 import type { Verdict } from "../src/resolve/schema";
 
@@ -53,6 +54,16 @@ describe("limitless venue object", () => {
     expect(venuePayload({ ...single, meta: { limitless_slug: "leg-slug" }, condition_id: null }, RESOLVED_A)).toMatchObject({ slug: "leg-slug", condition_id: null });
     expect(venuePayload({ ...single, meta: null }, RESOLVED_A)).toMatchObject({ slug: "single-slug", group_slug: null });
   });
+  it("the index is taken over the leg's own labels recorded at registration (meta.outcome_labels), not an assumed Yes/No order", () => {
+    const reversed = { ...LIMITLESS_LEG, meta: { ...LIMITLESS_LEG.meta, outcome_labels: ["No", "Yes"] } };
+    expect(venuePayload(reversed, RESOLVED_A)).toMatchObject({ proposed_winning_outcome_index: 1 });
+    expect(venuePayload(reversed, RESOLVED_B)).toMatchObject({ proposed_winning_outcome_index: 0 });
+    // labels the options are not among: no proposal; a malformed list: no proposal; absent: tokens {yes, no}
+    expect(venuePayload({ ...LIMITLESS_LEG, meta: { outcome_labels: ["Up", "Down"] } }, RESOLVED_A)).toMatchObject({ proposed_winning_outcome_index: null });
+    expect(venuePayload({ ...LIMITLESS_LEG, meta: { outcome_labels: "Yes,No" } }, RESOLVED_A)).toMatchObject({ proposed_winning_outcome_index: null });
+    expect(venuePayload({ ...LIMITLESS_LEG, meta: { outcome_labels: ["Yes"] } }, RESOLVED_A)).toMatchObject({ proposed_winning_outcome_index: null });
+    expect(venuePayload({ ...LIMITLESS_LEG, meta: {} }, RESOLVED_A)).toMatchObject({ proposed_winning_outcome_index: 0 });
+  });
   it("options that are not the market's own labels are never proposed as a guess (reconcile could not read them back)", () => {
     expect(venuePayload({ ...LIMITLESS_LEG, option_a: "Democratic Party", option_b: "Republican Party" }, RESOLVED_A)).toMatchObject({ proposed_winning_outcome_index: null });
     expect(venuePayload({ ...LIMITLESS_LEG, option_a: "Yes", option_b: "yes" }, RESOLVED_A)).toMatchObject({ proposed_winning_outcome_index: null });
@@ -77,6 +88,23 @@ describe("round trip through reconcile's Limitless reader (the fixture's real AP
       }
     }
   }
+  it("a leg that carries its own outcomeTokens: the registration records them and the proposal reads back through reconcile", () => {
+    for (const outcomeTokens of [["No", "Yes"], ["Yes", "No"]]) {
+      const json = { ...leg, outcomeTokens };
+      // what scripts/lib/candidates-limitless.ts registers for this leg
+      // (the fixture carries no titles: Platform Content; the classifier needs one)
+      const entry = buildLimitless([{ ...FIX.group, title: "Group", automationType: "manual", expirationTimestamp: Date.parse("2026-11-01T00:00:00Z"), markets: [{ ...json, title: "Leg", expirationTimestamp: Date.parse("2026-11-01T00:00:00Z") }] }], { now: new Date("2026-10-01T00:00:00Z"), days: 45, maxVolume: 1e9 }).entries[0]!;
+      const reg = entry.registration;
+      expect(reg.meta).toMatchObject({ outcome_labels: outcomeTokens });
+      const m: VenueMarket = { platform: "limitless", external_id: String(reg.market.external_id), option_a: String(reg.market.option_a), option_b: String(reg.market.option_b), meta: reg.meta as Record<string, unknown> };
+      for (const c of [RESOLVED_A, RESOLVED_B]) {
+        const v = venuePayload(m, c);
+        if (v.platform !== "limitless") throw new Error("not limitless");
+        const read = limitlessOfficial({ ...json, status: "RESOLVED", expired: true, winningOutcomeIndex: v.proposed_winning_outcome_index }, m, String(json.slug), NOW);
+        expect(read, `${outcomeTokens.join("/")} ${c.winning_outcome}`).toMatchObject({ kind: "resolved", official: { outcome: c.winning_outcome } });
+      }
+    }
+  });
   it("the fixture's legs carry tokens {yes, no}, the order the proposal assumes; the container's outcomeTokens agree", () => {
     expect(limitlessLabels(FIX.single_clob)).toEqual(LIMITLESS_YES_NO);
     expect(limitlessLabels(leg)).toEqual(LIMITLESS_YES_NO);
@@ -100,6 +128,14 @@ describe("round trip through reconcile's Limitless reader (the fixture's real AP
 
 describe("polymarket and custom venue objects", () => {
   const PM: VenueMarket = { platform: "polymarket", external_id: "551234", option_a: "Yes", option_b: "No", condition_id: CID.toLowerCase(), meta: { slug: "cpi-above-3", event_id: 60182 } };
+  it("a label reconcile could not map back is never proposed: options equal after normalization, or an empty option", () => {
+    const same = { ...PM, option_a: "Yes", option_b: "yes." };
+    expect(venuePayload(same, RESOLVED_A)).toMatchObject({ proposed_outcome_label: null });
+    expect(venuePayload(same, RESOLVED_B)).toMatchObject({ proposed_outcome_label: null });
+    expect(venuePayload({ ...PM, option_a: "", option_b: "No" }, RESOLVED_A)).toMatchObject({ proposed_outcome_label: null });
+    expect(venuePayload({ ...PM, option_a: "", option_b: "No" }, RESOLVED_B)).toMatchObject({ proposed_outcome_label: "No" });
+    expect(venuePayload({ ...PM, option_a: "--", option_b: "No" }, RESOLVED_A)).toMatchObject({ proposed_outcome_label: null });
+  });
   it("condition_id, slug, event_id and the proposed outcome label; null for an UNRESOLVED commit", () => {
     expect(venuePayload(PM, RESOLVED_B)).toEqual({ platform: "polymarket", condition_id: CID.toLowerCase(), slug: "cpi-above-3", event_id: "60182", proposed_outcome_label: "No" });
     expect(venuePayload(PM, UNRESOLVED)).toMatchObject({ proposed_outcome_label: null, slug: "cpi-above-3" });
