@@ -24,7 +24,8 @@ type Row = Record<string, unknown>;
  * On the watch path the two halves add at most 3 + 14 = 17 to a run that, by count of src/ingest/watch.ts,
  * src/resolve/runtime.ts and src/bot/commit.ts, makes at most 26 subrequests on a web + Jev path before its alerts
  * (each alert 5 more; since migration 017 the commit takes 8: commit_context, insert, lease claim, send 3, receipt,
- * release, and 2 more after a dedup collision); a run that still hits Workers Free's 50 leaves its claimed rows 'delivering', and the drain's
+ * release, and 2 more after a dedup collision; 5 more when the page redirects WEB_MAX_REDIRECTS times, src/ingest/web.ts,
+ * each hop a request of its own); a run that still hits Workers Free's 50 leaves its claimed rows 'delivering', and the drain's
  * stale sweep requeues them.
  */
 export const QUEUE_SUBREQUESTS = 3 * COST.db + COST.alert;

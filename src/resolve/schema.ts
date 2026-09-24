@@ -12,6 +12,7 @@ export const ErrorReason = z.enum([
 ]);
 export const SourceKind = z.enum(["github_api", "github_events", "base_log", "solana_log", "web_fetch", "web_render", "official_release", "tenant_supplied"]);
 export const WatchSourceKind = z.enum(["github_api", "github_events", "base_log", "solana_log", "web_fetch", "web_render", "official_release"]);
+export type WatchSourceKind = z.infer<typeof WatchSourceKind>;
 export const DeterminationBasis = z.enum(["structured", "jev"]);
 export const NegativeRule = z.enum(["absence_after_deadline", "explicit_negative"]);
 export const Platform = z.enum(["polymarket", "limitless", "custom"]);
@@ -25,10 +26,30 @@ export const SourceRef = z.object({
   /**
    * github_api: "repos/o/r/pulls/1" | web: absolute URL | base_log: "base:0xaddr" | solana_log: "solana:<account>"
    * | official_release: "official:<series>:<period>" (e.g. "official:us_cpi_u_nsa_yoy:2026-09"; the rail fetches only
-   * the series' allowlisted hosts, src/resolve/official.ts)
+   * the series' allowlisted hosts, src/resolve/official.ts). A registration that creates watches must also match the
+   * per-kind grammar below (src/markets/policy.ts).
    */
   ref: z.string().min(1).max(2048),
 });
+
+/**
+ * Per-kind grammar of a watch source ref, enforced when a registration creates watches (src/markets/policy.ts). The
+ * GitHub adapter sends the service's token to api.github.com/<ref>, so a ref names one of the resources a resolver
+ * reads and nothing else: no query string, no percent-encoding, no "." or ".." segment (URL normalization would walk
+ * "repos/o/r/releases/tags/../../../../user" up to another endpoint). Owner: GitHub's login alphabet; repository:
+ * letters, digits, "-", "_", "."; a tag: the same alphabet plus "+" (a tag with "/" cannot be watched).
+ */
+const GH_OWNER = "[A-Za-z0-9][A-Za-z0-9-]{0,38}";
+const GH_REPO = "(?!\\.\\.?(?:/|$))[A-Za-z0-9_.-]{1,100}";
+const GH_TAG = "(?!\\.\\.?$)[A-Za-z0-9_.+-]{1,255}";
+/** Captures: owner, repo, then "pulls"|"issues" + number, or "releases" + optional tag, or nothing (the repository). */
+export const GITHUB_API_REF = new RegExp(`^repos/(${GH_OWNER})/(${GH_REPO})(?:/(?:(pulls|issues)/([1-9][0-9]{0,9})|(releases)(?:/tags/(${GH_TAG}))?))?$`);
+/** Captures: owner, repo. */
+export const GITHUB_EVENTS_REF = new RegExp(`^repos/(${GH_OWNER})/(${GH_REPO})/events$`);
+/** Captures: the contract address. */
+export const BASE_LOG_REF = /^base:(0x[0-9a-fA-F]{40})$/;
+/** Captures: the account (base58, 32-44 characters). */
+export const SOLANA_LOG_REF = /^solana:([1-9A-HJ-NP-Za-km-z]{32,44})$/;
 
 /**
  * official_release series with a deterministic adapter (src/ingest/official.ts). Each names one published number:

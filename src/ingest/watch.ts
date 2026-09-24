@@ -143,6 +143,12 @@ export interface WatchRunOptions {
    * webhooks get their first delivery attempt under it (plan §18 (a)); without it the attempt is awaited briefly.
    */
   waitUntil?: WaitUntil;
+  /**
+   * Who started the run, recorded in its loop_runs row: the signed pg_net dispatch (lease and single-use signature
+   * checked by POST /internal/watch/:id), an admin manual run (neither checked), or a tenant's /v1/resolve fetch (the
+   * lease taken first by lease_watch_now). The run releases the lease when it records its outcome.
+   */
+  dispatch?: "pg_net" | "admin" | "tenant_fetch";
 }
 
 export async function runWatch(env: Env, cfg: Config, watchId: string, opts: WatchRunOptions = {}): Promise<WatchRunSummary> {
@@ -151,7 +157,7 @@ export async function runWatch(env: Env, cfg: Config, watchId: string, opts: Wat
   const summary: WatchRunSummary = { watch_id: watchId, outcome: "skipped", rows_written: 0, detail: "" };
   let unsaved = false;
   const finish = async (s: WatchRunSummary, meta: Record<string, unknown> = {}) => {
-    const { error: le } = await client.from("loop_runs").insert({ loop_name: "watch", outcome: s.outcome, rows_written: s.rows_written, duration_ms: Date.now() - started, error: s.outcome === "failure" ? s.detail.slice(0, 500) : null, meta: { watch_id: watchId, ...meta, verdict: s.verdict ?? null, detail: s.detail.slice(0, 200) } });
+    const { error: le } = await client.from("loop_runs").insert({ loop_name: "watch", outcome: s.outcome, rows_written: s.rows_written, duration_ms: Date.now() - started, error: s.outcome === "failure" ? s.detail.slice(0, 500) : null, meta: { watch_id: watchId, ...(opts.dispatch ? { dispatch: opts.dispatch } : {}), ...meta, verdict: s.verdict ?? null, detail: s.detail.slice(0, 200) } });
     s.recorded = !le && !unsaved;
     return s;
   };

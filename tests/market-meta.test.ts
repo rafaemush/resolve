@@ -2,14 +2,16 @@
  * POST /internal/markets with importer metadata (plan §16.4 P5 step 1): meta is merged into markets.meta through a
  * whitelist (unknown keys dropped and reported, wrong types refused), condition_id also lands in its column (012),
  * is_test in markets.is_test; a repeat registration writes nothing; a failed idempotency lookup never falls through to an
- * insert; a misspelled top-level field is a 400 that names the accepted shape (seed-shadow's preflight reads it).
+ * insert; a misspelled top-level field is a 400 that names the accepted shape (seed-shadow's preflight reads it). The
+ * market and its watches are written by register_market (migration 019), emulated by tests/lib/fake-register.ts.
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
 import { fakeDb, type FakeDb } from "./lib/fake-db";
+import { registerMarketStandIn } from "./lib/fake-register";
 
 const h = vi.hoisted(() => ({ db: null as unknown as FakeDb }));
-vi.mock("../src/db/supabase", () => ({ db: () => h.db.client, rpc: vi.fn() }));
+vi.mock("../src/db/supabase", async (orig) => ({ db: () => h.db.client, rpc: (await orig<typeof import("../src/db/supabase")>()).rpc }));
 
 import { internal } from "../src/api/internal";
 import { mergeMeta, META_KEYS } from "../src/markets/meta";
@@ -40,7 +42,7 @@ describe("mergeMeta", () => {
 });
 
 describe("POST /internal/markets", () => {
-  beforeEach(() => { h.db = fakeDb({ markets: [], watches: [] }); });
+  beforeEach(() => { h.db = fakeDb({ markets: [], watches: [] }, {}, { rpc: { register_market: registerMarketStandIn } }); });
 
   it("writes whitelisted meta, condition_id and is_test on the new market and reports what it dropped", async () => {
     const res = await post({ market, meta: { condition_id: CID, slug: "sudan-err", event_id: "60182", volume_num: 5 }, is_test: false });

@@ -24,7 +24,12 @@ const MANIFEST = resolve(DIR, "manifest.sha256");
 const UA = "ResolveBot/1.0 (+eval)";
 
 export type IngestGroup = "non200" | "projection";
-interface StubResponse { status: number; headers?: Record<string, string>; body?: string | null; redirected?: boolean; url?: string }
+/**
+ * The upstream answer. redirected + url: the answer came from url after a redirect. The github adapter's fetch follows
+ * redirects, so it gets this answer with Response.redirected/url set; the web adapter follows them itself, so the
+ * registered URL first answers redirect_status (default 301) with Location url, and url answers this.
+ */
+interface StubResponse { status: number; headers?: Record<string, string>; body?: string | null; redirected?: boolean; url?: string; redirect_status?: number }
 interface AdapterExpect { evidence: boolean; raw_bytes: boolean; error: boolean; window_status: "ok" | "gap" | null; http_status: number | null }
 interface AdapterCase { id: string; group: "non200"; title: string; adapter: "github" | "web"; source_ref: Record<string, unknown>; resolver_kind?: string; response: StubResponse; expect: AdapterExpect }
 interface ProjectionCase { id: string; group: "projection"; title: string; source_kind: string; resolver?: ChangeResolver; a: EvidenceInput; b: EvidenceInput; expect: "equal" | "different" }
@@ -85,16 +90,16 @@ export function authorCases(): IngestCase[] {
     { id: "ING-004", group: "non200", title: "GitHub 200 reached through a redirect (repo renamed or transferred) is a gap", adapter: "github", source_ref: PR_REF, resolver_kind: "github_pr_merged",
       response: { status: 200, headers: { "content-type": "application/json; charset=utf-8" }, body: JSON.stringify(pr({ counters: C1, updated_at: "2026-09-23T06:01:40Z" })), redirected: true, url: "https://api.github.com/repositories/188613327/pulls/4821" }, expect: NO_EVIDENCE_GAP(200) },
     { id: "ING-005", group: "non200", title: "Web redirect to a different site is a gap, never evidence", adapter: "web", source_ref: { url: "https://blog.aurora-protocol.example/" },
-      response: { status: 200, headers: { "content-type": "text/plain" }, body: "Aurora v2 upgrade is live on mainnet. Buy this domain today.", redirected: true, url: "https://parked-domains.example/aurora" }, expect: NO_EVIDENCE_GAP(200) },
+      response: { status: 200, headers: { "content-type": "text/plain" }, body: "Aurora v2 upgrade is live on mainnet. Buy this domain today.", redirected: true, url: "https://parked-domains.example/aurora", redirect_status: 301 }, expect: NO_EVIDENCE_GAP(301) },
     { id: "ING-006", group: "non200", title: "Web 429 with Retry-After is a gap, never evidence", adapter: "web", source_ref: { url: "https://blog.aurora-protocol.example/" },
       response: { status: 429, headers: { "content-type": "text/plain", "retry-after": "120" }, body: "Too Many Requests" }, expect: NO_EVIDENCE_GAP(429) },
     { id: "ING-007", group: "non200", title: "control: GitHub 200 from the registered URL is evidence", adapter: "github", source_ref: PR_REF, resolver_kind: "github_pr_merged",
       response: { status: 200, headers: { "content-type": "application/json; charset=utf-8", etag: 'W/"abc"' }, body: JSON.stringify(pr({ counters: C1, updated_at: "2026-09-23T06:01:40Z" })) }, expect: { evidence: true, raw_bytes: true, error: false, window_status: "ok", http_status: 200 } },
     { id: "ING-008", group: "non200", title: "control: same-site web redirect (http -> https, www.) is evidence", adapter: "web", source_ref: { url: "http://aurora-protocol.example/status" },
-      response: { status: 200, headers: { "content-type": "text/plain" }, body: "Aurora status: v2 upgrade activated on mainnet at block 1,200,000.", redirected: true, url: "https://www.aurora-protocol.example/status/" }, expect: { evidence: true, raw_bytes: true, error: false, window_status: "ok", http_status: 200 } },
+      response: { status: 200, headers: { "content-type": "text/plain" }, body: "Aurora status: v2 upgrade activated on mainnet at block 1,200,000.", redirected: true, url: "https://www.aurora-protocol.example/status/", redirect_status: 301 }, expect: { evidence: true, raw_bytes: true, error: false, window_status: "ok", http_status: 200 } },
 
     { id: "ING-009", group: "non200", title: "Web redirect on the same host off the registered path (moved article -> homepage) is a gap, never a SOURCE_MISMATCH verdict", adapter: "web", source_ref: { url: "https://blog.aurora-protocol.example/posts/v2-launch" },
-      response: { status: 200, headers: { "content-type": "text/plain" }, body: "Aurora blog. Latest posts: community call notes, validator operations guide.", redirected: true, url: "https://blog.aurora-protocol.example/" }, expect: NO_EVIDENCE_GAP(200) },
+      response: { status: 200, headers: { "content-type": "text/plain" }, body: "Aurora blog. Latest posts: community call notes, validator operations guide.", redirected: true, url: "https://blog.aurora-protocol.example/", redirect_status: 301 }, expect: NO_EVIDENCE_GAP(301) },
 
     { id: "ING-101", group: "projection", title: "PR payloads differing only in head/base repo counters and updated_at project equal", source_kind: "github_api", resolver: { kind: "github_pr_merged" },
       a: ghEv(pr({ counters: C1, updated_at: "2026-09-23T06:01:40Z" })), b: ghEv(pr({ counters: C2, updated_at: "2026-09-23T06:05:02Z" })), expect: "equal" },
@@ -161,19 +166,23 @@ function stubResponse(s: StubResponse): Response {
 async function runAdapterCase(k: AdapterCase): Promise<string[]> {
   const watch = { id: `eval-${k.id}`, market_id: "eval", source_kind: k.adapter === "github" ? "github_api" : "web_fetch", source_ref: k.source_ref, poll_interval_s: 300, etag: null, cursor: {}, coverage: [], last_evidence_hash: null, consecutive_errors: 0, backlog: false, active: true } as WatchRow;
   const expectedHost = k.adapter === "github" ? "api.github.com" : new URL(String(k.source_ref.url)).host;
+  // web: the redirect is its own hop, answered before the page it points at (which a refused hop never requests)
+  const hop = k.adapter === "web" && k.response.redirected && k.response.url ? { status: k.response.redirect_status ?? 301, location: k.response.url } : null;
+  const hosts = new Set([expectedHost, ...(hop ? [new URL(hop.location).host] : [])]);
   const saved = globalThis.fetch;
   let calls = 0;
   globalThis.fetch = (async (input: RequestInfo | URL) => {
     calls++;
     const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-    if (new URL(url).host !== expectedHost) throw new Error(`ingest eval: unexpected fetch to ${url}`);
+    if (!hosts.has(new URL(url).host)) throw new Error(`ingest eval: unexpected fetch to ${url}`);
+    if (hop && url !== hop.location) return new Response(null, { status: hop.status, headers: { location: hop.location } });
     return stubResponse(k.response);
   }) as typeof fetch;
   let out: FetchOutcome;
   try {
     out = k.adapter === "github" ? await fetchGithub({} as Env, watch, k.resolver_kind, UA) : await fetchWeb({} as Env, watch, UA);
   } finally { globalThis.fetch = saved; }
-  if (calls !== 1) throw new Error(`expected exactly one fetch, saw ${calls}`);
+  if (calls < 1 || calls > (hop ? 2 : 1)) throw new Error(`expected ${hop ? "one or two fetches (the redirect, then its target when followed)" : "exactly one fetch"}, saw ${calls}`);
   const got: AdapterExpect = { evidence: out.evidence !== undefined, raw_bytes: out.rawBytes !== undefined, error: out.error !== undefined, window_status: out.window?.status ?? null, http_status: out.httpStatus ?? null };
   return (Object.keys(k.expect) as Array<keyof AdapterExpect>).filter((f) => got[f] !== k.expect[f]).map((f) => `${f} ${String(got[f])} != ${String(k.expect[f])}`);
 }

@@ -10,6 +10,9 @@ import type { Env } from "../src/env";
 
 vi.mock("../src/ingest/watch", () => ({ runWatch: vi.fn(async () => ({ recorded: true, outcome: "no_op" })) }));
 vi.mock("../src/jobs/limitless-recorder", () => ({ runLimitlessRecorder: vi.fn(async () => ({ recorded: true, errors: [] })) }));
+// A valid watch signature is then claimed once (claim_watch_dispatch, migration 019; tests/dispatch.test.ts covers the
+// refusals). Here the claim always succeeds: this file is about which signatures open which route.
+vi.mock("../src/db/supabase", () => ({ db: () => ({}), rpc: vi.fn(async () => "claimed") }));
 
 import { verifyDispatchSignature } from "../src/api/dispatch-auth";
 import { internal, LIMITLESS_RECORD_ID } from "../src/api/internal";

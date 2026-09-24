@@ -1,6 +1,7 @@
 /**
  * scripts/seed-shadow.ts rules (plan §16.4 P5 step 3), pure: --check refuses a Polymarket entry without condition_id,
- * a market over the $50k cap, is_test true, a past deadline, a non-https source, meta outside the whitelist, a question or
+ * a market over the $50k cap, is_test true, a past deadline, a source the Worker's registration policy refuses (non-https,
+ * private address, resolver on another repo, web_render), meta outside the whitelist, a question or
  * a deadline in event_statement, an approval with needs_review left and duplicates; only approved entries block. The
  * read-back (after --apply, and for a row a rerun finds already present) compares the database row and its active
  * watches with what was sent.
@@ -49,6 +50,12 @@ describe("seed-shadow --check", () => {
     expect(errorsOf(entry({ is_test: true }))).toEqual([expect.stringContaining("is_test must be false")]);
     expect(errorsOf(entry({ market: { deadline_utc: "2026-09-24T11:59:59Z", open_at: "2026-09-01T00:00:00Z" } }))).toEqual([expect.stringContaining("is not in the future")]);
     expect(errorsOf(entry({ market: { sources: [{ kind: "web_fetch", ref: "http://www.bls.gov/cpi/" }] } }))).toEqual([expect.stringContaining("is not https")]);
+  });
+
+  it("runs the Worker's registration policy offline: what the Worker would refuse blocks --apply", () => {
+    expect(errorsOf(entry({ market: { sources: [{ kind: "web_fetch", ref: "https://10.0.0.5/cpi" }] } }))).toEqual([expect.stringContaining("private address")]);
+    expect(errorsOf(entry({ market: { sources: [{ kind: "github_api", ref: "repos/acme/other/pulls/42" }], resolver: { kind: "github_pr_merged", repo: "acme/widget", pr: 42 } } }))).toEqual([expect.stringContaining("is on acme/other")]);
+    expect(errorsOf(entry({ market: { sources: [{ kind: "web_render", ref: "https://www.bls.gov/cpi/" }] } }))).toEqual([expect.stringContaining("Browser Rendering")]);
   });
 
   it("validates the market with the Worker's schema, the platform and the meta whitelist", () => {

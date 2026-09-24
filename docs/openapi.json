@@ -886,6 +886,16 @@
               }
             }
           },
+          "409": {
+            "description": "conflict: fetch:true while a poll of the market's watch is in progress (a scheduled dispatch or another fetch holds it); nothing ran, retry in a minute",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
           "422": {
             "description": "strict_v0 tenants: UNSAFE_INPUT with no verdict body",
             "content": {
@@ -907,7 +917,7 @@
             }
           },
           "503": {
-            "description": "UPSTREAM_UNAVAILABLE: billing or model unavailable (no credits charged), or error_reason VERDICT_NOT_RECORDED: the verdict could not be stored, the charge is refunded (credits_refunded) and a replay of that Idempotency-Key answers the same; retry with a new key",
+            "description": "UPSTREAM_UNAVAILABLE: billing or model unavailable, or the watch lease for fetch:true could not be taken (no credits charged), or error_reason VERDICT_NOT_RECORDED: the verdict could not be stored, the charge is refunded (credits_refunded) and a replay of that Idempotency-Key answers the same; retry with a new key",
             "content": {
               "application/json": {
                 "schema": {
@@ -921,7 +931,7 @@
     },
     "/v1/markets": {
       "post": {
-        "summary": "Register a market and its watches (robots and contract checks at registration)",
+        "summary": "Register a market and its watches in one transaction. Sources must match their kind (GitHub: repos/{owner}/{repo}/pulls/{n}, issues/{n}, releases, releases/tags/{tag}, events, or the repository itself for a numeric_threshold resolver; base_log: base:0x + 40 hex; solana_log: solana:<account>), name the resolver's own repo, PR, contract or account, and web sources must be public https URLs on the default port; web_render is not accepted yet. At registration: robots.txt (a disallow = unsupported_source; a robots.txt that answers 5xx or 429, or not at all, could not be checked: 503), contract code on Base, and a Solana account that exists and is not a program. Re-registering the same external_id returns the existing market",
         "security": [
           {
             "bearerAuth": []
@@ -951,7 +961,7 @@
             }
           },
           "400": {
-            "description": "validation_error",
+            "description": "validation_error: schema, source policy or a Solana program id",
             "content": {
               "application/json": {
                 "schema": {
@@ -961,7 +971,27 @@
             }
           },
           "403": {
-            "description": "watch limit reached",
+            "description": "validation_error: watch limit reached (watch_limit, active_watches, requested_watches at top level)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "conflict: the service's Base watch capacity is reached (max_base_watches, active_base_watches, requested_base_watches at top level)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "UPSTREAM_UNAVAILABLE: a registration check could not be made (Base or Solana RPC, robots.txt); nothing was stored, retry after Retry-After",
             "content": {
               "application/json": {
                 "schema": {

@@ -42,6 +42,7 @@ vi.mock("../src/resolve/runtime", async () => {
 
 import { v1 } from "../src/api/v1";
 import { alert } from "../src/ops/alerts";
+import { runWatch } from "../src/ingest/watch";
 import { MarketRegistration } from "../src/resolve/schema";
 import { sha256Hex } from "../src/resolve/text";
 
@@ -108,5 +109,76 @@ describe("POST /v1/resolve: a verdict that could not be recorded", () => {
     expect(res.status).toBe(503);
     expect(((await res.json()) as { credits_refunded: number }).credits_refunded).toBe(0);
     expect(vi.mocked(alert).mock.calls.map((c) => [c[1], c[3]?.dedupMinutes])).toEqual([[`refund_failed_${id}`, 1440]]);
+  });
+});
+
+/**
+ * POST /v1/resolve with fetch:true runs a watch outside the pg_net schedule. It takes the watch's lease first
+ * (lease_watch_now, migration 019, emulated here: free or expired -> now + 120 s, live -> null), so it can never overlap
+ * a dispatched run or another fetch of the same watch.
+ */
+describe("POST /v1/resolve fetch:true: one run of a watch at a time", () => {
+  const M = "7d1c2b3a-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+  const W = "5b0f3c2e-8f1a-4c7e-9d2b-1a2b3c4d5e6f";
+  let leaseCalls: string[];
+  let leaseAtRun: Array<string | null>;
+  const fetchNow = () => v1.request("/resolve", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ market_id: M, fetch: true }) }, env, ctx);
+  const watchRow = () => h.db.tables.watches![0]!;
+  function fetchDb(leaseUntil: string | null, leaseRpc: "ok" | "fails" = "ok") {
+    leaseCalls = []; leaseAtRun = [];
+    h.db = fakeDb({ markets: [{ id: M, tenant_id: "t1", ...market }], watches: [{ id: W, market_id: M, active: true, lease_until: leaseUntil }], evidence: [], api_request_log: [] }, {}, {
+      rpc: {
+        lease_watch_now: async (db, a) => {
+          leaseCalls.push(a.p_watch);
+          if (leaseRpc === "fails") return { data: null, error: { code: "57014", message: "statement timeout" } };
+          const w = db.tables.watches!.find((r) => r.id === a.p_watch);
+          if (!w || (w.lease_until && Date.parse(w.lease_until) >= Date.now())) return { data: null, error: null };
+          w.lease_until = new Date(Date.now() + 120_000).toISOString();
+          return { data: w.lease_until, error: null };
+        },
+      },
+    });
+    // runWatch is stubbed: it records the lease it ran under and, like a run still in flight, has not released it yet
+    vi.mocked(runWatch).mockReset().mockImplementation(async (_env, _cfg, id) => {
+      leaseAtRun.push((h.db.tables.watches!.find((r) => r.id === id)?.lease_until as string | null) ?? null);
+      return { watch_id: id, outcome: "no_op", rows_written: 0, detail: "unchanged", recorded: true };
+    });
+  }
+
+  it("a watch leased by a dispatched run in flight answers 409 and never runs the watch", async () => {
+    const live = new Date(Date.now() + 60_000).toISOString();
+    fetchDb(live);
+    const res = await fetchNow();
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: { code: string; message: string } }).error).toMatchObject({ code: "conflict", message: expect.stringContaining("in progress") });
+    expect(leaseCalls).toEqual([W]);
+    expect(vi.mocked(runWatch)).not.toHaveBeenCalled();
+    expect(watchRow().lease_until).toBe(live);
+  });
+
+  it("a free watch is leased before it runs, marked tenant_fetch; a second fetch while it runs answers 409", async () => {
+    fetchDb(null);
+    const first = await fetchNow();
+    expect(first.status).toBe(404); // ran; no evidence stored yet for the market
+    expect(vi.mocked(runWatch).mock.calls.map((c) => [c[2], c[3]?.dispatch])).toEqual([[W, "tenant_fetch"]]);
+    expect(leaseAtRun).toHaveLength(1);
+    expect(Date.parse(leaseAtRun[0]!)).toBeGreaterThan(Date.now());
+    const second = await fetchNow();
+    expect(second.status).toBe(409);
+    expect(vi.mocked(runWatch)).toHaveBeenCalledTimes(1);
+  });
+
+  it("an expired lease is taken over, as select_due_watches() would", async () => {
+    fetchDb(new Date(Date.now() - 1000).toISOString());
+    expect((await fetchNow()).status).toBe(404);
+    expect(vi.mocked(runWatch)).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails closed when the lease cannot be taken: 503, and the watch does not run", async () => {
+    fetchDb(null, "fails");
+    const res = await fetchNow();
+    expect(res.status).toBe(503);
+    expect(((await res.json()) as { error: { message: string } }).error.message).toContain("the fetch did not run");
+    expect(vi.mocked(runWatch)).not.toHaveBeenCalled();
   });
 });
