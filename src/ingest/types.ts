@@ -10,6 +10,10 @@ export interface MarketRow extends MarketRegistration {
   /** Smoke/test market (migration 012): commits recorded with channel 'none', never posted or reconciled. Absent before 012. */
   is_test?: boolean;
   condition_id?: string | null;
+  /** Reconcile scheduling (migration 012): next check, consecutive checks that could not map/reach/write, first official sighting. */
+  reconcile_next_at?: string;
+  reconcile_attempts?: number;
+  official_first_seen_at?: string | null;
   meta?: Record<string, unknown>;
 }
 

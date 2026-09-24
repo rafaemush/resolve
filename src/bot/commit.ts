@@ -36,6 +36,13 @@ export const PUBLIC_FLOOR = { confidence: 0.9, firstCommits: 100, caveat: "below
 /** A pending commit younger than this may still have its first post attempt in flight; retryUnposted leaves it alone. */
 export const RETRY_AFTER_S = 60;
 
+/**
+ * SQLSTATE of migration 012's bot_posts_commit_market_open: the market stopped being open (the reconcile settled it)
+ * while this verdict was computed. Nothing is recorded or posted: a commit on a settled market would never be
+ * reconciled or revealed, yet would count as a public call.
+ */
+export const MARKET_NOT_OPEN_SQLSTATE = "RS001";
+
 export const CommittedVerdict = z.object({
   preimage_version: z.enum(["v1", "v2"]),
   preimage: z.string().min(1),
@@ -171,6 +178,7 @@ export async function commitVerdict(env: Env, market: MarketRow, resolutionId: s
     commitment_sha256: commitment, nonce, payload, dedup_key: `commit:${market.id}:${signature}`,
   }).select("id").single();
   if (error?.code === "23505") return { committed: false, posted: false, reason: "already committed for this verdict signature" };
+  if (error?.code === MARKET_NOT_OPEN_SQLSTATE) return { committed: false, posted: false, reason: `not committed: ${error.message}` };
   if (error || !row) {
     await alert(env, `commit_insert_${market.id}`, `commit for ${marketRef(market)} (resolution ${resolutionId}, ${signature}) was not recorded: ${error?.message ?? "no row"}. Nothing was posted.`, { dedupMinutes: 60 });
     return { committed: false, posted: false, reason: `bot_posts insert: ${error?.message ?? "no row"}` };

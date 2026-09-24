@@ -37,10 +37,15 @@ function check(r: Record<string, unknown>, expect: Record<string, unknown>): num
 /**
  * Migration 012: a pending commit may take its delivery receipt once and nothing else; delete is refused; the view
  * counts one agreement per market (the final reconciliation) and never a test market; anon cannot read the view.
+ * settle_market(): a final left on an older commit moves to the newest one in the same transaction (the
+ * uq_reconciliations_final collision a four-request settle ran into), a second call is a no-op, a commit after the settle
+ * is refused (RS001), a commit the plan did not see stops it, an unfinished post-deadline watch poll holds it (waived
+ * 24 h later); defer_reconcile() keeps the first official sighting; anon can execute neither.
  */
 const P2A_BLOCK = `
 do $$
 declare m uuid; mt uuid; c1 uuid; c2 uuid; rv uuid; smoke boolean; b record; a record; out jsonb := '{}'::jsonb;
+  ms uuid; mc uuid; ma uuid; mw uuid; ws uuid; wa uuid; cs1 uuid; cs2 uuid; cs3 uuid; cc uuid; res jsonb; plan jsonb; revs jsonb;
 begin
   insert into markets (platform, external_id, condition, event_statement, option_a, option_b, positive_option, open_at, deadline_utc)
     values ('polymarket', '__selftest_p2a__', 'selftest condition', 'selftest statement', 'Yes', 'No', 'OPTION_A', now() - interval '3 days', now() - interval '2 days') returning id into m;
@@ -99,10 +104,74 @@ begin
                                    'view_committed_delta', a.nc - b.nc, 'view_shadowed_delta', a.ns - b.ns);
   begin update reconciliations set final = true where resolution_id = '__selftest_p2a_r1__';
     out := out || '{"second_final_refused": false}'; exception when unique_violation then out := out || '{"second_final_refused": true}'; end;
+
+  -- settle_market: the partial settle an older Worker left (final on s2), then a newer commit s3
+  insert into markets (platform, external_id, condition, event_statement, option_a, option_b, positive_option, open_at, deadline_utc)
+    values ('polymarket', '__selftest_p2a_settle__', 'selftest condition', 'selftest statement', 'Yes', 'No', 'OPTION_A', now() - interval '3 days', now() - interval '2 days') returning id into ms;
+  insert into watches (market_id, source_kind, source_ref, last_polled_at) values (ms, 'web_fetch', '{}', now()) returning id into ws;
+  insert into resolutions (id, market_id, mode, status_row, resolution_status, winning_outcome, confidence_score, determination_basis, caveats, thresholds_version) values
+    ('__selftest_p2a_s1__', ms, 'shadow', 'complete', 'UNRESOLVED', 'NONE', 0.50, 'structured', '["selftest"]', 'v1'),
+    ('__selftest_p2a_s2__', ms, 'shadow', 'complete', 'UNRESOLVED', 'NONE', 0.50, 'structured', '["selftest2"]', 'v1'),
+    ('__selftest_p2a_s3__', ms, 'shadow', 'complete', 'RESOLVED', 'OPTION_A', 0.95, 'structured', '[]', 'v1');
+  insert into bot_posts (resolution_id, market_id, channel, kind, commitment_sha256, nonce, payload, dedup_key, posted_at)
+    values ('__selftest_p2a_s1__', ms, 'pending', 'commit', repeat('1', 64), 'n', '{}', '__selftest_p2a_cs1__', null) returning id into cs1;
+  insert into bot_posts (resolution_id, market_id, channel, kind, commitment_sha256, nonce, payload, dedup_key, posted_at)
+    values ('__selftest_p2a_s2__', ms, 'pending', 'commit', repeat('2', 64), 'n', '{}', '__selftest_p2a_cs2__', null) returning id into cs2;
+  insert into reconciliations (resolution_id, market_id, platform, official_outcome, agreement, final) values
+    ('__selftest_p2a_s1__', ms, 'polymarket', 'OPTION_A', 'abstained', false),
+    ('__selftest_p2a_s2__', ms, 'polymarket', 'OPTION_A', 'abstained', true);
+  insert into bot_posts (resolution_id, market_id, channel, kind, commitment_sha256, nonce, payload, dedup_key, posted_at)
+    values ('__selftest_p2a_s3__', ms, 'pending', 'commit', repeat('3', 64), 'n', '{}', '__selftest_p2a_cs3__', null) returning id into cs3;
+  plan := jsonb_build_array(
+    jsonb_build_object('resolution_id', '__selftest_p2a_s1__', 'platform', 'polymarket', 'official_outcome', 'OPTION_A', 'agreement', 'abstained', 'final', false),
+    jsonb_build_object('resolution_id', '__selftest_p2a_s2__', 'platform', 'polymarket', 'official_outcome', 'OPTION_A', 'agreement', 'abstained', 'final', false),
+    jsonb_build_object('resolution_id', '__selftest_p2a_s3__', 'platform', 'polymarket', 'official_outcome', 'OPTION_A', 'agreement', 'agree', 'final', true));
+  revs := jsonb_build_array(jsonb_build_object('resolution_id', '__selftest_p2a_s3__', 'channel', 'pending', 'commitment_sha256', repeat('3', 64), 'nonce', 'n', 'payload', '{}'::jsonb, 'dedup_key', '__selftest_p2a_rv3__'));
+  begin perform settle_market(ms, array[cs1, cs2, cs3], plan || jsonb_build_array(plan->2), revs, 'resolved', 'OPTION_A', now(), null);
+    out := out || '{"settle_two_finals_refused": false}'; exception when others then out := out || '{"settle_two_finals_refused": true}'; end;
+  res := settle_market(ms, array[cs1, cs2, cs3], plan, revs, 'resolved', 'OPTION_A', now(), null);
+  out := out || jsonb_build_object('settle_result', res->>'result', 'settle_rows', res->'reconciliations', 'settle_reveals', res->'reveals',
+    'settle_final', (select resolution_id from reconciliations where market_id = ms and final),
+    'settle_status', (select status from markets where id = ms), 'settle_watch_active', (select active from watches where id = ws));
+  out := out || jsonb_build_object('settle_again', settle_market(ms, array[cs1, cs2, cs3], plan, revs, 'resolved', 'OPTION_A', now(), null)->>'result');
+  begin insert into bot_posts (resolution_id, market_id, channel, kind, commitment_sha256, nonce, payload, dedup_key, posted_at)
+      values ('__selftest_p2a_s3__', ms, 'pending', 'commit', repeat('4', 64), 'n', '{}', '__selftest_p2a_cs4__', null);
+    out := out || '{"late_commit_refused": false}'; exception when sqlstate 'RS001' then out := out || '{"late_commit_refused": true}'; end;
+  out := out || jsonb_build_object('defer_closed_market', defer_reconcile(jsonb_build_array(jsonb_build_object('id', ms, 'next_at', now(), 'attempts', 1))));
+
+  -- a commit the plan did not see: watches off, nothing else written, the market stays open for the next run
+  insert into markets (platform, external_id, condition, event_statement, option_a, option_b, positive_option, open_at, deadline_utc)
+    values ('polymarket', '__selftest_p2a_changed__', 'selftest condition', 'selftest statement', 'Yes', 'No', 'OPTION_A', now() - interval '3 days', now() - interval '2 days') returning id into mc;
+  insert into watches (market_id, source_kind, source_ref, last_polled_at) values (mc, 'web_fetch', '{}', now()) returning id into wa;
+  insert into bot_posts (resolution_id, market_id, channel, kind, commitment_sha256, nonce, payload, dedup_key, posted_at)
+    values ('__selftest_p2a_r2__', mc, 'pending', 'commit', repeat('5', 64), 'n', '{}', '__selftest_p2a_cc__', null) returning id into cc;
+  res := settle_market(mc, '{}'::uuid[], '[]', '[]', 'resolved', 'OPTION_A', now(), null);
+  out := out || jsonb_build_object('changed_result', res->>'result', 'changed_status', (select status from markets where id = mc),
+    'changed_watch_active', (select active from watches where id = wa), 'changed_rows', (select count(*) from reconciliations where market_id = mc));
+
+  -- the post-deadline watch poll has not run yet (deadline 30 min ago, grace 1 h): nothing written, watch still on
+  insert into markets (platform, external_id, condition, event_statement, option_a, option_b, positive_option, open_at, deadline_utc)
+    values ('polymarket', '__selftest_p2a_await__', 'selftest condition', 'selftest statement', 'Yes', 'No', 'OPTION_A', now() - interval '3 days', now() - interval '30 minutes') returning id into ma;
+  insert into watches (market_id, source_kind, source_ref, last_polled_at) values (ma, 'web_fetch', '{}', now() - interval '1 minute') returning id into wa;
+  res := settle_market(ma, '{}'::uuid[], '[]', '[]', 'resolved', 'OPTION_A', now(), null);
+  out := out || jsonb_build_object('await_result', res->>'result', 'await_status', (select status from markets where id = ma), 'await_watch_active', (select active from watches where id = wa));
+  perform defer_reconcile(jsonb_build_array(jsonb_build_object('id', ma, 'next_at', now() + interval '10 minutes', 'attempts', 0, 'first_seen_at', now() - interval '7 minutes')));
+  perform defer_reconcile(jsonb_build_array(jsonb_build_object('id', ma, 'next_at', now() + interval '20 minutes', 'attempts', 3, 'first_seen_at', now())));
+  out := out || jsonb_build_object('defer_keeps_first_seen', (select official_first_seen_at = now() - interval '7 minutes' from markets where id = ma),
+    'defer_attempts', (select reconcile_attempts from markets where id = ma), 'defer_next_at', (select reconcile_next_at = now() + interval '20 minutes' from markets where id = ma));
+  -- a watch still failing 24 h after deadline + grace no longer holds the market
+  insert into markets (platform, external_id, condition, event_statement, option_a, option_b, positive_option, open_at, deadline_utc)
+    values ('polymarket', '__selftest_p2a_waived__', 'selftest condition', 'selftest statement', 'Yes', 'No', 'OPTION_A', now() - interval '5 days', now() - interval '3 days') returning id into mw;
+  insert into watches (market_id, source_kind, source_ref, last_polled_at, consecutive_errors) values (mw, 'web_fetch', '{}', now(), 9);
+  out := out || jsonb_build_object('waived_result', settle_market(mw, '{}'::uuid[], '[]', '[]', 'closed_unresolved', null, null, null)->>'result');
   begin
     set local role anon;
     begin perform 1 from v_track_record limit 1; out := out || '{"anon_view_denied": false}';
     exception when insufficient_privilege then out := out || '{"anon_view_denied": true}'; end;
+    begin perform settle_market(ma, '{}'::uuid[], '[]', '[]', 'resolved', 'OPTION_A', now(), null); out := out || '{"anon_settle_denied": false}';
+    exception when insufficient_privilege then out := out || '{"anon_settle_denied": true}'; end;
+    begin perform defer_reconcile('[]'); out := out || '{"anon_defer_denied": false}';
+    exception when insufficient_privilege then out := out || '{"anon_defer_denied": true}'; end;
     reset role;
   exception when others then out := out || jsonb_build_object('anon_view_denied', 'set role failed: ' || sqlerrm);
   end;
@@ -164,6 +233,12 @@ end $$;`;
     // the test market's resolution, commit and final agree never count
     view_reconciled_delta: 1, view_abstained_delta: 0, view_correct_delta: 1, view_committed_delta: 1, view_shadowed_delta: 1,
     second_final_refused: true, anon_view_denied: true,
+    settle_two_finals_refused: true, settle_result: "settled", settle_rows: 3, settle_reveals: 1, settle_final: "__selftest_p2a_s3__",
+    settle_status: "resolved", settle_watch_active: false, settle_again: "not_open", late_commit_refused: true, defer_closed_market: 0,
+    changed_result: "commits_changed", changed_status: "open", changed_watch_active: false, changed_rows: 0,
+    await_result: "awaiting_watch", await_status: "open", await_watch_active: true,
+    defer_keeps_first_seen: true, defer_attempts: 3, defer_next_at: true, waived_result: "settled",
+    anon_settle_denied: true, anon_defer_denied: true,
   });
   console.log("rolled back: nothing persisted from the P2a block");
 

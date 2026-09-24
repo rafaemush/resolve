@@ -1,17 +1,27 @@
 /**
  * In-memory stand-in for the PostgREST query shapes the commit/reconcile code uses: select (eq on a column or an
  * embedded "a.b" path, in, lte, is null, order, limit, single, maybeSingle, head count), insert (+ select().single()),
- * upsert with onConflict/ignoreDuplicates, update. Unique columns answer 23505 like Postgres. Every executed query is
- * one entry in `calls`, so a test can count subrequests. Triggers are not emulated: scripts/selftest-db.ts proves
- * those against real Postgres.
+ * upsert with onConflict/ignoreDuplicates, update, and rpc() through test-supplied stand-ins. Unique columns and partial
+ * unique indexes (e.g. uq_reconciliations_final) answer 23505 like Postgres; an ON CONFLICT target covers only its own
+ * column, exactly as in Postgres. Every executed query or rpc is one entry in `calls`, so a test can count
+ * subrequests; the queries an rpc stand-in runs internally are not. Triggers are not emulated: scripts/selftest-db.ts
+ * proves those against real Postgres.
  */
-type Row = Record<string, any>;
+export type Row = Record<string, any>;
 type Filter = (r: Row) => boolean;
+
+/** At most one row per value of `col` among the rows matching `where` (CREATE UNIQUE INDEX ... (col) WHERE ...). */
+export interface PartialUnique { name: string; col: string; where: (r: Row) => boolean }
+export type RpcStandIn = (db: FakeDb, args: Record<string, any>) => Promise<{ data: any; error: any }>;
+export interface FakeDbOptions { partialUnique?: Record<string, PartialUnique[]>; rpc?: Record<string, RpcStandIn> }
 
 export interface FakeDb {
   tables: Record<string, Row[]>;
   calls: Array<{ table: string; action: string }>;
-  client: { from: (table: string) => Query };
+  client: { from: (table: string) => Query; rpc: (fn: string, args: Record<string, any>) => Promise<{ data: any; error: any }> };
+  options: FakeDbOptions;
+  /** true while an rpc stand-in runs: its internal queries are part of one subrequest. */
+  inRpc: boolean;
 }
 
 const path = (r: Row, col: string): unknown => col.split(".").reduce<any>((o, k) => (o == null ? undefined : o[k]), r);
@@ -55,10 +65,19 @@ class Query implements PromiseLike<{ data: any; error: any; count?: number | nul
     for (const c of cols) if (row[c] != null && this.rows().some((r) => r[c] === row[c])) return c;
     return null;
   }
+  /** The partial unique index `candidate` would violate, ignoring the row it replaces (an update). */
+  private partialConflict(candidate: Row, self: Row | null): string | null {
+    for (const u of this.db.options.partialUnique?.[this.table] ?? []) {
+      if (!u.where(candidate)) continue;
+      if (this.rows().some((r) => r !== self && u.where(r) && r[u.col] === candidate[u.col])) return u.name;
+    }
+    return null;
+  }
 
   private exec(one: boolean): { data: any; error: any; count?: number | null } {
-    this.db.calls.push({ table: this.table, action: this.action });
+    if (!this.db.inRpc) this.db.calls.push({ table: this.table, action: this.action });
     const uniq = this.unique[this.table] ?? [];
+    const dup = (c: string) => ({ data: null, error: { code: "23505", message: `duplicate key value violates unique constraint (${c})` } });
     if (this.action === "insert" || this.action === "upsert") {
       const inserted: Row[] = [];
       for (const p of this.payload) {
@@ -66,8 +85,8 @@ class Query implements PromiseLike<{ data: any; error: any; count?: number | nul
           if (this.conflict.ignore) continue;
           return { data: null, error: { code: "42P10", message: "fake: upsert update path not emulated" } };
         }
-        const c = this.conflictOn(p, uniq);
-        if (c) return { data: null, error: { code: "23505", message: `duplicate key value violates unique constraint (${c})` } };
+        const c = this.conflictOn(p, uniq) ?? this.partialConflict(p, null);
+        if (c) return dup(c);
         const row = { id: `${this.table}-${++seq}`, created_at: new Date().toISOString(), ...structuredClone(p) };
         this.rows().push(row);
         inserted.push(row);
@@ -76,7 +95,11 @@ class Query implements PromiseLike<{ data: any; error: any; count?: number | nul
       return { data: one ? structuredClone(inserted[0] ?? null) : structuredClone(inserted), error: null };
     }
     const matched = this.rows().filter((r) => this.filters.every((f) => f(r)));
-    if (this.action === "update") { for (const r of matched) Object.assign(r, structuredClone(this.patch)); return { data: null, error: null }; }
+    if (this.action === "update") {
+      for (const r of matched) { const c = this.partialConflict({ ...r, ...this.patch }, r); if (c) return dup(c); }
+      for (const r of matched) Object.assign(r, structuredClone(this.patch));
+      return { data: null, error: null };
+    }
     if (this.head) return { data: null, error: null, count: matched.length };
     let out = [...matched];
     if (this.orderBy) { const { col, asc } = this.orderBy; out.sort((a, b) => (String(path(a, col)) < String(path(b, col)) ? -1 : String(path(a, col)) > String(path(b, col)) ? 1 : 0) * (asc ? 1 : -1)); }
@@ -85,7 +108,25 @@ class Query implements PromiseLike<{ data: any; error: any; count?: number | nul
   }
 }
 
-export function fakeDb(tables: Record<string, Row[]> = {}, unique: Record<string, string[]> = {}): FakeDb {
-  const db: FakeDb = { tables, calls: [], client: { from: (t: string) => new Query(db, t, unique) } };
+export function fakeDb(tables: Record<string, Row[]> = {}, unique: Record<string, string[]> = {}, options: FakeDbOptions = {}): FakeDb {
+  const db: FakeDb = {
+    tables, calls: [], options, inRpc: false,
+    client: {
+      from: (t: string) => new Query(db, t, unique),
+      // One subrequest, one transaction: the stand-in's writes are rolled back when it answers an error.
+      rpc: async (fn: string, args: Record<string, any>) => {
+        db.calls.push({ table: `rpc:${fn}`, action: "rpc" });
+        const impl = options.rpc?.[fn];
+        if (!impl) return { data: null, error: { code: "PGRST202", message: `fake: no stand-in for rpc ${fn}` } };
+        const snapshot = structuredClone(db.tables);
+        db.inRpc = true;
+        try {
+          const r = await impl(db, structuredClone(args));
+          if (r.error) { for (const k of Object.keys(db.tables)) delete db.tables[k]; Object.assign(db.tables, snapshot); }
+          return r;
+        } finally { db.inRpc = false; }
+      },
+    },
+  };
   return db;
 }

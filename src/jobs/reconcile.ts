@@ -5,11 +5,13 @@
  *   1. re-post commits still pending after 60 s (retryUnposted);
  *   2. post at most 5 pending reveals as replies to their commits;
  *   3. alert when a commit or reveal is still pending after 15 minutes;
- *   4. discovery: non-test shadow markets past their deadline, oldest deadline first, at most 25. For each official
- *      outcome: one reconciliation row per commit (final on the latest commit, the market's one public agreement),
- *      one pending reveal row per commit, watches deactivated, market status set last so a partial failure is simply
- *      redone next run (every write is insert-or-ignore). No official outcome 21 days after the deadline closes the
- *      market as closed_unresolved through the same reveal path.
+ *   4. discovery: non-test shadow markets past their deadline whose reconcile_next_at is due, longest-waiting first, at
+ *      most 25. A market the run does not settle (platform pending, label unmappable, platform unreachable, a failed
+ *      write, a watch still owed its post-deadline poll) is rescheduled in one batched write, so it moves behind the
+ *      others instead of holding a slot forever. An official outcome is settled by settle_market() (migration 012) in
+ *      one transaction: one reconciliation row per commit (final on the latest commit, the market's one public
+ *      agreement), one pending reveal row per commit, watches off, the terminal status. No official outcome 21 days
+ *      after the deadline closes the market as closed_unresolved through the same path.
  * Official outcomes map to OPTION_A/OPTION_B only by normalized label equality with the registered option text. The
  * positional fallback that used to map "first outcome" to OPTION_A is gone: no match means no reconciliation and an
  * alert, never a guess.
@@ -32,6 +34,12 @@ export const MAX_RETRIES_PER_RUN = 5;
 /** No official outcome this long after the deadline: the market closes as closed_unresolved (agreement unresolved_by_platform). */
 export const CLOSE_OUT_DAYS = 21;
 export const UNPOSTED_ALERT_MINUTES = 15;
+/** Recheck of a market the platform has not resolved yet: the cron interval (see recheckDelaySeconds). */
+export const RECHECK_PENDING_S = 600;
+/** Cap of the backoff for markets that cannot be mapped, reached or written. */
+export const RECHECK_MAX_S = 6 * 3600;
+/** gamma closed with no umaResolutionStatus at all for this long is no longer "pending": someone has to look. */
+export const UMA_SILENT_DAYS = 7;
 const UA = "ResolveBot/1.0";
 const FETCH_TIMEOUT_MS = 8000;
 
@@ -82,19 +90,29 @@ const GammaMarket = z.object({
   slug: z.string().nullish(),
 });
 
-/** Pure: gamma market JSON -> official state. official_at is gamma closedTime, labeled; otherwise the first observation. */
+/**
+ * Pure: gamma market JSON -> official state. Official means closed AND umaResolutionStatus "resolved" (plan §16.4 P2):
+ * on a closed market that UMA has not settled, outcomePrices can be a last trade, not a resolution. Closed for
+ * UMA_SILENT_DAYS with no UMA status at all is unmappable (alerted), never read from prices. official_at is gamma
+ * closedTime, labeled; otherwise the observation time.
+ */
 export function polymarketOfficial(json: unknown, m: Options, observedAt: string, apiUrl: string): OfficialState {
   const p = GammaMarket.safeParse(json);
   if (!p.success) return { kind: "unreachable", detail: `gamma schema drift: ${p.error.issues[0]?.path.join(".") ?? "?"}` };
   const j = p.data;
   const sourceUrl = j.slug ? `https://polymarket.com/event/${j.slug}` : apiUrl;
   const uma = j.umaResolutionStatus ?? "";
-  if (j.closed !== true || (uma && uma !== "resolved")) return { kind: "pending", source_url: sourceUrl, detail: `closed=${j.closed ?? "?"} uma=${uma || "n/a"}` };
-  const outcomes = stringArray(j.outcomes), prices = stringArray(j.outcomePrices).map(Number);
   const closedAt = gammaTime(j.closedTime);
+  if (j.closed !== true || uma !== "resolved") {
+    if (j.closed === true && !uma && closedAt && Date.parse(observedAt) - Date.parse(closedAt) > UMA_SILENT_DAYS * 86_400_000) {
+      return { kind: "unmappable", label: null, source_url: sourceUrl, detail: `closed since ${closedAt} with no umaResolutionStatus; outcomePrices are not an official outcome` };
+    }
+    return { kind: "pending", source_url: sourceUrl, detail: `closed=${j.closed ?? "?"} uma=${uma || "n/a"}` };
+  }
+  const outcomes = stringArray(j.outcomes), prices = stringArray(j.outcomePrices).map(Number);
   const at = closedAt ?? observedAt;
   const atSource = closedAt ? "gamma_closed_time" as const : "first_observed_poll" as const;
-  if (uma === "resolved" && prices.length === 2 && prices.every((x) => x === 0.5)) {
+  if (prices.length === 2 && prices.every((x) => x === 0.5)) {
     return { kind: "resolved", official: { outcome: "VOID", label: null, at, at_source: atSource, source_url: sourceUrl }, detail: "resolved 50-50" };
   }
   const winners = prices.flatMap((x, i) => (x >= 0.99 ? [i] : []));
@@ -133,7 +151,8 @@ function limitlessLabels(j: z.infer<typeof LimitlessMarket>): string[] | null {
 /**
  * Pure: GET /markets/{slug} JSON -> official state. Resolved when winningOutcomeIndex is a number; equal positive
  * payoutNumerators with no index = VOID (CTF 50-50). The REST object has no resolution timestamp and updatedAt is not
- * one (plan §17.1), so official_at is the first time this poll saw the outcome, labeled limitless_api_poll.
+ * one (plan §17.1), so official_at is the observation time, labeled limitless_api_poll (withFirstSeen swaps in an
+ * earlier sighting when a previous run saw the outcome and could not settle).
  */
 export function limitlessOfficial(json: unknown, m: Options, slug: string, observedAt: string): OfficialState {
   const sourceUrl = `https://limitless.exchange/markets/${slug}`;
@@ -232,51 +251,67 @@ export function planReconciliations(m: Pick<MarketRow, "id" | "platform">, commi
   }));
 }
 
+/** A market checked without being settled: when to look again, the backoff exponent, a first official sighting to keep. */
+export interface Deferral { id: string; next_at: string; attempts: number; first_seen_at: string | null }
+
+/**
+ * Pure. Seconds until a market the run did not settle is checked again. "pending" stays at the cron interval: the
+ * official time of a Limitless market is the first poll that sees its outcome (±10 min, plan §17.3), and fairness comes
+ * from ordering discovery by reconcile_next_at, not from backing off. "failed" (unmappable, unreachable, a write that
+ * failed) doubles per consecutive failed check up to 6 hours: those need a fix or the end of an outage, and their alerts
+ * repeat daily.
+ */
+export function recheckDelaySeconds(kind: "pending" | "failed", failedBefore: number): number {
+  if (kind === "pending") return RECHECK_PENDING_S;
+  return Math.min(RECHECK_MAX_S, RECHECK_PENDING_S * 2 ** Math.min(20, Math.max(0, failedBefore)));
+}
+
+/** Pure. "retry" = due again at once (a stale plan, or the budget ran out), with the failure count unchanged. */
+export function deferral(m: Pick<MarketRow, "id" | "reconcile_attempts">, kind: "pending" | "failed" | "retry", nowMs: number, firstSeen: string | null = null): Deferral {
+  const failedBefore = m.reconcile_attempts ?? 0;
+  if (kind === "retry") return { id: m.id, next_at: new Date(nowMs).toISOString(), attempts: failedBefore, first_seen_at: firstSeen };
+  return { id: m.id, next_at: new Date(nowMs + recheckDelaySeconds(kind, failedBefore) * 1000).toISOString(), attempts: kind === "pending" ? 0 : failedBefore + 1, first_seen_at: firstSeen };
+}
+
+const pollTime = (s: OfficialRecord["at_source"]) => s === "limitless_api_poll" || s === "first_observed_poll";
+
+/**
+ * Pure. A poll-observed official time is the first observation: when an earlier run saw the outcome but could not
+ * settle, markets.official_first_seen_at holds that sighting and it wins over this run's (later) one.
+ */
+export function withFirstSeen(state: OfficialState, firstSeen: string | null | undefined): OfficialState {
+  if (state.kind !== "resolved" || !firstSeen || !pollTime(state.official.at_source)) return state;
+  return { ...state, official: { ...state.official, at: firstSeen } };
+}
+
 export interface ReconcileSummary {
   checked: number; resolved: number; closed_out: number; pending: number; unmappable: number; unreachable: number; disagreements: number;
+  awaiting_watch: number; settle_retried: number; rescheduled: number;
   reconciliations: number; reveals_recorded: number; reveals_posted: number; reveals_waiting: number; retried: number; retry_posted: number;
   stopped_by_budget: boolean; subrequests: number; errors: string[];
 }
 
 interface CommitDbRow { id: string; market_id: string; resolution_id: string | null; created_at: string; telegram_date: string | null; channel: string; message_id: number | null; commitment_sha256: string; nonce: string; payload: Record<string, unknown>; resolutions: ResolutionFallback | null }
 
+/** settle_market()'s answer (migration 012). */
+const SettleAnswer = z.discriminatedUnion("result", [
+  z.object({ result: z.literal("settled"), reconciliations: z.number().int(), reveals: z.number().int() }),
+  z.object({ result: z.literal("not_open"), status: z.string() }),
+  z.object({ result: z.literal("awaiting_watch") }),
+  z.object({ result: z.literal("commits_changed") }),
+]);
+
+/** One market's check: its reschedule (null once settled), whether it spent the alert reserved with it, whether the budget stopped the run. */
+interface Step { defer: Deferral | null; alerted: boolean; stop: boolean }
+
 export async function runReconcile(env: Env): Promise<ReconcileSummary> {
   const client = db(env);
   const started = Date.now();
-  const nowIso = new Date(started).toISOString();
   const budget = new Budget(RECONCILE_SUBREQUESTS - COST.db); // the loop_runs row below is reserved up front
-  const out: ReconcileSummary = { checked: 0, resolved: 0, closed_out: 0, pending: 0, unmappable: 0, unreachable: 0, disagreements: 0, reconciliations: 0, reveals_recorded: 0, reveals_posted: 0, reveals_waiting: 0, retried: 0, retry_posted: 0, stopped_by_budget: false, subrequests: 0, errors: [] };
+  const out: ReconcileSummary = { checked: 0, resolved: 0, closed_out: 0, pending: 0, unmappable: 0, unreachable: 0, disagreements: 0, awaiting_watch: 0, settle_retried: 0, rescheduled: 0, reconciliations: 0, reveals_recorded: 0, reveals_posted: 0, reveals_waiting: 0, retried: 0, retry_posted: 0, stopped_by_budget: false, subrequests: 0, errors: [] };
   const say = async (key: string, text: string, dedupMinutes: number) => {
     if (budget.take(COST.alert)) await alert(env, key, text, { dedupMinutes });
     else out.errors.push(`alert ${key} not sent: subrequest budget`);
-  };
-
-  /** false = the subrequest budget cannot cover this market's writes; nothing was written for it. */
-  const onOfficial = async (m: MarketRow, state: OfficialState): Promise<boolean> => {
-    switch (state.kind) {
-      case "unreachable":
-        out.unreachable++; out.errors.push(`${marketRef(m)}: ${state.detail}`);
-        return true;
-      case "unmappable":
-        out.unmappable++;
-        await say(`reconcile_label_${m.id}`, `reconcile cannot map the official outcome of ${marketRef(m)} (options "${m.option_a}" / "${m.option_b}"): ${state.detail}. No reconciliation was written. ${state.source_url}`, 1440);
-        return true;
-      case "pending": {
-        if (Date.now() < Date.parse(m.deadline_utc) + CLOSE_OUT_DAYS * 86_400_000) { out.pending++; return true; }
-        const settled = await settle(env, client, budget, m, { outcome: null, label: null, at: null, at_source: null, source_url: state.source_url }, out);
-        if (settled) out.closed_out++;
-        return settled;
-      }
-      case "resolved": {
-        const settled = await settle(env, client, budget, m, state.official, out);
-        if (settled) out.resolved++;
-        return settled;
-      }
-      default: {
-        const never: never = state;
-        throw new Error(`unhandled official state ${JSON.stringify(never)}`);
-      }
-    }
   };
 
   const rt = await retryUnposted(env, MAX_RETRIES_PER_RUN, budget);
@@ -285,18 +320,7 @@ export async function runReconcile(env: Env): Promise<ReconcileSummary> {
   out.reveals_posted = rv.posted; out.reveals_waiting = rv.waiting;
   if (rt.stopped || rv.stopped) out.stopped_by_budget = true;
   await alertStalePending(client, budget, say, out);
-
-  if (budget.take(COST.db)) {
-    const { data: markets, error } = await client.from("markets").select("*").is("tenant_id", null).eq("is_test", false).eq("status", "open").in("platform", ["polymarket", "limitless"])
-      .is("deleted_at", null).lte("deadline_utc", nowIso).order("deadline_utc", { ascending: true }).limit(MARKETS_PER_RUN);
-    if (error) out.errors.push(`markets: ${redact(error.message)}`);
-    for (const raw of markets ?? []) {
-      const m = raw as unknown as MarketRow;
-      if (!budget.take(COST.http)) { out.stopped_by_budget = true; break; }
-      out.checked++;
-      if (!(await onOfficial(m, await officialFor(env, m, nowIso)))) break; // out of budget: the market is redone next run
-    }
-  } else out.stopped_by_budget = true;
+  await discover(env, client, budget, started, out);
   if (out.unreachable) await say("reconcile_unreachable", `reconcile could not read ${out.unreachable} platform answer(s): ${out.errors.slice(0, 3).join("; ")}`, 360);
 
   out.subrequests = budget.used + COST.db;
@@ -328,19 +352,87 @@ async function alertStalePending(client: Db, budget: Budget, say: Say, out: Reco
 }
 
 /**
- * Write the outcome for one market: reconciliation rows, reveal rows, watches off, market status last. Every write is
- * insert-or-ignore, so a partial failure is redone identically next run and a first observation (official_at of a
- * Limitless poll) is never overwritten. Returns false when the budget cannot cover the writes (nothing written).
+ * Due markets, longest-waiting first; every market checked and not settled is rescheduled in one defer_reconcile()
+ * request. A failure of either request is alerted from a reservation taken up front.
  */
-async function settle(env: Env, client: Db, budget: Budget, m: MarketRow, official: OfficialRecord, out: ReconcileSummary): Promise<boolean> {
-  if (!budget.take(COST.db)) { out.stopped_by_budget = true; return false; }
+async function discover(env: Env, client: Db, budget: Budget, nowMs: number, out: ReconcileSummary): Promise<void> {
+  if (!budget.take(2 * COST.db + COST.alert)) { out.stopped_by_budget = true; return; }
+  const nowIso = new Date(nowMs).toISOString();
+  const { data: markets, error } = await client.from("markets").select("*").is("tenant_id", null).eq("is_test", false).eq("status", "open").in("platform", ["polymarket", "limitless"])
+    .is("deleted_at", null).lte("deadline_utc", nowIso).lte("reconcile_next_at", nowIso).order("reconcile_next_at", { ascending: true }).limit(MARKETS_PER_RUN);
+  if (error) {
+    budget.release(COST.db);
+    out.errors.push(`markets: ${redact(error.message)}`);
+    await alert(env, "reconcile_discovery", `reconcile could not list the markets due for a check: ${redact(error.message)}. Nothing was reconciled this run.`, { dedupMinutes: 60 });
+    return;
+  }
+  const deferrals: Deferral[] = [];
+  for (const raw of markets ?? []) {
+    const m = raw as unknown as MarketRow;
+    // one alert per market (a label it cannot map, or a write that failed) is reserved with its check
+    if (!budget.take(COST.http + COST.alert)) { out.stopped_by_budget = true; break; }
+    out.checked++;
+    const step = await checkMarket(env, client, budget, m, nowMs, out);
+    if (!step.alerted) budget.release(COST.alert);
+    if (step.defer) deferrals.push(step.defer);
+    if (step.stop) break;
+  }
+  if (!deferrals.length) { budget.release(COST.db + COST.alert); return; }
+  const { data: n, error: de } = await client.rpc("defer_reconcile", { p_rows: deferrals });
+  if (de) {
+    out.errors.push(`reschedule: ${redact(de.message)}`);
+    await alert(env, "reconcile_reschedule", `reconcile could not reschedule ${deferrals.length} market(s): ${redact(de.message)}. They stay due, so the next run checks them again ahead of newer markets.`, { dedupMinutes: 360 });
+    return;
+  }
+  budget.release(COST.alert);
+  out.rescheduled = typeof n === "number" ? n : 0;
+}
+
+async function checkMarket(env: Env, client: Db, budget: Budget, m: MarketRow, nowMs: number, out: ReconcileSummary): Promise<Step> {
+  const state = withFirstSeen(await officialFor(env, m, new Date(nowMs).toISOString()), m.official_first_seen_at);
+  switch (state.kind) {
+    case "unreachable":
+      out.unreachable++; out.errors.push(`${marketRef(m)}: ${state.detail}`);
+      return { defer: deferral(m, "failed", nowMs), alerted: false, stop: false };
+    case "unmappable":
+      out.unmappable++;
+      await alert(env, `reconcile_label_${m.id}`, `reconcile cannot map the official outcome of ${marketRef(m)} (options "${m.option_a}" / "${m.option_b}"): ${state.detail}. No reconciliation was written; the market stays open, rechecked with backoff, until its registration is fixed by hand. ${state.source_url}`, { dedupMinutes: 1440 });
+      return { defer: deferral(m, "failed", nowMs), alerted: true, stop: false };
+    case "pending":
+      if (nowMs < Date.parse(m.deadline_utc) + CLOSE_OUT_DAYS * 86_400_000) { out.pending++; return { defer: deferral(m, "pending", nowMs), alerted: false, stop: false }; }
+      return settle(env, client, budget, m, { outcome: null, label: null, at: null, at_source: null, source_url: state.source_url }, nowMs, out);
+    case "resolved":
+      return settle(env, client, budget, m, state.official, nowMs, out);
+    default: {
+      const never: never = state;
+      throw new Error(`unhandled official state ${JSON.stringify(never)}`);
+    }
+  }
+}
+
+/**
+ * Plan one market's outcome and write it through settle_market(), which does every write in one transaction (and
+ * nothing when a watch still owes its post-deadline poll, or a commit landed that this plan did not see). A failure
+ * spends the alert reserved with the market's check and reschedules it with backoff.
+ */
+async function settle(env: Env, client: Db, budget: Budget, m: MarketRow, official: OfficialRecord, nowMs: number, out: ReconcileSummary): Promise<Step> {
+  const firstSeen = official.at && pollTime(official.at_source) ? official.at : null;
+  const later = (kind: "pending" | "failed" | "retry", alerted = false, stop = false): Step => ({ defer: deferral(m, kind, nowMs, firstSeen), alerted, stop });
+  const failed = async (what: string, message: string): Promise<Step> => {
+    const text = `${marketRef(m)} ${what}: ${redact(message)}`;
+    out.errors.push(text);
+    await alert(env, `reconcile_write_${m.id}`, `reconcile could not settle ${text}. Nothing was written for the market; it stays open and is retried with backoff.`, { dedupMinutes: 1440 });
+    return later("failed", true);
+  };
+  if (!budget.take(COST.db)) { out.stopped_by_budget = true; return later("retry", false, true); }
   const { data, error } = await client.from("bot_posts")
     .select("id, market_id, resolution_id, created_at, telegram_date, channel, message_id, commitment_sha256, nonce, payload, resolutions(resolution_status, winning_outcome, confidence_score, caveats, thresholds_version, determination_basis)")
     .eq("market_id", m.id).eq("kind", "commit");
-  if (error) { out.errors.push(`${marketRef(m)} commits: ${redact(error.message)}`); return true; }
+  if (error) return failed("commits read", error.message);
+  const rows = (data ?? []) as unknown as CommitDbRow[];
   const commits: Array<CommitForPlan & { db: CommitDbRow; provable: boolean }> = [];
   const unprovable: string[] = []; // commits that cannot be revealed: unreadable, or a preimage that does not hash to the commitment
-  for (const r of (data ?? []) as unknown as CommitDbRow[]) {
+  for (const r of rows) {
     const committed = r.resolution_id ? committedOf(r as CommitRow, r.resolutions) : null;
     if (!committed || !r.resolution_id) { unprovable.push(`${r.id} (committed verdict unreadable)`); continue; }
     // Never reveal a preimage that does not hash to the published commitment.
@@ -348,19 +440,12 @@ async function settle(env: Env, client: Db, budget: Budget, m: MarketRow, offici
     if (!provable) unprovable.push(`${r.id} (preimage does not hash to the commitment)`);
     commits.push({ id: r.id, resolution_id: r.resolution_id, created_at: r.created_at, telegram_date: r.telegram_date, committed, db: r, provable });
   }
-  if (unprovable.length) out.errors.push(`${marketRef(m)} unprovable commits: ${unprovable.join(", ")}`);
   const plan = planReconciliations(m, commits, official);
   const disagree = plan.filter((p) => p.row.agreement === "disagree");
-  // writes + the alerts this market will raise, reserved together so an alert is never dropped for budget
-  const need = 4 * COST.db + (disagree.length ? COST.alert : 0) + (unprovable.length ? COST.alert : 0);
-  if (!budget.take(need)) { out.stopped_by_budget = true; return false; }
-  const fail = (what: string, e: { message: string }) => { out.errors.push(`${marketRef(m)} ${what}: ${redact(e.message)}`); return true; };
+  // the write + the alerts a settled market raises, reserved together so an alert is never dropped for budget
+  const alerts = ((disagree.length ? 1 : 0) + (unprovable.length ? 1 : 0)) * COST.alert;
+  if (!budget.take(COST.db + alerts)) { out.stopped_by_budget = true; return later("retry", false, true); }
 
-  if (plan.length) {
-    const { error: re } = await client.from("reconciliations").upsert(plan.map((p) => p.row), { onConflict: "resolution_id", ignoreDuplicates: true });
-    if (re) return fail("reconciliations", re);
-    out.reconciliations += plan.length;
-  }
   const byId = new Map(commits.map((c) => [c.id, c]));
   const reveals = plan.flatMap((p) => {
     const c = byId.get(p.commit_id)!;
@@ -369,23 +454,46 @@ async function settle(env: Env, client: Db, budget: Budget, m: MarketRow, offici
     // A commit that was never public (channel none) gets a recorded, never-posted reveal; otherwise the reveal waits
     // pending until postPendingReveals replies to the posted commit.
     const channel = c.db.channel === "none" ? "none" : "pending";
-    return [{ resolution_id: c.resolution_id, market_id: m.id, channel, kind: "reveal", message_id: null, reply_to_message_id: c.db.message_id, telegram_date: null, posted_at: null, commitment_sha256: c.db.commitment_sha256, nonce: c.db.nonce, payload, dedup_key: `reveal:${c.id}` }];
+    return [{ resolution_id: c.resolution_id, channel, reply_to_message_id: c.db.message_id, commitment_sha256: c.db.commitment_sha256, nonce: c.db.nonce, payload, dedup_key: `reveal:${c.id}` }];
   });
-  if (reveals.length) {
-    const { error: ve } = await client.from("bot_posts").upsert(reveals, { onConflict: "dedup_key", ignoreDuplicates: true });
-    if (ve) return fail("reveals", ve);
-    out.reveals_recorded += reveals.length;
-  }
-  const { error: we } = await client.from("watches").update({ active: false }).eq("market_id", m.id).eq("active", true);
-  if (we) return fail("watches", we);
   const status = official.outcome === null ? "closed_unresolved" : official.outcome === "VOID" ? "void" : "resolved";
-  const { error: me } = await client.from("markets").update({ status, official_outcome: official.outcome, official_resolved_at: official.at, official_source_url: official.source_url }).eq("id", m.id).eq("status", "open");
-  if (me) return fail("market status", me);
-
+  const { data: answer, error: se } = await client.rpc("settle_market", {
+    // every commit read, readable or not: settle_market refuses a plan that missed a commit written since
+    p_market: m.id, p_commit_ids: rows.map((r) => r.id), p_reconciliations: plan.map((p) => p.row), p_reveals: reveals,
+    p_status: status, p_official_outcome: official.outcome, p_official_at: official.at, p_official_source_url: official.source_url,
+  });
+  const parsed = se ? null : SettleAnswer.safeParse(answer);
+  if (!parsed?.success) {
+    budget.release(alerts);
+    return failed("settle_market", se?.message ?? `unexpected answer ${JSON.stringify(answer).slice(0, 200)}`);
+  }
+  const a = parsed.data;
+  switch (a.result) {
+    case "awaiting_watch": // nothing written; the post-deadline verdict may still be committed
+      budget.release(alerts); out.awaiting_watch++;
+      return later("pending");
+    case "commits_changed": // watches are off now, so the next run's plan is complete
+      budget.release(alerts); out.settle_retried++;
+      return later("retry");
+    case "not_open": // settled by a concurrent run
+      budget.release(alerts); out.settle_retried++;
+      return { defer: null, alerted: false, stop: false };
+    case "settled":
+      break;
+    default: {
+      const never: never = a;
+      throw new Error(`unhandled settle answer ${JSON.stringify(never)}`);
+    }
+  }
+  out.reconciliations += a.reconciliations; out.reveals_recorded += a.reveals;
+  if (official.outcome === null) out.closed_out++; else out.resolved++;
   if (disagree.length) {
     out.disagreements += disagree.length;
     await alert(env, `reconcile_disagree_${m.id}`, `DISAGREE on ${marketRef(m)}: ${disagree.length} commit(s) called the market against the official ${official.outcome}${official.label ? ` (${official.label})` : ""}${disagree.some((d) => d.row.final) ? ", including the final commit (a false RESOLVED on the public record)" : ""}. Revealed through the same path as agreements. ${official.source_url ?? ""}`, { dedupMinutes: 1440 });
   }
-  if (unprovable.length) await alert(env, `reveal_preimage_${m.id}`, `${marketRef(m)}: ${unprovable.length} commit(s) cannot be revealed: ${unprovable.join(", ")}. Readable ones are reconciled; none of these is revealed.`, { dedupMinutes: 1440 });
-  return true;
+  if (unprovable.length) {
+    out.errors.push(`${marketRef(m)} unprovable commits: ${unprovable.join(", ")}`);
+    await alert(env, `reveal_preimage_${m.id}`, `${marketRef(m)}: ${unprovable.length} commit(s) cannot be revealed: ${unprovable.join(", ")}. Readable ones are reconciled; none of these is revealed.`, { dedupMinutes: 1440 });
+  }
+  return { defer: null, alerted: false, stop: false };
 }

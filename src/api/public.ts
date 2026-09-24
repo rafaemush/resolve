@@ -20,9 +20,9 @@ pub.get("/v1/track-record", async (c) => {
   if (error) return err(c, "UPSTREAM_UNAVAILABLE", "track record store unavailable", 503);
   const rows = (data ?? []).map((r) => {
     const gate = `n=${r.n_reconciled_cumulative ?? r.n_reconciled}, not yet reportable`;
-    return { ...r, coverage_accuracy: r.reportable ? r.coverage_accuracy : gate, precision: r.reportable ? r.precision : gate, abstention_rate: r.reportable ? r.abstention_rate : gate, wilson_low: r.reportable ? r.wilson_low : gate, wilson_high: r.reportable ? r.wilson_high : gate };
+    return { ...r, coverage_accuracy: r.reportable ? r.coverage_accuracy : gate, reconciled_accuracy: r.reportable ? r.reconciled_accuracy : gate, precision: r.reportable ? r.precision : gate, abstention_rate: r.reportable ? r.abstention_rate : gate, wilson_low: r.reportable ? r.wilson_low : gate, wilson_high: r.reportable ? r.wilson_high : gate };
   });
-  const res = ok(c, { note: "Every number here is a database row; test markets are excluded and each market counts once, by its latest commit. Percentages are cumulative per platform and appear only once 100 markets on that platform have been reconciled against the platform of record; precision carries a 95 % Wilson interval. Any commitment can be checked at /v1/track-record/verify?hash=<sha256>. Informational signal, not financial advice, not an oracle of record.", rows });
+  const res = ok(c, { note: "Every number here is a database row; test markets are excluded and each market counts once, by its latest commit. Percentages are cumulative per platform and appear only once 100 markets on that platform have been reconciled against the platform of record; precision carries a 95 % Wilson interval. median_lead_seconds uses the platform's own resolution time only; median_lead_seconds_poll uses the first poll that saw the outcome, so it overstates the lead by up to the poll delay. Any commitment can be checked at /v1/track-record/verify?hash=<sha256>. Informational signal, not financial advice, not an oracle of record.", rows });
   res.headers.set("Cache-Control", "public, max-age=60, s-maxage=60");
   c.executionCtx.waitUntil(caches.default.put(cacheKey, res.clone()));
   return res;

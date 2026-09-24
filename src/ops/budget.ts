@@ -22,6 +22,8 @@ export class Budget {
     this.spent += n;
     return true;
   }
+  /** Give back part of a reservation the operation turned out not to need (an alert that was never raised). */
+  release(n: number): void { this.spent = Math.max(0, this.spent - n); }
   get left(): number { return this.limit - this.spent; }
   get used(): number { return this.spent; }
 }

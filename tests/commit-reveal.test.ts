@@ -12,7 +12,7 @@ const h = vi.hoisted(() => ({ db: null as unknown as FakeDb }));
 vi.mock("../src/db/supabase", () => ({ db: () => h.db.client }));
 vi.mock("../src/ops/alerts", () => ({ alert: vi.fn(async () => ({ sent: true, deduped: false })) }));
 
-import { applyPublicFloor, buildPreimage, buildReveal, commitVerdict, committedFields, committedOf, floorCandidate, PUBLIC_FLOOR, retryCandidates, retryUnposted, type CommittedVerdict, type OfficialRecord } from "../src/bot/commit";
+import { applyPublicFloor, buildPreimage, buildReveal, commitVerdict, committedFields, committedOf, floorCandidate, MARKET_NOT_OPEN_SQLSTATE, PUBLIC_FLOOR, retryCandidates, retryUnposted, type CommittedVerdict, type OfficialRecord } from "../src/bot/commit";
 import { alert } from "../src/ops/alerts";
 import { sha256Hex } from "../src/resolve/text";
 
@@ -188,6 +188,15 @@ describe("commitVerdict: insert first, then post, then the receipt", () => {
     expect(sent).toHaveLength(0);
     expect(h.db.tables.bot_posts![0]).toMatchObject({ channel: "none", posted_at: null });
     expect(h.db.tables.bot_posts![0]!.payload.committed.resolution_status).toBe("RESOLVED"); // no floor off the record
+  });
+
+  it("a market settled while the verdict was computed: nothing recorded, nothing posted, no alert (RS001)", async () => {
+    h.db.client.from = () => ({ insert: () => ({ select: () => ({ single: async () => ({ data: null, error: { code: MARKET_NOT_OPEN_SQLSTATE, message: `market ${MARKET.id} is resolved: a commit is recorded only while its market is open` } }) }) }) }) as never;
+    const r = await commitVerdict(env, MARKET, "res1", verdict({ confidence_score: 0.95 }));
+    expect(r).toMatchObject({ committed: false, posted: false });
+    expect(r.reason).toContain("is resolved");
+    expect(sent).toHaveLength(0);
+    expect(vi.mocked(alert)).not.toHaveBeenCalled();
   });
 
   it("an insert failure is alerted and nothing is posted", async () => {
