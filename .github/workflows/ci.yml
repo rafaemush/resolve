@@ -35,6 +35,8 @@ jobs:
         run: pnpm eval:build --check
       - name: frozen ingestion cases match the authored cases and pass (adapters + change projection, no network)
         run: pnpm eval:ingest --check && pnpm eval:ingest
+      - name: frozen official_release cases match the authored cases and pass (saved official bodies, no network)
+        run: pnpm eval:official --check && pnpm eval:official
       - name: failure-injection suite (replay; a missing Jev fixture is a harness error)
         run: pnpm eval --mode replay
       - name: mutation harness (every deterministic rail must turn the suite red; any green mutation fails the build)

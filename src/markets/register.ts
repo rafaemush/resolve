@@ -4,6 +4,7 @@ import { MarketRegistration, type MarketRegistration as Reg } from "../resolve/s
 import { robotsAllows } from "../ingest/web";
 import { baseRpcUrl, getBlock, blockAtOrAfter, hasCode } from "../ingest/base";
 import type { MarketMeta } from "./meta";
+import { officialRefusal, officialRegistrationIssues, parseOfficialRef } from "../resolve/official";
 
 export interface RegisterResult {
   marketId: string;
@@ -26,9 +27,22 @@ export interface RegisterOptions {
   isTest?: boolean;
 }
 
+/**
+ * Schema parse plus the official_release cross-field rules (series/source match, bucket, release_at, prior_level,
+ * refused series such as the PDF-only Bank of Japan). Throws with every reason; pure, so tests call it directly.
+ */
+export function validateRegistration(input: unknown): Reg {
+  const refused = officialRefusal(input);
+  if (refused) throw new Error(refused);
+  const reg: Reg = MarketRegistration.parse(input);
+  const issues = officialRegistrationIssues(reg);
+  if (issues.length) throw new Error(`official_release registration refused: ${issues.join("; ")}`);
+  return reg;
+}
+
 /** Validate, run registration-time source checks (robots, contract code), insert the market and one watch per source. */
 export async function registerMarket(env: Env, cfg: Config, input: unknown, tenantId: string | null, opts: RegisterOptions = {}): Promise<RegisterResult> {
-  const reg: Reg = MarketRegistration.parse(input);
+  const reg: Reg = validateRegistration(input);
   const client = db(env);
   // Idempotent registration: the same (tenant, platform, external_id) returns the existing market. A repeat never rewrites
   // it: meta and is_test of a market that may already carry a public commit stay as first registered.
@@ -66,6 +80,10 @@ export async function registerMarket(env: Env, cfg: Config, input: unknown, tena
     } else if (s.kind === "solana_log") {
       const account = s.ref.split(":")[1] ?? "";
       watchSpecs.push({ source_kind: "solana_log", source_ref: { chain: "solana", account }, cursor: { from_ts: reg.open_at } });
+    } else if (s.kind === "official_release") {
+      // The adapter fetches only the series' allowlisted hosts (src/resolve/official.ts); nothing to probe here.
+      const p = parseOfficialRef(s.ref)!;
+      watchSpecs.push({ source_kind: "official_release", source_ref: { ref: s.ref, series: p.series, period: p.period }, cursor: {} });
     } else {
       watchSpecs.push({ source_kind: s.kind, source_ref: { ref: s.ref.replace(/^\/+/, "") }, cursor: {} });
     }
@@ -84,7 +102,10 @@ export async function registerMarket(env: Env, cfg: Config, input: unknown, tena
   const watches: RegisterResult["watches"] = [];
   if (status === "open" && opts.createWatches !== false) {
     for (const w of watchSpecs) {
-      const { data, error: we } = await client.from("watches").insert({ market_id: m.id, source_kind: w.source_kind, source_ref: w.source_ref, cursor: w.cursor, poll_interval_s: nearDeadline ? 60 : 300, next_poll_at: new Date().toISOString() }).select("id, source_kind").single();
+      // official_release schedules its own next_poll_at (release minute, then its cadence); 60 s is the retry
+      // interval the lease applies after a failed poll.
+      const interval = w.source_kind === "official_release" || nearDeadline ? 60 : 300;
+      const { data, error: we } = await client.from("watches").insert({ market_id: m.id, source_kind: w.source_kind, source_ref: w.source_ref, cursor: w.cursor, poll_interval_s: interval, next_poll_at: new Date().toISOString() }).select("id, source_kind").single();
       if (we || !data) throw new Error(`watches insert: ${we?.message ?? "no row"}`);
       watches.push({ id: data.id as string, source_kind: data.source_kind as string });
     }

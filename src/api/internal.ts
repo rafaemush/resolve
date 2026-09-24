@@ -14,7 +14,10 @@ import { mintKey } from "./keys";
 import { runReconcile } from "../jobs/reconcile";
 import { scanDeposits } from "../jobs/deposits";
 import { drainWebhooks } from "../webhooks/deliver";
+import { alert } from "../ops/alerts";
 import { Budget, INVOCATION_SUBREQUESTS } from "../ops/budget";
+import { OfficialSeries } from "../resolve/schema";
+import { CorroborationStatus, hostAllowed, type OfficialCorroboration } from "../resolve/official";
 
 type Vars = { requestId: string; schemaVersion: string };
 export const internal = new Hono<{ Bindings: Env; Variables: Vars }>();
@@ -102,6 +105,44 @@ internal.post("/tenants", async (c) => {
   const { data: k, error: ke } = await client.from("api_keys").insert({ tenant_id: t.id, key_hash: key.hash, key_prefix: key.prefix, name: "initial", environment: b.environment ?? "test", daily_cap: 1000 }).select("id").single();
   if (ke || !k) return err(c, "internal_error", ke?.message ?? "key insert failed", 500);
   return ok(c, { tenant_id: t.id, key_id: k.id, key: key.raw, note: "Shown once." }, 201);
+});
+
+const RecheckBody = z.object({
+  series: OfficialSeries,
+  period: z.string().regex(/^\d{4}-(?:\d{2}(?:-\d{2})?|Q[1-4])$/),
+  corroboration: z.object({
+    status: CorroborationStatus,
+    source_url: z.string().url().nullable().default(null),
+    value_text: z.string().regex(/^[+-]?\d+(?:\.\d+)?$/).nullable().default(null),
+    detail: z.string().min(1).max(500),
+  }),
+  actor: z.string().min(1).max(120),
+  reason: z.string().min(8).max(2000),
+});
+
+/**
+ * The audited way out of sources_disagree (migration 016 recheck_official_corroboration): an operator who checked the
+ * second source again supersedes the stored corroboration. The previous value is appended to
+ * official_corroboration_history first; the first print itself is never touched. The legs re-resolve on their next
+ * poll (the change projection includes the corroboration status); POST /internal/watch/:id runs one at once.
+ */
+internal.post("/official/recheck", async (c) => {
+  if (!isAdmin(c)) return err(c, "forbidden", "admin key required", 403);
+  const parsed = RecheckBody.safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) return err(c, "validation_error", parsed.error.issues.map((i) => `${i.path.join(".")} ${i.message}`).join("; ").slice(0, 400), 400);
+  const b = parsed.data;
+  if (b.corroboration.source_url && !hostAllowed(b.series, b.corroboration.source_url)) return err(c, "validation_error", `corroboration.source_url must be an https URL on the ${b.series} allowlist`, 400);
+  const corroboration: OfficialCorroboration = {
+    status: b.corroboration.status, source_url: b.corroboration.source_url, value: b.corroboration.value_text === null ? null : Number(b.corroboration.value_text),
+    value_text: b.corroboration.value_text, detail: b.corroboration.detail, checked_at: new Date().toISOString(),
+  };
+  try {
+    const row = await rpc<Record<string, unknown>>(db(c.env), "recheck_official_corroboration", { p_series: b.series, p_period: b.period, p_corroboration: corroboration, p_actor: `admin_api:${b.actor}`, p_reason: b.reason });
+    await alert(c.env, `official_recheck_${b.series}_${b.period}`, `${b.series} ${b.period}: corroboration re-checked by ${b.actor} to ${corroboration.status}${corroboration.value_text ? ` (${corroboration.value_text})` : ""}. Reason: ${b.reason}`, { dedupMinutes: 1, meta: { series: b.series, period: b.period, recheck_id: row.recheck_id ?? null } });
+    return ok(c, row);
+  } catch (e) {
+    return err(c, "validation_error", String(e).slice(0, 400), 400);
+  }
 });
 
 internal.post("/reconcile", async (c) => { if (!isAdmin(c)) return err(c, "forbidden", "admin key required", 403); return ok(c, await runReconcile(c.env)); });

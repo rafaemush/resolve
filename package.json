@@ -16,6 +16,7 @@
     "eval:build": "tsx evals/build.ts",
     "eval:mutate": "tsx evals/mutate.ts",
     "eval:ingest": "tsx evals/ingest.ts",
+    "eval:official": "tsx evals/official.ts",
     "openapi": "tsx scripts/openapi.ts",
     "migrate": "tsx scripts/migrate.ts",
     "selftest:db": "tsx scripts/selftest-db.ts",

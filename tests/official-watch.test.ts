@@ -1,0 +1,547 @@
+/**
+ * The official_release watch path with its I/O edges replaced: an in-memory stand-in for PostgREST and the two
+ * migration-016 RPCs (same semantics: first print wins, one live fetch lease), a stubbed fetch serving the bodies
+ * saved on 2026-09-24, an injected clock for the burst, the real resolver behind a mocked runtime, mocked alerts.
+ * Pages marked SYNTHETIC are saved bodies with the month or a value edited, to stand for a release not yet made.
+ */
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { Env, Config } from "../src/env";
+import { officialFixture as fx } from "../evals/lib/official-fixtures";
+
+type Row = Record<string, unknown>;
+
+const h = vi.hoisted(() => {
+  const state = {
+    watch: {} as Row, evidence: [] as Row[], resolutions: [] as Row[], loopRuns: [] as Row[],
+    obs: new Map<string, Row>(), slots: new Map<string, number>(), extends: [] as number[], hideObsFromSelect: false, nowMs: undefined as number | undefined, rpcCalls: [] as string[], seq: 0,
+  };
+  const now = () => state.nowMs ?? Date.now();
+  class Q implements PromiseLike<{ data: unknown; error: unknown; count?: number }> {
+    action: "select" | "insert" | "update" = "select";
+    payload: Row | undefined;
+    filters: Array<[string, unknown]> = [];
+    constructor(private table: string) {}
+    select() { return this; }
+    insert(p: Row) { this.action = "insert"; this.payload = p; return this; }
+    update(p: Row) { this.action = "update"; this.payload = p; return this; }
+    eq(c: string, v: unknown) { this.filters.push([c, v]); return this; }
+    gte() { return this; }
+    or() { return this; }
+    order() { return this; }
+    limit() { return this; }
+    single() { return Promise.resolve(this.exec()); }
+    maybeSingle() { return Promise.resolve(this.exec()); }
+    then<A, B>(ok?: ((v: { data: unknown; error: unknown }) => A | PromiseLike<A>) | null, no?: ((e: unknown) => B | PromiseLike<B>) | null) { return Promise.resolve(this.exec()).then(ok, no); }
+    exec(): { data: unknown; error: unknown; count?: number } {
+      const t = this.table;
+      if (t === "watches" && this.action === "select") return { data: structuredClone(state.watch), error: null };
+      if (t === "watches" && this.action === "update") { Object.assign(state.watch, structuredClone(this.payload)); return { data: null, error: null }; }
+      if (t === "loop_runs") { state.loopRuns.push(this.payload!); return { data: null, error: null }; }
+      if (t === "official_observations") {
+        const f = Object.fromEntries(this.filters) as { series: string; period: string };
+        return { data: state.hideObsFromSelect ? null : (state.obs.get(`${f.series}|${f.period}`) ?? null), error: null };
+      }
+      if (t === "evidence" && this.action === "insert") {
+        const p = this.payload!;
+        if (state.evidence.some((e) => e.market_id === p.market_id && e.raw_sha256 === p.raw_sha256)) return { data: null, error: { code: "23505", message: "duplicate key" } };
+        const row = { id: `ev${++state.seq}`, ...p };
+        state.evidence.push(row);
+        return { data: { id: row.id }, error: null };
+      }
+      if (t === "evidence") return { data: null, error: null };
+      throw new Error(`fake client: unexpected ${this.action} on ${t}`);
+    }
+  }
+  const rpc = async (_c: unknown, fn: string, a: Row): Promise<unknown> => {
+    state.rpcCalls.push(fn);
+    const k = `${a.p_series}|${a.p_period}`;
+    if (fn === "claim_official_fetch") {
+      const until = state.slots.get(k);
+      if (until !== undefined && until > now()) return false;
+      state.slots.set(k, now() + Number(a.p_seconds) * 1000);
+      return true;
+    }
+    if (fn === "extend_official_fetch") {
+      state.extends.push(Number(a.p_seconds));
+      const until = Math.max(state.slots.get(k) ?? 0, now() + Number(a.p_seconds) * 1000);
+      state.slots.set(k, until);
+      return new Date(until).toISOString();
+    }
+    if (fn === "record_official_observation") {
+      const existing = state.obs.get(k);
+      if (existing) return { ...existing, inserted: false, revision_differs: Number(existing.value) !== Number(a.p_value) };
+      const row = { series: a.p_series, period: a.p_period, value: a.p_value, value_text: a.p_value_text, deciding_text: a.p_deciding_text, source_url: a.p_source_url, raw_sha256: a.p_raw_sha256, observed_at: new Date(now()).toISOString(), corroboration: a.p_corroboration, meta: a.p_meta };
+      state.obs.set(k, row);
+      return { ...row, inserted: true, revision_differs: false };
+    }
+    throw new Error(`rpc ${fn} not expected`);
+  };
+  return { state, rpc, client: { from: (t: string) => new Q(t) } };
+});
+
+vi.mock("../src/db/supabase", () => ({ db: () => h.client, rpc: h.rpc }));
+vi.mock("../src/ops/alerts", () => ({ alert: vi.fn(async () => ({ sent: true, deduped: false })) }));
+vi.mock("../src/bot/commit", () => ({ commitVerdict: vi.fn(async () => ({ committed: true, posted: false, reason: "recorded without channel" })) }));
+vi.mock("../src/webhooks/deliver", () => ({ enqueueEvent: vi.fn() }));
+vi.mock("../src/resolve/runtime", async () => {
+  const real = await vi.importActual<typeof import("../src/resolve")>("../src/resolve");
+  const th = await vi.importActual<typeof import("../src/resolve/thresholds")>("../src/resolve/thresholds");
+  return {
+    JevUnavailableError: class extends Error {},
+    resolveWithRuntime: vi.fn(async (_e: unknown, _c: unknown, o: { marketId: string; market: never; evidence: never; evidenceId: string | null }) => {
+      const result = await real.resolveMarket({ marketId: o.marketId, market: o.market, evidence: o.evidence, thresholds: th.DEFAULT_THRESHOLDS, spotlightSecret: "t", model: "jev-1.13.0" }, { jev: async () => { throw new Error("Jev must never be called for official_release"); } });
+      const id = `res${h.state.resolutions.length + 1}`;
+      h.state.resolutions.push({ id, market_id: o.marketId, evidence_id: o.evidenceId, status_row: "complete", verdict: result.verdict });
+      return { resolutionId: id, jevCalls: 0, jevCostUsd: 0, result };
+    }),
+  };
+});
+
+import { runWatch } from "../src/ingest/watch";
+import { fetchOfficial, officialIdleNextPoll, inReleaseMinute, BURST_MAX_REQUESTS, BURST_WINDOW_MS } from "../src/ingest/official-watch";
+import { fetchPrimary, officialGet, budget, OFFICIAL_UA } from "../src/ingest/official";
+import { alert } from "../src/ops/alerts";
+import type { MarketRow, WatchRow } from "../src/ingest/types";
+import { buildLegRegistration } from "../src/markets/official-legs";
+
+const WATCH_ID = "33333333-3333-4333-8333-333333333333";
+const MARKET_ID = "44444444-4444-4444-8444-444444444444";
+const MIN = 60_000;
+
+type Group = Parameters<typeof buildLegRegistration>[0]["group"];
+function market(group: Group, label: string, deadline = "2026-10-15T03:59:00Z", open_at = "2026-09-15T00:00:00Z"): MarketRow {
+  const r = buildLegRegistration({ platform: "limitless", external_id: `leg-${label}`, group, label, open_at, deadline_utc: deadline, criteria: "test" });
+  if (!r.ok) throw new Error(r.reason);
+  return { ...r.market, id: MARKET_ID, tenant_id: null, status: "open", official_outcome: null, official_resolved_at: null, official_source_url: null };
+}
+const cpiGroup = (release_at: string): Group => ({ series: "us_cpi_u_nsa_yoy", period: "2026-09", release_at, title: "September Inflation US - Annual" });
+function setWatch(m: MarketRow) {
+  const r = m.resolver as { series: string; period: string };
+  h.state.watch = {
+    id: WATCH_ID, market_id: MARKET_ID, source_kind: "official_release", source_ref: { ref: `official:${r.series}:${r.period}`, series: r.series, period: r.period }, poll_interval_s: 60,
+    next_poll_at: new Date(Date.now() + MIN).toISOString(), etag: null, cursor: {}, coverage: [], last_evidence_hash: null, last_canonical_hash: null, last_http_status: null,
+    consecutive_errors: 0, backlog: false, active: true, markets: m,
+  };
+}
+const watchRow = () => h.state.watch as unknown as WatchRow;
+
+// Upstream: the saved August CPI page, a SYNTHETIC September page (the August body with its header month edited),
+// and the saved BLS API body (it has no 2026-M09 index, so corroboration is unavailable).
+const CPI_AUG = fx("bls_cpi_nr0.html");
+const CPI_SEP = CPI_AUG.replace("CONSUMER PRICE INDEX - AUGUST 2026", "CONSUMER PRICE INDEX - SEPTEMBER 2026");
+let calls: Array<{ url: string; ua: string | null }> = [];
+function serve(router: (url: string, n: number) => Response | Promise<Response>) {
+  calls = [];
+  vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    calls.push({ url, ua: (init?.headers as Record<string, string> | undefined)?.["User-Agent"] ?? null });
+    return router(url, calls.filter((c) => c.url === url).length);
+  });
+}
+const ok = (body: string, type = "text/html") => new Response(body, { status: 200, headers: { "content-type": type } });
+const cpiRouter = (sepFromAttempt: number) => (url: string, n: number) => {
+  if (url === "https://www.bls.gov/news.release/cpi.nr0.htm") return ok(n >= sepFromAttempt ? CPI_SEP : CPI_AUG);
+  if (url === "https://api.bls.gov/publicAPI/v1/timeseries/data/CUUR0000SA0") return ok(fx("bls_v1_cpi.json"), "application/json");
+  return new Response("not found", { status: 404 });
+};
+
+let put: ReturnType<typeof vi.fn>;
+const env = () => ({ RAW: { put } }) as unknown as Env;
+const cfg = { botUa: "ResolveBot/test" } as Config;
+const alertKeys = () => vi.mocked(alert).mock.calls.map((c) => [c[1], c[3]?.dedupMinutes]);
+/** A clock the burst's sleeps advance, so 25 s of polling runs instantly. */
+function clock(startIso: string) {
+  let t = Date.parse(startIso);
+  const sleeps: number[] = [];
+  h.state.nowMs = t;
+  return { deps: { now: () => t, sleep: async (ms: number) => { sleeps.push(ms); t += ms; h.state.nowMs = t; } }, sleeps, now: () => t };
+}
+
+beforeEach(() => {
+  Object.assign(h.state, { evidence: [], resolutions: [], loopRuns: [], obs: new Map(), slots: new Map(), extends: [], hideObsFromSelect: false, nowMs: undefined, rpcCalls: [], seq: 0 });
+  put = vi.fn(async () => ({}));
+  vi.mocked(alert).mockClear();
+});
+afterEach(() => { vi.unstubAllGlobals(); });
+
+describe("schedule", () => {
+  it("polls at the release minute, then every minute for 10 minutes, every 5 to 6 h, then every 15; observed legs every 6 h", () => {
+    const rel = Date.parse("2026-10-14T12:30:00Z");
+    const s = { releaseAtMs: rel, fallbackEndMs: Date.parse("2026-11-10T13:30:00Z") };
+    expect(officialIdleNextPoll(rel - 3 * 3600_000, s, "before")).toBe("2026-10-14T12:30:00.000Z");
+    expect(officialIdleNextPoll(rel + 5_000, s, "awaiting")).toBe("2026-10-14T12:31:00.000Z");
+    expect(officialIdleNextPoll(rel + 11 * MIN + 5_000, s, "awaiting")).toBe("2026-10-14T12:46:00.000Z");
+    expect(officialIdleNextPoll(rel + 7 * 3600_000, s, "awaiting")).toBe("2026-10-14T19:45:00.000Z");
+    expect(officialIdleNextPoll(rel + 5_000, s, "observed")).toBe("2026-10-14T18:30:05.000Z");
+    // (10) after the market's fallback window (the next CPI release, Nov 10) the watch drops to daily polls
+    expect(officialIdleNextPoll(Date.parse("2026-11-10T14:00:10Z"), s, "missing")).toBe("2026-11-11T14:00:00.000Z");
+    expect(officialIdleNextPoll(Date.parse("2026-11-10T14:00:10Z"), s, "awaiting")).toBe("2026-11-11T14:00:00.000Z");
+    expect([inReleaseMinute(rel, rel), inReleaseMinute(rel + 59_999, rel), inReleaseMinute(rel + MIN, rel), inReleaseMinute(rel - 1, rel)]).toEqual([true, true, false, false]);
+  });
+});
+
+describe("fetchOfficial", () => {
+  it("(a) before release_at: no upstream request and no database call; next poll at the release minute", async () => {
+    const m = market(cpiGroup("2026-10-14T12:30:00Z"), "3.4%");
+    setWatch(m);
+    const c = clock("2026-10-14T09:00:00Z");
+    serve(cpiRouter(1));
+    const out = await fetchOfficial(env(), watchRow(), m, c.deps);
+    expect(out).toMatchObject({ notModified: true, nextPollAt: "2026-10-14T12:30:00.000Z" });
+    expect(out.note).toMatch(/^awaiting_release/);
+    expect(calls).toHaveLength(0);
+    expect(h.state.rpcCalls).toHaveLength(0);
+  });
+
+  it("(c) the release-minute burst polls every 3 s and stops at the first observation", async () => {
+    const m = market(cpiGroup("2026-10-14T12:30:00Z"), "3.4%");
+    setWatch(m);
+    const c = clock("2026-10-14T12:29:57Z"); // dispatched 3 s early: waits for release_at, never fetches before it
+    serve(cpiRouter(3));
+    const out = await fetchOfficial(env(), watchRow(), m, c.deps);
+    expect(c.sleeps).toEqual([3000, 3000, 3000]);
+    expect(calls.map((x) => x.url)).toEqual([
+      "https://www.bls.gov/news.release/cpi.nr0.htm", "https://www.bls.gov/news.release/cpi.nr0.htm", "https://www.bls.gov/news.release/cpi.nr0.htm",
+      "https://api.bls.gov/publicAPI/v1/timeseries/data/CUUR0000SA0",
+    ]);
+    expect(calls.every((x) => x.ua === OFFICIAL_UA)).toBe(true);
+    const doc = out.evidence!.structured as Record<string, unknown>;
+    expect(doc).toMatchObject({ kind: "official_observation", series: "us_cpi_u_nsa_yoy", period: "2026-09", value_text: "3.4", observed_at: "2026-10-14T12:30:06.000Z" });
+    expect((doc.corroboration as Row).status).toBe("unavailable"); // the saved API body has no 2026-M09 yet: not a disagreement
+    expect(put).toHaveBeenCalledWith(`raw/${doc.raw_sha256 as string}`, expect.any(Uint8Array), expect.anything());
+    expect(h.state.obs.get("us_cpi_u_nsa_yoy|2026-09")).toBeDefined();
+  });
+
+  it("(c) a burst that never sees the target stops at 10 requests inside 25 s and records nothing", async () => {
+    const m = market(cpiGroup("2026-10-14T12:30:00Z"), "3.4%");
+    setWatch(m);
+    const c = clock("2026-10-14T12:30:00.200Z");
+    serve(cpiRouter(99));
+    const out = await fetchOfficial(env(), watchRow(), m, c.deps);
+    expect(out).toMatchObject({ notModified: true, nextPollAt: "2026-10-14T12:31:00.000Z" });
+    expect(out.note).toContain("document is about 2026-08");
+    expect(calls.length).toBeLessThanOrEqual(BURST_MAX_REQUESTS);
+    expect(c.now() - Date.parse("2026-10-14T12:30:00.200Z")).toBeLessThanOrEqual(BURST_WINDOW_MS);
+    expect(h.state.obs.size).toBe(0);
+  });
+
+  it("(b) only the fetch-slot holder requests the source; the others wait for the stored first print", async () => {
+    const m = market(cpiGroup("2026-10-14T12:30:00Z"), "3.3%");
+    setWatch(m);
+    const c = clock("2026-10-14T12:30:01Z");
+    h.state.slots.set("us_cpi_u_nsa_yoy|2026-09", c.now() + 30_000);
+    serve(cpiRouter(1));
+    const out = await fetchOfficial(env(), watchRow(), m, c.deps);
+    expect(out).toMatchObject({ notModified: true, note: "awaiting_observation: another leg of this event holds the fetch lease", nextPollAt: "2026-10-14T12:31:00.000Z" });
+    expect(calls).toHaveLength(0);
+  });
+
+  it("(b) a stored first print is read, never refetched", async () => {
+    const m = market(cpiGroup("2026-10-14T12:30:00Z"), "3.3%");
+    setWatch(m);
+    h.state.obs.set("us_cpi_u_nsa_yoy|2026-09", { series: "us_cpi_u_nsa_yoy", period: "2026-09", value: 3.4, value_text: "3.4", deciding_text: "CONSUMER PRICE INDEX - SEPTEMBER 2026: Over the last 12 months, the all items index increased 3.4 percent before seasonal adjustment.", source_url: "https://www.bls.gov/news.release/cpi.nr0.htm", raw_sha256: "b".repeat(64), observed_at: "2026-10-14T12:30:04.123456+00:00", corroboration: null, meta: {} });
+    const c = clock("2026-10-14T12:31:00Z");
+    serve(cpiRouter(1));
+    const out = await fetchOfficial(env(), watchRow(), m, c.deps);
+    expect(calls).toHaveLength(0);
+    expect(h.state.rpcCalls).toHaveLength(0);
+    expect(out.evidence!.structured).toMatchObject({ value_text: "3.4", observed_at: "2026-10-14T12:30:04.123Z" });
+    expect(out.nextPollAt).toBe("2026-10-14T18:31:00.000Z");
+  });
+
+  it("a revision offered after the first print is alerted and ignored (first print wins)", async () => {
+    const m = market({ series: "us_ppi_fd_nsa_yoy", period: "2026-08", release_at: "2026-09-10T12:30:00Z", title: "PPI" }, "5.4%");
+    setWatch(m);
+    // the first print is stored, but this leg's read raced it (null), so it fetched a later page offering 5.6
+    h.state.obs.set("us_ppi_fd_nsa_yoy|2026-08", { series: "us_ppi_fd_nsa_yoy", period: "2026-08", value: 5.4, value_text: "5.4", deciding_text: "PRODUCER PRICE INDEXES - AUGUST 2026: On an unadjusted basis, the index for final demand increased 5.4 percent for the 12 months ended in August.", source_url: "https://www.bls.gov/news.release/ppi.nr0.htm", raw_sha256: "c".repeat(64), observed_at: "2026-09-10T12:30:02.000Z", corroboration: null, meta: {} });
+    h.state.hideObsFromSelect = true;
+    const revised = fx("bls_ppi_nr0.html").replace("demand increased 5.4 percent for the 12 months", "demand increased 5.6 percent for the 12 months"); // SYNTHETIC revision
+    const c = clock("2026-09-10T13:00:00Z");
+    serve((url) => url.includes("ppi.nr0") ? ok(revised) : ok(fx("bls_v1_ppi.json"), "application/json"));
+    const out = await fetchOfficial(env(), watchRow(), m, c.deps);
+    expect(out.evidence!.structured).toMatchObject({ value_text: "5.4" });
+    expect(alertKeys()).toContainEqual(["official_revision_us_ppi_fd_nsa_yoy_2026-08", 1440]);
+  });
+
+  it("a disagreeing corroboration is recorded, alerted, and holds the leg (sources_disagree)", async () => {
+    const m = market({ series: "fomc_upper_bound", period: "2026-09-16", release_at: "2026-09-16T18:00:00Z", prior_level: 3.75, title: "Fed Decision in September?" }, "25 bps increase");
+    setWatch(m);
+    const fredDisagree = fx("fred_dfedtaru.csv").replace("2026-09-17,4.00", "2026-09-17,3.75"); // SYNTHETIC disagreement
+    serve((url) => url.includes("press_monetary.xml") ? ok(fx("fed_press_monetary.xml"), "text/xml") : url.includes("monetary20260916a.htm") ? ok(fx("fed_monetary20260916a.html")) : url.includes("fred.stlouisfed.org") ? ok(fredDisagree, "text/csv") : new Response("", { status: 404 }));
+    const c = clock("2026-09-16T18:05:00Z");
+    const out = await fetchOfficial(env(), watchRow(), m, c.deps);
+    expect(out.evidence!.structured).toMatchObject({ value_text: "3-3/4 to 4", corroboration: { status: "disagree", value_text: "3.75" } });
+    expect(alertKeys()).toContainEqual(["official_disagree_fomc_upper_bound_2026-09-16", 1440]);
+  });
+
+  it("(d) not observed by release_at + 6 h: one release_not_observed document per leg and an alert", async () => {
+    const m = market(cpiGroup("2026-10-14T12:30:00Z"), "3.4%");
+    setWatch(m);
+    const c = clock("2026-10-14T18:31:00Z");
+    serve(cpiRouter(99)); // a shutdown: the page still names August
+    const out = await fetchOfficial(env(), watchRow(), m, c.deps);
+    expect(out.evidence!.structured).toMatchObject({ kind: "official_missing", series: "us_cpi_u_nsa_yoy", period: "2026-09" });
+    expect(out.nextPollAt).toBe("2026-10-14T18:46:00.000Z");
+    expect(alertKeys()).toContainEqual(["official_missing_us_cpi_u_nsa_yoy_2026-09", 720]);
+    expect(h.state.obs.size).toBe(0); // never an older period
+  });
+
+  it("non-200 is never evidence: 403 with Retry-After is a typed error, alerted per series", async () => {
+    const m = market(cpiGroup("2026-10-14T12:30:00Z"), "3.4%");
+    setWatch(m);
+    serve(() => new Response("<html>Access Denied</html>", { status: 403, headers: { "retry-after": "120" } }));
+    const c = clock("2026-10-14T12:45:00Z");
+    const out = await fetchOfficial(env(), watchRow(), m, c.deps);
+    expect(out.evidence).toBeUndefined();
+    expect(out).toMatchObject({ deferSeconds: 120 });
+    expect(out.error).toContain("HTTP 403");
+    expect(alertKeys()).toContainEqual(["official_upstream_us_cpi_u_nsa_yoy_2026-09", 60]);
+  });
+
+  it("a retryable 503 alerts per series outside the burst (the fetch lease rotates, so no leg builds a streak)", async () => {
+    const m = market(cpiGroup("2026-10-14T12:30:00Z"), "3.4%");
+    setWatch(m);
+    serve(() => new Response("upstream busy", { status: 503 }));
+    const out = await fetchOfficial(env(), watchRow(), m, clock("2026-10-14T12:40:00Z").deps);
+    expect(out).toMatchObject({ httpStatus: 503 });
+    expect(out.evidence).toBeUndefined();
+    expect(alertKeys()).toContainEqual(["official_upstream_us_cpi_u_nsa_yoy_2026-09", 60]);
+  });
+
+  it("inside the burst a 503 is retried every 3 s and only the observation that follows counts", async () => {
+    const m = market(cpiGroup("2026-10-14T12:30:00Z"), "3.4%");
+    setWatch(m);
+    serve((url, n) => url.includes("cpi.nr0") ? (n < 3 ? new Response("busy", { status: 503 }) : ok(CPI_SEP)) : ok(fx("bls_v1_cpi.json"), "application/json"));
+    const c = clock("2026-10-14T12:30:00.500Z");
+    const out = await fetchOfficial(env(), watchRow(), m, c.deps);
+    expect(c.sleeps).toEqual([3000, 3000]);
+    expect(out.evidence!.structured).toMatchObject({ period: "2026-09", value_text: "3.4" });
+    expect(alertKeys()).toEqual([]);
+  });
+
+  it("(8) a Retry-After extends the event's fetch lease, so every leg of the ladder backs off", async () => {
+    const m = market(cpiGroup("2026-10-14T12:30:00Z"), "3.4%");
+    setWatch(m);
+    serve(() => new Response("slow down", { status: 429, headers: { "retry-after": "600" } }));
+    const c = clock("2026-10-14T12:45:00Z");
+    const out = await fetchOfficial(env(), watchRow(), m, c.deps);
+    expect(out).toMatchObject({ deferSeconds: 600 });
+    expect(h.state.extends).toEqual([600]);
+    // another leg polling a minute later cannot claim the slot: no upstream request
+    calls = [];
+    h.state.nowMs = c.now() + 60_000;
+    const other = await fetchOfficial(env(), watchRow(), m, { now: () => c.now() + 60_000, sleep: c.deps.sleep });
+    expect(other.note).toBe("awaiting_observation: another leg of this event holds the fetch lease");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("(9) with an ExecutionContext every holder capture runs in waitUntil, also outside the release minute", async () => {
+    const m = market(cpiGroup("2026-10-14T12:30:00Z"), "3.4%");
+    setWatch(m);
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      await gate; // the upstream is slow: the poll must not wait for it
+      return url.includes("cpi.nr0") ? ok(CPI_SEP) : ok(fx("bls_v1_cpi.json"), "application/json");
+    });
+    const pending: Array<Promise<unknown>> = [];
+    const c = clock("2026-10-14T12:45:00Z");
+    const out = await fetchOfficial(env(), watchRow(), m, { ...c.deps, waitUntil: (p) => pending.push(p) });
+    expect(out).toMatchObject({ notModified: true, nextPollAt: "2026-10-14T12:46:00.000Z" });
+    expect(out.note).toMatch(/^the capture continues in waitUntil/);
+    expect(pending).toHaveLength(1);
+    expect(h.state.obs.size).toBe(0);
+    release();
+    await Promise.all(pending);
+    expect(h.state.obs.get("us_cpi_u_nsa_yoy|2026-09")).toMatchObject({ value_text: "3.4" });
+  });
+
+  it("(9) without one, a capture outside the release minute is capped at 12 s including corroboration", async () => {
+    const m = market({ series: "fomc_upper_bound", period: "2026-09-16", release_at: "2026-09-16T18:00:00Z", prior_level: 3.75, title: "Fed" }, "25 bps increase");
+    setWatch(m);
+    const c = clock("2026-09-16T18:20:00Z");
+    const started: number[] = [];
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      started.push(c.now());
+      await c.deps.sleep(7000); // every upstream answer takes 7 s (the fake clock; a real one would abort at the deadline)
+      return url.includes("press_monetary") ? ok(fx("fed_press_monetary.xml"), "text/xml") : url.includes("monetary20260916a") ? ok(fx("fed_monetary20260916a.html")) : ok(fx("fred_dfedtaru.csv"), "text/csv");
+    });
+    const t0 = c.now();
+    const out = await fetchOfficial(env(), watchRow(), m, c.deps);
+    expect(out.evidence).toBeDefined();
+    // feed at 0 s, statement at 7 s; the corroboration would start at 14 s, past the 12 s cap, so it is never requested
+    expect(started.map((t) => t - t0)).toEqual([0, 7000]);
+    const obs = [...h.state.obs.values()][0]!;
+    expect(obs.corroboration).toMatchObject({ status: "unavailable" });
+    expect(String((obs.corroboration as { detail: string }).detail)).toContain("time budget exhausted");
+  });
+
+  it("(10) never observed: after the fallback window and a week of daily polls the watch stops, with one alert", async () => {
+    const m = market(cpiGroup("2026-10-14T12:30:00Z"), "3.4%");
+    setWatch(m);
+    serve(cpiRouter(99));
+    const out = await fetchOfficial(env(), watchRow(), m, clock("2026-11-17T14:00:00Z").deps);
+    expect(out.stop).toMatch(/never observed/);
+    expect(out.evidence!.structured).toMatchObject({ kind: "official_missing" });
+    expect(alertKeys()).toContainEqual(["official_stopped_us_cpi_u_nsa_yoy_2026-09", 14_400]);
+    const daily = await fetchOfficial(env(), watchRow(), m, clock("2026-11-12T09:00:00Z").deps);
+    expect(daily.stop).toBeUndefined();
+    expect(daily.nextPollAt).toBe("2026-11-13T09:00:00.000Z");
+  });
+
+  it("(2) a document that contradicts the registered prior_level is alerted", async () => {
+    const bok = market({ series: "bok_base_rate", period: "2026-10-22", release_at: "2026-10-22T01:00:00Z", prior_level: 3.0, title: "BoK" }, "50+ bps cut", "2026-10-22T00:00:00Z");
+    setWatch(bok);
+    h.state.obs.set("bok_base_rate|2026-10-22", { series: "bok_base_rate", period: "2026-10-22", value: 2.25, value_text: "2.25", deciding_text: "(October 22, 2026) The Monetary Policy Board of the Bank of Korea decided today to lower the Base Rate by 25 basis points from 2.50% to 2.25%", source_url: "https://www.bok.or.kr/eng/bbs/E0000627/news.rss?menuNo=400022", raw_sha256: "9".repeat(64), observed_at: "2026-10-22T01:30:05+00:00", corroboration: null, meta: { direction: "down", stated_prior: "2.50", stated_step_bps: 25 } });
+    const out = await fetchOfficial(env(), watchRow(), bok, clock("2026-10-22T01:31:00Z").deps);
+    expect(out.evidence).toBeDefined();
+    expect(alertKeys()).toContainEqual(["official_prior_mismatch_bok_base_rate_2026-10-22", 1440]);
+  });
+
+  it("schema drift (a 200 that no longer parses) is an error and a schema alert, never an observation", async () => {
+    const m = market(cpiGroup("2026-10-14T12:30:00Z"), "3.4%");
+    setWatch(m);
+    serve(() => ok("<html><body>We are redesigning bls.gov</body></html>"));
+    const out = await fetchOfficial(env(), watchRow(), m, clock("2026-10-14T12:45:00Z").deps);
+    expect(out.error).toContain("schema drift");
+    expect(alertKeys()).toContainEqual(["official_schema_us_cpi_u_nsa_yoy", 360]);
+  });
+});
+
+describe("host allowlist", () => {
+  it("refuses a host outside the series' allowlist without requesting it", async () => {
+    serve(() => ok("x"));
+    const g = await officialGet("us_cpi_u_nsa_yoy", "https://cpi-mirror.example/cpi.htm", budget(() => Date.now(), 8000, 1), "text/html");
+    expect(g).toMatchObject({ ok: false, retryable: false });
+    expect(calls).toHaveLength(0);
+    expect((await officialGet("us_cpi_u_nsa_yoy", "http://www.bls.gov/news.release/cpi.nr0.htm", budget(() => Date.now(), 8000, 1), "text/html")).ok).toBe(false); // https only
+  });
+  const moved = (location: string, status = 302) => new Response(null, { status, headers: { location } });
+  it("(7) a redirect off the allowlist is refused before it is requested (redirect: manual)", async () => {
+    serve((url) => (url.startsWith("https://www.bls.gov/") ? moved("https://parked.example/cpi") : ok(CPI_SEP)));
+    const res = await fetchPrimary("us_cpi_u_nsa_yoy", "2026-09", budget(() => Date.now(), 8000, 4));
+    expect(res).toMatchObject({ kind: "error", retryable: false });
+    expect((res as { error: string }).error).toContain("redirected off the us_cpi_u_nsa_yoy allowlist");
+    expect(calls.map((c) => c.url)).toEqual(["https://www.bls.gov/news.release/cpi.nr0.htm"]);
+  });
+  it("(7) an https downgrade is refused; an allowlisted https hop is followed and counted", async () => {
+    serve((url) => (url === "https://www.bls.gov/news.release/cpi.nr0.htm" ? moved("http://www.bls.gov/news.release/cpi.nr0.htm", 301) : ok(CPI_SEP)));
+    expect((await fetchPrimary("us_cpi_u_nsa_yoy", "2026-09", budget(() => Date.now(), 8000, 4))).kind).toBe("error");
+    expect(calls).toHaveLength(1);
+    serve((url) => (url === "https://www.bls.gov/news.release/cpi.nr0.htm" ? moved("/news.release/cpi.nr0.htm?x=1") : ok(CPI_SEP)));
+    const b = budget(() => Date.now(), 8000, 4);
+    const res = await fetchPrimary("us_cpi_u_nsa_yoy", "2026-09", b);
+    expect(res).toMatchObject({ kind: "observed", obs: { source_url: "https://www.bls.gov/news.release/cpi.nr0.htm?x=1", period: "2026-09" } });
+    expect(b.used).toBe(2);
+  });
+  it("(7) at most 3 redirect hops", async () => {
+    serve((url, n) => moved(`https://www.bls.gov/hop${calls.length}`));
+    const res = await fetchPrimary("us_cpi_u_nsa_yoy", "2026-09", budget(() => Date.now(), 8000, 10));
+    expect((res as { error: string }).error).toContain("more than 3 redirects");
+    expect(calls).toHaveLength(4);
+  });
+});
+
+describe("runWatch with an official_release source", () => {
+  // Only Date is faked: the dispatch minute is fixed, so "inside the release minute" never straddles a boundary.
+  beforeEach(() => { vi.useFakeTimers({ toFake: ["Date"], now: new Date("2026-10-14T12:30:05Z") }); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  it("before release: a no_op that schedules the release minute and fetches nothing", async () => {
+    const release = "2026-11-10T13:30:00.000Z"; // the October CPI: not in the registry, so the market's own release_at
+    const m = market({ series: "us_cpi_u_nsa_yoy", period: "2026-10", release_at: release, title: "CPI Oct" }, "3.4%", "2026-11-11T03:59:00Z");
+    setWatch(m);
+    serve(cpiRouter(1));
+    const s = await runWatch(env(), cfg, WATCH_ID);
+    expect(s).toMatchObject({ outcome: "no_op" });
+    expect(s.detail).toMatch(/^awaiting_release/);
+    expect(h.state.watch.next_poll_at).toBe(release);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("a stored first print resolves the leg once (structured, never Jev); the next poll is a no_op six hours out", async () => {
+    const m = market(cpiGroup("2026-10-14T12:30:00Z"), "3.4%", "2026-10-14T11:00:00Z"); // deadline + grace passed at 12:00: no post-deadline duplicate
+    setWatch(m);
+    h.state.obs.set("us_cpi_u_nsa_yoy|2026-09", { series: "us_cpi_u_nsa_yoy", period: "2026-09", value: 3.4, value_text: "3.4", deciding_text: "CONSUMER PRICE INDEX - SEPTEMBER 2026: Over the last 12 months, the all items index increased 3.4 percent before seasonal adjustment.", source_url: "https://www.bls.gov/news.release/cpi.nr0.htm", raw_sha256: "d".repeat(64), observed_at: "2026-10-14T12:30:03+00:00", corroboration: { status: "agree", source_url: "https://api.bls.gov/publicAPI/v1/timeseries/data/CUUR0000SA0", value: 3.4, value_text: "3.4", detail: "t", checked_at: "2026-10-14T12:30:04Z" }, meta: { direction: null } });
+    serve(cpiRouter(1));
+    const s1 = await runWatch(env(), cfg, WATCH_ID);
+    expect(s1.outcome).toBe("success");
+    expect(h.state.resolutions).toHaveLength(1);
+    expect(h.state.resolutions[0]!.verdict).toMatchObject({ resolution_status: "RESOLVED", winning_outcome: "OPTION_A", determination_basis: "structured", caveats: ["first_print"] });
+    expect(h.state.evidence[0]).toMatchObject({ source_kind: "official_release", observed_at: "2026-10-14T12:30:03.000Z" });
+    const s2 = await runWatch(env(), cfg, WATCH_ID);
+    expect(s2.outcome).toBe("no_op");
+    expect(h.state.resolutions).toHaveLength(1);
+    expect(Date.parse(String(h.state.watch.next_poll_at)) - Date.now()).toBeGreaterThan(5.9 * 3600_000);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("(3) an awaiting_release verdict never saves the change hash: the leg re-checks instead of freezing", async () => {
+    // an event outside the registry, and a first print this very market captured before its own release_at
+    const m = market({ series: "us_cpi_u_nsa_yoy", period: "2026-08", release_at: "2026-09-11T12:30:00Z", title: "CPI Aug" }, "3.4%", "2026-09-12T03:59:00Z", "2026-08-01T00:00:00Z");
+    setWatch(m);
+    h.state.obs.set("us_cpi_u_nsa_yoy|2026-08", { series: "us_cpi_u_nsa_yoy", period: "2026-08", value: 3.4, value_text: "3.4", deciding_text: "CONSUMER PRICE INDEX - AUGUST 2026: Over the last 12 months, the all items index increased 3.4 percent before seasonal adjustment.", source_url: "https://www.bls.gov/news.release/cpi.nr0.htm", raw_sha256: "7".repeat(64), observed_at: "2026-09-11T12:29:00+00:00", corroboration: null, meta: { captured_by_market: MARKET_ID } });
+    const s1 = await runWatch(env(), cfg, WATCH_ID);
+    expect(h.state.resolutions[0]!.verdict).toMatchObject({ resolution_status: "UNRESOLVED", caveats: ["awaiting_release"] });
+    expect(s1.detail).toMatch(/awaiting_release: change .* kept pending/);
+    expect(h.state.watch.last_canonical_hash).toBeNull();
+    expect(Date.parse(String(h.state.watch.next_poll_at)) - Date.now()).toBe(900_000);
+    const s2 = await runWatch(env(), cfg, WATCH_ID);
+    expect(s2.outcome).toBe("success"); // re-resolved, not a no_op on a saved hash
+    expect(h.state.resolutions).toHaveLength(2);
+    // the same first print captured by ANOTHER market is the release itself: this leg resolves
+    h.state.obs.get("us_cpi_u_nsa_yoy|2026-08")!.meta = { captured_by_market: "another-market" };
+    await runWatch(env(), cfg, WATCH_ID);
+    expect(h.state.resolutions[2]!.verdict).toMatchObject({ resolution_status: "RESOLVED", winning_outcome: "OPTION_A" });
+  });
+
+  it("(10) a never-observed event: the marker resolves once, then the watch is deactivated (not polled forever)", async () => {
+    vi.setSystemTime(new Date("2026-11-18T00:00:00Z")); // CPI Sep fallback ended Nov 10 13:30Z; a week of daily polls since
+    const m = market(cpiGroup("2026-10-14T12:30:00Z"), "3.4%");
+    setWatch(m);
+    serve(cpiRouter(99));
+    const s1 = await runWatch(env(), cfg, WATCH_ID);
+    expect(s1.outcome).toBe("success");
+    expect(h.state.resolutions[0]!.verdict).toMatchObject({ resolution_status: "UNRESOLVED", caveats: ["release_not_observed"] });
+    expect(h.state.watch.active).toBe(true);
+    const s2 = await runWatch(env(), cfg, WATCH_ID);
+    expect(s2.outcome).toBe("no_op");
+    expect(s2.detail).toContain("watch stopped");
+    expect(h.state.watch.active).toBe(false);
+    expect(alertKeys().filter(([k]) => k === "official_stopped_us_cpi_u_nsa_yoy_2026-09")).toHaveLength(2); // deduped by alert() itself (14,400 min)
+  });
+
+  it("(6) an audited corroboration re-check changes the projection, so legs held at sources_disagree re-resolve", async () => {
+    const m = market(cpiGroup("2026-10-14T12:30:00Z"), "3.4%");
+    setWatch(m);
+    const row = { series: "us_cpi_u_nsa_yoy", period: "2026-09", value: 3.4, value_text: "3.4", deciding_text: "CONSUMER PRICE INDEX - SEPTEMBER 2026: Over the last 12 months, the all items index increased 3.4 percent before seasonal adjustment.", source_url: "https://www.bls.gov/news.release/cpi.nr0.htm", raw_sha256: "8".repeat(64), observed_at: "2026-10-14T12:30:03+00:00", meta: {},
+      corroboration: { status: "disagree", source_url: "https://api.bls.gov/publicAPI/v1/timeseries/data/CUUR0000SA0", value: 3.5, value_text: "3.5", detail: "t", checked_at: "2026-10-14T12:30:04Z" } };
+    h.state.obs.set("us_cpi_u_nsa_yoy|2026-09", row);
+    await runWatch(env(), cfg, WATCH_ID);
+    expect(h.state.resolutions[0]!.verdict).toMatchObject({ resolution_status: "UNRESOLVED", caveats: ["sources_disagree"] });
+    expect((await runWatch(env(), cfg, WATCH_ID)).outcome).toBe("no_op");
+    // what recheck_official_corroboration writes (the history row is the database's; the value is never touched)
+    row.corroboration = { status: "agree", source_url: "https://api.bls.gov/publicAPI/v1/timeseries/data/CUUR0000SA0", value: 3.4, value_text: "3.4", detail: "BLS API re-read after its correction", checked_at: "2026-10-14T13:10:00Z" };
+    expect((await runWatch(env(), cfg, WATCH_ID)).outcome).toBe("success");
+    expect(h.state.resolutions[1]!.verdict).toMatchObject({ resolution_status: "RESOLVED", winning_outcome: "OPTION_A" });
+  });
+
+  it("in the release minute with an ExecutionContext, the burst runs in waitUntil and the legs resolve from its first print", async () => {
+    const m = market(cpiGroup("2026-10-14T12:30:00Z"), "3.4%"); // dispatched at 12:30:05, inside the release minute
+    setWatch(m);
+    serve(cpiRouter(1));
+    const pending: Array<Promise<unknown>> = [];
+    const s = await runWatch(env(), cfg, WATCH_ID, { waitUntil: (p) => pending.push(p) });
+    expect(s.outcome).toBe("no_op");
+    expect(s.detail).toMatch(/waitUntil/);
+    expect(pending).toHaveLength(1);
+    await Promise.all(pending);
+    expect(h.state.obs.get("us_cpi_u_nsa_yoy|2026-09")).toMatchObject({ value_text: "3.4" });
+    expect(h.state.resolutions).toHaveLength(0);
+    const s2 = await runWatch(env(), cfg, WATCH_ID);
+    expect(s2.outcome).toBe("success");
+    expect(h.state.resolutions[0]!.verdict).toMatchObject({ resolution_status: "RESOLVED", winning_outcome: "OPTION_A" });
+  });
+});

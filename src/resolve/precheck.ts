@@ -7,6 +7,7 @@ import type { MarketRegistration, EvidenceInput, Check } from "./schema";
 import type { Thresholds } from "./thresholds";
 import { canonicalize, findAnchor, fuzzyIndex, windowsAround, sha256Hex, hmacHex, type AnchorHit } from "./text";
 import { railEnabled } from "./rails";
+import { hostAllowed, parseOfficialRef, OFFICIAL_SERIES, type OfficialSeriesId } from "./official";
 
 export type EarlyStatus =
   | { kind: "ERROR"; error_code: "UNSAFE_INPUT" | "SOURCE_MISMATCH" | "INSUFFICIENT_DATA"; error_reason: string; caveats: string[] }
@@ -44,7 +45,7 @@ const MARKERS: Array<[string, RegExp]> = [
   ["html_comment_directive", /<!--[\s\S]{0,300}?\b(ignore|output|resolve[sd]?|OPTION_A|OPTION_B|system|instruction)\b[\s\S]{0,300}?-->/i],
 ];
 
-const STRUCTURED_KINDS = new Set(["github_api", "github_events", "base_log", "solana_log"]);
+const STRUCTURED_KINDS = new Set(["github_api", "github_events", "base_log", "solana_log", "official_release"]);
 const EN_STOP = new Set(["the", "and", "of", "to", "in", "is", "that", "for", "was", "with", "on", "as", "by", "at", "it", "this", "from", "are", "be", "or"]);
 
 function detectLanguage(text: string): "en" | "other" | "unknown" {
@@ -84,6 +85,15 @@ export function sourceMatches(market: MarketRegistration, ev: EvidenceInput): { 
       const [, addr] = s.ref.split(":");
       const evAddr = String(prov.address ?? prov.account ?? "").toLowerCase();
       if (ev.source_kind === s.kind && addr && evAddr && evAddr === addr.toLowerCase()) return { pass: true, detail: `${s.kind} ${addr}` };
+      continue;
+    }
+    if (s.kind === "official_release") {
+      // The same series, from a document on the series' allowlisted hosts. The period is gate 1's question
+      // (src/resolve/official.ts): a release that still names the previous period is "awaiting_release", not a
+      // mismatched source.
+      const p = parseOfficialRef(s.ref);
+      if (!p || !(p.series in OFFICIAL_SERIES) || ev.source_kind !== "official_release" || String(prov.series ?? "") !== p.series) continue;
+      if (ev.source_url && hostAllowed(p.series as OfficialSeriesId, ev.source_url)) return { pass: true, detail: `official ${p.series}` };
       continue;
     }
     if (s.kind === "github_api" || s.kind === "github_events") {

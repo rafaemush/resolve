@@ -3,15 +3,17 @@
  * because of a harness error). Each mutation is paired with a CONTROL run that uses the same synthetic Jev stub with
  * every rail on; the control must stay green, so the red can only come from the rail that was removed.
  * Resolver rails run the failure-injection suite (evals/run.ts); ingestion rails run the frozen ingestion cases
- * (evals/ingest.ts), where `classes` names ingestion groups.
+ * (evals/ingest.ts) and official_release rails the frozen official cases (evals/official.ts), where `classes` names
+ * their groups; each of those groups carries control cases that resolve the same way with the rail on or off.
  *   pnpm eval:mutate [--strict]
  */
 import { runSuite, type Summary, type StubKind } from "./run";
 import { runIngestSuite } from "./ingest";
+import { runOfficialSuite } from "./official";
 import { __setRailsForMutationTesting, type Rail } from "../src/resolve/rails";
 import type { EvalCase } from "./lib/cases";
 
-interface Mutation { name: string; suite?: "resolve" | "ingest"; env?: Record<string, string>; rails?: Rail[]; classes: string[]; mutateExpect?: (k: EvalCase) => EvalCase; stub?: StubKind; stubAlways?: boolean }
+interface Mutation { name: string; suite?: "resolve" | "ingest" | "official"; env?: Record<string, string>; rails?: Rail[]; classes: string[]; mutateExpect?: (k: EvalCase) => EvalCase; stub?: StubKind; stubAlways?: boolean }
 type SuiteSummary = Pick<Summary, "cases" | "grader_fail" | "harness_error" | "skipped"> & { outcomes: Array<{ id: string; result: string; failures: string[] }> };
 const M: Mutation[] = [
   { name: "1_resolve_threshold_zero", env: { RESOLVE_MIN_P: "0", RESOLVE_ND_MAX: "1" }, classes: ["E"], stub: "hedging", stubAlways: true },
@@ -25,6 +27,8 @@ const M: Mutation[] = [
   { name: "9_coverage_proof_off", rails: ["coverage_proof"], classes: ["I"] },
   { name: "10_non200_evidence_off", suite: "ingest", rails: ["non200_never_evidence"], classes: ["non200"] },
   { name: "11_projection_off", suite: "ingest", rails: ["stable_projection"], classes: ["projection"] },
+  { name: "12_official_gate_off", suite: "official", rails: ["official_release_gate"], classes: ["release_gate"] },
+  { name: "13_first_print_off", suite: "official", rails: ["first_print_lock"], classes: ["first_print"] },
 ];
 
 async function runWith(m: Mutation, mutated: boolean): Promise<SuiteSummary> {
@@ -33,6 +37,7 @@ async function runWith(m: Mutation, mutated: boolean): Promise<SuiteSummary> {
   __setRailsForMutationTesting(mutated ? (m.rails ?? []) : []);
   try {
     if (m.suite === "ingest") return await runIngestSuite({ groups: m.classes, quiet: true, label: m.name + (mutated ? "" : "_control") });
+    if (m.suite === "official") return await runOfficialSuite({ groups: m.classes, quiet: true, label: m.name + (mutated ? "" : "_control") });
     return await runSuite({ mode: "replay", maxCostUsd: 0, skipMissing: false, classes: m.classes, report: false, quiet: true, mutateExpect: mutated ? m.mutateExpect : undefined, label: m.name + (mutated ? "" : "_control"), mutationStub: m.stub ?? "fooled", stubAlways: m.stubAlways });
   } finally {
     __setRailsForMutationTesting([]);

@@ -6,6 +6,7 @@
 import type { MarketRegistration, EvidenceInput, Coverage, Resolver } from "./schema";
 import type { PrecheckResult } from "./precheck";
 import { railEnabled } from "./rails";
+import { decideOfficial } from "./official";
 
 export type Option = "OPTION_A" | "OPTION_B";
 export const other = (o: Option): Option => (o === "OPTION_A" ? "OPTION_B" : "OPTION_A");
@@ -141,6 +142,9 @@ function findPositive(market: MarketRegistration, s: unknown, text: string): Pos
       }
       return { found: false, detail: `no matching signature in ${sigs.length}` };
     }
+    case "official_release":
+      // decided whole by decideOfficial, which decideStructured routes to first; never a presence/absence question
+      return { found: false, detail: "official_release is decided by decideOfficial" };
     case "numeric_threshold": {
       let value: number | undefined;
       if (s !== undefined && s !== null) value = parseNumber(getPath(s, r.path));
@@ -162,6 +166,7 @@ export function resolverAppliesTo(market: MarketRegistration, ev: EvidenceInput)
   if (r.kind.startsWith("github_")) return ev.source_kind === "github_api" || ev.source_kind === "github_events";
   if (r.kind === "evm_log_present") return ev.source_kind === "base_log";
   if (r.kind === "solana_sig_present") return ev.source_kind === "solana_log";
+  if (r.kind === "official_release") return ev.source_kind === "official_release";
   return true; // numeric_threshold reads structured or text
 }
 
@@ -199,6 +204,8 @@ function coverageProof(kind: string, cov: Coverage | undefined, market: MarketRe
 export function decideStructured(market: MarketRegistration, ev: EvidenceInput, pre: PrecheckResult, now: Date): StructuredDecision | null {
   const r = market.resolver;
   if (!railEnabled("structured_router")) return null;
+  // official_release answers every evidence kind itself: web evidence for such a market is an ERROR, never a Jev call
+  if (r?.kind === "official_release") return decideOfficial(market, ev);
   if (!r || !resolverAppliesTo(market, ev)) return null;
   if (ev.structured === undefined && r.kind !== "numeric_threshold") return null;
   const pos = market.positive_option;

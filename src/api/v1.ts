@@ -146,7 +146,10 @@ v1.post("/resolve", async (c) => {
     }
     evidence = { source_kind: e.source_kind as EvidenceInput["source_kind"], source_url: (e.source_url as string | null) ?? undefined, text, structured, observed_at: String(e.source_kind).startsWith("web") ? ((e.claimed_at as string | null) ?? undefined) : (e.observed_at as string), fetched_at: e.fetched_at as string, http_status: (e.http_status as number | null) ?? undefined, coverage: (e.coverage as EvidenceInput["coverage"]) ?? undefined, provenance: (e.provenance as Record<string, unknown>) ?? undefined };
   } else {
-    const reg = await registerMarket(c.env, cfg, { ...body.market!, platform: body.market!.platform ?? "custom" }, auth.tenantId, { createWatches: false });
+    let reg: Awaited<ReturnType<typeof registerMarket>>;
+    // registration refusals (e.g. an official_release market whose source does not match its resolver) are the caller's 400
+    try { reg = await registerMarket(c.env, cfg, { ...body.market!, platform: body.market!.platform ?? "custom" }, auth.tenantId, { createWatches: false }); }
+    catch (e) { return err(c, "validation_error", String(e).slice(0, 400), 400); }
     const { data: m } = await client.from("markets").select("*").eq("id", reg.marketId).single();
     market = m as unknown as MarketRow;
     const ev = body.evidence!;

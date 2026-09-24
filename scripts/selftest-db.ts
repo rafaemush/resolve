@@ -457,4 +457,117 @@ end $$;`;
   await sql(`update tenants set deleted_at = now() where id='${tid}'`);
   if (bad || !ok) process.exit(1);
 }
-main().catch((e) => { console.error(String(e)); process.exit(1); });
+// --official runs only the migration 016 block below; the default run above is unchanged.
+if (!process.argv.includes("--official")) main().catch((e) => { console.error(String(e)); process.exit(1); });
+
+// =====================================================================================================================
+// official_release (migration 016): rollback-only assertions.
+//   RESOLVE_SELFTEST_NON_PRODUCTION=1 pnpm tsx scripts/selftest-db.ts --official
+// Kept in its own block (main's part of this file changes independently). Everything runs inside one DO block that
+// always ends with RAISE, so nothing persists; still, it is refused unless the operator declares a non-production
+// target, and it has never been run against production. It asserts: first print wins, revision_differs, the guard
+// trigger's refusals (UPDATE of the observation, DELETE, corroboration overwrite) and its one allowance (from null),
+// service_role write denial with read + RPC access, the fetch lease and its extension, and the audited re-check
+// (history appended before the supersede, value untouched, history append-only, guard re-armed afterwards).
+// =====================================================================================================================
+const OFFICIAL_SELFTEST_SQL = `
+do $$
+declare r1 jsonb; r2 jsonb; r3 jsonb; c2 boolean; ext timestamptz; out jsonb := '{}'::jsonb;
+  corr jsonb := '{"status":"disagree","value":3.5,"value_text":"3.5","source_url":null,"detail":"selftest","checked_at":"2099-02-01T00:00:00Z"}';
+begin
+  r1 := record_official_observation('selftest_series', '2099-01', 3.4, '3.4', 'SELFTEST - JANUARY 2099: 3.4', 'https://www.bls.gov/selftest', repeat('a', 64), corr, '{}'::jsonb);
+  r2 := record_official_observation('selftest_series', '2099-01', 3.6, '3.6', 'SELFTEST revised', 'https://www.bls.gov/selftest2', repeat('b', 64), null, '{}'::jsonb);
+  r3 := record_official_observation('selftest_series', '2099-01', 3.4, '3.4', 'SELFTEST again', 'https://www.bls.gov/selftest', repeat('a', 64), null, '{}'::jsonb);
+  out := out || jsonb_build_object('first_inserted', r1->'inserted', 'second_inserted', r2->'inserted', 'second_revision_differs', r2->'revision_differs',
+    'second_returns_first_value', r2->'value', 'second_keeps_first_text', r2->>'deciding_text', 'third_revision_differs', r3->'revision_differs');
+
+  begin update official_observations set value = 9 where series = 'selftest_series';
+    out := out || '{"update_value":"allowed"}';
+  exception when others then out := out || jsonb_build_object('update_value', case when sqlerrm like '%immutable%' then 'refused' else 'error: ' || sqlerrm end); end;
+  begin delete from official_observations where series = 'selftest_series';
+    out := out || '{"delete":"allowed"}';
+  exception when others then out := out || jsonb_build_object('delete', case when sqlerrm like '%never deleted%' then 'refused' else 'error: ' || sqlerrm end); end;
+  begin update official_observations set corroboration = '{"status":"agree"}' where series = 'selftest_series' and period = '2099-01';
+    out := out || '{"overwrite_corroboration":"allowed"}';
+  exception when others then out := out || jsonb_build_object('overwrite_corroboration', case when sqlerrm like '%already set%' then 'refused' else 'error: ' || sqlerrm end); end;
+  perform record_official_observation('selftest_series', '2099-02', 1.0, '1.0', 'SELFTEST - FEBRUARY 2099', 'https://www.bls.gov/selftest', repeat('c', 64), null, '{}'::jsonb);
+  begin update official_observations set corroboration = '{"status":"unavailable"}' where series = 'selftest_series' and period = '2099-02';
+    out := out || '{"set_from_null":"allowed"}';
+  exception when others then out := out || jsonb_build_object('set_from_null', 'error: ' || sqlerrm); end;
+
+  begin
+    set local role service_role;
+    begin insert into official_observations (series, period, value, value_text, deciding_text, source_url, raw_sha256)
+            values ('selftest_series', '2099-03', 1, '1', 'x', 'https://www.bls.gov/x', repeat('d', 64));
+      out := out || '{"service_role_insert":"allowed"}';
+    exception when insufficient_privilege then out := out || '{"service_role_insert":"denied"}'; end;
+    begin update official_observations set corroboration = null where series = 'selftest_series';
+      out := out || '{"service_role_update":"allowed"}';
+    exception when insufficient_privilege then out := out || '{"service_role_update":"denied"}'; end;
+    begin insert into official_corroboration_history (series, period, next, actor, reason) values ('selftest_series', '2099-01', '{"status":"agree"}', 'x', 'selftest direct write');
+      out := out || '{"service_role_history_insert":"allowed"}';
+    exception when insufficient_privilege then out := out || '{"service_role_history_insert":"denied"}'; end;
+    out := out || jsonb_build_object('service_role_select', (select count(*) from official_observations where series = 'selftest_series'),
+      'service_role_rpc_claim', claim_official_fetch('selftest_series', '2099-01', 45));
+    reset role;
+  exception when others then out := out || jsonb_build_object('service_role_block', 'error: ' || sqlerrm);
+  end;
+
+  c2 := claim_official_fetch('selftest_series', '2099-01', 45);
+  ext := extend_official_fetch('selftest_series', '2099-01', 600);
+  out := out || jsonb_build_object('claim_while_leased', c2, 'extended_seconds', round(extract(epoch from ext - now())),
+    'claim_after_extend', claim_official_fetch('selftest_series', '2099-01', 45));
+
+  perform recheck_official_corroboration('selftest_series', '2099-01',
+    '{"status":"agree","value":3.4,"value_text":"3.4","source_url":null,"detail":"selftest re-read","checked_at":"2099-02-02T00:00:00Z"}'::jsonb,
+    'selftest', 'selftest re-check of a disagreement');
+  out := out || jsonb_build_object(
+    'recheck_status', (select corroboration->>'status' from official_observations where series = 'selftest_series' and period = '2099-01'),
+    'recheck_value_untouched', (select value from official_observations where series = 'selftest_series' and period = '2099-01'),
+    'history_rows', (select count(*) from official_corroboration_history where series = 'selftest_series'),
+    'history_previous_status', (select previous->>'status' from official_corroboration_history where series = 'selftest_series' order by id limit 1));
+  begin update official_corroboration_history set reason = 'tampered with' where series = 'selftest_series';
+    out := out || '{"history_update":"allowed"}';
+  exception when others then out := out || jsonb_build_object('history_update', case when sqlerrm like '%append-only%' then 'refused' else 'error: ' || sqlerrm end); end;
+  begin perform recheck_official_corroboration('selftest_series', '2099-01', '{"status":"probably"}'::jsonb, 'selftest', 'selftest unknown status');
+    out := out || '{"recheck_bad_status":"allowed"}';
+  exception when others then out := out || jsonb_build_object('recheck_bad_status', case when sqlerrm like '%known status%' then 'refused' else 'error: ' || sqlerrm end); end;
+  begin update official_observations set corroboration = '{"status":"disagree"}' where series = 'selftest_series' and period = '2099-01';
+    out := out || '{"overwrite_after_recheck":"allowed"}';
+  exception when others then out := out || jsonb_build_object('overwrite_after_recheck', case when sqlerrm like '%already set%' then 'refused' else 'error: ' || sqlerrm end); end;
+  raise exception 'SELFTEST_OFFICIAL %', out::text;
+end $$;`;
+
+const OFFICIAL_SELFTEST_EXPECT: Record<string, unknown> = {
+  first_inserted: true, second_inserted: false, second_revision_differs: true, second_returns_first_value: 3.4, second_keeps_first_text: "SELFTEST - JANUARY 2099: 3.4", third_revision_differs: false,
+  update_value: "refused", delete: "refused", overwrite_corroboration: "refused", set_from_null: "allowed",
+  service_role_insert: "denied", service_role_update: "denied", service_role_history_insert: "denied", service_role_select: 2, service_role_rpc_claim: true,
+  claim_while_leased: false, extended_seconds: 600, claim_after_extend: false,
+  recheck_status: "agree", recheck_value_untouched: 3.4, history_rows: 1, history_previous_status: "disagree",
+  history_update: "refused", recheck_bad_status: "refused", overwrite_after_recheck: "refused",
+};
+
+async function officialSelftest(): Promise<void> {
+  if (process.env.RESOLVE_SELFTEST_NON_PRODUCTION !== "1") {
+    console.error("selftest --official: refused. Set RESOLVE_SELFTEST_NON_PRODUCTION=1 only when SUPABASE_PROJECT_REF names a staging or local database (the block rolls back, but it is never run against production).");
+    process.exit(2);
+  }
+  let msg = "";
+  try { await sql(OFFICIAL_SELFTEST_SQL); } catch (e) { msg = String(e); }
+  let inner = msg;
+  const j = msg.indexOf("{");
+  if (j >= 0) { try { inner = String(JSON.parse(msg.slice(j)).message ?? msg); } catch { /* keep raw */ } }
+  const m = inner.match(/SELFTEST_OFFICIAL (\{.*\})/s);
+  if (!m) { console.error("official selftest did not return results:", msg.slice(0, 800)); process.exit(1); }
+  let r: Record<string, unknown>;
+  try { r = JSON.parse(m[1]!); } catch { console.error("official selftest: unreadable results", m[1]!.slice(0, 400)); process.exit(1); }
+  let bad = 0;
+  for (const [k, v] of Object.entries(OFFICIAL_SELFTEST_EXPECT)) {
+    const ok = JSON.stringify(r[k]) === JSON.stringify(v);
+    if (!ok) bad++;
+    console.log(`${ok ? "PASS" : "FAIL"} official.${k} = ${JSON.stringify(r[k])}${ok ? "" : ` (expected ${JSON.stringify(v)})`}`);
+  }
+  console.log("rolled back: nothing persisted from the official DO block");
+  if (bad) process.exit(1);
+}
+if (process.argv.includes("--official")) officialSelftest().catch((e) => { console.error(String(e)); process.exit(1); });

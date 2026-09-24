@@ -18,6 +18,11 @@ const rails = {
   non200_never_evidence: true,
   /** watch: change detection hashes the projection of deciding fields, not raw bytes. */
   stable_projection: true,
+  // official_release rails (src/resolve/official.ts). Off = the failure each one exists for; evals/official.ts proves it.
+  /** gate 1: no verdict from an observation made before release_at, or one whose deciding text names another period. */
+  official_release_gate: true,
+  /** the stored first print decides; a later (revised) read of the same period never replaces it. */
+  first_print_lock: true,
 };
 export type Rail = keyof typeof rails;
 export function railEnabled(r: Rail): boolean { return rails[r]; }

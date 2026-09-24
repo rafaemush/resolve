@@ -111,6 +111,21 @@ function projectChain(s: unknown, key: "logs" | "signatures"): string | null {
   return stableStringify([...earlier, ...(s[key] as unknown[])]);
 }
 
+/**
+ * official_release: series|period|first-print value|corroboration status. The stored first print never changes
+ * (migration 016), so every poll after the first is a no_op; only an audited corroboration re-check
+ * (recheck_official_corroboration) changes the status, and that re-resolves the legs held at sources_disagree.
+ * "release_not_observed" is its own value, so the 6 h marker is stored once and the first print that follows it is a
+ * change.
+ */
+function projectOfficial(s: unknown): string | null {
+  if (!isObj(s) || typeof s.series !== "string" || typeof s.period !== "string") return null;
+  if (s.kind === "official_missing") return `official|${s.series}|${s.period}|release_not_observed`;
+  if (s.kind !== "official_observation" || typeof s.value_text !== "string") return null;
+  const status = isObj(s.corroboration) && typeof s.corroboration.status === "string" ? s.corroboration.status : "none";
+  return `official|${s.series}|${s.period}|${s.value_text}|${status}`;
+}
+
 function projectSource(sourceKind: string, resolverKind: string | undefined, ev: EvidenceInput): string {
   const s = ev.structured;
   switch (sourceKind) {
@@ -124,6 +139,8 @@ function projectSource(sourceKind: string, resolverKind: string | undefined, ev:
       return projectChain(s, "logs") ?? canonicalize(rawText(ev)).text;
     case "solana_log":
       return projectChain(s, "signatures") ?? canonicalize(rawText(ev)).text;
+    case "official_release":
+      return projectOfficial(s) ?? canonicalize(rawText(ev)).text;
     default:
       return canonicalize(rawText(ev)).text;
   }

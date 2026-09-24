@@ -1,0 +1,176 @@
+{
+ "_note": "Public response bodies saved 2026-09-24 by curl from a macOS host with UA ResolveBot/1.0 (+https://resolve.rafaemush.workers.dev/bot); byte-exact (files over 20 KB are gzip-compressed, the sha256 is of the uncompressed body). Used by tests/official-*.test.ts and evals/official.ts; never fetched by tests.",
+ "files": {
+  "bls_cpi_nr0.html": {
+   "fetched_at": "2026-09-24T13:15:14Z",
+   "url": "https://www.bls.gov/news.release/cpi.nr0.htm",
+   "http_status": 200,
+   "content_type": "text/html",
+   "bytes": 90388,
+   "sha256": "8b4d352b4f1ffc6604d953d304c151993c722f8a096a4030765183105ade9484",
+   "file": "bls_cpi_nr0.html.gz"
+  },
+  "bls_ppi_nr0.html": {
+   "fetched_at": "2026-09-24T13:15:35Z",
+   "url": "https://www.bls.gov/news.release/ppi.nr0.htm",
+   "http_status": 200,
+   "content_type": "text/html",
+   "bytes": 132182,
+   "sha256": "f2e99245081cb24cfa5d38b5242d8d6d4501550afa03a2304eab6affcc400386",
+   "file": "bls_ppi_nr0.html.gz"
+  },
+  "bls_v1_cpi.json": {
+   "fetched_at": "2026-09-24T13:14:54Z",
+   "url": "https://api.bls.gov/publicAPI/v1/timeseries/data/CUUR0000SA0",
+   "http_status": 200,
+   "content_type": "application/json",
+   "bytes": 3199,
+   "sha256": "2cbad1c2017ff495363f9b3d46711593b6b717c42b5b0a32e905dd6813416dfa",
+   "file": "bls_v1_cpi.json"
+  },
+  "bls_v1_ppi.json": {
+   "fetched_at": "2026-09-24T13:14:56Z",
+   "url": "https://api.bls.gov/publicAPI/v1/timeseries/data/WPUFD4",
+   "http_status": 200,
+   "content_type": "application/json",
+   "bytes": 3616,
+   "sha256": "73ee24c87a648b7426d7248e1dbaf78290f4aff8666eb9d1da73f00a77931860",
+   "file": "bls_v1_ppi.json"
+  },
+  "fed_press_monetary.xml": {
+   "fetched_at": "2026-09-24T13:16:10Z",
+   "url": "https://www.federalreserve.gov/feeds/press_monetary.xml",
+   "http_status": 200,
+   "content_type": "text/xml",
+   "bytes": 9645,
+   "sha256": "6ef9f8ee2019c031b583ee3a64eec38170840e2ff4229ec92e43f49702857855",
+   "file": "fed_press_monetary.xml"
+  },
+  "fed_monetary20260916a.html": {
+   "fetched_at": "2026-09-24T13:16:32Z",
+   "url": "https://www.federalreserve.gov/newsevents/pressreleases/monetary20260916a.htm",
+   "http_status": 200,
+   "content_type": "text/html",
+   "bytes": 82636,
+   "sha256": "887808770b68774218cba3d25a8bc3436c3d73bdd703ab25d9c1f24b371b749c",
+   "file": "fed_monetary20260916a.html.gz"
+  },
+  "fred_dfedtaru.csv": {
+   "fetched_at": "2026-09-24T13:16:14Z",
+   "url": "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DFEDTARU",
+   "http_status": 200,
+   "content_type": "application/csv",
+   "bytes": 103898,
+   "sha256": "5c9490ef455fa99c2833b32c781df650e8535b4e0053723a4c782b9cf4a1261d",
+   "file": "fred_dfedtaru.csv.gz"
+  },
+  "ecb_mopo_2026_include.html": {
+   "fetched_at": "2026-09-24T13:17:16Z",
+   "url": "https://www.ecb.europa.eu/press/govcdec/mopo/2026/html/index_include.en.html",
+   "http_status": 200,
+   "content_type": "text/html;",
+   "bytes": 31286,
+   "sha256": "80911e8acec80c811d274431628402df63daa4c944a243deea0b7855e65f2631",
+   "file": "ecb_mopo_2026_include.html.gz"
+  },
+  "ecb_mp260910.html": {
+   "fetched_at": "2026-09-24T13:17:24Z",
+   "url": "https://www.ecb.europa.eu/press/pr/date/2026/html/ecb.mp260910~314e508016.en.html",
+   "http_status": 200,
+   "content_type": "text/html;",
+   "bytes": 106729,
+   "sha256": "08c5bad85e184871ca0b6ce5a80f0bd23d96ff95e1d908fdda1be27a25310915",
+   "file": "ecb_mp260910.html.gz"
+  },
+  "ecb_dfr.csv": {
+   "fetched_at": "2026-09-24T13:16:40Z",
+   "url": "https://data-api.ecb.europa.eu/service/data/FM/B.U2.EUR.4F.KR.DFR.LEV?format=csvdata&lastNObservations=5",
+   "http_status": 200,
+   "content_type": "text/csv",
+   "bytes": 1933,
+   "sha256": "4b06fdf582d402c382661b6991af5de4cde514579d2c2caf49c67694406945dc",
+   "file": "ecb_dfr.csv"
+  },
+  "boe_rss_news.xml": {
+   "fetched_at": "2026-09-24T13:22:52Z",
+   "url": "https://www.bankofengland.co.uk/rss/news",
+   "http_status": 200,
+   "content_type": "text/xml;",
+   "bytes": 25247,
+   "sha256": "732a30d4a6f3d8a8393e036d5886e5f4a932afbf413cf5281a96dd86887b7357",
+   "file": "boe_rss_news.xml.gz"
+  },
+  "boe_iadb_iudbedr.csv": {
+   "fetched_at": "2026-09-24T13:22:33Z",
+   "url": "https://www.bankofengland.co.uk/boeapps/database/_iadb-fromshowcolumns.asp?csv.x=yes&Datefrom=01/Jan/2025&Dateto=now&SeriesCodes=IUDBEDR&CSVF=TN&UsingCodes=Y&VPD=Y&VFD=N",
+   "http_status": 200,
+   "content_type": "application/csv",
+   "bytes": 7536,
+   "sha256": "1b7a98c98655b930ff8c552dd1ec9abda62f8b7bc1f93a4b61ca01adfe92e55c",
+   "file": "boe_iadb_iudbedr.csv"
+  },
+  "bok_rss_mpd.xml": {
+   "fetched_at": "2026-09-24T13:21:22Z",
+   "url": "https://www.bok.or.kr/eng/bbs/E0000627/news.rss?menuNo=400022",
+   "http_status": 200,
+   "content_type": "application/xml;charset=UTF-8",
+   "bytes": 886379,
+   "sha256": "9585c85a804e4c1d3fa881a60f7fdfafc75580b2ff124fec5ccdacecab538e02",
+   "file": "bok_rss_mpd.xml.gz"
+  },
+  "ecos_722Y001_20260824_20260902.json": {
+   "fetched_at": "2026-09-24T13:21:41Z",
+   "url": "https://ecos.bok.or.kr/api/StatisticSearch/sample/json/en/1/10/722Y001/D/20260824/20260902/0101000",
+   "http_status": 200,
+   "content_type": "application/json;",
+   "bytes": 3840,
+   "sha256": "d1e1013d36b037be49c9e1f40acc38900ebd644911e46812bcd7342bfc92abcd",
+   "file": "ecos_722Y001_20260824_20260902.json"
+  },
+  "ecos_722Y001_20260911_20260924.json": {
+   "fetched_at": "2026-09-24T13:20:37Z",
+   "url": "https://ecos.bok.or.kr/api/StatisticSearch/sample/json/en/1/10/722Y001/D/20260911/20260924/0101000",
+   "http_status": 200,
+   "content_type": "application/json;",
+   "bytes": 3831,
+   "sha256": "d8567133aff47f713e9b26c4deffed1d11fef78e97a8638c315e450333041057",
+   "file": "ecos_722Y001_20260911_20260924.json"
+  },
+  "bok_rss_press.xml": {
+   "fetched_at": "2026-09-24T13:26:16Z",
+   "url": "https://www.bok.or.kr/eng/bbs/E0000634/news.rss?menuNo=400069",
+   "http_status": 200,
+   "content_type": "application/xml;charset=UTF-8",
+   "bytes": 262995,
+   "sha256": "d7b3b66c60e5c86631d4892d1fe8cdfe033427e7f352b4969cf2b39acb608257",
+   "file": "bok_rss_press.xml.gz"
+  },
+  "ecos_200Y102_10211.json": {
+   "fetched_at": "2026-09-24T13:20:35Z",
+   "url": "https://ecos.bok.or.kr/api/StatisticSearch/sample/json/en/1/10/200Y102/Q/2025Q1/2026Q4/10211",
+   "http_status": 200,
+   "content_type": "application/json;",
+   "bytes": 2000,
+   "sha256": "8e03b6af7b32dac048b03075c95a9802dcf0267f9ec5c735a75b5d7e483a6533",
+   "file": "ecos_200Y102_10211.json"
+  },
+  "bcb_historicotaxasjuros.json": {
+   "fetched_at": "2026-09-24T13:22:00Z",
+   "url": "https://www.bcb.gov.br/api/servico/sitebcb/historicotaxasjuros",
+   "http_status": 200,
+   "content_type": "application/json;",
+   "bytes": 102280,
+   "sha256": "3e147fca02cdfe8a965421e1f9ab5162b1eda0ad8da6a1d96d240d0803b21660",
+   "file": "bcb_historicotaxasjuros.json.gz"
+  },
+  "bcb_sgs432_ultimos3.json": {
+   "fetched_at": "2026-09-24T13:21:56Z",
+   "url": "https://api.bcb.gov.br/dados/serie/bcdata.sgs.432/dados/ultimos/3?formato=json",
+   "http_status": 200,
+   "content_type": "application/json;",
+   "bytes": 115,
+   "sha256": "f1e6d1e970dfcd466a586997748a1e315c2e0d52b9e469048e80b704b41e7c3b",
+   "file": "bcb_sgs432_ultimos3.json"
+  }
+ }
+}

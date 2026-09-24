@@ -93,7 +93,8 @@
                     "base_log",
                     "solana_log",
                     "web_fetch",
-                    "web_render"
+                    "web_render",
+                    "official_release"
                   ]
                 },
                 "ref": {
@@ -298,6 +299,85 @@
                   "value"
                 ],
                 "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "const": "official_release"
+                  },
+                  "series": {
+                    "type": "string",
+                    "enum": [
+                      "us_cpi_u_nsa_yoy",
+                      "us_ppi_fd_nsa_yoy",
+                      "fomc_upper_bound",
+                      "ecb_dfr",
+                      "boe_bank_rate",
+                      "bok_base_rate",
+                      "kr_gdp_advance_yoy",
+                      "bcb_selic_target"
+                    ]
+                  },
+                  "period": {
+                    "type": "string",
+                    "pattern": "^\\d{4}-(?:\\d{2}(?:-\\d{2})?|Q[1-4])$"
+                  },
+                  "release_at": {
+                    "type": "string",
+                    "format": "date-time",
+                    "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                  },
+                  "prior_level": {
+                    "type": "number"
+                  },
+                  "bucket": {
+                    "type": "object",
+                    "properties": {
+                      "label": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 100
+                      },
+                      "lo": {
+                        "type": "number"
+                      },
+                      "hi": {
+                        "type": "number"
+                      },
+                      "lo_inclusive": {
+                        "type": "boolean"
+                      },
+                      "hi_inclusive": {
+                        "type": "boolean"
+                      }
+                    },
+                    "required": [
+                      "label",
+                      "lo_inclusive",
+                      "hi_inclusive"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "rounding": {
+                    "type": "string",
+                    "enum": [
+                      "pct_1dp",
+                      "bps_away_from_zero_25",
+                      "bps_nearest_25_min_25"
+                    ]
+                  }
+                },
+                "required": [
+                  "kind",
+                  "series",
+                  "period",
+                  "release_at",
+                  "bucket",
+                  "rounding"
+                ],
+                "additionalProperties": false
               }
             ]
           },
@@ -450,6 +530,7 @@
                       "solana_log",
                       "web_fetch",
                       "web_render",
+                      "official_release",
                       "tenant_supplied"
                     ]
                   },

@@ -22,7 +22,7 @@ export interface CoverageWindow { from: string; to: string; status: "ok" | "gap"
 export interface WatchRow {
   id: string;
   market_id: string;
-  source_kind: "github_api" | "github_events" | "base_log" | "solana_log" | "web_fetch" | "web_render";
+  source_kind: "github_api" | "github_events" | "base_log" | "solana_log" | "web_fetch" | "web_render" | "official_release";
   source_ref: Record<string, unknown>;
   poll_interval_s: number;
   etag: string | null;
@@ -59,6 +59,15 @@ export interface FetchOutcome {
   httpStatus?: number;
   /** The source asked us to wait (Retry-After, rate-limit reset, X-Poll-Interval); seconds, capped at 3600. */
   deferSeconds?: number;
+  /**
+   * official_release: when to poll next if this poll ends as a no_op (not modified / unchanged projection). The
+   * adapter knows the release schedule; the lease's poll_interval_s default stays in force on every other path.
+   */
+  nextPollAt?: string;
+  /** Why a notModified poll changed nothing (loop_runs detail). */
+  note?: string;
+  /** official_release: nothing further can change; deactivate the watch when this poll ends as a no_op (the reason). */
+  stop?: string;
 }
 
 /** Append a window, extending the previous one when contiguous and same status. Keeps jsonb small. */

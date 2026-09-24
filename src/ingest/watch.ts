@@ -5,6 +5,7 @@ import { fetchGithub } from "./github";
 import { fetchBaseLogs } from "./base";
 import { fetchSolanaSignatures } from "./solana";
 import { fetchWeb } from "./web";
+import { fetchOfficial } from "./official-watch";
 import { projectForChange } from "./projection";
 import { MAX_DEFER_S } from "./http";
 import { appendWindow, summarizeCoverage, type WatchRow, type MarketRow, type FetchOutcome, type CoverageWindow } from "./types";
@@ -72,6 +73,16 @@ export function decideWatchAction(i: WatchActionInput): WatchAction {
 export function verdictLooked(v: Pick<Verdict, "error_code">): boolean {
   return v.error_code !== "UPSTREAM_UNAVAILABLE";
 }
+
+/**
+ * An awaiting_release verdict (official_release gate 1: the observation predates the scheduled release or names
+ * another period) says "not yet", not "decided". Saving its change hash would freeze the leg: every later poll of the
+ * same first print would be a no_op. So its hash is never saved, nothing is published, and the leg re-checks later.
+ */
+export function awaitingRelease(v: Pick<Verdict, "resolution_status" | "caveats">): boolean {
+  return v.resolution_status === "UNRESOLVED" && Array.isArray(v.caveats) && v.caveats.includes("awaiting_release");
+}
+export const AWAITING_RECHECK_S = 900;
 
 /**
  * Seconds until the retry after a could-not-look verdict. Every retry stores an observation (web HTML rarely
@@ -156,7 +167,9 @@ export async function runWatch(env: Env, cfg: Config, watchId: string, opts: Wat
   if (!watch.active || !market || market.status !== "open") { summary.detail = `inactive watch or market status ${market?.status}`; await client.from("watches").update({ lease_until: null, last_polled_at: new Date().toISOString() }).eq("id", watchId); return finish(summary); }
 
   const deadlineGrace = new Date(Date.parse(market.deadline_utc) + market.grace_seconds * 1000);
-  const afterDeadline = Date.now() > deadlineGrace.getTime();
+  // official_release: the deadline is the platform's trading close, not part of the question, and a "No" is a
+  // positive determination of another bucket, so there is no post-deadline absence observation to take.
+  const afterDeadline = watch.source_kind !== "official_release" && Date.now() > deadlineGrace.getTime();
   if (afterDeadline) watch.etag = null; // always take a full post-deadline snapshot (absence proof needs an observation, not a 304)
   const resolver = market.resolver;
 
@@ -166,6 +179,7 @@ export async function runWatch(env: Env, cfg: Config, watchId: string, opts: Wat
     case "base_log": out = await fetchBaseLogs(env, watch, resolver); break;
     case "solana_log": out = await fetchSolanaSignatures(env, watch, resolver); break;
     case "web_fetch": out = await fetchWeb(env, watch, cfg.botUa); break;
+    case "official_release": out = await fetchOfficial(env, watch, market, { waitUntil: opts.waitUntil }); break;
     default: out = { error: `${watch.source_kind} not implemented yet` };
   }
   const nowIso = new Date().toISOString();
@@ -209,8 +223,10 @@ export async function runWatch(env: Env, cfg: Config, watchId: string, opts: Wat
   if (out.error && !out.evidence) return fail(out.error, { httpStatus: out.httpStatus });
   if (out.notModified) {
     update.consecutive_errors = 0; update.last_error = null;
+    if (out.nextPollAt) update.next_poll_at = out.nextPollAt;
+    if (out.stop) update.active = false;
     const ue = await save();
-    summary.outcome = ue ? "failure" : "no_op"; summary.detail = ue ?? "not modified";
+    summary.outcome = ue ? "failure" : "no_op"; summary.detail = ue ?? `${out.note ?? "not modified"}${out.stop ? ` | watch stopped: ${out.stop}` : ""}`;
     return finish(summary, meta);
   }
 
@@ -228,8 +244,10 @@ export async function runWatch(env: Env, cfg: Config, watchId: string, opts: Wat
   const action = decideWatchAction({ changeSha, lastCanonicalHash: watch.last_canonical_hash, afterDeadline, resolvedSinceDeadline });
   if (!action.store) {
     update.consecutive_errors = 0; update.last_error = null;
+    if (out.nextPollAt) update.next_poll_at = out.nextPollAt;
+    if (out.stop) update.active = false;
     const ue = await save();
-    summary.outcome = ue ? "failure" : "no_op"; summary.detail = ue ?? `unchanged projection ${changeSha.slice(0, 12)}`;
+    summary.outcome = ue ? "failure" : "no_op"; summary.detail = ue ?? `unchanged projection ${changeSha.slice(0, 12)}${out.stop ? ` | watch stopped: ${out.stop}` : ""}`;
     return finish(summary, meta);
   }
 
@@ -291,6 +309,7 @@ export async function runWatch(env: Env, cfg: Config, watchId: string, opts: Wat
   };
   let looked = true;
   let recorded = false;
+  let awaiting = false;
   try {
     const evInput: EvidenceInput = { ...ev }; // precheck treats a web observed_at as claimed_at and uses fetched_at
     const rt = await resolveWithRuntime(env, cfg, { marketId: market.id, market, evidence: evInput, evidenceId, mode, tenantId: market.tenant_id, apiKeyId: null, requestId: null, creditsCharged: charged, beforeJev });
@@ -301,9 +320,12 @@ export async function runWatch(env: Env, cfg: Config, watchId: string, opts: Wat
     if (evidenceId) await client.from("evidence").update({ windows: rt.result.pre.windows, injection_markers: rt.result.pre.markers }).eq("id", evidenceId);
     const v = rt.result.verdict;
     looked = verdictLooked(v);
+    awaiting = looked && awaitingRelease(v);
     if (!looked) {
       // Nothing is published for a verdict that could not look (no commit, no tenant event); the retry publishes.
       if (charged > 0 && chargeRequestId) await refund(chargeRequestId, rt.resolutionId);
+    } else if (awaiting) {
+      // a "not yet" is not a verdict to publish; the re-check publishes
     } else if (mode === "shadow") {
       const cm = await commitVerdict(env, market, rt.resolutionId, v);
       summary.detail += ` | commit: ${cm.reason}`;
@@ -329,6 +351,15 @@ export async function runWatch(env: Env, cfg: Config, watchId: string, opts: Wat
     update.cursor = watch.cursor; update.backlog = watch.backlog; delete update.etag; update.last_evidence_hash = rawSha;
     const r2 = r2Error ? ` | r2 put failed (evidence ${evidenceId ?? "?"} stored without raw_r2_key): ${r2Error}` : "";
     return fail(`could not look: ${summary.verdict}; change ${changeSha.slice(0, 12)} kept pending${r2}`, { backoff: true });
+  }
+  if (awaiting) {
+    update.consecutive_errors = 0; update.last_error = null; update.last_evidence_hash = rawSha;
+    update.next_poll_at = new Date(Date.now() + AWAITING_RECHECK_S * 1000).toISOString();
+    const ue = await save();
+    summary.rows_written = rows;
+    summary.outcome = ue ? "failure" : "success";
+    summary.detail = [ue, `awaiting_release: change ${changeSha.slice(0, 12)} kept pending (hash not saved), re-check in ${AWAITING_RECHECK_S} s`].filter(Boolean).join(" | ");
+    return finish(summary, meta);
   }
   update.consecutive_errors = 0; update.last_error = null; update.last_evidence_hash = rawSha; update.last_canonical_hash = changeSha;
   if (out.backlog && !deferred) update.next_poll_at = new Date(Date.now() + 5000).toISOString();

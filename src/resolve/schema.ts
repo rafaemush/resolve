@@ -10,8 +10,8 @@ export const ErrorReason = z.enum([
   "MODEL_UNAVAILABLE", "BUDGET_EXCEEDED", "SOURCE_UNREACHABLE", "RENDER_BUDGET_EXHAUSTED",
   "BILLING_UNAVAILABLE", "PAID_JEV_DISABLED",
 ]);
-export const SourceKind = z.enum(["github_api", "github_events", "base_log", "solana_log", "web_fetch", "web_render", "tenant_supplied"]);
-export const WatchSourceKind = z.enum(["github_api", "github_events", "base_log", "solana_log", "web_fetch", "web_render"]);
+export const SourceKind = z.enum(["github_api", "github_events", "base_log", "solana_log", "web_fetch", "web_render", "official_release", "tenant_supplied"]);
+export const WatchSourceKind = z.enum(["github_api", "github_events", "base_log", "solana_log", "web_fetch", "web_render", "official_release"]);
 export const DeterminationBasis = z.enum(["structured", "jev"]);
 export const NegativeRule = z.enum(["absence_after_deadline", "explicit_negative"]);
 export const Platform = z.enum(["polymarket", "limitless", "custom"]);
@@ -22,9 +22,37 @@ const repo = z.string().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/, "owner/repo"
 
 export const SourceRef = z.object({
   kind: WatchSourceKind,
-  /** github_api: "repos/o/r/pulls/1" | web: absolute URL | base_log: "base:0xaddr" | solana_log: "solana:<account>" */
+  /**
+   * github_api: "repos/o/r/pulls/1" | web: absolute URL | base_log: "base:0xaddr" | solana_log: "solana:<account>"
+   * | official_release: "official:<series>:<period>" (e.g. "official:us_cpi_u_nsa_yoy:2026-09"; the rail fetches only
+   * the series' allowlisted hosts, src/resolve/official.ts)
+   */
   ref: z.string().min(1).max(2048),
 });
+
+/**
+ * official_release series with a deterministic adapter (src/ingest/official.ts). Each names one published number:
+ * a 12-month percent change as printed (CPI, PPI, Korea GDP advance) or a policy rate level whose change against
+ * prior_level the market decides (FOMC upper bound, ECB deposit facility, BoE Bank Rate, BoK Base Rate, BCB Selic).
+ */
+export const OfficialSeries = z.enum([
+  "us_cpi_u_nsa_yoy", "us_ppi_fd_nsa_yoy", "fomc_upper_bound", "ecb_dfr", "boe_bank_rate", "bok_base_rate", "kr_gdp_advance_yoy", "bcb_selic_target",
+]);
+/**
+ * The rounding the market text prescribes. pct_1dp: the 12-month change at one decimal as published.
+ * bps_away_from_zero_25 (Fed): a change off the 25 bp grid is rounded away from zero to the next 25.
+ * bps_nearest_25_min_25 (BoK, ECB, BCB, BoE): 0 < |d| < 25 counts as 25; otherwise nearest 25, ties away from zero.
+ */
+export const OfficialRounding = z.enum(["pct_1dp", "bps_away_from_zero_25", "bps_nearest_25_min_25"]);
+/** The leg a binary market represents, in the series' decided unit (percent at 1 dp, or basis points of change). */
+export const OfficialBucket = z.object({
+  label: z.string().min(1).max(100),
+  lo: z.number().finite().optional(),
+  hi: z.number().finite().optional(),
+  lo_inclusive: z.boolean(),
+  hi_inclusive: z.boolean(),
+});
+export type OfficialBucket = z.infer<typeof OfficialBucket>;
 
 export const Resolver = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("github_pr_merged"), repo, pr: z.number().int().positive() }),
@@ -33,6 +61,18 @@ export const Resolver = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("evm_log_present"), chain: z.literal("base"), address: hex, topic0: hex, topics: z.array(hex.nullable()).max(3).optional() }),
   z.object({ kind: z.literal("solana_sig_present"), account: z.string().min(32).max(64), discriminator: z.string().optional() }),
   z.object({ kind: z.literal("numeric_threshold"), path: z.string().min(1), op: z.enum([">=", "<=", ">", "<", "=="]), value: z.number(), unit: z.string().optional() }),
+  /**
+   * A binary leg of an official-release ladder: Yes iff the decided value falls in `bucket`, else No (a positive
+   * determination of another bucket, never an absence). period: YYYY-MM (monthly print), YYYY-Qn (quarterly) or
+   * YYYY-MM-DD (the decision day). release_at: the scheduled publication time; nothing is fetched before it.
+   * prior_level: the rate before the meeting, required for rate-change series. Cross-field rules are enforced at
+   * registration (officialRegistrationIssues, src/resolve/official.ts).
+   */
+  z.object({
+    kind: z.literal("official_release"), series: OfficialSeries,
+    period: z.string().regex(/^\d{4}-(?:\d{2}(?:-\d{2})?|Q[1-4])$/, "YYYY-MM | YYYY-Qn | YYYY-MM-DD"),
+    release_at: iso, prior_level: z.number().finite().optional(), bucket: OfficialBucket, rounding: OfficialRounding,
+  }),
 ]);
 export type Resolver = z.infer<typeof Resolver>;
 
