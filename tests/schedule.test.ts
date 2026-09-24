@@ -18,10 +18,10 @@ const h = vi.hoisted(() => {
   });
   return { state, job };
 });
-vi.mock("../src/jobs/tick", () => ({ LIVENESS_CRON: "* * * * *", TICK_SUBREQUESTS: 7, runTick: h.job("liveness", { inserted: true, alerts: [] }) }));
+vi.mock("../src/jobs/tick", () => ({ LIVENESS_CRON: "* * * * *", TICK_SUBREQUESTS: 8, runTick: h.job("liveness", { inserted: true, alerts: [] }), recorderCheckDue: vi.fn(() => true) }));
 vi.mock("../src/bot/post", () => ({ postPending: h.job("channel_post", { errors: [], send_errors: [], messages: 0 }) }));
 vi.mock("../src/jobs/dispatch", () => ({ checkDispatchFailures: h.job("dispatch_check", { ok: true }) }));
-vi.mock("../src/jobs/reconcile", () => ({ runReconcile: h.job("reconcile", { errors: [], unreachable: 0 }) }));
+vi.mock("../src/jobs/reconcile", async (actual) => ({ ...(await actual<typeof import("../src/jobs/reconcile")>()), runReconcile: h.job("reconcile", { errors: [], unreachable: 0 }) }));
 vi.mock("../src/jobs/deposits", async (actual) => ({ ...(await actual<typeof import("../src/jobs/deposits")>()), scanDeposits: h.job("deposit_scan", { scanned: true }) }));
 // The drain's budget arithmetic stays real (the deposit scan's share is derived from it); only the run is stubbed.
 vi.mock("../src/webhooks/deliver", async (actual) => ({ ...(await actual<typeof import("../src/webhooks/deliver")>()), drainWebhooks: h.job("webhook_drain", { claim_error: null, errors: 0 }) }));
@@ -30,6 +30,7 @@ vi.mock("../src/ops/alerts", () => ({ alert: vi.fn(async () => ({ sent: true, de
 
 import { CHANNEL_POST_LIMITS, CHANNEL_POST_SUBREQUESTS, CRONS, DEPOSIT_SCAN_SUBREQUESTS, jobsForCron, jobExceptionKey, runScheduled, type JobName } from "../src/jobs/schedule";
 import { postPending } from "../src/bot/post";
+import { recorderCheckDue, runTick } from "../src/jobs/tick";
 import { alert } from "../src/ops/alerts";
 import { drainWebhooks, drainSubrequests, DRAIN_MAX } from "../src/webhooks/deliver";
 import { scanDeposits, SCAN_RESERVE } from "../src/jobs/deposits";
@@ -83,9 +84,9 @@ describe("per-invocation subrequest budgets (Workers Free: 50)", async () => {
     // The scan's reserve, its cursor read and one window's minimum (safe header, eth_getLogs, cursor write) fit.
     expect(DEPOSIT_SCAN_SUBREQUESTS).toBeGreaterThanOrEqual(SCAN_RESERVE + COST.db + 2 * COST.http + COST.db);
   });
-  it("every-minute invocation: the tick (read, insert, one alertMany) + the channel poster's budget + one exception alert = 50", async () => {
+  it("every-minute invocation: the tick (dispatch read, recorder read, insert, one alertMany) + the channel poster's budget + one exception alert = 50", async () => {
     const { TICK_SUBREQUESTS } = await vi.importActual<typeof import("../src/jobs/tick")>("../src/jobs/tick");
-    expect(TICK_SUBREQUESTS).toBe(2 * COST.db + COST.alert);
+    expect(TICK_SUBREQUESTS).toBe(3 * COST.db + COST.alert);
     expect(TICK_SUBREQUESTS + CHANNEL_POST_SUBREQUESTS + EXCEPTION_RESERVE).toBe(INVOCATION_SUBREQUESTS);
     // the poster's claim + release, the three reads and one message with its alert fit
     expect(CHANNEL_POST_SUBREQUESTS).toBeGreaterThanOrEqual(2 * COST.db + 3 * COST.db + COST.telegram + COST.db + COST.alert);
@@ -136,6 +137,14 @@ describe("runScheduled", () => {
     h.state.throwIn = "deposit_scan";
     await runScheduled(env, "*/5 * * * *");
     expect(alerts()).toEqual([["job_reconcile_exception", 60], ["job_deposit_scan_exception", 60]]);
+  });
+
+  it("the liveness tick reads the recorder when recorderCheckDue says so for the current time", async () => {
+    const before = Date.now();
+    await runScheduled(env, "* * * * *");
+    expect(h.state.ran).toEqual(["liveness", "channel_post"]);
+    expect(vi.mocked(recorderCheckDue).mock.calls.at(-1)![0]).toBeGreaterThanOrEqual(before);
+    expect(vi.mocked(runTick).mock.calls.at(-1)![1]).toEqual({ checkRecorder: true });
   });
 
   it("a cron nobody routes is alerted, not ignored", async () => {

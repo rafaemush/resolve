@@ -1,10 +1,10 @@
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { z } from "zod";
 import type { Env } from "../env";
 import { parseConfig } from "../env";
 import { ok, err, waitUntilOf } from "./envelope";
 import { safeEqual, bearer } from "./admin";
-import { hmacHex } from "../resolve/text";
+import { verifyDispatchSignature } from "./dispatch-auth";
 import { runWatch } from "../ingest/watch";
 import { registerMarket } from "../markets/register";
 import { mergeMeta, META_KEYS } from "../markets/meta";
@@ -12,6 +12,7 @@ import { db, rpc } from "../db/supabase";
 import { makeJevCaller } from "../jev/client";
 import { mintKey } from "./keys";
 import { runReconcile } from "../jobs/reconcile";
+import { runLimitlessRecorder } from "../jobs/limitless-recorder";
 import { scanDeposits } from "../jobs/deposits";
 import { drainWebhooks } from "../webhooks/deliver";
 import { alert } from "../ops/alerts";
@@ -24,17 +25,22 @@ export const internal = new Hono<{ Bindings: Env; Variables: Vars }>();
 
 const isAdmin = (c: { req: { header: (n: string) => string | undefined }; env: Env }) => { const k = bearer(c as never); return !!k && safeEqual(k, c.env.ADMIN_API_KEY); };
 
-/** pg_net -> one watch poll. Signature = HMAC(secret, "<watch_id>|<YYYY-MM-DDTHH:MM>") over the dispatch minute (+-3 min tolerance). Admin bearer also accepted for manual runs. */
+/**
+ * A pg_net dispatch signed for `id` (src/api/dispatch-auth.ts: HMAC over "<id>|<minute>", +-3 min), or the admin bearer
+ * for a manual run. null = authorized; otherwise the 403 to answer.
+ */
+async function dispatchDenied(c: Context<{ Bindings: Env; Variables: Vars }>, id: string): Promise<Response | null> {
+  if (isAdmin(c)) return null;
+  const v = await verifyDispatchSignature(c.env.INTERNAL_HMAC_SECRET, id, c.req.header("x-internal-signature"), c.req.header("x-internal-minute"));
+  if (v.ok) return null;
+  return err(c, "forbidden", v.reason === "invalid" ? "invalid internal signature" : "bad or stale internal signature", 403);
+}
+
+/** pg_net -> one watch poll (select_due_watches, migrations 007/013): signed with the watch id. */
 internal.post("/watch/:id", async (c) => {
   const id = c.req.param("id");
-  if (!isAdmin(c)) {
-    const sig = c.req.header("x-internal-signature") ?? "";
-    const minute = c.req.header("x-internal-minute") ?? "";
-    const t = Date.parse(minute + ":00Z");
-    if (!sig || !Number.isFinite(t) || Math.abs(Date.now() - t) > 3 * 60_000) return err(c, "forbidden", "bad or stale internal signature", 403);
-    const expected = await hmacHex(c.env.INTERNAL_HMAC_SECRET, `${id}|${minute}`);
-    if (!safeEqual(sig, expected)) return err(c, "forbidden", "invalid internal signature", 403);
-  }
+  const denied = await dispatchDenied(c, id);
+  if (denied) return denied;
   const cfg = parseConfig(c.env);
   const s = await runWatch(c.env, cfg, id, { waitUntil: waitUntilOf(c) });
   // pg_net stores this status in net._http_response and dispatch_failures() (migration 013) counts >= 400 as a poll that
@@ -42,6 +48,22 @@ internal.post("/watch/:id", async (c) => {
   // transition and streak logic), is a delivered dispatch; only a run that could not record itself (loop_runs row or
   // watch bookkeeping) answers 500.
   return ok(c, s, s.recorded === false ? 500 : 200);
+});
+
+/** The id dispatch_internal('limitless_record') signs with (migration 018): a watch signature never opens this route. */
+export const LIMITLESS_RECORD_ID = "limitless_record";
+
+/**
+ * pg_net -> one Limitless recorder run (dispatch_internal, every 10 min; src/jobs/limitless-recorder.ts). Like a watch
+ * poll, a run that recorded its loop_runs row answers 200 whatever its outcome (failures are alerted by the recorder's
+ * own streak); only a run that could not record itself answers 500, which dispatch_failures() (migration 013) counts.
+ * The run's alert goes out under waitUntil, after the answer: pg_net hangs up at 30 s.
+ */
+internal.post("/limitless/record", async (c) => {
+  const denied = await dispatchDenied(c, LIMITLESS_RECORD_ID);
+  if (denied) return denied;
+  const r = await runLimitlessRecorder(c.env, { waitUntil: waitUntilOf(c) });
+  return ok(c, r, r.recorded ? 200 : 500);
 });
 
 /**

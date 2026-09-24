@@ -1,10 +1,11 @@
 /**
  * Cron routing (plan §16.4 P0 steps 7 and 10). Workers Free runs each cron trigger as its own invocation with its own
  * 50 subrequests, so the jobs are grouped by cost and ordered by what running out of subrequests would break:
- *   every minute   liveness: a worker_liveness row and one read of the newest dispatch row (TICK_SUBREQUESTS = 7 with
- *                  its alert), then the channel poster on what is left (CHANNEL_POST_SUBREQUESTS = 38): pending commits of
- *                  at most 4 events (the legs of an event as one message) and pending reveals of at most 4 commit
- *                  messages, under the channel lease and at most 15 messages a minute (src/bot/post.ts, src/bot/channel.ts)
+ *   every minute   liveness: a worker_liveness row and one read of the newest dispatch row, at :05, :15, ... one more
+ *                  read, of the newest Limitless recorder run (TICK_SUBREQUESTS = 8 with its alert), then the channel
+ *                  poster on what is left (CHANNEL_POST_SUBREQUESTS = 37): pending commits of at most 4 events (the legs
+ *                  of an event as one message) and pending reveals of at most 4 commit messages, under the channel lease
+ *                  and at most 15 messages a minute (src/bot/post.ts, src/bot/channel.ts)
  *   every 5 min    webhook drain first (cap 5 on a fixed budget of 2 + 5 x 4 + 5 = 27: a claimed row it could not finish
  *                  would sit in 'delivering' until the stale sweep), then the USDC deposit scan on what is left
  *                  (DEPOSIT_SCAN_SUBREQUESTS = 18; safe to cut off: credits are INSERT-first and the cursor moves only
@@ -15,7 +16,7 @@
  */
 import type { Env } from "../env";
 import { parseConfig } from "../env";
-import { runTick, LIVENESS_CRON, TICK_SUBREQUESTS } from "./tick";
+import { runTick, recorderCheckDue, LIVENESS_CRON, TICK_SUBREQUESTS } from "./tick";
 import { checkDispatchFailures } from "./dispatch";
 import { runReconcile } from "./reconcile";
 import { scanDeposits } from "./deposits";
@@ -53,7 +54,7 @@ export interface ScheduledReport { cron: string; jobs: JobReport[] }
 /** One job. `ok` is false for a failure the job already alerted itself (a failed insert, a claim error, a scan that did not scan). */
 async function execute(env: Env, job: JobName): Promise<{ ok: boolean; result: unknown }> {
   switch (job) {
-    case "liveness": { const r = await runTick(env); return { ok: r.inserted && r.alerts.length === 0, result: r }; }
+    case "liveness": { const r = await runTick(env, { checkRecorder: recorderCheckDue(Date.now()) }); return { ok: r.inserted && r.alerts.length === 0, result: r }; }
     case "channel_post": { const r = await postPending(env, new Budget(CHANNEL_POST_SUBREQUESTS), CHANNEL_POST_LIMITS); return { ok: r.errors.length === 0 && r.send_errors.length === 0, result: r }; }
     case "webhook_drain": { const r = await drainWebhooks(env, DRAIN_MAX); return { ok: r.claim_error === null && r.errors === 0, result: r }; }
     case "deposit_scan": { const r = await scanDeposits(env, parseConfig(env), new Budget(DEPOSIT_SCAN_SUBREQUESTS)); return { ok: r.scanned, result: r }; }

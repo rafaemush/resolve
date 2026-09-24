@@ -15,6 +15,8 @@
  *      agreement), one pending reveal row per commit, watches off, the terminal status. No official outcome 21 days
  *      after the deadline closes the market as closed_unresolved through the same path. A settled market's followers
  *      get shadow.revealed (queued inside the settle's reservation, src/shadow/events.ts);
+ *      A due Limitless market's official_at is the earliest sighting of its outcome: this run's, the stored first one,
+ *      or the Limitless recorder's (one batched read per run, src/jobs/limitless-recorder.ts);
  *   5. the queued shadow.revealed rows get their first delivery attempt with whatever budget is left (the 5-minute
  *      drain delivers the rest).
  * Official outcomes map to OPTION_A/OPTION_B only by normalized label equality with the registered option text. The
@@ -297,6 +299,19 @@ export function withFirstSeen(state: OfficialState, firstSeen: string | null | u
   return { ...state, official: { ...state.official, at: firstSeen } };
 }
 
+/**
+ * Pure. The Limitless recorder checks every expired manual market on its own 10-minute dispatch and often sees the
+ * outcome before reconcile reaches the market; its first sighting (limitless_markets.resolved_seen_at, migration 018)
+ * is the same kind of time (limitless_api_poll, an upper bound on the resolution) and wins when it is earlier than this
+ * run's or the stored first sighting. A platform timestamp is never replaced.
+ */
+export function withRecorderSeen(state: OfficialState, recorderSeen: string | null | undefined): OfficialState {
+  if (state.kind !== "resolved" || !recorderSeen || state.official.at_source !== "limitless_api_poll" || !state.official.at) return state;
+  const seen = Date.parse(recorderSeen);
+  if (!Number.isFinite(seen) || seen >= Date.parse(state.official.at)) return state;
+  return { ...state, official: { ...state.official, at: new Date(seen).toISOString() } };
+}
+
 export interface ReconcileSummary {
   checked: number; resolved: number; closed_out: number; pending: number; unmappable: number; unreachable: number; disagreements: number;
   awaiting_watch: number; settle_retried: number; rescheduled: number;
@@ -389,12 +404,16 @@ async function discover(env: Env, client: Db, budget: Budget, nowMs: number, out
     return;
   }
   const deferrals: Deferral[] = [];
-  for (const raw of markets ?? []) {
-    const m = raw as unknown as MarketRow;
+  const due = (markets ?? []) as unknown as MarketRow[];
+  const sightings = await recorderSightings(env, client, budget, due, out);
+  for (const m of due) {
+    // Could not read the recorder: settling now could stamp a later official_at than the first sighting, so the
+    // Limitless market waits for the next run (a failed read is alerted and in out.errors, so the run records a failure).
+    if (m.platform === "limitless" && sightings === null) { deferrals.push(deferral(m, "retry", nowMs)); continue; }
     // one alert per market (a label it cannot map, or a write that failed) is reserved with its check
     if (!budget.take(COST.http + COST.alert)) { out.stopped_by_budget = true; break; }
     out.checked++;
-    const step = await checkMarket(env, client, budget, m, nowMs, out, queued);
+    const step = await checkMarket(env, client, budget, m, nowMs, out, queued, sightings?.get(limitlessSlug(m)));
     if (!step.alerted) budget.release(COST.alert);
     if (step.defer) deferrals.push(step.defer);
     if (step.stop) break;
@@ -410,8 +429,33 @@ async function discover(env: Env, client: Db, budget: Budget, nowMs: number, out
   out.rescheduled = typeof n === "number" ? n : 0;
 }
 
-async function checkMarket(env: Env, client: Db, budget: Budget, m: MarketRow, nowMs: number, out: ReconcileSummary, queued: Row[]): Promise<Step> {
-  const state = withFirstSeen(await officialFor(env, m, new Date(nowMs).toISOString()), m.official_first_seen_at);
+/**
+ * The recorder's first sightings (slug -> resolved_seen_at) for the due Limitless markets, in one read. An empty map when
+ * none is due (no read); null when the read failed or the budget could not cover it: could not look, never "none seen".
+ * A failed read holds every due Limitless market, run after run, so it is alerted from an alert reserved with the read
+ * (1 + 5 subrequests; the alert is given back when the read succeeds): a grant change or a renamed column would
+ * otherwise stop every Limitless settlement with no one told.
+ */
+async function recorderSightings(env: Env, client: Db, budget: Budget, due: MarketRow[], out: ReconcileSummary): Promise<Map<string, string> | null> {
+  const limitless = due.filter((m) => m.platform === "limitless");
+  const slugs = [...new Set(limitless.map(limitlessSlug))];
+  if (!slugs.length) return new Map();
+  if (!budget.take(COST.db + COST.alert)) { out.stopped_by_budget = true; return null; }
+  const { data, error } = await client.from("limitless_markets").select("slug, resolved_seen_at").in("slug", slugs);
+  if (error) {
+    const msg = redact(error.message);
+    out.errors.push(`recorder sightings: ${msg}`);
+    await alert(env, "reconcile_recorder_read", `reconcile could not read limitless_markets (the recorder's first sightings): ${msg}. ${limitless.length} due Limitless market(s) are held, not settled, until it can; every run retries.`, { dedupMinutes: 360 });
+    return null;
+  }
+  budget.release(COST.alert);
+  const seen = new Map<string, string>();
+  for (const r of (data ?? []) as Array<{ slug: string; resolved_seen_at: string | null }>) if (r.resolved_seen_at) seen.set(r.slug, r.resolved_seen_at);
+  return seen;
+}
+
+async function checkMarket(env: Env, client: Db, budget: Budget, m: MarketRow, nowMs: number, out: ReconcileSummary, queued: Row[], recorderSeen?: string): Promise<Step> {
+  const state = withRecorderSeen(withFirstSeen(await officialFor(env, m, new Date(nowMs).toISOString()), m.official_first_seen_at), recorderSeen);
   switch (state.kind) {
     case "unreachable":
       out.unreachable++; out.errors.push(`${marketRef(m)}: ${state.detail}`);
