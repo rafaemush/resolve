@@ -2,7 +2,8 @@
  * npx tsx scripts/health-check.ts <base url> <git sha>
  * Run by scripts/deploy.sh after wrangler deploy: /health must report <git sha> (scripts/lib/health.ts). Exit 0 when it
  * does, or when this network cannot reach the Worker (a warning: the deploy went through); exit 1 when the Worker
- * answers with another version, a non-200 or another git_sha; exit 2 on bad arguments. Read-only: one GET per attempt.
+ * answers with another version, a non-200 or another git_sha, or Cloudflare answers 5xx for it on every attempt (it
+ * threw or hit a limit); exit 2 on bad arguments. Read-only: one GET per attempt.
  */
 import { checkDeployedSha, healthReport } from "./lib/health";
 

@@ -27,7 +27,7 @@ A tenant can follow a public shadow market (`POST /v1/markets/{id}/follow`) and 
 
 ## Deploying
 
-`pnpm run deploy` (plain `pnpm deploy` is pnpm's own workspace command) runs `scripts/deploy.sh`: it refuses a working tree with uncommitted changes, runs typecheck, the tests, the frozen-suite check, eval replay (a missing Jev fixture is red), the strict mutation harness, the OpenAPI check and a Worker bundle build, deploys only when every gate is green, and then requires `/health` to report the deployed commit as `git_sha`. `pnpm run deploy:dry` runs the same gates without deploying; CI runs them on every push and pull request.
+`pnpm run deploy` (plain `pnpm deploy` is pnpm's own workspace command) runs `scripts/deploy.sh`: it refuses a working tree with uncommitted changes and a commit that is not on `origin/main` yet (push first), runs typecheck, the tests, the frozen-suite check, eval replay (a missing Jev fixture is red), the strict mutation harness, the OpenAPI check and a Worker bundle build, deploys only when every gate is green, and then requires `/health` to report the deployed commit as `git_sha` (a Cloudflare error page for the Worker fails it; a network that cannot reach `workers.dev` only warns). `pnpm run deploy:dry` runs the same gates without deploying; CI runs them on every push and pull request.
 
 ## Status
 
