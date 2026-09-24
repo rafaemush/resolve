@@ -1,6 +1,6 @@
 /**
  * In-memory stand-in for the PostgREST query shapes the commit/reconcile code uses: select (eq on a column or an
- * embedded "a.b" path, in, lte, is null, order, limit, single, maybeSingle, head count), insert (+ select().single()),
+ * embedded "a.b" path, in, lte, gte, is null, order, limit, single, maybeSingle, head count), insert (+ select().single()),
  * upsert with onConflict/ignoreDuplicates, update, and rpc() through test-supplied stand-ins. Unique columns and partial
  * unique indexes (e.g. uq_reconciliations_final) answer 23505 like Postgres; an ON CONFLICT target covers only its own
  * column, exactly as in Postgres. Every executed query or rpc is one entry in `calls`, so a test can count
@@ -51,6 +51,7 @@ class Query implements PromiseLike<{ data: any; error: any; count?: number | nul
   eq(col: string, v: unknown) { this.filters.push((r) => path(r, col) === v); return this; }
   in(col: string, vs: unknown[]) { this.filters.push((r) => vs.includes(path(r, col))); return this; }
   lte(col: string, v: string) { this.filters.push((r) => String(path(r, col)) <= v); return this; }
+  gte(col: string, v: string) { this.filters.push((r) => String(path(r, col)) >= v); return this; }
   is(col: string, v: null) { this.filters.push((r) => (path(r, col) ?? null) === v); return this; }
   order(col: string, opts?: { ascending?: boolean }) { this.orderBy = { col, asc: opts?.ascending !== false }; return this; }
   limit(n: number) { this.max = n; return this; }

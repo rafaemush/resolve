@@ -16,7 +16,14 @@ import { commitVerdict } from "../bot/commit";
 import { enqueueEvent } from "../webhooks/deliver";
 import { alert } from "../ops/alerts";
 
-export interface WatchRunSummary { watch_id: string; outcome: "success" | "no_op" | "failure" | "skipped"; rows_written: number; detail: string; verdict?: string; resolution_id?: string }
+export interface WatchRunSummary {
+  watch_id: string; outcome: "success" | "no_op" | "failure" | "skipped"; rows_written: number; detail: string; verdict?: string; resolution_id?: string;
+  /**
+   * false when the run's loop_runs row or its watch bookkeeping (lease, streak, hashes) could not be written: the
+   * streak alert cannot fire then, so the dispatch answers 500 and dispatch_failures() (migration 013) counts it.
+   */
+  recorded?: boolean;
+}
 
 // ---- pure decisions (unit-tested in tests/watch-decision.test.ts) -------------------------------------------
 
@@ -122,12 +129,19 @@ export async function runWatch(env: Env, cfg: Config, watchId: string): Promise<
   const started = Date.now();
   const client = db(env);
   const summary: WatchRunSummary = { watch_id: watchId, outcome: "skipped", rows_written: 0, detail: "" };
+  let unsaved = false;
   const finish = async (s: WatchRunSummary, meta: Record<string, unknown> = {}) => {
-    await client.from("loop_runs").insert({ loop_name: "watch", outcome: s.outcome, rows_written: s.rows_written, duration_ms: Date.now() - started, error: s.outcome === "failure" ? s.detail.slice(0, 500) : null, meta: { watch_id: watchId, ...meta, verdict: s.verdict ?? null, detail: s.detail.slice(0, 200) } });
+    const { error: le } = await client.from("loop_runs").insert({ loop_name: "watch", outcome: s.outcome, rows_written: s.rows_written, duration_ms: Date.now() - started, error: s.outcome === "failure" ? s.detail.slice(0, 500) : null, meta: { watch_id: watchId, ...meta, verdict: s.verdict ?? null, detail: s.detail.slice(0, 200) } });
+    s.recorded = !le && !unsaved;
     return s;
   };
   const { data: w, error } = await client.from("watches").select("*, markets(*)").eq("id", watchId).single();
-  if (error || !w) { summary.outcome = "failure"; summary.detail = `watch load: ${error?.message ?? "not found"}`; return finish(summary); }
+  if (error || !w) {
+    summary.outcome = "failure"; summary.detail = `watch load: ${error?.message ?? "not found"}`;
+    // No watch row means no streak bookkeeping and no streak alert: this is the only signal.
+    await safeAlert(env, "watch_load_failed", `A dispatched watch ${watchId} could not be loaded, so it was not polled: ${summary.detail}`, 60, { watch_id: watchId });
+    return finish(summary);
+  }
   const watch = w as unknown as WatchRow;
   const market = watch.markets as MarketRow;
   if (!watch.active || !market || market.status !== "open") { summary.detail = `inactive watch or market status ${market?.status}`; await client.from("watches").update({ lease_until: null, last_polled_at: new Date().toISOString() }).eq("id", watchId); return finish(summary); }
@@ -159,6 +173,7 @@ export async function runWatch(env: Env, cfg: Config, watchId: string): Promise<
 
   const save = async (): Promise<string | null> => {
     const { error: ue } = await client.from("watches").update(update).eq("id", watchId);
+    if (ue) unsaved = true;
     return ue ? `watch update: ${ue.message}` : null;
   };
   /**

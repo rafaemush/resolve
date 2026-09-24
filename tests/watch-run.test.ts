@@ -13,7 +13,7 @@ const h = vi.hoisted(() => {
   const LOOKED = { resolution_status: "UNRESOLVED", winning_outcome: "NONE", error_code: null, error_reason: null } as Row;
   const state = {
     watch: {} as Row, evidence: [] as Row[], resolutions: [] as Row[], loopRuns: [] as Row[],
-    failEvidenceInsert: false, seq: 0, verdict: LOOKED,
+    failEvidenceInsert: false, failLoopRuns: false, failWatchUpdate: false, seq: 0, verdict: LOOKED,
   };
   // PostgREST or=(a.is.null,a.neq.X) with SQL semantics: neq never matches NULL.
   const orTerm = (r: Row, term: string) => {
@@ -43,9 +43,15 @@ const h = vi.hoisted(() => {
     then<A, B>(ok?: ((v: { data: unknown; error: unknown; count?: number }) => A | PromiseLike<A>) | null, no?: ((e: unknown) => B | PromiseLike<B>) | null) { return Promise.resolve(this.exec()).then(ok, no); }
     exec(): { data: unknown; error: unknown; count?: number } {
       const t = this.table;
-      if (t === "watches" && this.action === "select") return { data: structuredClone(state.watch), error: null };
-      if (t === "watches" && this.action === "update") { Object.assign(state.watch, structuredClone(this.payload)); return { data: null, error: null }; }
-      if (t === "loop_runs") { state.loopRuns.push(this.payload!); return { data: null, error: null }; }
+      if (t === "watches" && this.action === "select") return { data: structuredClone(state.watch ?? null), error: null };
+      if (t === "watches" && this.action === "update") {
+        if (state.failWatchUpdate) return { data: null, error: { code: "23514", message: "new row violates check constraint" } };
+        Object.assign(state.watch, structuredClone(this.payload)); return { data: null, error: null };
+      }
+      if (t === "loop_runs") {
+        if (state.failLoopRuns) return { data: null, error: { code: "57014", message: "canceling statement due to statement timeout" } };
+        state.loopRuns.push(this.payload!); return { data: null, error: null };
+      }
       if (t === "evidence" && this.action === "insert") {
         if (state.failEvidenceInsert) return { data: null, error: { code: "57014", message: "canceling statement due to statement timeout" } };
         const p = this.payload!;
@@ -130,7 +136,7 @@ const cfg = { botUa: "ResolveBot/test" } as Config;
 const alertKeys = () => vi.mocked(alert).mock.calls.map((c) => [c[1], c[3]?.dedupMinutes]);
 
 beforeEach(() => {
-  Object.assign(h.state, { evidence: [], resolutions: [], loopRuns: [], failEvidenceInsert: false, seq: 0, verdict: h.LOOKED });
+  Object.assign(h.state, { evidence: [], resolutions: [], loopRuns: [], failEvidenceInsert: false, failLoopRuns: false, failWatchUpdate: false, seq: 0, verdict: h.LOOKED });
   put = vi.fn(async () => ({}));
   vi.mocked(resolveWithRuntime).mockClear();
   vi.mocked(alert).mockClear();
@@ -328,5 +334,33 @@ describe("a verdict that could not look is never consumed (Jev gated, over budge
     expect(h.state.resolutions.at(-1)).toMatchObject({ id: r.resolution_id, credits_refunded: 5 });
     expect(enqueueEvent).not.toHaveBeenCalled();
     expect(alert).not.toHaveBeenCalled();
+  });
+});
+
+describe("dispatch outcome (migration 013: dispatch_failures() counts pg_net answers >= 400)", () => {
+  it("a run that recorded its outcome, failure included, is a delivered dispatch; one that could not record itself is not", async () => {
+    serve(200, JSON.stringify(pr(1)));
+    expect((await runWatch(env(), cfg, WATCH_ID)).recorded).toBe(true);
+    serve(403, RATE_LIMIT_403);
+    const failed = await runWatch(env(), cfg, WATCH_ID);
+    expect([failed.outcome, failed.recorded]).toEqual(["failure", true]);
+    h.state.failLoopRuns = true;
+    serve(200, JSON.stringify(pr(2)));
+    expect((await runWatch(env(), cfg, WATCH_ID)).recorded).toBe(false);
+  });
+
+  it("a failing watch whose streak cannot be saved is not a delivered dispatch either", async () => {
+    h.state.failWatchUpdate = true;
+    serve(403, RATE_LIMIT_403);
+    const r = await runWatch(env(), cfg, WATCH_ID);
+    expect([r.outcome, r.recorded]).toEqual(["failure", false]);
+    expect(h.state.loopRuns).toHaveLength(1);
+  });
+
+  it("a watch that cannot be loaded alerts: there is no streak to carry it", async () => {
+    h.state.watch = null as unknown as Row;
+    const r = await runWatch(env(), cfg, WATCH_ID);
+    expect([r.outcome, r.recorded]).toEqual(["failure", true]);
+    expect(alertKeys()).toEqual([["watch_load_failed", 60]]);
   });
 });

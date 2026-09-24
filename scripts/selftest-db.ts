@@ -1,7 +1,7 @@
 /**
- * Exercises the billing RPCs, then the commit-reveal trigger and the public view (migration 012), each inside a DO
- * block that always raises at the end, so the whole thing rolls back and nothing persists. The raised message
- * carries the assertion results. Then a real concurrency probe: 10 parallel begin_resolution calls with one
+ * Exercises the billing RPCs, the commit-reveal trigger and the public view (migration 012), and the dispatch
+ * observability of migration 013, each inside a DO block that always raises at the end, so the whole thing rolls back
+ * and nothing persists. The raised message carries the assertion results. Then a real concurrency probe: 10 parallel begin_resolution calls with one
  * Idempotency-Key against a __selftest__ tenant (soft-deleted afterwards; ledger rows are append-only by design).
  * Point it at staging: the concurrency probe persists rows.
  */
@@ -178,6 +178,36 @@ begin
   raise exception 'SELFTEST_P2A %', out::text;
 end $$;`;
 
+/**
+ * Migration 013: a select_due_watches() run that throws leaves a 'failure' row with its SQLSTATE (forced here with an
+ * unparsable watch_batch_max, rolled back with everything else), dispatch_failures() answers a count and refuses a bad
+ * window, and anon can execute neither.
+ */
+const OPS_BLOCK = `
+do $$
+declare out jsonb := '{}'::jsonb; n integer; lr record;
+begin
+  update app_config set value = 'not-a-number' where key = 'watch_batch_max';
+  if not found then insert into app_config (key, value) values ('watch_batch_max', 'not-a-number'); end if;
+  n := select_due_watches();
+  select outcome, error, meta into lr from loop_runs where loop_name = 'select_due_watches' order by id desc limit 1;
+  out := out || jsonb_build_object('throw_returns', n, 'throw_outcome', lr.outcome, 'throw_sqlstate', lr.meta->>'sqlstate', 'throw_has_error', lr.error is not null);
+  n := dispatch_failures(10);
+  out := out || jsonb_build_object('dispatch_failures_is_count', n >= 0);
+  begin perform dispatch_failures(0); out := out || '{"bad_window_refused": false}';
+  exception when others then out := out || '{"bad_window_refused": true}'; end;
+  begin
+    set local role anon;
+    begin perform dispatch_failures(10); out := out || '{"anon_dispatch_failures_denied": false}';
+    exception when insufficient_privilege then out := out || '{"anon_dispatch_failures_denied": true}'; end;
+    begin perform select_due_watches(); out := out || '{"anon_select_due_watches_denied": false}';
+    exception when insufficient_privilege then out := out || '{"anon_select_due_watches_denied": true}'; end;
+    reset role;
+  exception when others then out := out || jsonb_build_object('anon_dispatch_failures_denied', 'set role failed: ' || sqlerrm);
+  end;
+  raise exception 'SELFTEST_OPS %', out::text;
+end $$;`;
+
 async function main() {
   const block = `
 do $$
@@ -241,6 +271,14 @@ end $$;`;
     anon_settle_denied: true, anon_defer_denied: true,
   });
   console.log("rolled back: nothing persisted from the P2a block");
+
+  const ops = await rollbackBlock("SELFTEST_OPS", OPS_BLOCK);
+  if (!ops) process.exit(1);
+  bad += check(ops, {
+    throw_returns: 0, throw_outcome: "failure", throw_sqlstate: "22P02", throw_has_error: true,
+    dispatch_failures_is_count: true, bad_window_refused: true, anon_dispatch_failures_denied: true, anon_select_due_watches_denied: true,
+  });
+  console.log("rolled back: nothing persisted from the ops block");
 
   // concurrency probe (persists rows on a __selftest__ tenant; tenant soft-deleted after)
   const [t] = await sql<{ id: string }>("insert into tenants (display_name, credits_balance) values ('__selftest_concurrency__', 100) returning id");

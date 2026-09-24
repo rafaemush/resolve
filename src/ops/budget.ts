@@ -13,6 +13,13 @@ export const COST = {
   alert: 5,
 } as const;
 
+/** Workers Free: subrequests per invocation. Each cron trigger is its own invocation (src/jobs/schedule.ts). */
+export const INVOCATION_SUBREQUESTS = 50;
+/** Every scheduled invocation keeps one alert back for a job that throws (src/jobs/schedule.ts). */
+export const EXCEPTION_RESERVE = COST.alert;
+/** The 10-minute pg_net dispatch check: one RPC and at most one alert (src/jobs/dispatch.ts). */
+export const DISPATCH_CHECK_SUBREQUESTS = COST.db + COST.alert;
+
 export class Budget {
   private spent = 0;
   constructor(readonly limit: number) {}

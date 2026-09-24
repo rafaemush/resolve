@@ -24,10 +24,13 @@ import { buildReveal, committedOf, marketRef, postPendingReveals, retryUnposted,
 import type { MarketRow } from "../ingest/types";
 import { alert } from "../ops/alerts";
 import { redact } from "../ops/redact";
-import { Budget, COST } from "../ops/budget";
+import { Budget, COST, DISPATCH_CHECK_SUBREQUESTS, EXCEPTION_RESERVE, INVOCATION_SUBREQUESTS } from "../ops/budget";
 
-/** Of Workers Free's 50 subrequests per invocation: the cron tick's loop_runs insert runs first in the same invocation. */
-export const RECONCILE_SUBREQUESTS = 45;
+/**
+ * Of Workers Free's 50 subrequests per invocation: the 10-minute invocation runs the pg_net dispatch check first and
+ * keeps one alert back for a job that throws (src/jobs/schedule.ts), so reconcile gets 50 - 6 - 5 = 39.
+ */
+export const RECONCILE_SUBREQUESTS = INVOCATION_SUBREQUESTS - DISPATCH_CHECK_SUBREQUESTS - EXCEPTION_RESERVE;
 export const MARKETS_PER_RUN = 25;
 export const MAX_REVEALS_PER_RUN = 5;
 export const MAX_RETRIES_PER_RUN = 5;

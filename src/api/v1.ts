@@ -14,6 +14,8 @@ import { registerMarket } from "../markets/register";
 import { runWatch } from "../ingest/watch";
 import { sha256Hex } from "../resolve/text";
 import type { MarketRow } from "../ingest/types";
+import { alert } from "../ops/alerts";
+import { redact } from "../ops/redact";
 
 type Vars = { requestId: string; schemaVersion: string; auth: AuthContext };
 export const v1 = new Hono<{ Bindings: Env; Variables: Vars }>();
@@ -36,16 +38,19 @@ v1.use("*", async (c, next) => {
   const res = c.res;
   const auth = c.get("auth");
   const clone = res.clone();
+  // The request log is the per-request evidence trail: a row that could not be written is an alert, not a log line.
+  const logFailed = (why: unknown) => alert(c.env, "api_request_log_failed", `api_request_log insert failed for ${c.req.method} ${c.req.path} (request ${c.get("requestId")}): ${redact(String(why)).slice(0, 200)}`, { dedupMinutes: 60 });
   c.executionCtx.waitUntil((async () => {
     const body = await clone.text();
     const hash = await sha256Hex(body);
-    await db(c.env).from("api_request_log").insert({
+    const { error } = await db(c.env).from("api_request_log").insert({
       request_id: c.get("requestId"), api_key_id: auth?.keyId ?? null, tenant_id: auth?.tenantId ?? null, auth_source: "database",
       route: c.req.routePath || c.req.path, method: c.req.method, status: res.status, duration_ms: Date.now() - t0,
       redacted_params: { path: c.req.path, query_keys: [...new URL(c.req.url).searchParams.keys()], content_length: c.req.header("content-length") ?? null },
       response_sha256: hash, client_colo: ((c.req.raw as Request & { cf?: { colo?: string } }).cf?.colo) ?? null, user_agent: (c.req.header("user-agent") ?? "").slice(0, 200),
     });
-  })().catch((e) => console.error("api_request_log failed", String(e))));
+    if (error) await logFailed(error.message);
+  })().catch(logFailed));
 });
 
 const ResolveBody = z.object({
@@ -159,7 +164,11 @@ v1.post("/resolve", async (c) => {
   const rt = await resolveWithRuntime(c.env, cfg, { marketId: market.id, market, evidence, evidenceId, mode: "tenant", tenantId: auth.tenantId, apiKeyId: auth.keyId, requestId: br.request_id, creditsCharged: br.charged });
   let refunded = 0;
   if (rt.result.verdict.error_code === "UPSTREAM_UNAVAILABLE" && br.charged > 0) {
-    refunded = await rpc<number>(client, "refund_credits", { p_request_id: br.request_id }).catch(() => 0);
+    refunded = await rpc<number>(client, "refund_credits", { p_request_id: br.request_id }).catch(async (e) => {
+      // Money path: the tenant was charged for a verdict that could not look. Refund by hand until P3's refund_pending job.
+      await alert(c.env, `refund_failed_${br.request_id}`, `refund_credits failed for request ${br.request_id} (tenant ${auth.tenantId}, ${br.charged} credit(s) charged for an UPSTREAM_UNAVAILABLE verdict): ${redact(String(e)).slice(0, 200)}. Refund it by hand.`, { dedupMinutes: 1440, meta: { request_id: br.request_id, tenant_id: auth.tenantId, credits: br.charged } });
+      return 0;
+    });
   }
   return verdictResponse(c, auth, rt.result.verdict, { request_id: br.request_id, credits_charged: br.charged - refunded, credits_refunded: refunded, balance: br.balance + refunded, route: plan.route });
 });

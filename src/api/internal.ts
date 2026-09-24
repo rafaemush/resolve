@@ -32,7 +32,11 @@ internal.post("/watch/:id", async (c) => {
   }
   const cfg = parseConfig(c.env);
   const s = await runWatch(c.env, cfg, id);
-  return ok(c, s, s.outcome === "failure" ? 500 : 200);
+  // pg_net stores this status in net._http_response and dispatch_failures() (migration 013) counts >= 400 as a poll that
+  // did not happen. A run that recorded its outcome, 'failure' included (a source error, alerted by the runner's own
+  // transition and streak logic), is a delivered dispatch; only a run that could not record itself (loop_runs row or
+  // watch bookkeeping) answers 500.
+  return ok(c, s, s.recorded === false ? 500 : 200);
 });
 
 internal.post("/markets", async (c) => {

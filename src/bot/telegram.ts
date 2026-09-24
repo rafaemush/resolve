@@ -27,7 +27,9 @@ export async function sendMessage(env: Env, text: string, opts: { replyTo?: numb
   return { ok: false, message_id: null, date: null, error: "retries exhausted" };
 }
 
-export async function alertOperator(env: Env, text: string): Promise<void> {
-  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_OPERATOR_CHAT_ID) { console.error("ALERT (no telegram):", text); return; }
-  await sendMessage(env, text, { chatId: env.TELEGRAM_OPERATOR_CHAT_ID });
+/** Operator DM. Returns whether Telegram took it, so a lost DM is logged by the caller instead of counted as sent. */
+export async function alertOperator(env: Env, text: string): Promise<{ ok: boolean; error?: string }> {
+  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_OPERATOR_CHAT_ID) { console.error("ALERT (no telegram):", text); return { ok: false, error: "TELEGRAM_BOT_TOKEN or TELEGRAM_OPERATOR_CHAT_ID unset" }; }
+  const r = await sendMessage(env, text, { chatId: env.TELEGRAM_OPERATOR_CHAT_ID });
+  return r.ok ? { ok: true } : { ok: false, error: r.error };
 }

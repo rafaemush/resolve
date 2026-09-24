@@ -2,15 +2,12 @@ import { Hono } from "hono";
 import { parseConfig, ConfigError, type Env } from "./env";
 import { db } from "./db/supabase";
 import { ok, err, requestId } from "./api/envelope";
-import { runTick } from "./jobs/tick";
+import { runScheduled, jobsForCron, CRONS } from "./jobs/schedule";
 import { safeEqual, bearer } from "./api/admin";
 import { internal } from "./api/internal";
 import { v1 } from "./api/v1";
 import { webhooks } from "./api/webhooks";
 import { pub } from "./api/public";
-import { drainWebhooks } from "./webhooks/deliver";
-import { scanDeposits } from "./jobs/deposits";
-import { runReconcile } from "./jobs/reconcile";
 import openapi from "./generated/openapi.json";
 
 type Vars = { requestId: string; schemaVersion: string };
@@ -45,12 +42,14 @@ app.get("/health", async (c) => {
   });
 });
 
-/** Admin: run one cron tick synchronously and return the insert outcome. */
+/** Admin: run exactly what one cron trigger runs (default: the every-minute tick), synchronously, with each job's report. */
 app.post("/internal/tick", async (c) => {
   const key = bearer(c);
   if (!key || !safeEqual(key, c.env.ADMIN_API_KEY)) return err(c, "forbidden", "admin key required", 403);
-  const r = await runTick(c.env, c.req.query("cron") ?? "* * * * *");
-  return ok(c, r, r.inserted ? 200 : 500);
+  const cron = c.req.query("cron") ?? CRONS.liveness;
+  if (!jobsForCron(cron).length) return err(c, "validation_error", `cron must be one of: ${Object.values(CRONS).join(" | ")}`, 400);
+  const r = await runScheduled(c.env, cron);
+  return ok(c, r, r.jobs.every((j) => j.ok) ? 200 : 500);
 });
 
 app.get("/openapi.json", (c) => c.json(openapi));
@@ -63,22 +62,8 @@ app.notFound((c) => err(c, "not_found", `no route ${c.req.method} ${c.req.path}`
 
 export default {
   fetch: app.fetch,
+  /** Routing, budgets and exception alerts live in src/jobs/schedule.ts. */
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
-    ctx.waitUntil((async () => {
-      const r = await runTick(env, event.cron);
-      if (r.error) console.error(JSON.stringify({ level: "error", job: "tick", cron: event.cron, error: r.error }));
-      if (event.cron === "*/10 * * * *") {
-        const rc = await runReconcile(env).catch((e) => ({ error: String(e) }));
-        console.log(JSON.stringify({ job: "reconcile", ...rc }));
-        return;
-      }
-      const wh = await drainWebhooks(env, 10).catch((e) => ({ error: String(e) }));
-      if ((wh as { claimed?: number }).claimed) console.log(JSON.stringify({ job: "webhooks", ...wh }));
-      if (new Date(event.scheduledTime).getUTCMinutes() % 5 === 0) {
-        const cfg = parseConfig(env);
-        const dep = await scanDeposits(env, cfg);
-        if (dep.found || !dep.scanned) console.log(JSON.stringify({ job: "deposits", ...dep }));
-      }
-    })());
+    ctx.waitUntil(runScheduled(env, event.cron));
   },
 };

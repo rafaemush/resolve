@@ -12,11 +12,13 @@ enabled = true
 [placement]
 mode = "smart"
 
-# Two cron triggers (Free allows 5 per account):
-#   every minute  -> liveness row + webhook delivery drain
-#   every 10 min  -> reconcile shadow verdicts against official outcomes
+# Three cron triggers (Free allows 5 per account); each is its own invocation with its own 50 subrequests.
+# Routing and per-invocation budgets: src/jobs/schedule.ts (tests/schedule.test.ts checks this list against it).
+#   every minute  -> worker_liveness row + dispatch (select_due_watches) check
+#   every 5 min   -> webhook delivery drain (cap 5), then the USDC deposit scan
+#   every 10 min  -> pg_net dispatch-failure count, then reconcile shadow verdicts against official outcomes
 [triggers]
-crons = ["* * * * *", "*/10 * * * *"]
+crons = ["* * * * *", "*/5 * * * *", "*/10 * * * *"]
 
 [[r2_buckets]]
 binding = "RAW"
