@@ -120,11 +120,26 @@ describe("registration refusals", () => {
     expect(tenantMarkets()).toBe(1);
   });
 
-  it("a robots.txt answering 503 registers the market as unsupported_source, without watches", async () => {
+  it("a robots.txt answering 503 is 'could not verify': 503, nothing stored, and the same registration succeeds once robots.txt answers", async () => {
+    // Stored as unsupported_source, the market would be answered as-is to every retry of its external_id: one robots
+    // outage would block it for good.
     stubFetch(() => new Response("maintenance", { status: 503 }));
-    const res = await postV1(market("robots", [{ kind: "web_fetch", ref: "https://status.acme-widget.example/v2" }]));
+    const down = await postV1(market("robots", [{ kind: "web_fetch", ref: "https://status.acme-widget.example/v2" }]));
+    expect(down.status).toBe(503);
+    expect(down.headers.get("retry-after")).toBe("60");
+    expect((await read(down)).error).toMatchObject({ code: "UPSTREAM_UNAVAILABLE", message: expect.stringContaining("could not verify robots.txt") });
+    expect(tenantMarkets()).toBe(1);
+    stubFetch(() => new Response("not found", { status: 404 }));
+    const up = await postV1(market("robots", [{ kind: "web_fetch", ref: "https://status.acme-widget.example/v2" }]));
+    expect(up.status).toBe(201);
+    expect((await read(up)).data).toMatchObject({ status: "open", watches: [{ source_kind: "web_fetch" }] });
+  });
+
+  it("a robots.txt rule that disallows the page registers the market as unsupported_source, without watches", async () => {
+    stubFetch(() => new Response("User-agent: *\nDisallow: /v2\n", { status: 200 }));
+    const res = await postV1(market("robots-rule", [{ kind: "web_fetch", ref: "https://status.acme-widget.example/v2" }]));
     expect(res.status).toBe(201);
-    expect((await read(res)).data).toMatchObject({ status: "unsupported_source", reasons: [expect.stringContaining("complete disallow")], watches: [] });
+    expect((await read(res)).data).toMatchObject({ status: "unsupported_source", reasons: [expect.stringContaining("disallows /v2")], watches: [] });
   });
 });
 

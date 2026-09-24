@@ -93,12 +93,14 @@ export function authorCases(): RegistrationCase[] {
       market: market("013", { sources: [{ kind: "solana_log", ref: `solana:${ACCOUNT}` }], resolver: { kind: "solana_sig_present", account: ACCOUNT } }), upstream: [{ host: "solana-rpc.eval.invalid", rpc: "getAccountInfo", status: 503, body: "upstream unavailable" }], expect: { outcome: "unverified", reason_includes: "could not verify" } },
     { id: "REG-014", group: "policy", control: false, title: "a Solana RPC timeout is 'could not verify'",
       market: market("014", { sources: [{ kind: "solana_log", ref: `solana:${ACCOUNT}` }] }), upstream: [{ host: "solana-rpc.eval.invalid", rpc: "getAccountInfo", timeout: true }], expect: { outcome: "unverified", reason_includes: "timed out" } },
-    { id: "REG-015", group: "policy", control: false, title: "robots.txt answering 503 is unreachable: complete disallow (RFC 9309 2.3.1.4)",
-      market: market("015", web("https://status.acme-widget.example/v2")), upstream: [robots("status.acme-widget.example", 503)], expect: { outcome: "unsupported_source", reason_includes: "complete disallow", fetches: 1 } },
-    { id: "REG-016", group: "policy", control: false, title: "robots.txt timing out is unreachable: complete disallow",
-      market: market("016", web("https://status.acme-widget.example/v2")), upstream: [robots("status.acme-widget.example", 0, { timeout: true })], expect: { outcome: "unsupported_source", reason_includes: "timed out", fetches: 1 } },
+    { id: "REG-015", group: "policy", control: false, title: "robots.txt answering 503 is unreachable (RFC 9309 2.3.1.4): 'could not verify', nothing stored, never a permanent unsupported_source",
+      market: market("015", web("https://status.acme-widget.example/v2")), upstream: [robots("status.acme-widget.example", 503)], expect: { outcome: "unverified", reason_includes: "complete disallow", fetches: 1 } },
+    { id: "REG-016", group: "policy", control: false, title: "robots.txt timing out is unreachable: 'could not verify'",
+      market: market("016", web("https://status.acme-widget.example/v2")), upstream: [robots("status.acme-widget.example", 0, { timeout: true })], expect: { outcome: "unverified", reason_includes: "timed out", fetches: 1 } },
     { id: "REG-017", group: "policy", control: false, title: "robots.txt redirecting to a loopback address is not followed: complete disallow",
       market: market("017", web("https://status.acme-widget.example/v2")), upstream: [robots("status.acme-widget.example", 301, { headers: { location: "http://127.0.0.1/robots.txt" } }), robots("127.0.0.1", 404)], expect: { outcome: "unsupported_source", reason_includes: "is not fetched", fetches: 1 } },
+    { id: "REG-018", group: "policy", control: false, title: "robots.txt answering 429 is a server declining to answer, not an absent file: 'could not verify'",
+      market: market("018", web("https://status.acme-widget.example/v2")), upstream: [robots("status.acme-widget.example", 429, { headers: { "retry-after": "120" } })], expect: { outcome: "unverified", reason_includes: "429", fetches: 1 } },
 
     // --- controls: the same verdict with the rail on or off ----------------------------------------------------------------
     { id: "REG-C01", group: "policy", control: true, title: "control: a github_pr_merged resolver and its pulls source on the same repo (case-insensitive) register, nothing probed",

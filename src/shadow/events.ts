@@ -23,7 +23,8 @@ type Row = Record<string, unknown>;
  * (inlineSubrequests(INLINE_MAX) = 1 + 2 x 4 + 5 = 14) runs on its own budget, or on what a reconcile run has left.
  * On the watch path the two halves add at most 3 + 14 = 17 to a run that, by count of src/ingest/watch.ts,
  * src/resolve/runtime.ts and src/bot/commit.ts, makes at most 24 subrequests on a web + Jev path before its alerts
- * (each alert 5 more); a run that still hits Workers Free's 50 leaves its claimed rows 'delivering', and the drain's
+ * (each alert 5 more; 5 more when the page redirects WEB_MAX_REDIRECTS times, src/ingest/web.ts, each hop a request of
+ * its own); a run that still hits Workers Free's 50 leaves its claimed rows 'delivering', and the drain's
  * stale sweep requeues them.
  */
 export const QUEUE_SUBREQUESTS = 3 * COST.db + COST.alert;

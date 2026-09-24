@@ -7,8 +7,9 @@
  *     contract or account turns every poll into a SOURCE_MISMATCH verdict on the public record;
  *   * a web source is a public https URL (the Worker must never be pointed at link-local, loopback or private
  *     addresses). Only literals can be checked: a Worker has no resolver API, so a public name that resolves to a
- *     private address is not caught here (Cloudflare's network does not route to the tenant's private networks).
- * Rail registration_policy off = none of this runs (the pre-P1a behaviour), for the mutation harness only.
+ *     private address is not caught here (Cloudflare's network does not route to the tenant's private networks). The
+ *     same check runs outside the rail on every web poll and every redirect hop (src/ingest/web.ts, src/ingest/robots.ts).
+ * Rail registration_policy off = registration runs none of this (the pre-P1a behaviour), for the mutation harness only.
  */
 import { railEnabled } from "../resolve/rails";
 import { GITHUB_API_REF, GITHUB_EVENTS_REF, BASE_LOG_REF, SOLANA_LOG_REF, type MarketRegistration, type Resolver } from "../resolve/schema";
@@ -112,11 +113,13 @@ const NON_PUBLIC_SUFFIXES = [".local", ".internal", ".localhost"];
  * compared on), no userinfo (credentials would be sent upstream and stored in markets.sources), the default port only,
  * and a host that is a public name or a public address literal. Hosts are read after WHATWG URL parsing, which turns
  * "0x7f.1" and "2130706433" into 127.0.0.1 and ::ffff:127.0.0.1 into ::ffff:7f00:1, so no spelling slips past.
+ * allowHttp: http is accepted too; only for polling a web watch stored before migration 019 as http (src/ingest/web.ts),
+ * never for a registration.
  */
-export function webUrlProblem(raw: string): string | null {
+export function webUrlProblem(raw: string, opts: { allowHttp?: boolean } = {}): string | null {
   let u: URL;
   try { u = new URL(raw); } catch { return `${raw} is not an absolute URL`; }
-  if (u.protocol !== "https:") return `${raw} is not https`;
+  if (u.protocol !== "https:" && !(opts.allowHttp && u.protocol === "http:")) return `${raw} is not https`;
   if (u.username || u.password) return `${u.host}: credentials in the URL`;
   if (u.port !== "") return `${u.host}: port ${u.port} is not the https default`;
   const host = u.hostname.toLowerCase().replace(/\.$/, "");
@@ -155,7 +158,9 @@ export function sourceRefProblem(s: { kind: string; ref: string }, resolver: Res
     case "github_api": {
       const g = parseGithubRef("github_api", s.ref);
       if (!g) return `github_api ref ${s.ref} is not one of ${GITHUB_API_FORMS}`;
-      // The repository document carries only counters: useful to a numeric_threshold (stars, forks), to nothing else.
+      // The repository document carries only counters: useful to a numeric_threshold (stars, forks; projected by path,
+      // evals ING-108), to nothing else. A deliberate addition to plan §16.4 P1 step 4's list of GitHub resources: a
+      // read-only document of the same repository, fetched with the same token.
       if (g.resource === "repo" && resolver?.kind !== "numeric_threshold") return `github_api ref ${s.ref} names a repository, which only a numeric_threshold resolver reads; use one of ${GITHUB_API_FORMS}`;
       return null;
     }

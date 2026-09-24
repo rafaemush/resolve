@@ -96,6 +96,19 @@ function notRecordedReplay(c: Parameters<typeof ok>[0], id: string, refunded: un
   return err(c, "UPSTREAM_UNAVAILABLE", `request ${id} failed before its verdict was recorded${credits > 0 ? ` and its ${credits} credit(s) were refunded` : ""}; send it again with a new Idempotency-Key`, 503, { retryAfterSeconds: 30, extra: { error_reason: "VERDICT_NOT_RECORDED" } });
 }
 
+/**
+ * A tenant fetch runs a watch outside the pg_net schedule, so it takes the same lease a dispatch holds
+ * (lease_watch_now, migration 019): while a dispatched run or another fetch holds it, this fetch does not run, and a
+ * dispatch signed before this lease is refused as lease_superseded. Without it two runs of one watch could overlap:
+ * duplicate evidence and resolutions, two charges for one change, and runWatch's release of the lease would turn the
+ * in-flight dispatch into a 409 that dispatch_failures() alerts on. An RPC error fails closed: running unleased is
+ * exactly the overlap. Subrequests: one on top of the pre-019 fetch path.
+ */
+async function leaseForFetch(client: Db, watchId: string): Promise<"leased" | "busy" | { error: string }> {
+  try { return (await rpc<string | null>(client, "lease_watch_now", { p_watch: watchId })) ? "leased" : "busy"; }
+  catch (e) { return { error: String(e) }; }
+}
+
 v1.post("/resolve", async (c) => {
   const cfg = parseConfig(c.env);
   const auth = c.get("auth");
@@ -129,6 +142,10 @@ v1.post("/resolve", async (c) => {
     if (body.fetch) {
       const { data: w } = await client.from("watches").select("id").eq("market_id", market.id).eq("active", true).is("deleted_at", null).limit(1).maybeSingle();
       if (!w) return err(c, "validation_error", "market has no active watch to fetch from", 400);
+      const leased = await leaseForFetch(client, w.id as string);
+      if (leased !== "leased") return leased === "busy"
+        ? err(c, "conflict", "a poll of this watch is in progress (a scheduled dispatch or another fetch); retry in a minute", 409)
+        : err(c, "UPSTREAM_UNAVAILABLE", `could not lease the watch, the fetch did not run: ${redact(leased.error).slice(0, 200)}`, 503);
       const s = await runWatch(c.env, cfg, w.id as string, { waitUntil: waitUntilOf(c), dispatch: "tenant_fetch" });
       if (s.resolution_id) {
         const { data: r } = await client.from("resolutions").select("*").eq("id", s.resolution_id).single();

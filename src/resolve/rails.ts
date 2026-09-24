@@ -28,7 +28,7 @@ const rails = {
   /**
    * A watch-creating registration names only whitelisted, well-formed refs per kind, agrees with its resolver, fetches
    * only public https hosts, reads a Solana account that exists and is not a program, and treats a robots.txt it could
-   * not read as a disallow.
+   * not read as a disallow for now: refused as unverified, nothing stored.
    */
   registration_policy: true,
 };

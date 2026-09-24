@@ -145,7 +145,8 @@ export interface WatchRunOptions {
   waitUntil?: WaitUntil;
   /**
    * Who started the run, recorded in its loop_runs row: the signed pg_net dispatch (lease and single-use signature
-   * checked by POST /internal/watch/:id), an admin manual run (neither checked), or a tenant's /v1/resolve fetch.
+   * checked by POST /internal/watch/:id), an admin manual run (neither checked), or a tenant's /v1/resolve fetch (the
+   * lease taken first by lease_watch_now). The run releases the lease when it records its outcome.
    */
   dispatch?: "pg_net" | "admin" | "tenant_fetch";
 }

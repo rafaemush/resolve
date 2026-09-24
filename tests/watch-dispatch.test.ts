@@ -1,9 +1,10 @@
 /**
  * POST /internal/watch/:id (plan §16.4 P1 step 7, audit schema:D17): a signed pg_net dispatch is claimed once
  * (claim_watch_dispatch, migration 019, emulated here with its ledger and the watches' leases) before any work. A
- * replayed signature is refused with 409, so a duplicate never runs the watch twice; a lease that is null or past is
- * refused; a claim that cannot be recorded fails closed (503); an admin bearer bypasses both checks and is marked
- * dispatch=admin. runWatch is stubbed: its own behaviour is covered by tests/watch-run.test.ts.
+ * replayed signature is refused with 409, so a duplicate never runs the watch twice; a lease that is null, past, or
+ * taken after the signed minute (a later dispatch or a tenant fetch) is refused; a claim that cannot be recorded fails
+ * closed (503); an admin bearer bypasses both checks and is marked dispatch=admin. runWatch is stubbed: its own
+ * behaviour is covered by tests/watch-run.test.ts; the database side by scripts/selftest/dispatch.ts.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
@@ -29,7 +30,11 @@ vi.mock("../src/db/supabase", () => ({
     if (!h.leases.has(args.p_watch)) return "watch_not_found";
     const lease = h.leases.get(args.p_watch)!;
     if (lease === null) return "lease_missing";
-    return lease <= Date.now() ? "lease_expired" : "claimed";
+    if (lease <= Date.now()) return "lease_expired";
+    // the lease the signed minute took ends before minute + 180 s; a later one belongs to another run
+    if (lease >= Date.parse(`${args.p_minute}:00Z`) + 180_000) return "lease_superseded";
+    h.leases.set(args.p_watch, Math.max(lease, Date.now() + 120_000));
+    return "claimed";
   }),
 }));
 vi.mock("../src/ingest/watch", () => ({
@@ -94,6 +99,15 @@ describe("POST /internal/watch/:id: single-use signature and lease", () => {
     const released = await dispatch(W, new Date(Date.now() - 60_000).toISOString().slice(0, 16));
     expect(released.status).toBe(409);
     expect(await message(released)).toContain("not leased");
+    expect(h.runs).toHaveLength(0);
+  });
+
+  it("refuses a late dispatch once the watch was leased again after its minute (a later dispatch or a tenant fetch): 409, not run", async () => {
+    // signed two minutes ago, still inside the 3-minute signature window; the lease now held was taken just now
+    h.leases.set(W, Date.now() + 120_000);
+    const late = await dispatch(W, new Date(Date.now() - 2 * 60_000).toISOString().slice(0, 16));
+    expect(late.status).toBe(409);
+    expect(await message(late)).toContain("leased again");
     expect(h.runs).toHaveLength(0);
   });
 

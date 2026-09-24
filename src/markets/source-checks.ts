@@ -83,9 +83,9 @@ export async function verifySolanaAccount(url: string, account: string): Promise
 
 /**
  * Probe every source and build the watch plan. A source a probe rules out (robots disallow, no contract code) makes
- * the market unsupported_source with a reason, as before; a probe that could not be made refuses the whole
- * registration (RegistrationError "unverified", nothing stored), because an unsupported_source market would be
- * returned as-is by every retry of the same registration.
+ * the market unsupported_source with a reason, as before; a probe that could not be made (an RPC failure, a robots.txt
+ * that could not be read) refuses the whole registration (RegistrationError "unverified", nothing stored), because an
+ * unsupported_source market would be returned as-is by every retry of the same registration.
  */
 export async function checkSources(env: Env, cfg: Pick<Config, "botUa">, reg: MarketRegistration, now = Date.now()): Promise<SourcePlan> {
   const cost = sourceCheckCost(reg.sources);
@@ -99,6 +99,7 @@ export async function checkSources(env: Env, cfg: Pick<Config, "botUa">, reg: Ma
     switch (s.kind) {
       case "web_fetch": case "web_render": {
         const r = await robotsAllows(s.ref, cfg.botUa);
+        if (r.unreachable) throw new RegistrationError({ kind: "unverified", message: `${s.ref}: could not verify robots.txt (${r.reason}); nothing was registered, retry later` });
         if (!r.allowed) { refusedOne = true; reasons.push(`${s.ref}: ${r.reason}`); break; }
         specs.push({ source_kind: s.kind, source_ref: { url: s.ref }, cursor: {} });
         break;

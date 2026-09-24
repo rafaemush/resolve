@@ -5,7 +5,9 @@
 --     +-3 minute window, so the same signed request could run a watch twice in that window: two evidence rows, two
 --     resolutions, two commits, two tenant charges (audit schema:D17). claim_watch_dispatch() records each
 --     (watch_id, minute) once, INSERT first, before the Worker does any work, and checks the watch still holds the
---     lease select_due_watches() took for it.
+--     lease select_due_watches() took for that minute (not a later one), then holds it for the run.
+--   * POST /v1/resolve with fetch:true ran a watch with no lease at all, so a tenant fetch could overlap a dispatched
+--     run of the same watch. lease_watch_now() takes the same lease atomically, or reports that a run holds it.
 --   * registerMarket inserted the market and then each watch in separate requests, and POST /v1/markets counted the
 --     tenant's watches before inserting: a failure half-way left an open market polling fewer sources (or none), and
 --     two concurrent registrations could both pass watch_limit. register_market() does both inserts in one transaction
@@ -13,9 +15,10 @@
 --     advisory lock: Base log reads go to public RPCs whose rate limits the plan's capacity arithmetic is built on.
 --
 -- Compatibility with the Worker deployed before this migration (8d67d16; it keeps running until the new one is
--- deployed): everything here is new (a table, three functions, one app_config row, one pg_cron job). No existing
--- table, column, constraint, view or function changes. The old Worker never calls claim_watch_dispatch() or
--- register_market() and keeps inserting markets and watches directly, which service_role may still do. Idempotent.
+-- deployed): everything here is new (a table, four functions, one app_config row, one pg_cron job). No existing
+-- table, column, constraint, view or function changes. The old Worker never calls claim_watch_dispatch(),
+-- lease_watch_now() or register_market() and keeps inserting markets and watches directly, which service_role may
+-- still do. Idempotent.
 -- Nothing here is reachable by anon or authenticated (migration 010: default privileges alone are not enough, so every
 -- function is revoked from public, anon and authenticated explicitly and granted to service_role only).
 begin;
@@ -48,16 +51,36 @@ begin
   on conflict (watch_id, minute) do nothing
   returning watch_id into v_claimed;
   if v_claimed is null then return 'signature_used'; end if;
-  select lease_until into v_lease from watches where id = p_watch;
+  -- The row lock orders this check against select_due_watches() (which skips locked rows) and lease_watch_now().
+  select lease_until into v_lease from watches where id = p_watch for update;
   if not found then return 'watch_not_found'; end if;
   if v_lease is null then return 'lease_missing'; end if;
   if v_lease <= now() then return 'lease_expired'; end if;
+  -- select_due_watches() signs minute M and sets lease_until = now() + 120 s inside M, so the lease M took ends before
+  -- M + 180 s. A lease past that was taken later (a later dispatch or a tenant fetch, possible only once M's lease
+  -- ended): this request is late, and that run is the current one.
+  if v_lease >= (p_minute || ':00+00')::timestamptz + interval '180 seconds' then return 'lease_superseded'; end if;
+  -- Hold the lease for the whole run: claimed near its end, the run would otherwise outlive it and overlap the next
+  -- dispatch. runWatch releases it (lease_until null) when the run is recorded.
+  update watches set lease_until = greatest(lease_until, now() + interval '120 seconds') where id = p_watch;
   return 'claimed';
 end $$;
 comment on function public.claim_watch_dispatch(uuid, text) is
-  'Called by POST /internal/watch/:id after the HMAC check, before any work. Inserts (p_watch, p_minute) into used_dispatch_signatures first; returns signature_used when it was already there (a replay or duplicate: the Worker answers 409), watch_not_found, lease_missing (lease_until null: the watch was already polled and released, or never leased), lease_expired (lease_until at or before now: the request came after the 120 s lease select_due_watches() took), or claimed (run the poll). The signature stays used whatever the answer. service_role only.';
+  'Called by POST /internal/watch/:id after the HMAC check, before any work. Inserts (p_watch, p_minute) into used_dispatch_signatures first; returns signature_used when it was already there (a replay or duplicate: the Worker answers 409), watch_not_found, lease_missing (lease_until null: the watch was already polled and released, or never leased), lease_expired (lease_until at or before now: the request came after the 120 s lease select_due_watches() took), lease_superseded (lease_until at or after p_minute + 180 s: the lease was taken after the one minute p_minute leased, by a later dispatch or a tenant fetch, so this late request must not run beside it), or claimed (run the poll; the lease is extended to at least now + 120 s so it covers the run). The signature stays used whatever the answer. service_role only.';
 revoke all on function public.claim_watch_dispatch(uuid, text) from public, anon, authenticated;
 grant execute on function public.claim_watch_dispatch(uuid, text) to service_role;
+
+create or replace function public.lease_watch_now(p_watch uuid)
+returns timestamptz language sql security definer set search_path = public as $$
+  -- The lease condition of select_due_watches(): a live lease means a run of this watch is in progress.
+  update watches set lease_until = now() + interval '120 seconds'
+   where id = p_watch and (lease_until is null or lease_until < now())
+  returning lease_until;
+$$;
+comment on function public.lease_watch_now(uuid) is
+  'Called by POST /v1/resolve with fetch:true before it runs a watch outside the pg_net schedule. Takes the watch''s lease for 120 s, exactly as select_due_watches() does, and returns the new lease_until; returns null when the watch is leased (a dispatched run or another fetch holds it: the Worker answers 409) or does not exist. One UPDATE, so two callers can never both take it; runWatch releases it when the run is recorded. next_poll_at is untouched. service_role only.';
+revoke all on function public.lease_watch_now(uuid) from public, anon, authenticated;
+grant execute on function public.lease_watch_now(uuid) to service_role;
 
 create or replace function public.gc_dispatch_signatures()
 returns integer language sql security definer set search_path = public as $$

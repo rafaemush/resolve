@@ -27,20 +27,22 @@ export const internal = new Hono<{ Bindings: Env; Variables: Vars }>();
 const isAdmin = (c: { req: { header: (n: string) => string | undefined }; env: Env }) => { const k = bearer(c as never); return !!k && safeEqual(k, c.env.ADMIN_API_KEY); };
 
 /** claim_watch_dispatch's answer (migration 019). */
-const DispatchClaim = z.enum(["claimed", "signature_used", "watch_not_found", "lease_missing", "lease_expired"]);
+const DispatchClaim = z.enum(["claimed", "signature_used", "watch_not_found", "lease_missing", "lease_expired", "lease_superseded"]);
 const DISPATCH_REFUSAL: Record<Exclude<z.infer<typeof DispatchClaim>, "claimed">, { status: 404 | 409; message: string }> = {
   signature_used: { status: 409, message: "signature already used" },
   watch_not_found: { status: 404, message: "watch not found" },
   lease_missing: { status: 409, message: "watch not leased: this dispatch is not the current one" },
   lease_expired: { status: 409, message: "watch lease expired: this dispatch arrived after its 120 s lease" },
+  lease_superseded: { status: 409, message: "watch leased again since this dispatch's minute: a later dispatch or a tenant fetch holds it" },
 };
 
 /**
  * pg_net -> one watch poll. Signature = HMAC(secret, "<watch_id>|<YYYY-MM-DDTHH:MM>") over the dispatch minute (+-3 min
  * tolerance). A valid signature is then claimed once (claim_watch_dispatch, migration 019): the (watch_id, minute) row
  * is inserted first, before any work, so a replayed or duplicated request is refused (409) and two runs of one dispatch
- * can never both resolve or charge; and the watch must hold the lease select_due_watches() took for it 120 s before
- * posting (null = already polled or never leased, past = the request came too late). Refusals answer >= 400, so
+ * can never both resolve or charge; and the watch must hold the lease select_due_watches() took for it in the signed
+ * minute (null = already polled or never leased, past = the request came too late, taken after that minute = a later
+ * dispatch or a tenant fetch is the current run); a claim holds the lease for the run. Refusals answer >= 400, so
  * dispatch_failures() (migration 013) counts them and the 10-minute job alerts. An admin bearer runs the poll by hand,
  * bypassing both checks; that run is marked dispatch=admin in its loop_runs row.
  * Subrequests: the claim is one on top of runWatch's worst case (36 for an official_release slot holder without

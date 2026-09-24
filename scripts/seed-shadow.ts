@@ -18,9 +18,10 @@
  *            is_test, condition_id, every meta key and the sources landed, and that an open market has one active watch
  *            per source. Stops at the first failure; rerunning skips what exists once the same check passes on it (a
  *            market left without its watches by a failed or timed-out registration stops the rerun, named), so the
- *            command is idempotent. An entry whose sources the Worker rules out (robots) is registered as
+ *            command is idempotent. An entry whose sources the Worker rules out (a robots.txt rule) is registered as
  *            unsupported_source by the Worker and reported; it has no watches. A check the Worker could not make (an
- *            RPC down, HTTP 503) stores nothing and stops the run; rerun it later.
+ *            RPC down, a robots.txt that answered 5xx or 429 or not at all: HTTP 503) stores nothing and stops the run;
+ *            rerun it later.
  * Secrets (ADMIN_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY) are read from .env by scripts/lib/env.ts and never
  * printed. The founder's ISP blocks *.workers.dev: set RESOLVE_PUBLIC_URL to a reachable host (the custom domain).
  */

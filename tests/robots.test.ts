@@ -59,18 +59,27 @@ describe("robotsAllows (RFC 9309)", () => {
     }
   });
 
-  it("disallows on 5xx and 429 (unreachable: complete disallow)", async () => {
+  it("disallows on 5xx and 429, flagged unreachable (complete disallow for now, not a verdict on the page)", async () => {
     for (const status of [500, 502, 503, 504, 429]) {
       stub([{ status }]);
-      expect(await robotsAllows(PAGE, UA), String(status)).toMatchObject({ allowed: false, reason: expect.stringContaining("complete disallow") });
+      expect(await robotsAllows(PAGE, UA), String(status)).toMatchObject({ allowed: false, unreachable: true, reason: expect.stringContaining("complete disallow") });
     }
   });
 
-  it("disallows on a timeout and on a network error: found nothing is not could not look", async () => {
+  it("disallows on a timeout and on a network error, flagged unreachable: found nothing is not could not look", async () => {
     stub(["timeout"]);
-    expect(await robotsAllows(PAGE, UA)).toMatchObject({ allowed: false, reason: expect.stringContaining("timed out") });
+    expect(await robotsAllows(PAGE, UA)).toMatchObject({ allowed: false, unreachable: true, reason: expect.stringContaining("timed out") });
     stub(["network"]);
-    expect(await robotsAllows(PAGE, UA)).toMatchObject({ allowed: false, reason: expect.stringContaining("unreachable") });
+    expect(await robotsAllows(PAGE, UA)).toMatchObject({ allowed: false, unreachable: true, reason: expect.stringContaining("unreachable") });
+  });
+
+  it("a rule, a refused redirect or a 3xx without Location is a disallow the server gave: not unreachable", async () => {
+    stub([{ status: 200, body: "User-agent: *\nDisallow: /v2/\n" }]);
+    expect((await robotsAllows(PAGE, UA)).unreachable).toBeUndefined();
+    stub([{ status: 301, headers: { location: "http://127.0.0.1/robots.txt" } }]);
+    expect((await robotsAllows(PAGE, UA)).unreachable).toBeUndefined();
+    stub([{ status: 302 }]);
+    expect((await robotsAllows(PAGE, UA)).unreachable).toBeUndefined();
   });
 
   it("follows a redirect to another public https host and reads the rules there", async () => {

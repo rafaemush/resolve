@@ -3,9 +3,13 @@
  *   2xx  the rules decide (our UA's group, else "*"; the longest matching rule wins, Allow on a tie)
  *   3xx  followed, at most ROBOTS_MAX_REDIRECTS hops, every hop through the web URL policy (a redirect to a private
  *        address is not followed: disallow); more hops = unavailable = allow (2.3.1.2)
- *   4xx  unavailable = allow (2.3.1.3), except 429: a rate limit is the server refusing to answer, not the file's
- *        absence, so it reads as unreachable
- *   5xx, 429, timeout, network error  unreachable = complete disallow (2.3.1.4): "found nothing" is not "could not look"
+ *   4xx  unavailable = allow (2.3.1.3), except 429: a rate limit is the server declining to answer now, not the
+ *        file's absence, so it reads as unreachable (Google's crawlers read 429 the same way)
+ *   5xx, 429, timeout, network error  unreachable = complete disallow (2.3.1.4), flagged `unreachable`: the page is
+ *        not fetched, and the registration is refused as "could not verify" (503, nothing stored, retry), never stored
+ *        as unsupported_source. RFC 9309 makes this state temporary; an unsupported_source market would be answered
+ *        as-is to every retry of the same external_id, turning one outage into a permanent verdict. "Found nothing" is
+ *        not "could not look".
  * Rail registration_policy off = the pre-P1a reading (redirects followed blindly; any failure allowed).
  */
 import { railEnabled } from "../resolve/rails";
@@ -20,7 +24,8 @@ export function ruleToRegex(rule: string): RegExp {
   return new RegExp("^" + escaped + (endAnchored ? "$" : ""));
 }
 
-export interface RobotsResult { allowed: boolean; reason: string }
+/** unreachable: the file could not be read (5xx, 429, timeout, network error); allowed is then false. */
+export interface RobotsResult { allowed: boolean; reason: string; unreachable?: true }
 
 export const ROBOTS_MAX_REDIRECTS = 5;
 export const ROBOTS_TIMEOUT_MS = 5000;
@@ -67,7 +72,7 @@ export async function robotsAllows(url: string, botUa: string): Promise<RobotsRe
     try { res = await get(target, botUa, "manual"); }
     catch (e) {
       const timeout = e instanceof Error && (e.name === "TimeoutError" || e.name === "AbortError");
-      return { allowed: false, reason: `robots.txt ${timeout ? `timed out after ${ROBOTS_TIMEOUT_MS} ms` : `unreachable (${String(e).slice(0, 80)})`}: complete disallow (RFC 9309 2.3.1.4)` };
+      return { allowed: false, unreachable: true, reason: `robots.txt ${timeout ? `timed out after ${ROBOTS_TIMEOUT_MS} ms` : `unreachable (${String(e).slice(0, 80)})`}: complete disallow (RFC 9309 2.3.1.4)` };
     }
     const s = res.status;
     if (s >= 300 && s < 400) {
@@ -84,7 +89,7 @@ export async function robotsAllows(url: string, botUa: string): Promise<RobotsRe
     }
     if (s >= 200 && s < 300) return robotsVerdict(await res.text(), u, botUa);
     await discardBody(res);
-    if (s === 429 || s >= 500) return { allowed: false, reason: `robots.txt answered ${s}: unreachable, complete disallow (RFC 9309 2.3.1.4)` };
+    if (s === 429 || s >= 500) return { allowed: false, unreachable: true, reason: `robots.txt answered ${s}: unreachable, complete disallow (RFC 9309 2.3.1.4)` };
     if (s >= 400) return { allowed: true, reason: `robots.txt ${s}: unavailable, allowed (RFC 9309 2.3.1.3)` };
     return { allowed: false, reason: `robots.txt answered ${s}: complete disallow` };
   }
