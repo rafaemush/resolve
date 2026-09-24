@@ -1,6 +1,8 @@
 import type { Env } from "../env";
 import type { WatchRow, FetchOutcome } from "./types";
 import { ruleToRegex } from "./robots";
+import { railEnabled } from "../resolve/rails";
+import { discardBody, retryAfterSeconds, sameSite } from "./http";
 
 const MAX_BYTES = 512 * 1024;
 const MAX_TEXT = 64 * 1024;
@@ -27,7 +29,12 @@ export async function htmlToText(res: Response): Promise<{ text: string; claimed
   return { text, claimedAt: claimedIso, title: title ? String(title).trim() : null };
 }
 
-/** Fetch a page with a declared UA and hard caps. observed_at is always our fetch time for web sources. */
+/**
+ * Fetch a page with a declared UA and hard caps. observed_at is always our fetch time for web sources.
+ * Only a 200 is evidence. Redirects are followed; one that lands on a different site (precheck's host rule:
+ * hostname without "www.") is a coverage gap, because its text would be judged against the registered source
+ * it did not come from. Same-site redirects (http -> https, a trailing slash) are fine; final_url is recorded.
+ */
 export async function fetchWeb(env: Env, watch: WatchRow, botUa: string): Promise<FetchOutcome> {
   const url = String(watch.source_ref.url ?? watch.source_ref.ref ?? "");
   if (!/^https?:\/\//.test(url)) return { error: "source_ref.url invalid" };
@@ -39,24 +46,25 @@ export async function fetchWeb(env: Env, watch: WatchRow, botUa: string): Promis
   catch (e) { return { error: `web fetch failed: ${String(e).slice(0, 120)}` }; }
   const now = new Date().toISOString();
   const from = String(watch.cursor.last_to ?? now);
-  if (res.status === 304) return { notModified: true, etag: watch.etag, window: { from, to: now, status: "ok" }, cursor: { ...watch.cursor, last_to: now } };
-  if (res.status !== 200) return { error: `web ${res.status} for ${url}`, window: { from, to: now, status: "gap" }, cursor: { ...watch.cursor, last_to: now } };
+  const cursor = { ...watch.cursor, last_to: now };
+  const deferSeconds = retryAfterSeconds(res.headers, Date.now());
+  const answered = { httpStatus: res.status, ...(deferSeconds !== undefined ? { deferSeconds } : {}) };
+  const gap = (error: string): FetchOutcome => ({ error, window: { from, to: now, status: "gap" }, cursor, ...answered });
+  if (railEnabled("non200_never_evidence") && res.redirected && res.url && !sameSite(url, res.url)) { await discardBody(res); return gap(`web ${url} redirected off-site to ${res.url}`); }
+  if (res.status === 304) return { notModified: true, etag: watch.etag, window: { from, to: now, status: "ok" }, cursor, ...answered };
+  if (res.status !== 200) { await discardBody(res); return gap(`web ${res.status} for ${url}`); }
   const ct = (res.headers.get("content-type") ?? "").toLowerCase();
   const buf = new Uint8Array(await res.clone().arrayBuffer());
-  if (buf.byteLength > MAX_BYTES) return { error: `page too large (${buf.byteLength} bytes)`, window: { from, to: now, status: "gap" }, cursor: { ...watch.cursor, last_to: now } };
+  if (buf.byteLength > MAX_BYTES) return gap(`page too large (${buf.byteLength} bytes)`);
   let text: string, claimedAt: string | null = null, structured: unknown = undefined;
   if (ct.includes("json")) { text = new TextDecoder().decode(buf); try { structured = JSON.parse(text); } catch { /* keep text */ } }
   else if (ct.includes("html")) { const h = await htmlToText(res); text = h.text; claimedAt = h.claimedAt; }
   else text = new TextDecoder().decode(buf).slice(0, MAX_TEXT);
   const etag = res.headers.get("etag");
   return {
-    evidence: { source_kind: "web_fetch", source_url: res.url || url, text, structured, observed_at: claimedAt ?? undefined, fetched_at: t0, http_status: 200, etag: etag ?? undefined, coverage: { snapshot_status: 200, deciding_field_present: text.length > 0 }, provenance: { url, final_url: res.url, content_type: ct, bytes: buf.byteLength, last_modified: res.headers.get("last-modified") } },
-    rawBytes: buf, etag, window: { from, to: now, status: "ok" }, cursor: { ...watch.cursor, last_to: now },
+    evidence: { source_kind: "web_fetch", source_url: res.url || url, text, structured, observed_at: claimedAt ?? undefined, fetched_at: t0, http_status: 200, etag: etag ?? undefined, coverage: { snapshot_status: 200, deciding_field_present: text.length > 0 }, provenance: { url, final_url: res.url || url, redirected: res.redirected, content_type: ct, bytes: buf.byteLength, last_modified: res.headers.get("last-modified") } },
+    rawBytes: buf, etag, window: { from, to: now, status: "ok" }, cursor, ...answered,
   };
-}
-
-/** Minimal robots.txt check")).join(".*");
-  return new RegExp("^" + body + (endAnchored ? "$" : ""));
 }
 
 /** Minimal robots.txt check for our UA and '*'. Disallowed => the market registers as unsupported_source. */

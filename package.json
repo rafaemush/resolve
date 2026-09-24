@@ -13,6 +13,7 @@
     "eval": "tsx evals/run.ts",
     "eval:build": "tsx evals/build.ts",
     "eval:mutate": "tsx evals/mutate.ts",
+    "eval:ingest": "tsx evals/ingest.ts",
     "bench": "tsx evals/bench.ts",
     "openapi": "tsx scripts/openapi.ts",
     "db:push": "supabase db push"

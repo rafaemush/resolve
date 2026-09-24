@@ -54,7 +54,7 @@ internal.get("/markets/:id", async (c) => {
   const id = c.req.param("id");
   const [m, w, e, r, l] = await Promise.all([
     client.from("markets").select("*").eq("id", id).single(),
-    client.from("watches").select("id, source_kind, source_ref, poll_interval_s, next_poll_at, lease_until, etag, cursor, coverage, last_evidence_hash, last_polled_at, last_error, consecutive_errors, backlog").eq("market_id", id),
+    client.from("watches").select("id, source_kind, source_ref, poll_interval_s, next_poll_at, lease_until, etag, cursor, coverage, last_evidence_hash, last_canonical_hash, last_http_status, last_polled_at, last_error, consecutive_errors, backlog").eq("market_id", id),
     client.from("evidence").select("id, source_kind, source_url, observed_at, claimed_at, fetched_at, http_status, raw_sha256, canonical_sha256, raw_bytes, raw_r2_key, coverage, injection_markers, created_at").eq("market_id", id).order("created_at", { ascending: false }).limit(5),
     client.from("resolutions").select("id, mode, status_row, resolution_status, winning_outcome, confidence_score, error_code, error_reason, caveats, determination_basis, jev_model, thresholds_version, credits_charged, duration_ms, jev_ms, created_at").eq("market_id", id).order("created_at", { ascending: false }).limit(5),
     client.from("loop_runs").select("started_at, outcome, rows_written, duration_ms, error, meta").eq("loop_name", "watch").contains("meta", { market_id: id }).order("started_at", { ascending: false }).limit(5),

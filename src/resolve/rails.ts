@@ -12,6 +12,12 @@ const rails = {
   coverage_proof: true,
   structured_router: true,
   after_deadline_positive: true,
+  // Ingestion rails (src/ingest). Off = the pre-P1a behaviour, so the mutation harness can prove
+  // evals/ingest.ts catches its absence.
+  /** github/web: a non-200 answer or a moved resource is a coverage gap, never evidence. */
+  non200_never_evidence: true,
+  /** watch: change detection hashes the projection of deciding fields, not raw bytes. */
+  stable_projection: true,
 };
 export type Rail = keyof typeof rails;
 export function railEnabled(r: Rail): boolean { return rails[r]; }

@@ -21,6 +21,11 @@ export interface WatchRow {
   cursor: Record<string, unknown>;
   coverage: CoverageWindow[];
   last_evidence_hash: string | null;
+  /** sha256 of the change projection (src/ingest/projection.ts) of the last STORED observation; null before the first. */
+  last_canonical_hash?: string | null;
+  /** HTTP status of the last HTTP answer (github/web); null for chain sources and before migration 011's first write. */
+  last_http_status?: number | null;
+  next_poll_at?: string;
   consecutive_errors: number;
   backlog: boolean;
   active: boolean;
@@ -37,8 +42,12 @@ export interface FetchOutcome {
   /** The observed window this poll covers, for the coverage proof. */
   window?: CoverageWindow;
   backlog?: boolean;
-  /** A transport or source error: recorded as a gap window and consecutive_errors++. */
+  /** A transport or source error: recorded as a gap window and consecutive_errors++. Carries no evidence (rail non200_never_evidence). */
   error?: string;
+  /** Status of the HTTP answer that produced this outcome (github/web only). */
+  httpStatus?: number;
+  /** The source asked us to wait (Retry-After, rate-limit reset, X-Poll-Interval); seconds, capped at 3600. */
+  deferSeconds?: number;
 }
 
 /** Append a window, extending the previous one when contiguous and same status. Keeps jsonb small. */
