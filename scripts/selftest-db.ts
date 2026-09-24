@@ -1,7 +1,7 @@
 /**
- * Exercises the billing RPCs, the commit-reveal trigger and the public view (migration 012), and the dispatch
- * observability of migration 013, each inside a DO block that always raises at the end, so the whole thing rolls back
- * and nothing persists. The raised message carries the assertion results. Then a real concurrency probe: 10 parallel begin_resolution calls with one
+ * Exercises the billing RPCs, the commit-reveal trigger and the public view (migration 012), the dispatch
+ * observability of migration 013, and the no-cold-pitch gate and follows of migration 014, each inside a DO block that
+ * always raises at the end, so the whole thing rolls back and nothing persists. The raised message carries the assertion results. Then a real concurrency probe: 10 parallel begin_resolution calls with one
  * Idempotency-Key against a __selftest__ tenant (soft-deleted afterwards; ledger rows are append-only by design).
  * Point it at staging: the concurrency probe persists rows.
  */
@@ -208,6 +208,104 @@ begin
   raise exception 'SELFTEST_OPS %', out::text;
 end $$;`;
 
+/**
+ * Migration 014: log_touch() refuses an outbound pitch (dm, email, call) with no settled reconciliation on the lead's
+ * platform unless an override reason is given (blank is not a reason), a direct insert cannot skip the gate, pending /
+ * unresolved_by_platform / test-market / tenant-market rows are not evidence, a real one is; the touch log is
+ * append-only; follow_market() is idempotent, holds the cap (null = unlimited), refuses anything but an open non-test
+ * shadow market, and allows a new follow after an unfollow; anon can execute neither function nor read the tables.
+ * The evidence half runs on platform custom, which the Worker never reconciles (custom_prior_evidence must be false).
+ */
+const GTM_BLOCK = `
+do $$
+declare out jsonb := '{}'::jsonb; prior boolean; lx uuid; lc uuid; tid uuid; t uuid; tt uuid; res jsonb; n integer;
+  m_pend uuid; m_unres uuid; m_test uuid; m_ten uuid; m_ok uuid; f1 uuid; f2 uuid; f_test uuid; f_closed uuid;
+  mk constant text := 'insert into markets (platform, external_id, condition, event_statement, option_a, option_b, positive_option, open_at, deadline_utc, tenant_id, status) values (''custom'', $1, ''selftest condition'', ''selftest statement'', ''Yes'', ''No'', ''OPTION_A'', now() - interval ''3 days'', now() - interval ''2 days'', $2, $3) returning id';
+  rs constant text := 'insert into resolutions (id, market_id, mode, status_row, resolution_status, winning_outcome, confidence_score, determination_basis, caveats, thresholds_version) values ($1, $2, ''shadow'', ''complete'', ''RESOLVED'', ''OPTION_A'', 0.95, ''structured'', ''[]'', ''v1'')';
+  rc constant text := 'insert into reconciliations (resolution_id, market_id, platform, official_outcome, agreement, final) values ($1, $2, ''custom'', $3, $4, true)';
+begin
+  prior := exists (select 1 from reconciliations r join markets m on m.id = r.market_id
+                    where m.platform = 'custom' and m.tenant_id is null and not m.is_test and r.agreement in ('agree', 'disagree', 'abstained', 'void'));
+  out := out || jsonb_build_object('custom_prior_evidence', prior);
+  insert into leads (name, platform) values ('__selftest_lead_x__', '__selftest_platform__') returning id into lx;
+  insert into leads (name, platform) values ('__selftest_lead_c__', 'custom') returning id into lc;
+
+  begin perform log_touch(lx, 'dm', 'out', 'selftest pitch', null, null); out := out || '{"cold_dm_refused": false}';
+  exception when sqlstate 'RS002' then out := out || '{"cold_dm_refused": true}'; end;
+  begin perform log_touch(lx, 'email', 'out', 'selftest pitch', null, null); out := out || '{"cold_email_refused": false}';
+  exception when sqlstate 'RS002' then out := out || '{"cold_email_refused": true}'; end;
+  begin perform log_touch(lx, 'call', 'out', 'selftest pitch', null, null); out := out || '{"cold_call_refused": false}';
+  exception when sqlstate 'RS002' then out := out || '{"cold_call_refused": true}'; end;
+  begin perform log_touch(lx, 'dm', 'out', 'selftest pitch', null, '   '); out := out || '{"blank_override_refused": false}';
+  exception when sqlstate 'RS002' then out := out || '{"blank_override_refused": true}'; end;
+  begin insert into gtm_touches (lead_id, kind, direction, summary) values (lx, 'email', 'out', 'selftest direct insert'); out := out || '{"direct_insert_refused": false}';
+  exception when sqlstate 'RS002' then out := out || '{"direct_insert_refused": true}'; end;
+  tid := log_touch(lx, 'dm', 'out', 'selftest pitch', ' ', 'selftest: vendor asked for the pitch');
+  out := out || jsonb_build_object('override_accepted', tid is not null,
+    'override_stored', (select override_reason from gtm_touches where id = tid), 'blank_url_stored_null', (select evidence_url is null from gtm_touches where id = tid));
+  out := out || jsonb_build_object('reply_out_accepted', log_touch(lx, 'reply', 'out', 'selftest reply', null, null) is not null,
+    'ops_out_accepted', log_touch(lx, 'ops', 'out', 'selftest vendor request', null, null) is not null,
+    'dm_in_accepted', log_touch(lx, 'dm', 'in', 'selftest inbound', null, null) is not null);
+  begin update gtm_touches set summary = 'edited' where id = tid; out := out || '{"touch_update_refused": false}';
+  exception when others then out := out || '{"touch_update_refused": true}'; end;
+  begin delete from gtm_touches where id = tid; out := out || '{"touch_delete_refused": false}';
+  exception when others then out := out || '{"touch_delete_refused": true}'; end;
+
+  -- not evidence: pending, unresolved_by_platform, a test market, a tenant market
+  insert into tenants (display_name) values ('__selftest_gtm_tenant__') returning id into t;
+  execute mk into m_pend using '__selftest_gtm_pend__', null::uuid, 'open';
+  execute mk into m_unres using '__selftest_gtm_unres__', null::uuid, 'open';
+  execute mk into m_test using '__selftest_gtm_test__', null::uuid, 'open';
+  update markets set is_test = true where id = m_test;
+  execute mk into m_ten using '__selftest_gtm_ten__', t, 'open';
+  execute rs using '__selftest_gtm_r_pend__', m_pend; execute rc using '__selftest_gtm_r_pend__', m_pend, null::text, 'pending';
+  execute rs using '__selftest_gtm_r_unres__', m_unres; execute rc using '__selftest_gtm_r_unres__', m_unres, null::text, 'unresolved_by_platform';
+  execute rs using '__selftest_gtm_r_test__', m_test; execute rc using '__selftest_gtm_r_test__', m_test, 'OPTION_A', 'agree';
+  execute rs using '__selftest_gtm_r_ten__', m_ten; execute rc using '__selftest_gtm_r_ten__', m_ten, 'OPTION_A', 'agree';
+  begin perform log_touch(lc, 'dm', 'out', 'selftest pitch', null, null); out := out || '{"non_evidence_refused": false}';
+  exception when sqlstate 'RS002' then out := out || '{"non_evidence_refused": true}'; end;
+  -- evidence: a settled reconciliation on a public non-test shadow market of the lead's platform
+  execute mk into m_ok using '__selftest_gtm_ok__', null::uuid, 'open';
+  execute rs using '__selftest_gtm_r_ok__', m_ok; execute rc using '__selftest_gtm_r_ok__', m_ok, 'OPTION_A', 'abstained';
+  out := out || jsonb_build_object('evidence_accepted', log_touch(lc, 'dm', 'out', 'selftest evidence-led pitch', null, null) is not null);
+  update leads set deleted_at = now() where id = lx;
+  begin perform log_touch(lx, 'reply', 'out', 'selftest reply', null, null); out := out || '{"deleted_lead_refused": false}';
+  exception when sqlstate 'RS002' then out := out || '{"deleted_lead_refused": true}'; end;
+
+  -- follow_market
+  insert into tenants (display_name) values ('__selftest_gtm_follower__') returning id into tt;
+  execute mk into f1 using '__selftest_gtm_f1__', null::uuid, 'open';
+  execute mk into f2 using '__selftest_gtm_f2__', null::uuid, 'open';
+  execute mk into f_closed using '__selftest_gtm_closed__', null::uuid, 'resolved';
+  out := out || jsonb_build_object('follow_first', follow_market(tt, f1, 1)->>'result', 'follow_again', follow_market(tt, f1, 1)->>'result',
+    'follow_over_cap', follow_market(tt, f2, 1)->>'result', 'follow_unlimited', follow_market(tt, f2, null)->>'result',
+    'follow_active', (follow_market(tt, f2, null)->>'active')::int,
+    'follow_test', follow_market(tt, m_test, null)->>'result', 'follow_tenant_market', follow_market(tt, m_ten, null)->>'result',
+    'follow_closed', follow_market(tt, f_closed, null)->>'reason', 'follow_missing', follow_market(tt, gen_random_uuid(), null)->>'result');
+  begin perform follow_market(tt, f1, -1); out := out || '{"negative_cap_refused": false}';
+  exception when others then out := out || '{"negative_cap_refused": true}'; end;
+  begin perform follow_market(gen_random_uuid(), f1, null); out := out || '{"unknown_tenant_refused": false}';
+  exception when others then out := out || '{"unknown_tenant_refused": true}'; end;
+  begin insert into market_follows (tenant_id, market_id) values (tt, f1); out := out || '{"second_active_refused": false}';
+  exception when unique_violation then out := out || '{"second_active_refused": true}'; end;
+  update market_follows set deleted_at = now() where tenant_id = tt and market_id = f1 and deleted_at is null;
+  res := follow_market(tt, f1, 2);
+  select count(*) into n from market_follows where tenant_id = tt and market_id = f1;
+  out := out || jsonb_build_object('refollow_after_unfollow', res->>'result', 'follow_rows_kept', n);
+  begin
+    set local role anon;
+    begin perform log_touch(lc, 'reply', 'out', 'anon', null, null); out := out || '{"anon_log_touch_denied": false}';
+    exception when insufficient_privilege then out := out || '{"anon_log_touch_denied": true}'; end;
+    begin perform follow_market(tt, f1, null); out := out || '{"anon_follow_denied": false}';
+    exception when insufficient_privilege then out := out || '{"anon_follow_denied": true}'; end;
+    begin perform 1 from leads limit 1; out := out || '{"anon_leads_denied": false}';
+    exception when insufficient_privilege then out := out || '{"anon_leads_denied": true}'; end;
+    reset role;
+  exception when others then out := out || jsonb_build_object('anon_log_touch_denied', 'set role failed: ' || sqlerrm);
+  end;
+  raise exception 'SELFTEST_GTM %', out::text;
+end $$;`;
+
 async function main() {
   const block = `
 do $$
@@ -279,6 +377,21 @@ end $$;`;
     dispatch_failures_is_count: true, bad_window_refused: true, anon_dispatch_failures_denied: true, anon_select_due_watches_denied: true,
   });
   console.log("rolled back: nothing persisted from the ops block");
+
+  const gtm = await rollbackBlock("SELFTEST_GTM", GTM_BLOCK);
+  if (!gtm) process.exit(1);
+  bad += check(gtm, {
+    custom_prior_evidence: false,
+    cold_dm_refused: true, cold_email_refused: true, cold_call_refused: true, blank_override_refused: true, direct_insert_refused: true,
+    override_accepted: true, override_stored: "selftest: vendor asked for the pitch", blank_url_stored_null: true,
+    reply_out_accepted: true, ops_out_accepted: true, dm_in_accepted: true, touch_update_refused: true, touch_delete_refused: true,
+    non_evidence_refused: true, evidence_accepted: true, deleted_lead_refused: true,
+    follow_first: "followed", follow_again: "already_following", follow_over_cap: "cap_reached", follow_unlimited: "followed", follow_active: 2,
+    follow_test: "not_followable", follow_tenant_market: "not_followable", follow_closed: "market is resolved", follow_missing: "not_followable",
+    negative_cap_refused: true, unknown_tenant_refused: true, second_active_refused: true, refollow_after_unfollow: "followed", follow_rows_kept: 2,
+    anon_log_touch_denied: true, anon_follow_denied: true, anon_leads_denied: true,
+  });
+  console.log("rolled back: nothing persisted from the GTM block");
 
   // concurrency probe (persists rows on a __selftest__ tenant; tenant soft-deleted after)
   const [t] = await sql<{ id: string }>("insert into tenants (display_name, credits_balance) values ('__selftest_concurrency__', 100) returning id");

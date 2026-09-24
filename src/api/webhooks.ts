@@ -3,11 +3,12 @@ import type { Env } from "../env";
 import { ok, err } from "./envelope";
 import { db } from "../db/supabase";
 import type { AuthContext } from "./auth";
-import { randomKeyBody } from "./v1";
+import { randomKeyBody } from "./keys";
+import { WEBHOOK_EVENTS } from "../webhooks/deliver";
 
 type Vars = { requestId: string; schemaVersion: string; auth: AuthContext };
 export const webhooks = new Hono<{ Bindings: Env; Variables: Vars }>();
-const EVENTS = ["market.resolved", "market.unresolved_update", "market.error", "credits.low", "payment.credited"];
+const EVENTS: readonly string[] = WEBHOOK_EVENTS;
 
 webhooks.post("/", async (c) => {
   const auth = c.get("auth");

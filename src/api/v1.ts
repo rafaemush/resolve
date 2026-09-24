@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { z } from "zod";
 import type { Env } from "../env";
 import { parseConfig } from "../env";
-import { ok, err } from "./envelope";
+import { ok, err, waitUntilOf } from "./envelope";
 import { authenticate, rateLimit, extractApiKey, invalidateKeyCache, type AuthContext } from "./auth";
 import { db, rpc, type Db } from "../db/supabase";
 import { MarketRegistration, EvidenceInput, type Verdict } from "../resolve/schema";
@@ -16,6 +16,8 @@ import { sha256Hex } from "../resolve/text";
 import type { MarketRow } from "../ingest/types";
 import { alert } from "../ops/alerts";
 import { redact } from "../ops/redact";
+import { mintKey } from "./keys";
+import { followCap, followMarket, followRefusal, Plan, shapeShadow, type FollowAnswer, type FollowTarget, type ShadowCommitRow, type ShadowMarket } from "../shadow/follows";
 
 type Vars = { requestId: string; schemaVersion: string; auth: AuthContext };
 export const v1 = new Hono<{ Bindings: Env; Variables: Vars }>();
@@ -125,7 +127,7 @@ v1.post("/resolve", async (c) => {
     if (body.fetch) {
       const { data: w } = await client.from("watches").select("id").eq("market_id", market.id).eq("active", true).is("deleted_at", null).limit(1).maybeSingle();
       if (!w) return err(c, "validation_error", "market has no active watch to fetch from", 400);
-      const s = await runWatch(c.env, cfg, w.id as string);
+      const s = await runWatch(c.env, cfg, w.id as string, { waitUntil: waitUntilOf(c) });
       if (s.resolution_id) {
         const { data: r } = await client.from("resolutions").select("*").eq("id", s.resolution_id).single();
         return ok(c, { request_id: s.resolution_id, watch: s, resolution: r });
@@ -236,6 +238,98 @@ v1.get("/markets/:id/resolutions", async (c) => {
   const { data } = await db(c.env).from("resolutions").select("id, resolution_status, winning_outcome, confidence_score, error_code, error_reason, caveats, determination_basis, jev_model, thresholds_version, credits_charged, credits_refunded, created_at").eq("market_id", c.req.param("id")).eq("tenant_id", c.get("auth").tenantId).eq("status_row", "complete").order("created_at", { ascending: false }).limit(50);
   return ok(c, { resolutions: data ?? [] });
 });
+
+// ---- follows and the private early reveal (plan §17.3 P7-lite) ---------------------------------------------------
+
+const MarketId = z.string().uuid();
+const SHADOW_EVENTS = ["shadow.committed", "shadow.revealed"] as const;
+/** GET /v1/follows returns the newest this many; active_follows is the full count. */
+const FOLLOWS_PAGE = 1000;
+const storeDown = (c: Parameters<typeof ok>[0], what: string) => err(c, "UPSTREAM_UNAVAILABLE", `${what} unavailable; retry shortly.`, 503);
+
+/** The tenant's plan as tenants.plan says now (auth caches the key for up to 60 s; a plan change applies at once). */
+async function tenantPlan(client: Db, tenantId: string): Promise<{ plan: Plan } | { error: string }> {
+  const { data, error } = await client.from("tenants").select("plan").eq("id", tenantId).single();
+  if (error) return { error: error.message };
+  const plan = Plan.safeParse(data?.plan);
+  return plan.success ? { plan: plan.data } : { error: `unknown plan ${JSON.stringify(data?.plan)}` };
+}
+
+/** Follow a public shadow market: private early reveals by webhook (shadow.committed, shadow.revealed) and GET /v1/shadow/:id. */
+v1.post("/markets/:id/follow", async (c) => {
+  const auth = c.get("auth");
+  const id = MarketId.safeParse(c.req.param("id"));
+  if (!id.success) return err(c, "validation_error", "market id must be a uuid", 400);
+  const client = db(c.env);
+  const [{ data: m, error: me }, plan] = await Promise.all([
+    client.from("markets").select("id, tenant_id, is_test, status, deleted_at").eq("id", id.data).maybeSingle(),
+    tenantPlan(client, auth.tenantId),
+  ]);
+  if (me || "error" in plan) return storeDown(c, "market or tenant store");
+  const refusal = followRefusal(m as FollowTarget | null, auth.tenantId);
+  if (refusal) return err(c, refusal.code, refusal.message, refusal.status);
+  const cap = followCap(plan.plan);
+  let a: FollowAnswer;
+  // follow_market is one transaction: an error means no follow was recorded.
+  try { a = await followMarket(client, auth.tenantId, id.data, cap); }
+  catch { return storeDown(c, "follow store (no follow was recorded)"); }
+  const followed = (following: { follow_id: string; active: number }, created: boolean) => ok(c, {
+    follow_id: following.follow_id, market_id: id.data, following: true, already_following: !created, active_follows: following.active, follow_limit: cap,
+    events: SHADOW_EVENTS, read: `/v1/shadow/${id.data}`,
+    note: "Verdicts arrive as shadow.committed on every endpoint subscribed to it (POST /v1/webhooks) and at the read URL. Private early reveal, excluded from the public record.",
+  }, created ? 201 : 200);
+  switch (a.result) {
+    case "followed": return followed(a, true);
+    case "already_following": return followed(a, false);
+    case "cap_reached": return err(c, "validation_error", `follow limit (${a.cap}) reached for this plan; unfollow a market (DELETE /v1/markets/:id/follow) or change plans`, 403, { extra: { follow_limit: a.cap, active_follows: a.active } });
+    case "not_followable": return err(c, "validation_error", `market cannot be followed: ${a.reason}`, 400);
+    default: { const never: never = a; throw new Error(`unhandled follow answer ${JSON.stringify(never)}`); }
+  }
+});
+
+v1.delete("/markets/:id/follow", async (c) => {
+  const id = MarketId.safeParse(c.req.param("id"));
+  if (!id.success) return err(c, "validation_error", "market id must be a uuid", 400);
+  const { data, error } = await db(c.env).from("market_follows").update({ deleted_at: new Date().toISOString() })
+    .eq("tenant_id", c.get("auth").tenantId).eq("market_id", id.data).is("deleted_at", null).select("id");
+  if (error) return storeDown(c, "follow store");
+  if (!data?.length) return err(c, "not_found", "not following this market", 404);
+  return ok(c, { unfollowed: id.data });
+});
+
+v1.get("/follows", async (c) => {
+  const auth = c.get("auth");
+  const client = db(c.env);
+  const [{ data, error, count }, plan] = await Promise.all([
+    client.from("market_follows").select("id, market_id, created_at, markets(platform, external_id, status, deadline_utc)", { count: "exact" }).eq("tenant_id", auth.tenantId).is("deleted_at", null).order("created_at", { ascending: false }).limit(FOLLOWS_PAGE),
+    tenantPlan(client, auth.tenantId),
+  ]);
+  if (error || "error" in plan) return storeDown(c, "follow store");
+  type F = { id: string; market_id: string; created_at: string; markets: { platform: string; external_id: string; status: string; deadline_utc: string } | null };
+  const follows = ((data ?? []) as unknown as F[]).map((f) => ({
+    follow_id: f.id, market_id: f.market_id, followed_at: f.created_at,
+    market: f.markets ? `${f.markets.platform}:${f.markets.external_id}` : null, status: f.markets?.status ?? null, deadline_utc: f.markets?.deadline_utc ?? null,
+  }));
+  const active = count ?? follows.length;
+  return ok(c, { follows, active_follows: active, follow_limit: followCap(plan.plan), truncated: active > follows.length });
+});
+
+/** The private early reveal of one followed market: its committed verdicts, never the nonce or the preimage. */
+v1.get("/shadow/:market_id", async (c) => {
+  const id = MarketId.safeParse(c.req.param("market_id"));
+  if (!id.success) return err(c, "validation_error", "market id must be a uuid", 400);
+  const client = db(c.env);
+  const { data: f, error } = await client.from("market_follows").select("id, markets(id, platform, external_id, status, deadline_utc)")
+    .eq("tenant_id", c.get("auth").tenantId).eq("market_id", id.data).is("deleted_at", null).maybeSingle();
+  if (error) return storeDown(c, "follow store");
+  const market = (f as { markets: ShadowMarket | null } | null)?.markets;
+  if (!market) return err(c, "not_found", "not following this market (POST /v1/markets/:id/follow first)", 404);
+  const { data: commits, error: ce } = await client.from("bot_posts").select("id, commitment_sha256, created_at, channel, telegram_date, payload")
+    .eq("market_id", id.data).eq("kind", "commit").order("created_at", { ascending: false }).limit(50);
+  if (ce) return storeDown(c, "commit store");
+  return ok(c, shapeShadow(market, (commits ?? []) as ShadowCommitRow[]));
+});
+
 v1.get("/resolutions/:id", async (c) => {
   const { data } = await db(c.env).from("resolutions").select("*").eq("id", c.req.param("id")).eq("tenant_id", c.get("auth").tenantId).maybeSingle();
   if (!data) return err(c, "not_found", "resolution not found", 404);
@@ -269,17 +363,10 @@ v1.get("/payments/address", async (c) => {
 v1.post("/keys/rotate", async (c) => {
   const auth = c.get("auth");
   const client = db(c.env);
-  const raw = `rsl_${auth.environment}_${randomKeyBody()}`;
-  const hash = await sha256Hex(raw);
-  const { data: k, error } = await client.from("api_keys").insert({ tenant_id: auth.tenantId, key_hash: hash, key_prefix: raw.slice(0, 12) + "...", name: "rotated", environment: auth.environment, scopes: auth.scopes, daily_cap: auth.dailyCap }).select("id").single();
+  const key = await mintKey(auth.environment);
+  const { data: k, error } = await client.from("api_keys").insert({ tenant_id: auth.tenantId, key_hash: key.hash, key_prefix: key.prefix, name: "rotated", environment: auth.environment, scopes: auth.scopes, daily_cap: auth.dailyCap }).select("id").single();
   if (error || !k) return err(c, "internal_error", error?.message ?? "key insert failed", 500);
   await client.from("api_keys").update({ expires_at: new Date(Date.now() + 24 * 3600_000).toISOString() }).eq("id", auth.keyId);
   const old = extractApiKey(c); if (old) await invalidateKeyCache(await sha256Hex(old));
-  return ok(c, { key: raw, key_id: k.id, note: "Shown once. The previous key expires in 24 hours." }, 201);
+  return ok(c, { key: key.raw, key_id: k.id, note: "Shown once. The previous key expires in 24 hours." }, 201);
 });
-
-export function randomKeyBody(): string {
-  const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
-  const bytes = new Uint8Array(32); crypto.getRandomValues(bytes);
-  let s = ""; for (const b of bytes) s += chars[b % chars.length]; return s;
-}

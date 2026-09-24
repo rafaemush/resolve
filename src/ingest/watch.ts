@@ -13,7 +13,8 @@ import { railEnabled } from "../resolve/rails";
 import { resolveWithRuntime, JevUnavailableError } from "../resolve/runtime";
 import type { EvidenceInput, Verdict } from "../resolve/schema";
 import { commitVerdict } from "../bot/commit";
-import { enqueueEvent } from "../webhooks/deliver";
+import { publishEvent, type WaitUntil } from "../webhooks/deliver";
+import { publishShadowCommitted } from "../shadow/events";
 import { alert } from "../ops/alerts";
 
 export interface WatchRunSummary {
@@ -125,7 +126,15 @@ async function safeAlert(env: Env, key: string, text: string, dedupMinutes: numb
   catch (e) { console.error(JSON.stringify({ level: "error", job: "watch_alert", key, error: String(e).slice(0, 200) })); }
 }
 
-export async function runWatch(env: Env, cfg: Config, watchId: string): Promise<WatchRunSummary> {
+export interface WatchRunOptions {
+  /**
+   * waitUntil of the invocation running the poll (the pg_net dispatch or a /v1/resolve fetch). Tenant and follower
+   * webhooks get their first delivery attempt under it (plan §18 (a)); without it the attempt is awaited briefly.
+   */
+  waitUntil?: WaitUntil;
+}
+
+export async function runWatch(env: Env, cfg: Config, watchId: string, opts: WatchRunOptions = {}): Promise<WatchRunSummary> {
   const started = Date.now();
   const client = db(env);
   const summary: WatchRunSummary = { watch_id: watchId, outcome: "skipped", rows_written: 0, detail: "" };
@@ -298,9 +307,14 @@ export async function runWatch(env: Env, cfg: Config, watchId: string): Promise<
     } else if (mode === "shadow") {
       const cm = await commitVerdict(env, market, rt.resolutionId, v);
       summary.detail += ` | commit: ${cm.reason}`;
+      // The private early reveal: followers get the committed verdict as soon as the commitment exists.
+      if (cm.commit) {
+        const f = await publishShadowCommitted(env, market, cm.commit, { waitUntil: opts.waitUntil });
+        if (f.rows.length) summary.detail += ` | shadow.committed queued for ${f.rows.length} endpoint(s) of ${f.followers} follower(s)`;
+      }
     } else if (market.tenant_id) {
       const type = v.resolution_status === "RESOLVED" ? "market.resolved" : v.resolution_status === "ERROR" ? "market.error" : "market.unresolved_update";
-      await enqueueEvent(env, market.tenant_id, type, { market_id: market.id, external_id: market.external_id, request_id: rt.resolutionId, verdict: v });
+      await publishEvent(env, market.tenant_id, type, { market_id: market.id, external_id: market.external_id, request_id: rt.resolutionId, verdict: v }, { waitUntil: opts.waitUntil });
     }
   } catch (e) {
     // The runtime threw ResolutionNotRecordedError (alerted there): no verdict row exists, so the charge bought nothing.

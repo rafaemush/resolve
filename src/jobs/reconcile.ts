@@ -11,7 +11,10 @@
  *      others instead of holding a slot forever. An official outcome is settled by settle_market() (migration 012) in
  *      one transaction: one reconciliation row per commit (final on the latest commit, the market's one public
  *      agreement), one pending reveal row per commit, watches off, the terminal status. No official outcome 21 days
- *      after the deadline closes the market as closed_unresolved through the same path.
+ *      after the deadline closes the market as closed_unresolved through the same path. A settled market's followers
+ *      get shadow.revealed (queued inside the settle's reservation, src/shadow/events.ts);
+ *   5. the queued shadow.revealed rows get their first delivery attempt with whatever budget is left (the 5-minute
+ *      drain delivers the rest).
  * Official outcomes map to OPTION_A/OPTION_B only by normalized label equality with the registered option text. The
  * positional fallback that used to map "first outcome" to OPTION_A is gone: no match means no reconciliation and an
  * alert, never a guess.
@@ -25,6 +28,8 @@ import type { MarketRow } from "../ingest/types";
 import { alert } from "../ops/alerts";
 import { redact } from "../ops/redact";
 import { Budget, COST, DISPATCH_CHECK_SUBREQUESTS, EXCEPTION_RESERVE, INVOCATION_SUBREQUESTS } from "../ops/budget";
+import { queueForFollowers, shadowRevealedPayload, QUEUE_SUBREQUESTS, type RevealedCommit } from "../shadow/events";
+import { deliverInline } from "../webhooks/deliver";
 
 /**
  * Of Workers Free's 50 subrequests per invocation: the 10-minute invocation runs the pg_net dispatch check first and
@@ -291,8 +296,12 @@ export interface ReconcileSummary {
   checked: number; resolved: number; closed_out: number; pending: number; unmappable: number; unreachable: number; disagreements: number;
   awaiting_watch: number; settle_retried: number; rescheduled: number;
   reconciliations: number; reveals_recorded: number; reveals_posted: number; reveals_waiting: number; retried: number; retry_posted: number;
+  /** shadow.revealed deliveries queued for followers of the markets settled this run. */
+  shadow_revealed_queued: number;
   stopped_by_budget: boolean; subrequests: number; errors: string[];
 }
+
+type Row = Record<string, unknown>;
 
 interface CommitDbRow { id: string; market_id: string; resolution_id: string | null; created_at: string; telegram_date: string | null; channel: string; message_id: number | null; commitment_sha256: string; nonce: string; payload: Record<string, unknown>; resolutions: ResolutionFallback | null }
 
@@ -311,7 +320,8 @@ export async function runReconcile(env: Env): Promise<ReconcileSummary> {
   const client = db(env);
   const started = Date.now();
   const budget = new Budget(RECONCILE_SUBREQUESTS - COST.db); // the loop_runs row below is reserved up front
-  const out: ReconcileSummary = { checked: 0, resolved: 0, closed_out: 0, pending: 0, unmappable: 0, unreachable: 0, disagreements: 0, awaiting_watch: 0, settle_retried: 0, rescheduled: 0, reconciliations: 0, reveals_recorded: 0, reveals_posted: 0, reveals_waiting: 0, retried: 0, retry_posted: 0, stopped_by_budget: false, subrequests: 0, errors: [] };
+  const out: ReconcileSummary = { checked: 0, resolved: 0, closed_out: 0, pending: 0, unmappable: 0, unreachable: 0, disagreements: 0, awaiting_watch: 0, settle_retried: 0, rescheduled: 0, reconciliations: 0, reveals_recorded: 0, reveals_posted: 0, reveals_waiting: 0, retried: 0, retry_posted: 0, shadow_revealed_queued: 0, stopped_by_budget: false, subrequests: 0, errors: [] };
+  const queued: Row[] = [];
   const say = async (key: string, text: string, dedupMinutes: number) => {
     if (budget.take(COST.alert)) await alert(env, key, text, { dedupMinutes });
     else out.errors.push(`alert ${key} not sent: subrequest budget`);
@@ -323,8 +333,10 @@ export async function runReconcile(env: Env): Promise<ReconcileSummary> {
   out.reveals_posted = rv.posted; out.reveals_waiting = rv.waiting;
   if (rt.stopped || rv.stopped) out.stopped_by_budget = true;
   await alertStalePending(client, budget, say, out);
-  await discover(env, client, budget, started, out);
+  await discover(env, client, budget, started, out, queued);
   if (out.unreachable) await say("reconcile_unreachable", `reconcile could not read ${out.unreachable} platform answer(s): ${out.errors.slice(0, 3).join("; ")}`, 360);
+  // Last, on what the markets left: a row not attempted here is delivered by the 5-minute drain.
+  await deliverInline(env, queued, { budget });
 
   out.subrequests = budget.used + COST.db;
   const rows = out.reconciliations + out.reveals_recorded + out.reveals_posted + out.retry_posted;
@@ -358,7 +370,7 @@ async function alertStalePending(client: Db, budget: Budget, say: Say, out: Reco
  * Due markets, longest-waiting first; every market checked and not settled is rescheduled in one defer_reconcile()
  * request. A failure of either request is alerted from a reservation taken up front.
  */
-async function discover(env: Env, client: Db, budget: Budget, nowMs: number, out: ReconcileSummary): Promise<void> {
+async function discover(env: Env, client: Db, budget: Budget, nowMs: number, out: ReconcileSummary, queued: Row[]): Promise<void> {
   if (!budget.take(2 * COST.db + COST.alert)) { out.stopped_by_budget = true; return; }
   const nowIso = new Date(nowMs).toISOString();
   const { data: markets, error } = await client.from("markets").select("*").is("tenant_id", null).eq("is_test", false).eq("status", "open").in("platform", ["polymarket", "limitless"])
@@ -375,7 +387,7 @@ async function discover(env: Env, client: Db, budget: Budget, nowMs: number, out
     // one alert per market (a label it cannot map, or a write that failed) is reserved with its check
     if (!budget.take(COST.http + COST.alert)) { out.stopped_by_budget = true; break; }
     out.checked++;
-    const step = await checkMarket(env, client, budget, m, nowMs, out);
+    const step = await checkMarket(env, client, budget, m, nowMs, out, queued);
     if (!step.alerted) budget.release(COST.alert);
     if (step.defer) deferrals.push(step.defer);
     if (step.stop) break;
@@ -391,7 +403,7 @@ async function discover(env: Env, client: Db, budget: Budget, nowMs: number, out
   out.rescheduled = typeof n === "number" ? n : 0;
 }
 
-async function checkMarket(env: Env, client: Db, budget: Budget, m: MarketRow, nowMs: number, out: ReconcileSummary): Promise<Step> {
+async function checkMarket(env: Env, client: Db, budget: Budget, m: MarketRow, nowMs: number, out: ReconcileSummary, queued: Row[]): Promise<Step> {
   const state = withFirstSeen(await officialFor(env, m, new Date(nowMs).toISOString()), m.official_first_seen_at);
   switch (state.kind) {
     case "unreachable":
@@ -403,9 +415,9 @@ async function checkMarket(env: Env, client: Db, budget: Budget, m: MarketRow, n
       return { defer: deferral(m, "failed", nowMs), alerted: true, stop: false };
     case "pending":
       if (nowMs < Date.parse(m.deadline_utc) + CLOSE_OUT_DAYS * 86_400_000) { out.pending++; return { defer: deferral(m, "pending", nowMs), alerted: false, stop: false }; }
-      return settle(env, client, budget, m, { outcome: null, label: null, at: null, at_source: null, source_url: state.source_url }, nowMs, out);
+      return settle(env, client, budget, m, { outcome: null, label: null, at: null, at_source: null, source_url: state.source_url }, nowMs, out, queued);
     case "resolved":
-      return settle(env, client, budget, m, state.official, nowMs, out);
+      return settle(env, client, budget, m, state.official, nowMs, out, queued);
     default: {
       const never: never = state;
       throw new Error(`unhandled official state ${JSON.stringify(never)}`);
@@ -416,9 +428,10 @@ async function checkMarket(env: Env, client: Db, budget: Budget, m: MarketRow, n
 /**
  * Plan one market's outcome and write it through settle_market(), which does every write in one transaction (and
  * nothing when a watch still owes its post-deadline poll, or a commit landed that this plan did not see). A failure
- * spends the alert reserved with the market's check and reschedules it with backoff.
+ * spends the alert reserved with the market's check and reschedules it with backoff. A settled market's followers get
+ * shadow.revealed, queued inside the same reservation so it can never be dropped for budget.
  */
-async function settle(env: Env, client: Db, budget: Budget, m: MarketRow, official: OfficialRecord, nowMs: number, out: ReconcileSummary): Promise<Step> {
+async function settle(env: Env, client: Db, budget: Budget, m: MarketRow, official: OfficialRecord, nowMs: number, out: ReconcileSummary, queued: Row[]): Promise<Step> {
   const firstSeen = official.at && pollTime(official.at_source) ? official.at : null;
   const later = (kind: "pending" | "failed" | "retry", alerted = false, stop = false): Step => ({ defer: deferral(m, kind, nowMs, firstSeen), alerted, stop });
   const failed = async (what: string, message: string): Promise<Step> => {
@@ -445,8 +458,9 @@ async function settle(env: Env, client: Db, budget: Budget, m: MarketRow, offici
   }
   const plan = planReconciliations(m, commits, official);
   const disagree = plan.filter((p) => p.row.agreement === "disagree");
-  // the write + the alerts a settled market raises, reserved together so an alert is never dropped for budget
-  const alerts = ((disagree.length ? 1 : 0) + (unprovable.length ? 1 : 0)) * COST.alert;
+  // the write, the alerts a settled market raises and its followers' shadow.revealed, reserved together so neither an
+  // alert nor the event is ever dropped for budget
+  const alerts = ((disagree.length ? 1 : 0) + (unprovable.length ? 1 : 0)) * COST.alert + QUEUE_SUBREQUESTS;
   if (!budget.take(COST.db + alerts)) { out.stopped_by_budget = true; return later("retry", false, true); }
 
   const byId = new Map(commits.map((c) => [c.id, c]));
@@ -490,6 +504,16 @@ async function settle(env: Env, client: Db, budget: Budget, m: MarketRow, offici
   }
   out.reconciliations += a.reconciliations; out.reveals_recorded += a.reveals;
   if (official.outcome === null) out.closed_out++; else out.resolved++;
+  const revealed: RevealedCommit[] = plan.map((p) => {
+    const c = byId.get(p.commit_id)!;
+    return { commitment_sha256: c.db.commitment_sha256, committed_at: c.created_at, agreement: p.row.agreement, final: p.row.final, committed: c.provable ? c.committed : null };
+  });
+  const q = await queueForFollowers(env, m, "shadow.revealed", shadowRevealedPayload(m, official, revealed));
+  queued.push(...q.rows);
+  out.shadow_revealed_queued += q.rows.length;
+  if (q.error) out.errors.push(`${marketRef(m)} shadow.revealed: ${q.error}`);
+  // No follower (the common case): only the follows read was spent. Otherwise keep the reservation (an alert may be spent).
+  if (!q.followers && !q.error) budget.release(QUEUE_SUBREQUESTS - COST.db);
   if (disagree.length) {
     out.disagreements += disagree.length;
     await alert(env, `reconcile_disagree_${m.id}`, `DISAGREE on ${marketRef(m)}: ${disagree.length} commit(s) called the market against the official ${official.outcome}${official.label ? ` (${official.label})` : ""}${disagree.some((d) => d.row.final) ? ", including the final commit (a false RESOLVED on the public record)" : ""}. Revealed through the same path as agreements. ${official.source_url ?? ""}`, { dedupMinutes: 1440 });

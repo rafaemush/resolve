@@ -1,7 +1,8 @@
 /**
- * Stand-ins for migration 012's settle_market() and defer_reconcile(), step for step in the SQL's order, over the
- * in-memory database (tests/lib/fake-db.ts). They exist so reconcile runs can be tested end to end without Postgres;
- * the SQL itself is proven by scripts/selftest-db.ts. Run inside fakeDb's rpc(): one subrequest, rolled back on error.
+ * Stand-ins for migration 012's settle_market() and defer_reconcile() and migration 014's follow_market(), step for step
+ * in the SQL's order, over the in-memory database (tests/lib/fake-db.ts). They exist so reconcile runs and the follow
+ * routes can be tested end to end without Postgres; the SQL itself is proven by scripts/selftest-db.ts. Run inside
+ * fakeDb's rpc(): one subrequest, rolled back on error.
  */
 import type { FakeDb, FakeDbOptions, Row } from "./fake-db";
 
@@ -66,3 +67,24 @@ export async function deferReconcile(db: FakeDb, a: Record<string, any>): Promis
 }
 
 export const RECONCILE_RPCS: NonNullable<FakeDbOptions["rpc"]> = { settle_market: settleMarket, defer_reconcile: deferReconcile };
+
+/**
+ * Stand-in for migration 014's follow_market(), step for step in the SQL's order. The inserted row carries the market
+ * embedded as PostgREST's markets(...) select would return it, so reads that embed the market see it.
+ */
+export async function followMarket(db: FakeDb, a: Record<string, any>): Promise<{ data: any; error: any }> {
+  if (a.p_cap !== null && a.p_cap < 0) return fail(`follow_market: p_cap must be >= 0 or null (unlimited), got ${a.p_cap}`);
+  if (!(db.tables.tenants ?? []).some((t) => t.id === a.p_tenant && !t.deleted_at)) return fail(`follow_market: no tenant ${a.p_tenant}`);
+  const m = (db.tables.markets ?? []).find((x) => x.id === a.p_market);
+  if (!m || m.deleted_at || m.tenant_id !== null || m.is_test) return { data: { result: "not_followable", reason: "not a public shadow market" }, error: null };
+  if (m.status !== "open") return { data: { result: "not_followable", reason: `market is ${m.status}` }, error: null };
+  const follows = (db.tables.market_follows ??= []);
+  const active = follows.filter((f) => f.tenant_id === a.p_tenant && !f.deleted_at);
+  const existing = active.find((f) => f.market_id === a.p_market);
+  if (existing) return { data: { result: "already_following", follow_id: existing.id, active: active.length }, error: null };
+  if (a.p_cap !== null && active.length >= a.p_cap) return { data: { result: "cap_reached", active: active.length, cap: a.p_cap }, error: null };
+  const row = { id: `follow-${follows.length + 1}`, tenant_id: a.p_tenant, market_id: m.id, created_at: new Date().toISOString(), deleted_at: null,
+    markets: { id: m.id, platform: m.platform, external_id: m.external_id, status: m.status, deadline_utc: m.deadline_utc } };
+  follows.push(row);
+  return { data: { result: "followed", follow_id: row.id, active: active.length + 1 }, error: null };
+}

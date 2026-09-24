@@ -86,14 +86,16 @@ vi.mock("../src/resolve/runtime", () => ({
   }),
 }));
 vi.mock("../src/bot/commit", () => ({ commitVerdict: vi.fn(async () => ({ committed: true, posted: false, reason: "recorded without channel" })) }));
-vi.mock("../src/webhooks/deliver", () => ({ enqueueEvent: vi.fn() }));
+vi.mock("../src/webhooks/deliver", () => ({ publishEvent: vi.fn(async () => ({ queued: 1 })) }));
+vi.mock("../src/shadow/events", () => ({ publishShadowCommitted: vi.fn(async () => ({ followers: 1, rows: [{ id: "d1" }], error: null })) }));
 vi.mock("../src/ops/alerts", () => ({ alert: vi.fn(async () => ({ sent: true, deduped: false })) }));
 
 import { runWatch } from "../src/ingest/watch";
 import { resolveWithRuntime } from "../src/resolve/runtime";
 import { alert } from "../src/ops/alerts";
 import { commitVerdict } from "../src/bot/commit";
-import { enqueueEvent } from "../src/webhooks/deliver";
+import { publishEvent } from "../src/webhooks/deliver";
+import { publishShadowCommitted } from "../src/shadow/events";
 import { projectForChange } from "../src/ingest/projection";
 import { sha256Hex } from "../src/resolve/text";
 
@@ -141,7 +143,8 @@ beforeEach(() => {
   vi.mocked(resolveWithRuntime).mockClear();
   vi.mocked(alert).mockClear();
   vi.mocked(commitVerdict).mockClear();
-  vi.mocked(enqueueEvent).mockClear();
+  vi.mocked(publishEvent).mockClear();
+  vi.mocked(publishShadowCommitted).mockClear();
   h.rpc.mockClear();
   resetWatch();
 });
@@ -332,7 +335,7 @@ describe("a verdict that could not look is never consumed (Jev gated, over budge
       ["refund_credits", { p_request_id: "stub1" }],
     ]);
     expect(h.state.resolutions.at(-1)).toMatchObject({ id: r.resolution_id, credits_refunded: 5 });
-    expect(enqueueEvent).not.toHaveBeenCalled();
+    expect(publishEvent).not.toHaveBeenCalled();
     expect(alert).not.toHaveBeenCalled();
   });
 
@@ -353,6 +356,49 @@ describe("a verdict that could not look is never consumed (Jev gated, over budge
     expect(r.detail).toContain("resolutions insert");
     expect(h.rpc.mock.calls.map((c) => c[1])).toEqual(["begin_resolution", "refund_credits"]);
     expect(h.state.watch.last_canonical_hash).toBeNull(); // the change stays pending: the next poll resolves it again
+  });
+});
+
+describe("publishing a verdict that looked (plan §18 (a): first delivery attempt under the dispatch's waitUntil)", () => {
+  const waitUntil = vi.fn();
+  const COMMIT = { id: "c1", commitment_sha256: "a".repeat(64), committed_at: "2026-09-24T12:00:00.000Z", committed: { preimage_version: "v2" } };
+
+  it("shadow market: the recorded commit goes to its followers as shadow.committed, with the caller's waitUntil", async () => {
+    vi.mocked(commitVerdict).mockResolvedValueOnce({ committed: true, posted: true, reason: "posted", commit: COMMIT } as never);
+    serve(200, JSON.stringify(pr(1)));
+    const r = await runWatch(env(), cfg, WATCH_ID, { waitUntil });
+    expect(r.outcome).toBe("success");
+    expect(publishShadowCommitted).toHaveBeenCalledTimes(1);
+    const [, market, commit, opts] = vi.mocked(publishShadowCommitted).mock.calls[0]!;
+    expect(market).toMatchObject({ id: MARKET_ID, tenant_id: null });
+    expect(commit).toBe(COMMIT);
+    expect(opts).toEqual({ waitUntil });
+    expect(r.detail).toContain("shadow.committed queued for 1 endpoint(s) of 1 follower(s)");
+    expect(publishEvent).not.toHaveBeenCalled();
+  });
+
+  it("shadow market: no commit row (the same verdict signature was already committed), no follower event", async () => {
+    vi.mocked(commitVerdict).mockResolvedValueOnce({ committed: false, posted: false, reason: "already committed for this verdict signature" });
+    serve(200, JSON.stringify(pr(1)));
+    await runWatch(env(), cfg, WATCH_ID, { waitUntil });
+    expect(publishShadowCommitted).not.toHaveBeenCalled();
+  });
+
+  it("tenant market: the verdict event is published with the caller's waitUntil; nothing is committed publicly", async () => {
+    const tenant = "33333333-3333-4333-8333-333333333333";
+    resetWatch({ markets: { ...market(7 * 86_400_000), tenant_id: tenant } });
+    h.rpc.mockImplementation(async (_c: unknown, fn: string) => {
+      if (fn === "begin_resolution") return [{ request_id: "stub3", ok: true, charged: 5 }]; // bill-then-run
+      throw new Error(`rpc ${fn} not expected`);
+    });
+    serve(200, JSON.stringify(pr(1)));
+    const r = await runWatch(env(), cfg, WATCH_ID, { waitUntil });
+    expect(r.outcome).toBe("success");
+    expect(commitVerdict).not.toHaveBeenCalled();
+    expect(publishShadowCommitted).not.toHaveBeenCalled();
+    const [, to, type, payload, opts] = vi.mocked(publishEvent).mock.calls[0]!;
+    expect([to, type, opts]).toEqual([tenant, "market.unresolved_update", { waitUntil }]);
+    expect(payload).toMatchObject({ market_id: MARKET_ID, request_id: r.resolution_id, verdict: { resolution_status: "UNRESOLVED" } });
   });
 });
 

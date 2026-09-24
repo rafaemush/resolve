@@ -1,15 +1,14 @@
 import { Hono } from "hono";
 import type { Env } from "../env";
 import { parseConfig } from "../env";
-import { ok, err } from "./envelope";
+import { ok, err, waitUntilOf } from "./envelope";
 import { safeEqual, bearer } from "./admin";
 import { hmacHex } from "../resolve/text";
 import { runWatch } from "../ingest/watch";
 import { registerMarket } from "../markets/register";
 import { db, rpc } from "../db/supabase";
 import { makeJevCaller } from "../jev/client";
-import { sha256Hex } from "../resolve/text";
-import { randomKeyBody } from "./v1";
+import { mintKey } from "./keys";
 import { runReconcile } from "../jobs/reconcile";
 import { scanDeposits } from "../jobs/deposits";
 import { drainWebhooks } from "../webhooks/deliver";
@@ -32,7 +31,7 @@ internal.post("/watch/:id", async (c) => {
     if (!safeEqual(sig, expected)) return err(c, "forbidden", "invalid internal signature", 403);
   }
   const cfg = parseConfig(c.env);
-  const s = await runWatch(c.env, cfg, id);
+  const s = await runWatch(c.env, cfg, id, { waitUntil: waitUntilOf(c) });
   // pg_net stores this status in net._http_response and dispatch_failures() (migration 013) counts >= 400 as a poll that
   // did not happen. A run that recorded its outcome, 'failure' included (a source error, alerted by the runner's own
   // transition and streak logic), is a delivered dispatch; only a run that could not record itself (loop_runs row or
@@ -77,10 +76,10 @@ internal.post("/tenants", async (c) => {
   const { data: t, error } = await client.from("tenants").insert({ display_name: b.display_name, contact: b.contact ?? null, wallet_address: b.wallet_address ? b.wallet_address.toLowerCase() : null, plan: b.plan ?? "free", strict_v0: !!b.strict_v0, watch_limit: b.watch_limit ?? 5 }).select("id").single();
   if (error || !t) return err(c, "validation_error", error?.message ?? "tenant insert failed", 400);
   if (b.credits && b.credits > 0) await rpc(client, "grant_credits", { p_tenant: t.id, p_amount: b.credits, p_note: "onboarding grant" });
-  const raw = `rsl_${b.environment ?? "test"}_${randomKeyBody()}`;
-  const { data: k, error: ke } = await client.from("api_keys").insert({ tenant_id: t.id, key_hash: await sha256Hex(raw), key_prefix: raw.slice(0, 12) + "...", name: "initial", environment: b.environment ?? "test", daily_cap: 1000 }).select("id").single();
+  const key = await mintKey(b.environment ?? "test");
+  const { data: k, error: ke } = await client.from("api_keys").insert({ tenant_id: t.id, key_hash: key.hash, key_prefix: key.prefix, name: "initial", environment: b.environment ?? "test", daily_cap: 1000 }).select("id").single();
   if (ke || !k) return err(c, "internal_error", ke?.message ?? "key insert failed", 500);
-  return ok(c, { tenant_id: t.id, key_id: k.id, key: raw, note: "Shown once." }, 201);
+  return ok(c, { tenant_id: t.id, key_id: k.id, key: key.raw, note: "Shown once." }, 201);
 });
 
 internal.post("/reconcile", async (c) => { if (!isAdmin(c)) return err(c, "forbidden", "admin key required", 403); return ok(c, await runReconcile(c.env)); });

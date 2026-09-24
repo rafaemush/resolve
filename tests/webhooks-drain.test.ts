@@ -180,15 +180,34 @@ describe("drainWebhooks: a delivery whose claiming run died", () => {
 
 describe("enqueueEvent", () => {
   beforeEach(() => { h.failEndpointRead = false; h.failEndpointList = false; vi.mocked(alert).mockClear(); });
-  it("queues one delivery per subscribed endpoint", async () => {
+  it("queues one delivery per subscribed endpoint and returns the inserted rows", async () => {
     h.db = fakeDb({ webhook_endpoints: [endpoint("e1", { tenant_id: "t1", events: ["market.resolved"] }), endpoint("e2", { tenant_id: "t1", events: ["market.error"] })], webhook_deliveries: [] });
-    expect(await enqueueEvent(env, "t1", "market.resolved", { x: 1 })).toBe(1);
+    const rows = await enqueueEvent(env, "t1", "market.resolved", { x: 1 });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ endpoint_id: "e1", tenant_id: "t1", event_type: "market.resolved", payload: { x: 1 }, status: "pending", attempt: 0 });
+    expect(rows[0]!.id).toBe(h.db.tables.webhook_deliveries![0]!.id);
+    expect(vi.mocked(alert)).not.toHaveBeenCalled();
+  });
+  it("fans out to several tenants in one read and one insert, each row on its own tenant", async () => {
+    h.db = fakeDb({ webhook_endpoints: [
+      endpoint("e1", { tenant_id: "t1", events: ["shadow.committed"] }), endpoint("e2", { tenant_id: "t2", events: ["shadow.committed", "market.resolved"] }),
+      endpoint("e3", { tenant_id: "t3", events: ["market.resolved"] }), endpoint("e4", { tenant_id: "t9", events: ["shadow.committed"] }),
+    ], webhook_deliveries: [] });
+    const rows = await enqueueEvent(env, ["t1", "t2", "t3", "t2"], "shadow.committed", { m: 1 });
+    expect(rows.map((r) => [r.endpoint_id, r.tenant_id])).toEqual([["e1", "t1"], ["e2", "t2"]]);
+    expect(h.db.calls.map((c) => `${c.table}.${c.action}`)).toEqual(["webhook_endpoints.select", "webhook_deliveries.insert"]);
+  });
+  it("no tenant, or no subscribed endpoint: nothing queued, nothing alerted", async () => {
+    h.db = fakeDb({ webhook_endpoints: [endpoint("e1", { tenant_id: "t1", events: ["market.error"] })], webhook_deliveries: [] });
+    expect(await enqueueEvent(env, [], "shadow.committed", {})).toEqual([]);
+    expect(await enqueueEvent(env, "t1", "shadow.committed", {})).toEqual([]);
+    expect(h.db.tables.webhook_deliveries).toEqual([]);
     expect(vi.mocked(alert)).not.toHaveBeenCalled();
   });
   it("could not read the endpoints: the dropped event is alerted, not treated as no subscriber", async () => {
     h.failEndpointList = true;
     h.db = fakeDb({ webhook_endpoints: [endpoint("e1", { tenant_id: "t1", events: ["market.resolved"] })], webhook_deliveries: [] });
-    expect(await enqueueEvent(env, "t1", "market.resolved", { x: 1 })).toBe(0);
+    expect(await enqueueEvent(env, "t1", "market.resolved", { x: 1 })).toEqual([]);
     expect(vi.mocked(alert).mock.calls.map((c) => [c[1], c[3]?.dedupMinutes])).toEqual([["webhook_enqueue_failed", 60]]);
   });
 });

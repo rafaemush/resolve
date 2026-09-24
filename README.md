@@ -21,6 +21,10 @@ Every published accuracy or latency number is rendered from database rows (`eval
 
 Every shadow verdict is recorded first and then posted to the public Telegram channel as `sha256(preimage)`, where the preimage is `platform:external_id|status|outcome|confidence|caveats|canonical_sha256|thresholds_version|nonce`. When the platform resolves, the reveal is a reply that prints the preimage and the nonce, so the commitment can be recomputed from the post alone. `GET /v1/track-record/verify?hash=<sha256>` answers for any commitment: before the reveal only that it exists and when it was posted (never the nonce), after it everything needed to recompute it. `/v1/track-record` counts each market once, by its latest commit, excludes test markets, and shows percentages (with a 95 % Wilson interval) only after 100 reconciled markets per platform. A market is settled in one database transaction, only after its watch has made the post-deadline observation the absence rule needs; a commit can never land on a settled market. `median_lead_seconds` uses the platform's own resolution time only; lead times against a polled official time are reported separately as an upper bound.
 
+## Early reveals and pricing
+
+A tenant can follow a public shadow market (`POST /v1/markets/{id}/follow`) and receive each committed verdict privately the moment its commitment is recorded: `GET /v1/shadow/{market_id}` and the `shadow.committed` webhook, then `shadow.revealed` when the platform resolves. Early reveals are labeled as excluded from the public record and never carry the nonce or the preimage before the public reveal. Plans and credit prices: [docs/pricing.md](docs/pricing.md).
+
 ## Status
 
 Pre-launch. Nothing here is financial advice or an oracle of record.

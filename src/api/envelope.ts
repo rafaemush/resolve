@@ -47,3 +47,16 @@ export function err(
     status as 400,
   );
 }
+
+/**
+ * The request's ExecutionContext.waitUntil, or undefined where the context has none (Hono throws on
+ * c.executionCtx then): webhook first attempts run under it and are awaited briefly without it.
+ */
+export function waitUntilOf(c: Context): ((p: Promise<unknown>) => void) | undefined {
+  try {
+    const ctx = c.executionCtx;
+    return (p) => ctx.waitUntil(p);
+  } catch {
+    return undefined;
+  }
+}

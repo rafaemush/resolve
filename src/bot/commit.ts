@@ -155,11 +155,14 @@ async function deliver(env: Env, client: Db, row: PendingPost, replyTo: number |
   return { posted: false, error: postError };
 }
 
+/** A commit row as recorded: what the private early reveal (src/shadow/events.ts) sends to followers. */
+export interface RecordedCommit { id: string; commitment_sha256: string; committed_at: string; committed: CommittedVerdict }
+
 /**
  * Record the commit (INSERT first), then post it. Deduped per market + committed verdict signature by the unique
- * dedup_key. Test markets are recorded with channel 'none' and never posted.
+ * dedup_key. Test markets are recorded with channel 'none' and never posted. `commit` is set whenever a row was recorded.
  */
-export async function commitVerdict(env: Env, market: MarketRow, resolutionId: string, v: Verdict): Promise<{ committed: boolean; posted: boolean; reason: string }> {
+export async function commitVerdict(env: Env, market: MarketRow, resolutionId: string, v: Verdict): Promise<{ committed: boolean; posted: boolean; reason: string; commit?: RecordedCommit }> {
   const client = db(env);
   const isTest = market.is_test === true;
   let fields = committedFields(v);
@@ -176,17 +179,18 @@ export async function commitVerdict(env: Env, market: MarketRow, resolutionId: s
   const { data: row, error } = await client.from("bot_posts").insert({
     resolution_id: resolutionId, market_id: market.id, channel: isTest ? "none" : "pending", kind: "commit", message_id: null, telegram_date: null, posted_at: null,
     commitment_sha256: commitment, nonce, payload, dedup_key: `commit:${market.id}:${signature}`,
-  }).select("id").single();
+  }).select("id, created_at").single();
   if (error?.code === "23505") return { committed: false, posted: false, reason: "already committed for this verdict signature" };
   if (error?.code === MARKET_NOT_OPEN_SQLSTATE) return { committed: false, posted: false, reason: `not committed: ${error.message}` };
   if (error || !row) {
     await alert(env, `commit_insert_${market.id}`, `commit for ${marketRef(market)} (resolution ${resolutionId}, ${signature}) was not recorded: ${error?.message ?? "no row"}. Nothing was posted.`, { dedupMinutes: 60 });
     return { committed: false, posted: false, reason: `bot_posts insert: ${error?.message ?? "no row"}` };
   }
-  if (isTest) return { committed: true, posted: false, reason: "test market: recorded, never posted" };
-  if (!telegramConfigured(env)) return { committed: true, posted: false, reason: "pending: telegram not configured" };
-  const d = await deliver(env, client, { id: row.id as string, kind: "commit", payload }, null, null);
-  return { committed: true, posted: d.posted, reason: d.posted ? "posted" : `pending: ${d.error}` };
+  const commit: RecordedCommit = { id: row.id as string, commitment_sha256: commitment, committed_at: String(row.created_at), committed };
+  if (isTest) return { committed: true, posted: false, reason: "test market: recorded, never posted", commit };
+  if (!telegramConfigured(env)) return { committed: true, posted: false, reason: "pending: telegram not configured", commit };
+  const d = await deliver(env, client, { id: commit.id, kind: "commit", payload }, null, null);
+  return { committed: true, posted: d.posted, reason: d.posted ? "posted" : `pending: ${d.error}`, commit };
 }
 
 export interface PendingRow { id: string; kind: string; channel: string; created_at: string; payload: Record<string, unknown> }

@@ -998,6 +998,257 @@
         }
       }
     },
+    "/v1/markets/{id}/follow": {
+      "post": {
+        "summary": "Follow a public shadow market (open, not a test market) for the private early reveal: its committed verdicts at GET /v1/shadow/{market_id} and as shadow.committed / shadow.revealed webhooks, labeled \"private early reveal — excluded from the public record\". Idempotent. Active follows per tenant: 50, Growth 500, Platform unlimited (read from the tenant's plan)",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "already following: the same fields with already_following=true",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "follow_id, market_id, following, already_following=false, active_follows, follow_limit (null = unlimited), events, read",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "validation_error: bad id, the tenant's own market, or a market no longer open",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "validation_error: follow limit reached (follow_limit, active_follows at top level)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not_found: no such public shadow market",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "UPSTREAM_UNAVAILABLE: no follow was recorded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Stop following (soft delete); following again later creates a new follow",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "unfollowed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "validation_error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not_found: not following this market",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "UPSTREAM_UNAVAILABLE",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/follows": {
+      "get": {
+        "summary": "Active follows, newest first (at most 1000; active_follows is the full count), with the plan's follow_limit",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "follows[] (follow_id, market_id, followed_at, market platform:external_id, status, deadline_utc), active_follows, follow_limit, truncated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "UPSTREAM_UNAVAILABLE",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/shadow/{market_id}": {
+      "get": {
+        "summary": "Private early reveal of a followed market (\"private early reveal — excluded from the public record\"): every committed verdict, newest first, with its commitment_sha256, committed_at, posted state and evidence hashes. Never the nonce or the preimage: those appear only in the public reveal. 404 unless the tenant follows the market",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "market_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "market_id, platform, external_id, market, status, deadline_utc, label, latest, commits[] (commitment_sha256, committed_at, posted, posted_at, verdict {resolution_status, winning_outcome, confidence_score, caveats, determination_basis, thresholds_version} or null for a pre-v2 commit, evidence {raw_sha256, canonical_sha256}), how_to_verify, disclaimer",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "validation_error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not_found: not following this market",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "UPSTREAM_UNAVAILABLE",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/resolutions/{id}": {
       "get": {
         "summary": "One resolution by request_id",
@@ -1155,7 +1406,7 @@
     },
     "/v1/webhooks": {
       "post": {
-        "summary": "Register an https endpoint (secret shown once)",
+        "summary": "Register an https endpoint (secret shown once). events: a subset of market.resolved, market.unresolved_update, market.error, credits.low, payment.credited, shadow.committed, shadow.revealed (default: all). The first delivery attempt is made as the event happens (a few per event; the rest by the 5-minute queue drain); failed attempts retry on a backoff of 60 s, 5 min, 30 min, 2 h, 12 h, 24 h, then dead-letter",
         "security": [
           {
             "bearerAuth": []
@@ -1164,6 +1415,40 @@
             "apiKeyAuth": []
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "url"
+                ],
+                "properties": {
+                  "url": {
+                    "type": "string",
+                    "format": "uri",
+                    "pattern": "^https://"
+                  },
+                  "events": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "market.resolved",
+                        "market.unresolved_update",
+                        "market.error",
+                        "credits.low",
+                        "payment.credited",
+                        "shadow.committed",
+                        "shadow.revealed"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
         "responses": {
           "201": {
             "description": "endpoint + secret",
@@ -1171,6 +1456,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "validation_error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
                 }
               }
             }

@@ -142,9 +142,11 @@ describe("commitVerdict: insert first, then post, then the receipt", () => {
 
   it("records a pending row, posts it, then fills only the delivery columns", async () => {
     const r = await commitVerdict(env, MARKET, "res1", verdict({ confidence_score: 0.95 }));
-    expect(r).toEqual({ committed: true, posted: true, reason: "posted" });
+    expect(r).toMatchObject({ committed: true, posted: true, reason: "posted" });
     expect(h.db.calls.map((c) => `${c.table}.${c.action}`)).toEqual(["bot_posts.insert", "bot_posts.update"]);
     const row = h.db.tables.bot_posts![0]!;
+    // what the private early reveal sends followers: the recorded row, its commitment and the committed verdict
+    expect(r.commit).toEqual({ id: row.id, commitment_sha256: row.commitment_sha256, committed_at: row.created_at, committed: row.payload.committed });
     expect(row).toMatchObject({ kind: "commit", channel: "telegram", message_id: 77, telegram_date: new Date(1790000000 * 1000).toISOString(), posted_at: new Date(1790000000 * 1000).toISOString() });
     expect(row.payload.committed.preimage_version).toBe("v2");
     expect(await sha256Hex(row.payload.committed.preimage)).toBe(row.commitment_sha256);
@@ -184,7 +186,7 @@ describe("commitVerdict: insert first, then post, then the receipt", () => {
 
   it("test markets are recorded with channel none and never posted", async () => {
     const r = await commitVerdict(env, { ...MARKET, is_test: true }, "res1", verdict({ confidence_score: 0.85 }));
-    expect(r).toEqual({ committed: true, posted: false, reason: "test market: recorded, never posted" });
+    expect(r).toMatchObject({ committed: true, posted: false, reason: "test market: recorded, never posted" });
     expect(sent).toHaveLength(0);
     expect(h.db.tables.bot_posts![0]).toMatchObject({ channel: "none", posted_at: null });
     expect(h.db.tables.bot_posts![0]!.payload.committed.resolution_status).toBe("RESOLVED"); // no floor off the record
