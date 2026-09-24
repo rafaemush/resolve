@@ -7,6 +7,8 @@ import { safeEqual, bearer } from "./admin";
 import { hmacHex } from "../resolve/text";
 import { runWatch } from "../ingest/watch";
 import { registerMarket } from "../markets/register";
+import { registrationRefused } from "./registration";
+import { redact } from "../ops/redact";
 import { mergeMeta, META_KEYS } from "../markets/meta";
 import { db, rpc } from "../db/supabase";
 import { makeJevCaller } from "../jev/client";
@@ -24,19 +26,54 @@ export const internal = new Hono<{ Bindings: Env; Variables: Vars }>();
 
 const isAdmin = (c: { req: { header: (n: string) => string | undefined }; env: Env }) => { const k = bearer(c as never); return !!k && safeEqual(k, c.env.ADMIN_API_KEY); };
 
-/** pg_net -> one watch poll. Signature = HMAC(secret, "<watch_id>|<YYYY-MM-DDTHH:MM>") over the dispatch minute (+-3 min tolerance). Admin bearer also accepted for manual runs. */
+/** claim_watch_dispatch's answer (migration 019). */
+const DispatchClaim = z.enum(["claimed", "signature_used", "watch_not_found", "lease_missing", "lease_expired"]);
+const DISPATCH_REFUSAL: Record<Exclude<z.infer<typeof DispatchClaim>, "claimed">, { status: 404 | 409; message: string }> = {
+  signature_used: { status: 409, message: "signature already used" },
+  watch_not_found: { status: 404, message: "watch not found" },
+  lease_missing: { status: 409, message: "watch not leased: this dispatch is not the current one" },
+  lease_expired: { status: 409, message: "watch lease expired: this dispatch arrived after its 120 s lease" },
+};
+
+/**
+ * pg_net -> one watch poll. Signature = HMAC(secret, "<watch_id>|<YYYY-MM-DDTHH:MM>") over the dispatch minute (+-3 min
+ * tolerance). A valid signature is then claimed once (claim_watch_dispatch, migration 019): the (watch_id, minute) row
+ * is inserted first, before any work, so a replayed or duplicated request is refused (409) and two runs of one dispatch
+ * can never both resolve or charge; and the watch must hold the lease select_due_watches() took for it 120 s before
+ * posting (null = already polled or never leased, past = the request came too late). Refusals answer >= 400, so
+ * dispatch_failures() (migration 013) counts them and the 10-minute job alerts. An admin bearer runs the poll by hand,
+ * bypassing both checks; that run is marked dispatch=admin in its loop_runs row.
+ * Subrequests: the claim is one on top of runWatch's worst case (36 for an official_release slot holder without
+ * waitUntil, src/ingest/official-watch.ts): 37 of Workers Free's 50.
+ */
 internal.post("/watch/:id", async (c) => {
   const id = c.req.param("id");
-  if (!isAdmin(c)) {
+  const admin = isAdmin(c);
+  if (!admin) {
     const sig = c.req.header("x-internal-signature") ?? "";
     const minute = c.req.header("x-internal-minute") ?? "";
     const t = Date.parse(minute + ":00Z");
     if (!sig || !Number.isFinite(t) || Math.abs(Date.now() - t) > 3 * 60_000) return err(c, "forbidden", "bad or stale internal signature", 403);
     const expected = await hmacHex(c.env.INTERNAL_HMAC_SECRET, `${id}|${minute}`);
     if (!safeEqual(sig, expected)) return err(c, "forbidden", "invalid internal signature", 403);
+    // Only select_due_watches() signs, and it signs real watch ids; anything else never reaches the database.
+    if (!z.uuid().safeParse(id).success) return err(c, "validation_error", "watch id is not a uuid", 400);
+    let claim: z.infer<typeof DispatchClaim>;
+    try { claim = DispatchClaim.parse(await rpc(db(c.env), "claim_watch_dispatch", { p_watch: id, p_minute: minute })); }
+    catch (e) {
+      // Could not record the signature: running anyway would make a replay undetectable. Fail closed; pg_net's answer
+      // row makes it visible to dispatch_failures(), and the watch is due again at its next_poll_at.
+      return err(c, "UPSTREAM_UNAVAILABLE", `dispatch claim failed, the poll did not run: ${redact(String(e)).slice(0, 200)}`, 503);
+    }
+    if (claim !== "claimed") {
+      const r = DISPATCH_REFUSAL[claim];
+      return err(c, r.status === 404 ? "not_found" : "conflict", r.message, r.status);
+    }
+  } else {
+    console.log(JSON.stringify({ job: "watch_dispatch", dispatch: "admin", watch_id: id, note: "manual run: lease and single-use signature not checked" }));
   }
   const cfg = parseConfig(c.env);
-  const s = await runWatch(c.env, cfg, id, { waitUntil: waitUntilOf(c) });
+  const s = await runWatch(c.env, cfg, id, { waitUntil: waitUntilOf(c), dispatch: admin ? "admin" : "pg_net" });
   // pg_net stores this status in net._http_response and dispatch_failures() (migration 013) counts >= 400 as a poll that
   // did not happen. A run that recorded its outcome, 'failure' included (a source error, alerted by the runner's own
   // transition and streak logic), is a delivered dispatch; only a run that could not record itself (loop_runs row or
@@ -73,7 +110,7 @@ internal.post("/markets", async (c) => {
     const r = await registerMarket(c.env, cfg, body.data.market, body.data.tenant_id ?? null, { meta: meta.meta, isTest: body.data.is_test ?? false });
     return ok(c, { market_id: r.marketId, status: r.status, reasons: r.reasons, watches: r.watches, existing: r.existing, is_test: r.isTest, meta_applied: r.metaApplied, meta_dropped: meta.dropped }, r.existing ? 200 : 201);
   } catch (e) {
-    return err(c, "validation_error", String(e).slice(0, 400), 400);
+    return registrationRefused(c, e);
   }
 });
 

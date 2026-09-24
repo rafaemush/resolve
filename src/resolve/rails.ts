@@ -23,6 +23,14 @@ const rails = {
   official_release_gate: true,
   /** the stored first print decides; a later (revised) read of the same period never replaces it. */
   first_print_lock: true,
+  // Registration rail (src/markets/policy.ts, src/markets/source-checks.ts, src/ingest/robots.ts). Off = the pre-P1a
+  // behaviour; evals/registration.ts proves it.
+  /**
+   * A watch-creating registration names only whitelisted, well-formed refs per kind, agrees with its resolver, fetches
+   * only public https hosts, reads a Solana account that exists and is not a program, and treats a robots.txt it could
+   * not read as a disallow.
+   */
+  registration_policy: true,
 };
 export type Rail = keyof typeof rails;
 export function railEnabled(r: Rail): boolean { return rails[r]; }

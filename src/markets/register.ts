@@ -1,14 +1,17 @@
+import { z } from "zod";
 import type { Env, Config } from "../env";
-import { db } from "../db/supabase";
+import { db, rpc } from "../db/supabase";
 import { MarketRegistration, type MarketRegistration as Reg } from "../resolve/schema";
-import { robotsAllows } from "../ingest/web";
-import { baseRpcUrl, getBlock, blockAtOrAfter, hasCode } from "../ingest/base";
 import type { MarketMeta } from "./meta";
-import { officialRefusal, officialRegistrationIssues, parseOfficialRef } from "../resolve/official";
+import { officialRefusal, officialRegistrationIssues } from "../resolve/official";
+import { registrationPolicyIssues, webRenderRefusal, RegistrationError } from "./policy";
+import { checkSources, type SourcePlan } from "./source-checks";
+
+export type MarketStatus = "open" | "unsupported_source" | "resolved" | "void" | "closed_unresolved";
 
 export interface RegisterResult {
   marketId: string;
-  status: "open" | "unsupported_source";
+  status: MarketStatus;
   reasons: string[];
   watches: Array<{ id: string; source_kind: string }>;
   /** true: the (tenant, platform, external_id) market already existed and nothing was written (meta and is_test included). */
@@ -40,12 +43,42 @@ export function validateRegistration(input: unknown): Reg {
   return reg;
 }
 
-/** Validate, run registration-time source checks (robots, contract code), insert the market and one watch per source. */
+/**
+ * Everything a watch-creating registration decides before the database, in order: the registration policy
+ * (src/markets/policy.ts; pure, so a refused source is never requested, not even its robots.txt), web_render, then
+ * the source checks (src/markets/source-checks.ts: subrequest budget, robots, contract code, Solana account).
+ * Throws RegistrationError; evals/registration.ts runs it against a stubbed fetch.
+ */
+export async function planRegistration(env: Env, cfg: Pick<Config, "botUa">, reg: Reg, now = Date.now()): Promise<SourcePlan> {
+  const issues = registrationPolicyIssues(reg);
+  if (issues.length) throw new RegistrationError({ kind: "invalid", message: `registration refused: ${issues.join("; ")}` });
+  const render = webRenderRefusal(reg);
+  if (render) throw new RegistrationError({ kind: "invalid", message: render });
+  return checkSources(env, cfg, reg, now);
+}
+
+const WatchRef = z.object({ id: z.string(), source_kind: z.string() });
+const Count = z.number().int().nonnegative();
+/** register_market's answer (migration 019). */
+const RegisterAnswer = z.discriminatedUnion("outcome", [
+  z.object({ outcome: z.literal("created"), market_id: z.string(), status: z.enum(["open", "unsupported_source"]), is_test: z.boolean(), watches: z.array(WatchRef) }),
+  z.object({ outcome: z.literal("existing"), market_id: z.string(), status: z.enum(["open", "unsupported_source", "resolved", "void", "closed_unresolved"]), reasons: z.array(z.string()), is_test: z.boolean(), watches: z.array(WatchRef) }),
+  z.object({ outcome: z.literal("watch_limit"), watch_limit: Count, active_watches: Count, requested: Count }),
+  z.object({ outcome: z.literal("base_watch_cap"), base_watch_cap: Count, active_base_watches: Count, requested: Count }),
+]);
+
+/**
+ * Validate, run the registration-time policy and source checks, then store the market and its watches in one
+ * transaction (register_market, migration 019), which also holds the tenant's watch_limit and the service's Base watch
+ * cap under a lock, so two concurrent registrations can never both pass a limit. createWatches false (an inline market
+ * on /v1/resolve) stores the market only and skips the policy and the checks: nothing will be fetched for it.
+ */
 export async function registerMarket(env: Env, cfg: Config, input: unknown, tenantId: string | null, opts: RegisterOptions = {}): Promise<RegisterResult> {
   const reg: Reg = validateRegistration(input);
   const client = db(env);
   // Idempotent registration: the same (tenant, platform, external_id) returns the existing market. A repeat never rewrites
-  // it: meta and is_test of a market that may already carry a public commit stay as first registered.
+  // it: meta and is_test of a market that may already carry a public commit stay as first registered. Looked up before the
+  // checks, so a repeat costs no upstream request and answers the same whatever the sources say today.
   {
     let q = client.from("markets").select("id, status, meta, is_test").eq("platform", reg.platform).eq("external_id", reg.external_id).is("deleted_at", null);
     q = tenantId ? q.eq("tenant_id", tenantId) : q.is("tenant_id", null);
@@ -54,61 +87,27 @@ export async function registerMarket(env: Env, cfg: Config, input: unknown, tena
     if (ee) throw new Error(`markets lookup: ${ee.message}`);
     if (existing) {
       const { data: ws } = await client.from("watches").select("id, source_kind").eq("market_id", existing.id).is("deleted_at", null);
-      return { marketId: existing.id as string, status: existing.status as "open" | "unsupported_source", reasons: ((existing.meta as { registration_reasons?: string[] })?.registration_reasons) ?? [], watches: (ws ?? []).map((w) => ({ id: w.id as string, source_kind: w.source_kind as string })), existing: true, metaApplied: [], isTest: existing.is_test === true };
+      return { marketId: existing.id as string, status: existing.status as MarketStatus, reasons: ((existing.meta as { registration_reasons?: string[] })?.registration_reasons) ?? [], watches: (ws ?? []).map((w) => ({ id: w.id as string, source_kind: w.source_kind as string })), existing: true, metaApplied: [], isTest: existing.is_test === true };
     }
   }
-  const reasons: string[] = [];
-  let status: "open" | "unsupported_source" = "open";
-  const watchSpecs: Array<{ source_kind: Reg["sources"][number]["kind"]; source_ref: Record<string, unknown>; cursor: Record<string, unknown> }> = [];
-  for (const s of reg.sources) {
-    if (opts.createWatches === false) { watchSpecs.push({ source_kind: s.kind, source_ref: { ref: s.ref }, cursor: {} }); continue; }
-    if (s.kind === "web_fetch" || s.kind === "web_render") {
-      const r = await robotsAllows(s.ref, cfg.botUa);
-      if (!r.allowed) { status = "unsupported_source"; reasons.push(`${s.ref}: ${r.reason}`); continue; }
-      watchSpecs.push({ source_kind: s.kind, source_ref: { url: s.ref }, cursor: {} });
-    } else if (s.kind === "base_log") {
-      const address = s.ref.split(":")[1]?.toLowerCase() ?? "";
-      const url = baseRpcUrl(env);
-      try {
-        const safe = await getBlock(url, "safe");
-        const code = await hasCode(url, address);
-        if (!code) { status = "unsupported_source"; reasons.push(`${address}: no contract code at safe tag`); continue; }
-        const openBlock = await blockAtOrAfter(url, reg.open_at, safe);
-        const topic0 = reg.resolver?.kind === "evm_log_present" ? reg.resolver.topic0.toLowerCase() : null;
-        watchSpecs.push({ source_kind: "base_log", source_ref: { chain: "base", address, topic0 }, cursor: { block: openBlock - 1, from_ts: reg.open_at, has_code: true } });
-      } catch (e) { status = "unsupported_source"; reasons.push(`${address}: rpc failed at registration (${String(e).slice(0, 80)})`); }
-    } else if (s.kind === "solana_log") {
-      const account = s.ref.split(":")[1] ?? "";
-      watchSpecs.push({ source_kind: "solana_log", source_ref: { chain: "solana", account }, cursor: { from_ts: reg.open_at } });
-    } else if (s.kind === "official_release") {
-      // The adapter fetches only the series' allowlisted hosts (src/resolve/official.ts); nothing to probe here.
-      const p = parseOfficialRef(s.ref)!;
-      watchSpecs.push({ source_kind: "official_release", source_ref: { ref: s.ref, series: p.series, period: p.period }, cursor: {} });
-    } else {
-      watchSpecs.push({ source_kind: s.kind, source_ref: { ref: s.ref.replace(/^\/+/, "") }, cursor: {} });
-    }
-  }
-  if (!watchSpecs.length) status = "unsupported_source";
+  const plan: SourcePlan = opts.createWatches === false ? { status: "open", reasons: [], watches: [] } : await planRegistration(env, cfg, reg);
   const meta: MarketMeta = opts.meta ?? {};
-  const { data: m, error } = await client.from("markets").insert({
-    tenant_id: tenantId, platform: reg.platform, external_id: reg.external_id, condition: reg.condition, event_statement: reg.event_statement,
+  const market = {
+    platform: reg.platform, external_id: reg.external_id, condition: reg.condition, event_statement: reg.event_statement,
     option_a: reg.option_a, option_b: reg.option_b, positive_option: reg.positive_option, anchors: reg.anchors, sources: reg.sources,
     resolver: reg.resolver ?? null, negative_rule: reg.negative_rule, allow_prerelease: reg.allow_prerelease, open_at: reg.open_at, deadline_utc: reg.deadline_utc,
-    grace_seconds: reg.grace_seconds, status, meta: { ...meta, registration_reasons: reasons },
+    grace_seconds: reg.grace_seconds, status: plan.status, meta: { ...meta, registration_reasons: plan.reasons },
     condition_id: meta.condition_id ?? null, is_test: opts.isTest ?? false,
-  }).select("id, is_test").single();
-  if (error || !m) throw new Error(`markets insert: ${error?.message ?? "no row"}`);
-  const nearDeadline = Date.parse(reg.deadline_utc) - Date.now() < 24 * 3600 * 1000;
-  const watches: RegisterResult["watches"] = [];
-  if (status === "open" && opts.createWatches !== false) {
-    for (const w of watchSpecs) {
-      // official_release schedules its own next_poll_at (release minute, then its cadence); 60 s is the retry
-      // interval the lease applies after a failed poll.
-      const interval = w.source_kind === "official_release" || nearDeadline ? 60 : 300;
-      const { data, error: we } = await client.from("watches").insert({ market_id: m.id, source_kind: w.source_kind, source_ref: w.source_ref, cursor: w.cursor, poll_interval_s: interval, next_poll_at: new Date().toISOString() }).select("id, source_kind").single();
-      if (we || !data) throw new Error(`watches insert: ${we?.message ?? "no row"}`);
-      watches.push({ id: data.id as string, source_kind: data.source_kind as string });
-    }
+  };
+  const answer = RegisterAnswer.safeParse(await rpc(client, "register_market", { p_tenant: tenantId, p_market: market, p_watches: plan.watches }));
+  if (!answer.success) throw new Error(`register_market answered off contract: ${answer.error.issues.map((i) => `${i.path.join(".")} ${i.message}`).join("; ").slice(0, 200)}`);
+  const a = answer.data;
+  switch (a.outcome) {
+    case "created": return { marketId: a.market_id, status: a.status, reasons: plan.reasons, watches: a.watches, existing: false, metaApplied: Object.keys(meta).sort(), isTest: a.is_test };
+    // registered by a concurrent request between the lookup above and the transaction
+    case "existing": return { marketId: a.market_id, status: a.status, reasons: a.reasons, watches: a.watches, existing: true, metaApplied: [], isTest: a.is_test };
+    case "watch_limit": throw new RegistrationError({ kind: "watch_limit", limit: a.watch_limit, active: a.active_watches, requested: a.requested });
+    case "base_watch_cap": throw new RegistrationError({ kind: "base_watch_cap", cap: a.base_watch_cap, active: a.active_base_watches, requested: a.requested });
+    default: { const never: never = a; throw new Error(`unhandled register_market outcome ${String(never)}`); }
   }
-  return { marketId: m.id as string, status, reasons, watches, existing: false, metaApplied: Object.keys(meta).sort(), isTest: m.is_test === true };
 }

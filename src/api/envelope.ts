@@ -10,7 +10,7 @@ import type { Context } from "hono";
 export type ErrorCode =
   | "auth_required" | "invalid_key" | "key_expired" | "scope_denied" | "daily_cap_reached"
   | "rate_limited" | "insufficient_credits" | "validation_error" | "not_found"
-  | "UNSAFE_INPUT" | "UPSTREAM_UNAVAILABLE" | "internal_error" | "config_error" | "forbidden";
+  | "UNSAFE_INPUT" | "UPSTREAM_UNAVAILABLE" | "internal_error" | "config_error" | "forbidden" | "conflict";
 
 export function newRequestId(): string {
   return "req_" + crypto.randomUUID().replace(/-/g, "");

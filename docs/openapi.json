@@ -921,7 +921,7 @@
     },
     "/v1/markets": {
       "post": {
-        "summary": "Register a market and its watches (robots and contract checks at registration)",
+        "summary": "Register a market and its watches in one transaction. Sources must match their kind (GitHub: repos/{owner}/{repo}/pulls/{n}, issues/{n}, releases, releases/tags/{tag}, events; base_log: base:0x + 40 hex; solana_log: solana:<account>), name the resolver's own repo, PR, contract or account, and web sources must be public https URLs on the default port; web_render is not accepted yet. At registration: robots.txt (unreadable = disallowed), contract code on Base, and a Solana account that exists and is not a program. Re-registering the same external_id returns the existing market",
         "security": [
           {
             "bearerAuth": []
@@ -951,7 +951,7 @@
             }
           },
           "400": {
-            "description": "validation_error",
+            "description": "validation_error: schema, source policy or a Solana program id",
             "content": {
               "application/json": {
                 "schema": {
@@ -961,7 +961,27 @@
             }
           },
           "403": {
-            "description": "watch limit reached",
+            "description": "validation_error: watch limit reached (watch_limit, active_watches, requested_watches at top level)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "conflict: the service's Base watch capacity is reached (max_base_watches, active_base_watches, requested_base_watches at top level)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "UPSTREAM_UNAVAILABLE: a registration check could not be made (Base or Solana RPC); nothing was stored, retry after Retry-After",
             "content": {
               "application/json": {
                 "schema": {

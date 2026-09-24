@@ -422,6 +422,15 @@ describe("dispatch outcome (migration 013: dispatch_failures() counts pg_net ans
     expect(h.state.loopRuns).toHaveLength(1);
   });
 
+  it("the loop_runs row names who started the run (migration 019: admin runs skip the lease and the single-use check)", async () => {
+    serve(200, JSON.stringify(pr(1)));
+    await runWatch(env(), cfg, WATCH_ID, { dispatch: "admin" });
+    serve(200, JSON.stringify(pr(1)));
+    await runWatch(env(), cfg, WATCH_ID, { dispatch: "pg_net" });
+    await runWatch(env(), cfg, WATCH_ID);
+    expect(h.state.loopRuns.map((l) => (l.meta as Row).dispatch)).toEqual(["admin", "pg_net", undefined]);
+  });
+
   it("a watch that cannot be loaded alerts: there is no streak to carry it", async () => {
     h.state.watch = null as unknown as Row;
     const r = await runWatch(env(), cfg, WATCH_ID);

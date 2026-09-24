@@ -6,6 +6,7 @@
 import { CandidateFile, type CandidateEntry, type CandidatePlatform } from "./candidates";
 import { MarketRegistration } from "../../src/resolve/schema";
 import { mergeMeta, type MarketMeta } from "../../src/markets/meta";
+import { registrationPolicyIssues, webRenderRefusal } from "../../src/markets/policy";
 
 /** Plan §16.4 P5 step 3: shadow markets stay in the long tail (gamma volume_num_max, the same cap as candidates.ts). */
 export const SHADOW_VOLUME_CAP_USD = 50_000;
@@ -56,7 +57,9 @@ export interface FileCheck {
  * Rules: the registration parses with MarketRegistration (the Worker's own schema) and names the file's platform; meta
  * holds only whitelisted keys of the right type (src/markets/meta.ts), and a Polymarket entry carries meta.condition_id;
  * volume <= $50k; is_test is false; the deadline is in the future; event_statement is a declarative, deadline-free fact
- * (eventStatementProblem); every web source is https; an approved entry has nothing left under needs_review; no
+ * (eventStatementProblem); every source passes the Worker's registration policy (src/markets/policy.ts: per-kind ref
+ * grammar, resolver and sources on one subject, web sources public https URLs) and none is web_render, so --check
+ * catches offline what the Worker would refuse; an approved entry has nothing left under needs_review; no
  * (platform, external_id) appears twice.
  */
 export function checkCandidateFile(json: unknown, now: Date): FileCheck {
@@ -107,9 +110,9 @@ function checkEntry(e: CandidateEntry, index: number, platform: CandidatePlatfor
   else {
     if (m.data.platform !== platform) errors.push(`market.platform is ${m.data.platform}, the file is for ${platform}`);
     if (Date.parse(m.data.deadline_utc) <= now.getTime()) errors.push(`deadline_utc ${m.data.deadline_utc} is not in the future`);
-    for (const s of m.data.sources) {
-      if ((s.kind === "web_fetch" || s.kind === "web_render") && !s.ref.startsWith("https://")) errors.push(`source ${s.ref} is not https`);
-    }
+    for (const p of registrationPolicyIssues(m.data)) errors.push(`source policy: ${p}`);
+    const render = webRenderRefusal(m.data);
+    if (render) errors.push(render);
   }
   // Checked whatever else fails, so one --check run shows every field the founder still has to rewrite.
   const statement = typeof e.registration.market.event_statement === "string" ? eventStatementProblem(e.registration.market.event_statement) : null;
@@ -143,9 +146,9 @@ const sourceKeys = (sources: unknown): string[] =>
  * Pure. What the database row must show for an approved entry, read from the database and never taken from the Worker's
  * answer, both right after --apply registered it and when a rerun finds it already there: the same platform and
  * external_id, is_test false, condition_id, every whitelisted meta key and the sources as sent, and, while the market is
- * open, one active watch per source. registerMarket inserts the market first and its watches one by one afterwards, so a
- * watch insert that failed (or a client timeout mid-request) leaves an open market that polls fewer sources or none;
- * a rerun must name it instead of counting it as already present. Other statuses have no active watches by design
+ * open, one active watch per source. Since migration 019 the market and its watches land in one transaction, but a
+ * market registered before it (market first, then its watches one by one) can be an open market that polls fewer
+ * sources or none; a rerun must name it instead of counting it as already present. Other statuses have no active watches by design
  * (unsupported_source never gets any; terminal statuses deactivate them). Empty = verified.
  */
 export function verifyRow(row: ShadowRow | null, activeWatches: number, want: ExpectedShadow): string[] {

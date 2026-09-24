@@ -5,8 +5,8 @@
  *
  * --check    offline: every entry against the rules of scripts/lib/seed-shadow.ts (MarketRegistration, the meta whitelist,
  *            condition_id on Polymarket, the $50k cap, is_test false, a future deadline, a declarative deadline-free
- *            event_statement, https sources, needs_review empty once approved, no duplicates). Exit 1 when an approved
- *            entry fails.
+ *            event_statement, sources that pass the Worker's registration policy, needs_review empty once approved, no
+ *            duplicates). Exit 1 when an approved entry fails.
  * --dry-run  --check, then read-only: asks the Worker for its registration contract (an empty POST that it refuses with
  *            400 before any write) and reads production (service role, SELECT only) to show, per approved entry, whether
  *            it would be registered or skipped because (platform, external_id) already exists as a shadow market. An
@@ -18,8 +18,9 @@
  *            is_test, condition_id, every meta key and the sources landed, and that an open market has one active watch
  *            per source. Stops at the first failure; rerunning skips what exists once the same check passes on it (a
  *            market left without its watches by a failed or timed-out registration stops the rerun, named), so the
- *            command is idempotent. An entry whose sources the Worker refuses (robots) is registered as
- *            unsupported_source by the Worker and reported; it has no watches.
+ *            command is idempotent. An entry whose sources the Worker rules out (robots) is registered as
+ *            unsupported_source by the Worker and reported; it has no watches. A check the Worker could not make (an
+ *            RPC down, HTTP 503) stores nothing and stops the run; rerun it later.
  * Secrets (ADMIN_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY) are read from .env by scripts/lib/env.ts and never
  * printed. The founder's ISP blocks *.workers.dev: set RESOLVE_PUBLIC_URL to a reachable host (the custom domain).
  */

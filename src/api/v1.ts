@@ -11,6 +11,7 @@ import { thresholdsFromEnv } from "../resolve/thresholds";
 import { resolveWithRuntime, JevUnavailableError, type RuntimeOutput } from "../resolve/runtime";
 import { toStrictV0 } from "../resolve/verdict";
 import { registerMarket } from "../markets/register";
+import { registrationRefused } from "./registration";
 import { runWatch } from "../ingest/watch";
 import { sha256Hex } from "../resolve/text";
 import type { MarketRow } from "../ingest/types";
@@ -128,7 +129,7 @@ v1.post("/resolve", async (c) => {
     if (body.fetch) {
       const { data: w } = await client.from("watches").select("id").eq("market_id", market.id).eq("active", true).is("deleted_at", null).limit(1).maybeSingle();
       if (!w) return err(c, "validation_error", "market has no active watch to fetch from", 400);
-      const s = await runWatch(c.env, cfg, w.id as string, { waitUntil: waitUntilOf(c) });
+      const s = await runWatch(c.env, cfg, w.id as string, { waitUntil: waitUntilOf(c), dispatch: "tenant_fetch" });
       if (s.resolution_id) {
         const { data: r } = await client.from("resolutions").select("*").eq("id", s.resolution_id).single();
         return ok(c, { request_id: s.resolution_id, watch: s, resolution: r });
@@ -203,19 +204,19 @@ function rowToVerdict(r: Record<string, unknown>) {
   return { market_id: r.market_id, resolution_status: r.resolution_status, winning_outcome: r.winning_outcome, confidence_score: Number(r.confidence_score), error_code: r.error_code, error_reason: r.error_reason, caveats: r.caveats, determination_basis: r.determination_basis, checks: r.checks, jev_model: r.jev_model, thresholds_version: r.thresholds_version, latency_ms: r.duration_ms };
 }
 
+/**
+ * The tenant's watch_limit is held inside register_market (migration 019) under a lock on the tenant row: active
+ * watches plus this market's must fit, and two concurrent registrations cannot both pass. A re-registration of an
+ * existing (platform, external_id) returns that market whatever the limit.
+ */
 v1.post("/markets", async (c) => {
   const cfg = parseConfig(c.env);
   const auth = c.get("auth");
-  const client = db(c.env);
   const body = (await c.req.json().catch(() => null)) as unknown;
-  const { count } = await client.from("watches").select("id, markets!inner(tenant_id)", { count: "exact", head: true }).eq("markets.tenant_id", auth.tenantId).eq("active", true).is("deleted_at", null);
-  const { data: t } = await client.from("tenants").select("watch_limit").eq("id", auth.tenantId).single();
-  const limit = (t?.watch_limit as number | undefined) ?? 5;
-  if ((count ?? 0) >= limit) return err(c, "validation_error", `watch limit (${limit}) reached for this plan`, 403, { extra: { watch_limit: limit, active_watches: count } });
   try {
     const r = await registerMarket(c.env, cfg, body, auth.tenantId);
     return ok(c, { market_id: r.marketId, status: r.status, reasons: r.reasons, watches: r.watches }, 201);
-  } catch (e) { return err(c, "validation_error", String(e).slice(0, 400), 400); }
+  } catch (e) { return registrationRefused(c, e); }
 });
 
 v1.get("/markets", async (c) => {
