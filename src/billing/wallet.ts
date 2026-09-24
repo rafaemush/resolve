@@ -5,10 +5,23 @@
  * /v1/account/wallet verifies the signature here, then register_wallet() (migration 020) marks the challenge used and
  * sets the address in one transaction. Only externally owned accounts can sign; a contract wallet is matched by the
  * operator (POST /internal/deposits/match).
- * CPU (Workers Free: 10 ms per invocation): one secp256k1 public-key recovery, measured with Node 24 on the build
- * machine at ~1.8 ms warm and ~19 ms on the first call of an isolate (viem builds noble's base-point table then).
  */
 import { verifyMessage } from "viem";
+import { privateKeyToAddress } from "viem/accounts";
+
+/**
+ * CPU (Workers Free: 10 ms per invocation). A signature check is one secp256k1 public-key recovery, ~1 ms once warm.
+ * The first recovery in an isolate also builds noble-curves' base-point table (viem imports noble lazily and noble
+ * precomputes on first use). Measured 2026-09-24 on the build machine under workerd (wrangler dev, 3 fresh isolates
+ * each): that first recovery took 12-13 ms, so the request paying it could die at the 10 ms limit (Cloudflare's 1102
+ * page, no JSON envelope). The table is built here instead, at module scope: global scope runs at isolate startup under
+ * the separate 1 s startup limit, which this bundle already relies on (its global scope measures ~30 ms bundled, in
+ * Node 24; ~52 ms with this line). The first recovery on a request then took 2 ms under workerd. privateKeyToAddress is
+ * the smallest public viem call that multiplies the base point synchronously, and it shares the table with
+ * verifyMessage because both resolve to viem's one @noble/curves module. Key 1's public key is the generator itself: a
+ * published constant, not a secret.
+ */
+privateKeyToAddress(`0x${"0".repeat(63)}1`);
 
 export const WALLET_ADDRESS = /^0x[0-9a-fA-F]{40}$/;
 /** A 65-byte r || s || v signature, as personal_sign returns it. */

@@ -5,7 +5,7 @@
  * GET /v1/payments/address, where a buyer reads the tiers and how to register the wallet.
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
+import { generatePrivateKey, privateKeyToAccount, privateKeyToAddress } from "viem/accounts";
 import type { Env } from "../src/env";
 import { fakeDb, type FakeDb, type Row } from "./lib/fake-db";
 import { MIGRATION_020_CONFIG, MONEY_RPCS } from "./lib/fake-money";
@@ -34,14 +34,29 @@ vi.mock("../src/api/auth", () => ({
   invalidateKeyCache: async () => undefined,
 }));
 vi.mock("../src/ops/alerts", () => ({ alert: vi.fn(async () => ({ sent: true, deduped: false })) }));
+// The real function, recorded: src/billing/wallet.ts calls it once as it loads to build the base-point table.
+vi.mock("viem/accounts", async (importOriginal) => {
+  const m = await importOriginal<typeof import("viem/accounts")>();
+  return { ...m, privateKeyToAddress: vi.fn(m.privateKeyToAddress) };
+});
 
 import { v1 } from "../src/api/v1";
 import { challengeMessage, registerAnswer, signedBy, REGISTER_RESULTS } from "../src/billing/wallet";
 import { alert } from "../src/ops/alerts";
+// Read as this file loads, after src/billing/wallet.ts has: vitest clears mock history before each test.
+const atLoad = { calls: [...vi.mocked(privateKeyToAddress).mock.calls], results: [...vi.mocked(privateKeyToAddress).mock.results] };
 
 const T1 = "11111111-1111-4111-8111-111111111111";
 const T2 = "22222222-2222-4222-8222-222222222222";
 const OLD_WALLET = "0x00000000000000000000000000000000000000a1";
+
+describe("CPU: the first registration in an isolate does not build the secp256k1 base-point table", () => {
+  it("loading src/billing/wallet.ts multiplies the generator once (key 1, whose address is public), before any request", () => {
+    // Without it the first recovery in an isolate took 12-13 ms under workerd, over the 10 ms Workers Free allows.
+    expect(atLoad.calls).toEqual([[`0x${"0".repeat(63)}1`]]);
+    expect(atLoad.results).toEqual([{ type: "return", value: "0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf" }]);
+  });
+});
 
 describe("challengeMessage: exactly the text the wallet signs", () => {
   it("five lines, lowercase address, no trailing newline", () => {

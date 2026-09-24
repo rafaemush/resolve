@@ -87,9 +87,12 @@ describe("POST /internal/deposits/match", () => {
     await post(good);
     const other = await post({ ...good, tenant_id: T2 });
     expect([other.status, other.body.error.message]).toEqual([409, expect.stringContaining("already credited to another tenant")]);
-    h.db.tables.usdc_deposits!.push(deposit({ log_index: 4, amount_usdc: "0.000001", status: "dust" }), deposit({ log_index: 5, status: "seen" }));
-    expect((await post({ ...good, log_index: 4 })).status).toBe(409);
-    expect((await post({ ...good, log_index: 5 })).status).toBe(409);
+    // 250 USDC each (27,500 credits at the tier rate): the status alone refuses them, not the worth-under-a-credit check.
+    h.db.tables.usdc_deposits!.push(deposit({ log_index: 4, status: "dust" }), deposit({ log_index: 5, status: "seen" }));
+    for (const log_index of [4, 5]) {
+      const r = await post({ ...good, log_index });
+      expect([r.status, r.body.error.message]).toEqual([409, expect.stringContaining("only an unmatched deposit can be matched")]);
+    }
     expect((await post({ ...good, log_index: 9 })).status).toBe(404);
     h.db.tables.usdc_deposits!.push(deposit({ log_index: 6 }));
     h.db.tables.tenants![1]!.deleted_at = "2026-09-01T00:00:00Z";

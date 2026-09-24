@@ -9,6 +9,7 @@ import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { effectiveTiers, formatUsdc, packQuotes, parseUsdc, paygCredits, paygRate, PaygTiers, type PaygTiers as Tiers } from "../src/billing/tiers";
 import { MIGRATION_020_CONFIG } from "./lib/fake-money";
+import { MONEY_SELFTEST_EXPECT, MONEY_SELFTEST_SQL } from "../scripts/selftest/money";
 
 /** An app_config row exactly as supabase/migrations/020_money.sql inserts it. */
 function migrationConfig(key: string): string {
@@ -80,5 +81,16 @@ describe("PaygTiers: the rules payg_credits_per_usdc() enforces", () => {
     expect(effectiveTiers(migrationTiers(), 100)).toEqual({ tiers: TIERS });
     expect(effectiveTiers("not json", 100)).toEqual({ error: "app_config payg_tiers is not JSON" });
     expect(effectiveTiers('[{"min_usdc":250,"credits_per_usdc":110}]', 100)).toMatchObject({ error: expect.stringContaining("a tier at min_usdc 0 is required") });
+  });
+  it("refuses every value scripts/selftest/money.ts asserts payg_credits_per_usdc() refuses, an extra key included", () => {
+    // The quote and the credit must agree. Tiers the database credits at but the API refuses answer 503 'pricing is
+    // unavailable' and alert that nothing is credited while deposits are; the reverse quotes a rate no deposit gets.
+    const block = /\(values\s*([\s\S]*?)\) as x\(name, value\)/.exec(MONEY_SELFTEST_SQL)![1]!;
+    const cases = [...block.matchAll(/\('([a-z_]+)', '([^']*)'\)/g)].map((m) => [m[1]!, m[2]!] as const);
+    expect(cases.map(([name]) => name)).toContain("extra_key");
+    for (const [name, value] of cases) {
+      expect(MONEY_SELFTEST_EXPECT[`malformed_${name}`], name).toBe("RS004");
+      expect(effectiveTiers(value, 100), name).toHaveProperty("error");
+    }
   });
 });

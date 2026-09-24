@@ -3,9 +3,10 @@
  * ends with RAISE, so nothing it writes persists (tenants, deposits, ledger rows, challenges, app_config changes all roll
  * back); the raised message carries the results, printed as PASS/FAIL lines. It asserts: the PAYG tier math through
  * credit_from_deposit (49.99, 50, 249.99, 250, 999.99, 1000 USDC and the plan §11 packs), the passed rate as fallback
- * when payg_tiers is absent, dust, malformed tiers refused before anything is credited; match_deposit (only an unmatched
- * deposit, the tier rate, one ledger row, the audit, the same answer with replayed=true on a retry, every refusal with
- * its SQLSTATE and nothing written); the low-credit notice (once per crossing, a refund does not reset it, a purchase or
+ * when payg_tiers is absent, dust, malformed tiers (an extra key included) refused before anything is credited;
+ * match_deposit (only an unmatched deposit: a 'seen' or 'dust' row worth 27,500 credits is refused by its status alone;
+ * the tier rate, one ledger row, the audit, the same answer with replayed=true on a retry, every refusal with its
+ * SQLSTATE and nothing written); the low-credit notice (once per crossing, a refund does not reset it, a purchase or
  * grant does, release gives it back, the threshold is data); register_wallet (registered, used, expired, taken,
  * another tenant's challenge); and least privilege (anon denied, service_role allowed, search_path pinned, comments).
  *   RESOLVE_SELFTEST_NON_PRODUCTION=1 npx tsx scripts/selftest/money.ts                     Management API, SUPABASE_PROJECT_REF
@@ -23,7 +24,7 @@ export const MONEY_SELFTEST_SQL = `
 do $$
 declare
   t1 uuid; t2 uuid; tl uuid; tdel uuid; out jsonb := '{}'::jsonb; r record; m1 record; m2 record;
-  c1 uuid; c2 uuid; c3 uuid; c4 uuid; c5 uuid; w record; b1 record;
+  c1 uuid; c2 uuid; c3 uuid; c4 uuid; c5 uuid; w record; b1 record; bal integer;
   ok_tiers constant text := '[{"min_usdc":1000,"credits_per_usdc":120},{"min_usdc":250,"credits_per_usdc":110},{"min_usdc":0,"credits_per_usdc":100}]';
   wa1 constant text := '0x00000000000000000000000000000000000020a1';
   wa2 constant text := '0x00000000000000000000000000000000000020a2';
@@ -75,7 +76,8 @@ begin
       ('not_json', 'tiers please'),
       ('not_array', '{"min_usdc":0,"credits_per_usdc":100}'),
       ('empty', '[]'),
-      ('string_rate', '[{"min_usdc":0,"credits_per_usdc":"100"}]')) as x(name, value) loop
+      ('string_rate', '[{"min_usdc":0,"credits_per_usdc":"100"}]'),
+      ('extra_key', '[{"min_usdc":0,"credits_per_usdc":100,"note":"base"}]')) as x(name, value) loop
     insert into app_config (key, value) values ('payg_tiers', r.value) on conflict (key) do update set value = excluded.value;
     begin
       perform credit_from_deposit('0x__selftest_money_bad_' || r.name, 0, wa1, '0xdead', 300, 100, 200, 100);
@@ -104,6 +106,20 @@ begin
   exception when others then out := out || jsonb_build_object('match_other_tenant', sqlstate); end;
   begin perform match_deposit('0x__selftest_money_dust', 0, t1, 'selftest', 'selftest: dust'); out := out || '{"match_dust":"allowed"}';
   exception when others then out := out || jsonb_build_object('match_dust', sqlstate); end;
+  -- The status guard alone: 250 USDC (27,500 credits at the tier rate) in a 'seen' row and in a 'dust' row (recorded as
+  -- dust under other tiers), so the worth-less-than-one-credit check cannot be what refuses them.
+  insert into usdc_deposits (tx_hash, log_index, from_address, to_address, amount_usdc, block_number, safe_block_seen, status) values
+    ('0x__selftest_money_seen', 0, wnobody, '0xdead', 250, 100, 200, 'seen'),
+    ('0x__selftest_money_dust250', 0, wnobody, '0xdead', 250, 100, 200, 'dust');
+  select credits_balance into bal from tenants where id = t1;
+  begin perform match_deposit('0x__selftest_money_seen', 0, t1, 'selftest', 'selftest: seen'); out := out || '{"match_seen":"allowed"}';
+  exception when others then out := out || jsonb_build_object('match_seen', sqlstate); end;
+  begin perform match_deposit('0x__selftest_money_dust250', 0, t1, 'selftest', 'selftest: dust status'); out := out || '{"match_dust_250":"allowed"}';
+  exception when others then out := out || jsonb_build_object('match_dust_250', sqlstate); end;
+  out := out || jsonb_build_object(
+    'status_refused_rows', jsonb_build_array((select status from usdc_deposits where tx_hash = '0x__selftest_money_seen'), (select status from usdc_deposits where tx_hash = '0x__selftest_money_dust250')),
+    'status_refused_ledger_rows', (select count(*) from credit_ledger where tx_hash in ('0x__selftest_money_seen', '0x__selftest_money_dust250')),
+    'status_refused_balance_kept', (select credits_balance = bal from tenants where id = t1));
   begin perform match_deposit('0x__selftest_money_none', 0, t1, 'selftest', 'selftest: missing'); out := out || '{"match_missing":"allowed"}';
   exception when others then out := out || jsonb_build_object('match_missing', sqlstate); end;
   perform credit_from_deposit('0x__selftest_money_unm2', 0, wnobody, '0xdead', 50, 100, 200, 100);
@@ -236,13 +252,14 @@ export const MONEY_SELFTEST_EXPECT: Record<string, unknown> = {
   dust_status: "dust", dust_credits: 0, cent_status: "credited", cent_credits: 1, dust_row_status: "dust", replay_status: "duplicate",
   fallback_1000_at_100: 100000, fallback_10_at_77: 770, no_tiers_no_fallback: "RS004",
   malformed_falling: "RS004", malformed_no_zero: "RS004", malformed_typo_rate: "RS004", malformed_fraction_rate: "RS004", malformed_duplicate_min: "RS004",
-  malformed_not_json: "RS004", malformed_not_array: "RS004", malformed_empty: "RS004", malformed_string_rate: "RS004", malformed_rows_written: 0,
+  malformed_not_json: "RS004", malformed_not_array: "RS004", malformed_empty: "RS004", malformed_string_rate: "RS004", malformed_extra_key: "RS004", malformed_rows_written: 0,
   unmatched_status: "unmatched",
   match: { status: "credited", tenant: true, credits: 27500, balance_after: 27500, amount: "250.000000", rate: 110, replayed: false },
   match_again: { status: "credited", tenant: true, credits: 27500, balance_after: 27500, amount: "250.000000", rate: 110, replayed: true },
   match_ledger_rows: 1, match_balance: 27500, match_audit: true, match_note: true,
   match_scan_credited_same_tenant: { replayed: true, credits: 5000 },
-  match_other_tenant: "RS003", match_dust: "RS003", match_missing: "P0002", match_deleted_tenant: "P0002", match_blank_reason: "22023", match_without_tiers: "RS004",
+  match_other_tenant: "RS003", match_dust: "RS003", match_seen: "RS003", match_dust_250: "RS003",
+  status_refused_rows: ["seen", "dust"], status_refused_ledger_rows: 0, status_refused_balance_kept: true, match_missing: "P0002", match_deleted_tenant: "P0002", match_blank_reason: "22023", match_without_tiers: "RS004",
   refused_left_unmatched: "unmatched", refused_ledger_rows: 0, half_audit: "refused",
   low_above: false, low_default_threshold: 500, low_crossed: [true, 450], low_again: false, low_next_charge: false,
   low_refund_keeps_notice: true, low_after_refund_and_charge: false, low_cleared_by_grant: true, low_at_threshold: false,

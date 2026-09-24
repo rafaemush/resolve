@@ -51,7 +51,7 @@ insert into app_config (key, value) values
   ('low_credit_threshold', '500')
 on conflict (key) do nothing;
 comment on table app_config is
-  'Non-secret runtime configuration read by database functions and the Worker: worker_base_url, watch_daily_cap, watch_batch_max, usdc_cursor_block (deposit scan cursor), payg_tiers (JSON array of {min_usdc, credits_per_usdc}: the rate of a deposit is the one of the highest min_usdc at or below its amount; read by payg_credits_per_usdc()), low_credit_threshold (integer credits; credits.low fires when a charge leaves the balance below it; 500 when absent).';
+  'Non-secret runtime configuration read by database functions and the Worker: worker_base_url, watch_daily_cap, watch_batch_max, usdc_cursor_block (deposit scan cursor), payg_tiers (JSON array of {min_usdc, credits_per_usdc} objects with no other key: the rate of a deposit is the one of the highest min_usdc at or below its amount; read by payg_credits_per_usdc()), low_credit_threshold (integer credits; credits.low fires when a charge leaves the balance below it; 500 when absent).';
 
 -- 3. PAYG tiers -------------------------------------------------------------------------------------------------------
 create or replace function public.payg_credits_per_usdc(p_amount_usdc numeric, p_fallback integer default null)
@@ -97,6 +97,12 @@ begin
        or jsonb_typeof(t->'credits_per_usdc') is distinct from 'number' then
       raise exception using errcode = 'RS004', message = format('app_config payg_tiers: each tier is {min_usdc, credits_per_usdc} numbers, got %s', left(t::text, 200));
     end if;
+    -- Those two keys and no other, as src/billing/tiers.ts (z.strictObject) requires: an extra key ("bonus_per_usdc", a
+    -- misspelt "credit_per_usdc" beside the real one) is a rate someone meant and nobody would apply. Its own IF, after
+    -- the object check above: jsonb_object_keys raises on a non-object, and SQL does not promise to short-circuit OR.
+    if (select count(*) from jsonb_object_keys(t)) <> 2 then
+      raise exception using errcode = 'RS004', message = format('app_config payg_tiers: each tier has exactly the keys min_usdc and credits_per_usdc, got %s', left(t::text, 200));
+    end if;
     v_min := (t->>'min_usdc')::numeric;
     v_rate := (t->>'credits_per_usdc')::numeric;
     if v_min < 0 or v_min >= 1e12 or v_min <> round(v_min, 6) then
@@ -122,7 +128,7 @@ begin
   return v_best_rate;
 end $$;
 comment on function public.payg_credits_per_usdc(numeric, integer) is
-  'Credits per USDC for a deposit of p_amount_usdc: the credits_per_usdc of the payg_tiers tier with the highest min_usdc at or below the amount (defaults: >= 1000 -> 120, >= 250 -> 110, else 100). payg_tiers absent -> p_fallback, or RS004 when p_fallback is null. Malformed tiers raise RS004 (not JSON, a tier that is not {min_usdc, credits_per_usdc} numbers, no tier at 0, two tiers at one min_usdc, a rate that falls as min_usdc rises, a rate outside 1..1000): a deposit is never credited at a guessed rate; the scan holds and alerts instead. Used by credit_from_deposit() and match_deposit(); src/billing/tiers.ts mirrors it for the rates GET /v1/payments/address quotes.';
+  'Credits per USDC for a deposit of p_amount_usdc: the credits_per_usdc of the payg_tiers tier with the highest min_usdc at or below the amount (defaults: >= 1000 -> 120, >= 250 -> 110, else 100). payg_tiers absent -> p_fallback, or RS004 when p_fallback is null. Malformed tiers raise RS004 (not JSON, a tier that is not exactly {min_usdc, credits_per_usdc} numbers (no other key), no tier at 0, two tiers at one min_usdc, a rate that falls as min_usdc rises, a rate outside 1..1000): a deposit is never credited at a guessed rate; the scan holds and alerts instead. Used by credit_from_deposit() and match_deposit(); src/billing/tiers.ts mirrors it for the rates GET /v1/payments/address quotes.';
 
 -- 4. credit_from_deposit: same signature and return shape, tier rate inside ---------------------------------------------
 create or replace function public.credit_from_deposit(

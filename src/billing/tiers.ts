@@ -32,6 +32,7 @@ export function formatUsdc(micro: bigint): string {
 
 const isUsdc = (n: number) => { try { parseUsdc(n); return true; } catch { return false; } };
 
+/** Strict, as payg_credits_per_usdc() is: an extra key (a bonus, a misspelt rate) is a rate nobody would apply. */
 export const PaygTier = z.strictObject({
   min_usdc: z.number().refine(isUsdc, "min_usdc must be >= 0 with at most 6 decimals"),
   credits_per_usdc: z.number().int().min(1).max(MAX_CREDITS_PER_USDC),
