@@ -6,8 +6,11 @@ export interface TestKeyArgs {
   name: string;
   /** Plan for a new tenant (default free). For an existing tenant it must match: the script never changes a plan. */
   plan: Plan | null;
-  /** Credits granted once per tenant through grant_credits (ledger request_id issue-test-key:<tenant_id>). */
-  credits: number;
+  /**
+   * Credits granted once per tenant through grant_credits (ledger request_id issue-test-key:<tenant_id>). null = not
+   * given: the plan's evaluation grant (evaluationCredits).
+   */
+  credits: number | null;
   /** Shadow markets the tenant follows (follow_market, the same cap as POST /v1/markets/:id/follow). */
   follow: string[];
   /** api_keys.expires_at = now + this many days; 0 = no expiry. The Free / evaluation time-box is 30 days (docs/pricing.md). */
@@ -18,7 +21,7 @@ export interface TestKeyArgs {
 
 export class UsageError extends Error {}
 
-export const USAGE = `usage: npx tsx scripts/issue-test-key.ts --name "<tenant display name>" [--plan ${PLANS.join("|")}] [--credits N]
+export const USAGE = `usage: npx tsx scripts/issue-test-key.ts --name "<tenant display name>" [--plan ${PLANS.join("|")}] [--credits N (default 300 on free, else 0)]
        [--follow <market uuid>[,<market uuid>...]] [--expires-days N (default 30, 0 = never)] [--dry-run (default) | --apply]`;
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -34,7 +37,7 @@ function int(flag: string, v: string, min: number, max: number): number {
 
 /** Pure. Throws UsageError for anything it does not understand, so a typo never becomes a write. */
 export function parseTestKeyArgs(argv: string[]): TestKeyArgs {
-  const out: TestKeyArgs = { name: "", plan: null, credits: 0, follow: [], expiresDays: 30, apply: false };
+  const out: TestKeyArgs = { name: "", plan: null, credits: null, follow: [], expiresDays: 30, apply: false };
   let dryRun = false;
   for (let i = 0; i < argv.length; i++) {
     const raw = argv[i]!;
@@ -71,6 +74,19 @@ export function parseTestKeyArgs(argv: string[]): TestKeyArgs {
   if (!out.name) throw new UsageError("--name is required");
   if (out.name.length > 200) throw new UsageError("--name is longer than 200 characters");
   return out;
+}
+
+/** Credits an evaluation key comes with (docs/pricing.md, plan §17.5 "Free: 300 credits"). */
+export const FREE_EVALUATION_CREDITS = 300;
+
+/**
+ * Pure. The grant when --credits is not given: the Free evaluation grant on the free plan, nothing on a paid plan (paid
+ * credits come from a deposit or an explicit --credits). Without this default a forgotten flag issued a key whose
+ * first structured call answered insufficient_credits.
+ */
+export function evaluationCredits(plan: Plan, credits: number | null): number {
+  if (credits !== null) return credits;
+  return plan === "free" ? FREE_EVALUATION_CREDITS : 0;
 }
 
 /** The ledger request_id that makes the evaluation grant once per tenant (credit_ledger UNIQUE(reason, request_id)). */

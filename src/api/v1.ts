@@ -16,8 +16,9 @@ import { sha256Hex } from "../resolve/text";
 import type { MarketRow } from "../ingest/types";
 import { alert } from "../ops/alerts";
 import { redact } from "../ops/redact";
-import { mintKey } from "./keys";
-import { followCap, followMarket, followRefusal, Plan, shapeShadow, type FollowAnswer, type FollowTarget, type ShadowCommitRow, type ShadowMarket } from "../shadow/follows";
+import { mintKey, rotationExpiry } from "./keys";
+import { followBlock, followCap, followEntitlements, followMarket, followRefusal, Plan, shapeShadow, type FollowAnswer, type FollowTarget, type ShadowCommitRow, type ShadowMarket } from "../shadow/follows";
+import { subscribes } from "../webhooks/deliver";
 
 type Vars = { requestId: string; schemaVersion: string; auth: AuthContext };
 export const v1 = new Hono<{ Bindings: Env; Variables: Vars }>();
@@ -255,33 +256,42 @@ async function tenantPlan(client: Db, tenantId: string): Promise<{ plan: Plan } 
   return plan.success ? { plan: plan.data } : { error: `unknown plan ${JSON.stringify(data?.plan)}` };
 }
 
-/** Follow a public shadow market: private early reveals by webhook (shadow.committed, shadow.revealed) and GET /v1/shadow/:id. */
+/**
+ * Follow a public shadow market: private early reveals by webhook (shadow.committed, shadow.revealed) and GET /v1/shadow/:id.
+ * The answer counts the tenant's endpoints that will receive shadow.committed: an endpoint registered before these events
+ * existed was subscribed to the old defaults, and a follow with no subscribed endpoint must say so rather than deliver
+ * nothing silently.
+ */
 v1.post("/markets/:id/follow", async (c) => {
   const auth = c.get("auth");
   const id = MarketId.safeParse(c.req.param("id"));
   if (!id.success) return err(c, "validation_error", "market id must be a uuid", 400);
   const client = db(c.env);
-  const [{ data: m, error: me }, plan] = await Promise.all([
+  const [{ data: m, error: me }, plan, { data: eps, error: ee }] = await Promise.all([
     client.from("markets").select("id, tenant_id, is_test, status, deleted_at").eq("id", id.data).maybeSingle(),
     tenantPlan(client, auth.tenantId),
+    // the endpoints enqueueEvent would read for this tenant
+    client.from("webhook_endpoints").select("id, events").eq("tenant_id", auth.tenantId).eq("active", true).is("deleted_at", null),
   ]);
-  if (me || "error" in plan) return storeDown(c, "market or tenant store");
+  if (me || ee || "error" in plan) return storeDown(c, "market, tenant or webhook store");
   const refusal = followRefusal(m as FollowTarget | null, auth.tenantId);
   if (refusal) return err(c, refusal.code, refusal.message, refusal.status);
   const cap = followCap(plan.plan);
+  const subscribed = ((eps ?? []) as Array<{ events: string[] | null }>).filter((e) => subscribes(e, "shadow.committed")).length;
   let a: FollowAnswer;
   // follow_market is one transaction: an error means no follow was recorded.
   try { a = await followMarket(client, auth.tenantId, id.data, cap); }
   catch { return storeDown(c, "follow store (no follow was recorded)"); }
   const followed = (following: { follow_id: string; active: number }, created: boolean) => ok(c, {
-    follow_id: following.follow_id, market_id: id.data, following: true, already_following: !created, active_follows: following.active, follow_limit: cap,
-    events: SHADOW_EVENTS, read: `/v1/shadow/${id.data}`,
-    note: "Verdicts arrive as shadow.committed on every endpoint subscribed to it (POST /v1/webhooks) and at the read URL. Private early reveal, excluded from the public record.",
+    follow_id: following.follow_id, market_id: id.data, following: true, already_following: !created, follows_counted: following.active, follow_limit: cap,
+    events: SHADOW_EVENTS, read: `/v1/shadow/${id.data}`, endpoints_subscribed: subscribed,
+    note: "Verdicts arrive as shadow.committed on every active endpoint subscribed to it (POST /v1/webhooks) and at the read URL. Private early reveal, excluded from the public record.",
+    ...(subscribed === 0 ? { warning: `No active webhook endpoint of this account is subscribed to shadow.committed, so no webhook will arrive for this follow; read /v1/shadow/${id.data}, or register an endpoint whose events include ${SHADOW_EVENTS.join(" and ")} (POST /v1/webhooks). An endpoint's events are fixed when it is registered.` } : {}),
   }, created ? 201 : 200);
   switch (a.result) {
     case "followed": return followed(a, true);
     case "already_following": return followed(a, false);
-    case "cap_reached": return err(c, "validation_error", `follow limit (${a.cap}) reached for this plan; unfollow a market (DELETE /v1/markets/:id/follow) or change plans`, 403, { extra: { follow_limit: a.cap, active_follows: a.active } });
+    case "cap_reached": return err(c, "validation_error", `follow limit (${a.cap} follows of open markets) reached for this plan; a follow stops counting when its market settles. Unfollow a market (DELETE /v1/markets/:id/follow) or change plans`, 403, { extra: { follow_limit: a.cap, follows_counted: a.active } });
     case "not_followable": return err(c, "validation_error", `market cannot be followed: ${a.reason}`, 400);
     default: { const never: never = a; throw new Error(`unhandled follow answer ${JSON.stringify(never)}`); }
   }
@@ -300,18 +310,26 @@ v1.delete("/markets/:id/follow", async (c) => {
 v1.get("/follows", async (c) => {
   const auth = c.get("auth");
   const client = db(c.env);
-  const [{ data, error, count }, plan] = await Promise.all([
+  const [{ data, error, count }, counted, plan] = await Promise.all([
     client.from("market_follows").select("id, market_id, created_at, markets(platform, external_id, status, deadline_utc)", { count: "exact" }).eq("tenant_id", auth.tenantId).is("deleted_at", null).order("created_at", { ascending: false }).limit(FOLLOWS_PAGE),
+    // what the follow limit counts: follows of open markets (follow_market in migration 014)
+    client.from("market_follows").select("id, markets!inner(status, deleted_at)", { count: "exact", head: true }).eq("tenant_id", auth.tenantId).is("deleted_at", null).eq("markets.status", "open").is("markets.deleted_at", null),
     tenantPlan(client, auth.tenantId),
   ]);
-  if (error || "error" in plan) return storeDown(c, "follow store");
+  if (error || counted.error || counted.count == null || "error" in plan) return storeDown(c, "follow store");
   type F = { id: string; market_id: string; created_at: string; markets: { platform: string; external_id: string; status: string; deadline_utc: string } | null };
   const follows = ((data ?? []) as unknown as F[]).map((f) => ({
     follow_id: f.id, market_id: f.market_id, followed_at: f.created_at,
     market: f.markets ? `${f.markets.platform}:${f.markets.external_id}` : null, status: f.markets?.status ?? null, deadline_utc: f.markets?.deadline_utc ?? null,
   }));
   const active = count ?? follows.length;
-  return ok(c, { follows, active_follows: active, follow_limit: followCap(plan.plan), truncated: active > follows.length });
+  const limit = followCap(plan.plan);
+  // Only after a plan change can a tenant hold more follows of open markets than its limit; the oldest ones deliver.
+  const over = limit !== null && counted.count > limit;
+  return ok(c, {
+    follows, active_follows: active, follows_counted: counted.count, follow_limit: limit, truncated: active > follows.length,
+    ...(over ? { warning: `${counted.count} follows of open markets exceed this plan's limit of ${limit}: only the ${limit} oldest receive early reveals. Unfollow markets or change plans.` } : {}),
+  });
 });
 
 /** The private early reveal of one followed market: its committed verdicts, never the nonce or the preimage. */
@@ -319,15 +337,26 @@ v1.get("/shadow/:market_id", async (c) => {
   const id = MarketId.safeParse(c.req.param("market_id"));
   if (!id.success) return err(c, "validation_error", "market id must be a uuid", 400);
   const client = db(c.env);
-  const { data: f, error } = await client.from("market_follows").select("id, markets(id, platform, external_id, status, deadline_utc)")
-    .eq("tenant_id", c.get("auth").tenantId).eq("market_id", id.data).is("deleted_at", null).maybeSingle();
-  if (error) return storeDown(c, "follow store");
-  const market = (f as { markets: ShadowMarket | null } | null)?.markets;
-  if (!market) return err(c, "not_found", "not following this market (POST /v1/markets/:id/follow first)", 404);
-  const { data: commits, error: ce } = await client.from("bot_posts").select("id, commitment_sha256, created_at, channel, telegram_date, payload")
-    .eq("market_id", id.data).eq("kind", "commit").order("created_at", { ascending: false }).limit(50);
+  // The same entitlement as the webhooks (followBlock): a follow above the plan's limit reads nothing either.
+  const ent = await followEntitlements(client, id.data, c.get("auth").tenantId);
+  if (ent.error) return storeDown(c, "follow store");
+  const follow = ent.rows[0];
+  if (!follow) return err(c, "not_found", "not following this market (POST /v1/markets/:id/follow first)", 404);
+  const block = followBlock(follow);
+  if (block) {
+    const why = block === "over_follow_limit"
+      ? `this follow is number ${follow.open_rank} of your follows of open markets, above this plan's limit of ${followCap(follow.plan)}; unfollow other markets or change plans`
+      : "the evaluation has ended: no live key remains on this account";
+    return err(c, "validation_error", `early reveal not available: ${why}`, 403);
+  }
+  const [{ data: market, error: me }, { data: commits, error: ce }] = await Promise.all([
+    client.from("markets").select("id, platform, external_id, status, deadline_utc").eq("id", id.data).maybeSingle(),
+    client.from("bot_posts").select("id, commitment_sha256, created_at, channel, telegram_date, payload")
+      .eq("market_id", id.data).eq("kind", "commit").order("created_at", { ascending: false }).limit(50),
+  ]);
+  if (me || !market) return storeDown(c, "market store");
   if (ce) return storeDown(c, "commit store");
-  return ok(c, shapeShadow(market, (commits ?? []) as ShadowCommitRow[]));
+  return ok(c, shapeShadow(market as ShadowMarket, (commits ?? []) as ShadowCommitRow[]));
 });
 
 v1.get("/resolutions/:id", async (c) => {
@@ -364,9 +393,10 @@ v1.post("/keys/rotate", async (c) => {
   const auth = c.get("auth");
   const client = db(c.env);
   const key = await mintKey(auth.environment);
-  const { data: k, error } = await client.from("api_keys").insert({ tenant_id: auth.tenantId, key_hash: key.hash, key_prefix: key.prefix, name: "rotated", environment: auth.environment, scopes: auth.scopes, daily_cap: auth.dailyCap }).select("id").single();
+  const exp = rotationExpiry(auth.expiresAt, Date.now());
+  const { data: k, error } = await client.from("api_keys").insert({ tenant_id: auth.tenantId, key_hash: key.hash, key_prefix: key.prefix, name: "rotated", environment: auth.environment, scopes: auth.scopes, daily_cap: auth.dailyCap, expires_at: exp.newKey }).select("id").single();
   if (error || !k) return err(c, "internal_error", error?.message ?? "key insert failed", 500);
-  await client.from("api_keys").update({ expires_at: new Date(Date.now() + 24 * 3600_000).toISOString() }).eq("id", auth.keyId);
+  await client.from("api_keys").update({ expires_at: exp.oldKey }).eq("id", auth.keyId);
   const old = extractApiKey(c); if (old) await invalidateKeyCache(await sha256Hex(old));
-  return ok(c, { key: key.raw, key_id: k.id, note: "Shown once. The previous key expires in 24 hours." }, 201);
+  return ok(c, { key: key.raw, key_id: k.id, expires_at: exp.newKey, note: `Shown once. The previous key expires at ${exp.oldKey}.${exp.newKey ? " The new key keeps the previous key's expiry: rotation never extends a key." : ""}` }, 201);
 });

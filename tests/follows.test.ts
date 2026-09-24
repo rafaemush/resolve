@@ -1,13 +1,14 @@
 /**
- * Follows and the private early reveal (plan §17.3 P7-lite, §19.2 item 5): the follow rules and per-plan caps, the
- * shadow response and the event payloads (never the nonce or the preimage before the reveal), and the four tenant
- * routes over an in-memory database with migration 014's follow_market() stand-in.
+ * Follows and the private early reveal (plan §17.3 P7-lite, §19.2 item 5): the follow rules, per-plan caps and the
+ * entitlement rule (an evaluation ends with its key; a lowered plan keeps only its oldest follows), the shadow response
+ * and the event payloads (never the nonce or the preimage before the reveal), and the four tenant routes over an
+ * in-memory database with migration 014's follow_market() and follow_entitlements() stand-ins.
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
 import type { Verdict } from "../src/resolve/schema";
 import { fakeDb, type FakeDb, type Row } from "./lib/fake-db";
-import { followMarket as followMarketStandIn } from "./lib/fake-rpcs";
+import { followEntitlements as followEntitlementsStandIn, followMarket as followMarketStandIn } from "./lib/fake-rpcs";
 
 const h = vi.hoisted(() => ({ db: null as unknown as FakeDb, plan: "free" as string }));
 vi.mock("../src/db/supabase", () => ({
@@ -27,7 +28,7 @@ vi.mock("../src/api/auth", () => ({
 vi.mock("../src/ops/alerts", () => ({ alert: vi.fn(async () => ({ sent: true, deduped: false })) }));
 
 import { v1 } from "../src/api/v1";
-import { followCap, followRefusal, shapeShadow, shapeShadowCommit, EARLY_REVEAL_LABEL, PLANS, type FollowTarget, type ShadowCommitRow } from "../src/shadow/follows";
+import { followBlock, followCap, followEntitlements, followerTenants, followRefusal, shapeShadow, shapeShadowCommit, EARLY_REVEAL_LABEL, PLANS, type FollowEntitlement, type FollowTarget, type ShadowCommitRow } from "../src/shadow/follows";
 import { shadowCommittedPayload, shadowRevealedPayload } from "../src/shadow/events";
 import { buildPreimage, committedFields, DISCLAIMER, type CommittedVerdict, type OfficialRecord } from "../src/bot/commit";
 import { sha256Hex } from "../src/resolve/text";
@@ -48,6 +49,30 @@ function committed(over: Partial<Verdict> = {}): CommittedVerdict {
 describe("followCap (plan §17.3 P7-lite)", () => {
   it("50 by default, 500 on Growth, unlimited on Platform", () => {
     expect(Object.fromEntries(PLANS.map((p) => [p, followCap(p)]))).toEqual({ free: 50, payg: 50, builder: 50, growth: 500, platform: null });
+  });
+});
+
+describe("followBlock: an evaluation ends with its key; only follows within the plan's cap deliver", () => {
+  const e = (over: Partial<FollowEntitlement> = {}): FollowEntitlement => ({ tenant_id: "t1", follow_id: "f1", plan: "free", live_key: true, open_rank: 1, ...over });
+  it("a free follow delivers while a key is live, and not after", () => {
+    expect(followBlock(e())).toBeNull();
+    expect(followBlock(e({ live_key: false }))).toBe("evaluation_ended");
+  });
+  it("paid plans do not depend on a live key (a paid follow is not an evaluation)", () => {
+    for (const plan of ["payg", "builder", "growth", "platform"] as const) expect(followBlock(e({ plan, live_key: false }))).toBeNull();
+  });
+  it("rank within the cap delivers; above it does not (a lowered plan); Platform has no cap", () => {
+    expect(followBlock(e({ plan: "builder", open_rank: 50 }))).toBeNull();
+    expect(followBlock(e({ plan: "builder", open_rank: 51 }))).toBe("over_follow_limit");
+    expect(followBlock(e({ plan: "growth", open_rank: 500 }))).toBeNull();
+    expect(followBlock(e({ plan: "growth", open_rank: 501 }))).toBe("over_follow_limit");
+    expect(followBlock(e({ plan: "platform", open_rank: 100_000 }))).toBeNull();
+  });
+  it("an unreadable or malformed follow_entitlements answer is an error, never an empty follower list", async () => {
+    const client = (data: unknown, error: { message: string } | null = null) => ({ rpc: async () => ({ data, error }) }) as never;
+    expect(await followerTenants(client(null, { message: "timeout" }), "m1")).toEqual({ tenants: [], error: "timeout" });
+    expect((await followEntitlements(client([{ tenant_id: "t1", follow_id: "f1", plan: "gold", live_key: true, open_rank: 1 }]), "m1")).error).toContain("follow_entitlements answered");
+    expect(await followerTenants(client([]), "m1")).toEqual({ tenants: [], error: null });
   });
 });
 
@@ -147,20 +172,57 @@ describe("POST/DELETE /v1/markets/:id/follow, GET /v1/follows, GET /v1/shadow/:m
     caps = [];
     h.db = fakeDb({
       tenants: [{ id: "t1", plan: "free", deleted_at: null }, { id: "t2", plan: "free", deleted_at: null }],
+      // the calling key (the auth mock's k1): an authenticated tenant holds a live key
+      api_keys: [{ id: "k1", tenant_id: "t1", revoked_at: null, deleted_at: null, expires_at: null }],
       markets: [market(M), market(uuid(1), { tenant_id: "t2" }), market(uuid(2), { is_test: true }), market(uuid(3), { status: "resolved" }), market(uuid(4), { tenant_id: "t1" })],
-      market_follows: [], bot_posts: [], api_request_log: [],
-    }, {}, { rpc: { follow_market: async (db, a) => { caps.push(a.p_cap); return followMarketStandIn(db, a); } } });
+      market_follows: [], bot_posts: [], api_request_log: [], webhook_endpoints: [],
+    }, {}, { rpc: { follow_market: async (db, a) => { caps.push(a.p_cap); return followMarketStandIn(db, a); }, follow_entitlements: followEntitlementsStandIn } });
   });
+  const hook = (id: string, events: string[], over: Row = {}): Row => ({ id, tenant_id: "t1", url: `https://hooks.example/${id}`, active: true, deleted_at: null, events, ...over });
+  /** n follows by t1 of open markets that exist, older than anything the test creates. */
+  const openFollows = (n: number, status = "open") => {
+    for (let i = 0; i < n; i++) {
+      h.db.tables.markets!.push(market(uuid(100 + i), { status }));
+      h.db.tables.market_follows!.push({ id: `f${String(i).padStart(3, "0")}`, tenant_id: "t1", market_id: uuid(100 + i), created_at: new Date(Date.parse("2026-09-01T00:00:00Z") + i * 1000).toISOString(), deleted_at: null, markets: { status, deleted_at: null } });
+    }
+  };
 
   it("follows an open shadow market once (201, then 200 already_following) with the plan's cap", async () => {
+    h.db.tables.webhook_endpoints = [hook("e1", ["shadow.committed", "shadow.revealed"])];
     const a = await call("POST", `/markets/${M}/follow`);
     expect(a.status).toBe(201);
-    expect(a.body.data).toMatchObject({ market_id: M, following: true, already_following: false, active_follows: 1, follow_limit: 50, events: ["shadow.committed", "shadow.revealed"], read: `/v1/shadow/${M}` });
+    expect(a.body.data).toMatchObject({ market_id: M, following: true, already_following: false, follows_counted: 1, follow_limit: 50, events: ["shadow.committed", "shadow.revealed"], read: `/v1/shadow/${M}`, endpoints_subscribed: 1 });
+    expect(a.body.data.warning).toBeUndefined();
     const b = await call("POST", `/markets/${M}/follow`);
     expect(b.status).toBe(200);
-    expect(b.body.data).toMatchObject({ follow_id: a.body.data.follow_id, already_following: true, active_follows: 1 });
+    expect(b.body.data).toMatchObject({ follow_id: a.body.data.follow_id, already_following: true, follows_counted: 1 });
     expect(h.db.tables.market_follows).toHaveLength(1);
     expect(caps).toEqual([50, 50]);
+  });
+
+  it("says so when no endpoint will receive shadow.committed: none, the old defaults, inactive or deleted ones", async () => {
+    const OLD_DEFAULTS = ["market.resolved", "market.unresolved_update", "market.error", "credits.low", "payment.credited"]; // migration 009's default
+    h.db.tables.webhook_endpoints = [
+      hook("e1", OLD_DEFAULTS), hook("e2", ["shadow.committed"], { active: false }), hook("e3", ["shadow.committed"], { deleted_at: "2026-09-01T00:00:00Z" }),
+      hook("e4", ["shadow.committed"], { tenant_id: "t2" }), // another tenant's
+    ];
+    const r = await call("POST", `/markets/${M}/follow`);
+    expect(r.status).toBe(201); // the follow is recorded: GET /v1/shadow still reads it
+    expect(r.body.data.endpoints_subscribed).toBe(0);
+    expect(r.body.data.warning).toContain("No active webhook endpoint of this account is subscribed to shadow.committed");
+    expect(r.body.data.warning).toContain("POST /v1/webhooks");
+    h.db.tables.webhook_endpoints.push(hook("e5", [...OLD_DEFAULTS, "shadow.committed"]));
+    const again = await call("POST", `/markets/${M}/follow`);
+    expect([again.body.data.endpoints_subscribed, again.body.data.warning]).toEqual([1, undefined]);
+  });
+
+  it("a webhook store error is a 503 before anything is written", async () => {
+    const from = h.db.client.from;
+    h.db.client.from = ((t: string) => (t === "webhook_endpoints" ? { select: () => { const q: any = { eq: () => q, is: () => q, then: (ok: (v: unknown) => unknown) => Promise.resolve({ data: null, error: { message: "timeout" } }).then(ok) }; return q; } } : from(t))) as never;
+    const r = await call("POST", `/markets/${M}/follow`);
+    expect([r.status, r.body.error.code]).toEqual([503, "UPSTREAM_UNAVAILABLE"]);
+    expect(caps).toEqual([]);
+    expect(h.db.tables.market_follows).toHaveLength(0);
   });
 
   it("reads tenants.plan for the cap, not the key's cached plan: growth 500, platform unlimited", async () => {
@@ -174,11 +236,21 @@ describe("POST/DELETE /v1/markets/:id/follow, GET /v1/follows, GET /v1/shadow/:m
   });
 
   it("refuses past the cap with 403 and the limit", async () => {
-    h.db.tables.market_follows = Array.from({ length: 50 }, (_, i) => ({ id: `f${i}`, tenant_id: "t1", market_id: uuid(100 + i), deleted_at: null }));
+    openFollows(50);
     const r = await call("POST", `/markets/${M}/follow`);
     expect(r.status).toBe(403);
-    expect(r.body).toMatchObject({ ok: false, error: { code: "validation_error" }, follow_limit: 50, active_follows: 50 });
+    expect(r.body).toMatchObject({ ok: false, error: { code: "validation_error" }, follow_limit: 50, follows_counted: 50 });
+    expect(r.body.error.message).toContain("a follow stops counting when its market settles");
     expect(h.db.tables.market_follows).toHaveLength(50);
+  });
+
+  it("follows of settled markets hold no slot: 50 of them do not stop a new follow", async () => {
+    openFollows(50, "resolved");
+    const r = await call("POST", `/markets/${M}/follow`);
+    expect([r.status, r.body.data.follows_counted]).toEqual([201, 1]);
+    const list = await call("GET", "/follows");
+    expect(list.body.data).toMatchObject({ active_follows: 51, follows_counted: 1, follow_limit: 50 });
+    expect(list.body.data.warning).toBeUndefined();
   });
 
   it("another tenant's, a test and a missing market are 404; the tenant's own and a settled one are 400; a bad id is 400", async () => {
@@ -214,7 +286,7 @@ describe("POST/DELETE /v1/markets/:id/follow, GET /v1/follows, GET /v1/shadow/:m
     await call("POST", `/markets/${M}/follow`);
     h.db.tables.market_follows!.push({ id: "gone", tenant_id: "t1", market_id: uuid(7), deleted_at: "2026-09-01T00:00:00Z" }, { id: "other", tenant_id: "t2", market_id: M, deleted_at: null });
     const r = await call("GET", "/follows");
-    expect(r.body.data).toMatchObject({ active_follows: 1, follow_limit: 50, truncated: false });
+    expect(r.body.data).toMatchObject({ active_follows: 1, follows_counted: 1, follow_limit: 50, truncated: false });
     expect(r.body.data.follows).toEqual([{ follow_id: expect.any(String), market_id: M, followed_at: expect.any(String), market: `polymarket:ext-${M.slice(0, 4)}`, status: "open", deadline_utc: "2026-10-20T00:00:00.000Z" }]);
   });
 
@@ -235,5 +307,27 @@ describe("POST/DELETE /v1/markets/:id/follow, GET /v1/follows, GET /v1/shadow/:m
     await call("DELETE", `/markets/${M}/follow`);
     expect((await call("GET", `/shadow/${M}`)).status).toBe(404);
     expect((await call("GET", "/shadow/nope")).status).toBe(400);
+  });
+
+  it("after a plan is lowered, a follow above the new limit reads nothing and GET /v1/follows says why", async () => {
+    h.db.tables.tenants![0]!.plan = "growth";
+    openFollows(50);
+    expect((await call("POST", `/markets/${M}/follow`)).status).toBe(201); // number 51, inside Growth's 500
+    expect((await call("GET", `/shadow/${M}`)).status).toBe(200);
+    h.db.tables.tenants![0]!.plan = "builder"; // cap 50
+    const r = await call("GET", `/shadow/${M}`);
+    expect([r.status, r.body.error.code]).toEqual([403, "validation_error"]);
+    expect(r.body.error.message).toContain("number 51 of your follows of open markets, above this plan's limit of 50");
+    expect((await call("GET", `/shadow/${uuid(100)}`)).status).toBe(200); // the oldest still read
+    const list = await call("GET", "/follows");
+    expect(list.body.data).toMatchObject({ follows_counted: 51, follow_limit: 50 });
+    expect(list.body.data.warning).toContain("only the 50 oldest receive early reveals");
+  });
+
+  it("a free tenant with no live key left reads nothing (a revoked key the 60 s auth cache still admits)", async () => {
+    await call("POST", `/markets/${M}/follow`);
+    h.db.tables.api_keys![0]!.revoked_at = new Date(Date.now() - 1000).toISOString();
+    const r = await call("GET", `/shadow/${M}`);
+    expect([r.status, r.body.error.message]).toEqual([403, expect.stringContaining("the evaluation has ended")]);
   });
 });

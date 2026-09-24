@@ -212,14 +212,19 @@ end $$;`;
  * Migration 014: log_touch() refuses an outbound pitch (dm, email, call) with no settled reconciliation on the lead's
  * platform unless an override reason is given (blank is not a reason), a direct insert cannot skip the gate, pending /
  * unresolved_by_platform / test-market / tenant-market rows are not evidence, a real one is; the touch log is
- * append-only; follow_market() is idempotent, holds the cap (null = unlimited), refuses anything but an open non-test
- * shadow market, and allows a new follow after an unfollow; anon can execute neither function nor read the tables.
+ * append-only; a retry with the same request_id returns the recorded touch (even after the lead is deleted), the same
+ * request_id with other content is refused, and a blank one does not deduplicate; follow_market() is idempotent, holds
+ * the cap (null = unlimited) on follows of open markets only (a settled market frees its slot), refuses anything but an
+ * open non-test shadow market, and allows a new follow after an unfollow; follow_entitlements() reports live_key false
+ * for a tenant whose keys are all expired or revoked, and ranks follows oldest first among open markets plus the market
+ * asked about; anon can execute none of the functions nor read the tables.
  * The evidence half runs on platform custom, which the Worker never reconciles (custom_prior_evidence must be false).
  */
 const GTM_BLOCK = `
 do $$
 declare out jsonb := '{}'::jsonb; prior boolean; lx uuid; lc uuid; tid uuid; t uuid; tt uuid; res jsonb; n integer;
-  m_pend uuid; m_unres uuid; m_test uuid; m_ten uuid; m_ok uuid; f1 uuid; f2 uuid; f_test uuid; f_closed uuid;
+  m_pend uuid; m_unres uuid; m_test uuid; m_ten uuid; m_ok uuid; f1 uuid; f2 uuid; f3 uuid; f_test uuid; f_closed uuid;
+  tr uuid; ti uuid; te uuid; e1 uuid; e2 uuid; e3 uuid;
   mk constant text := 'insert into markets (platform, external_id, condition, event_statement, option_a, option_b, positive_option, open_at, deadline_utc, tenant_id, status) values (''custom'', $1, ''selftest condition'', ''selftest statement'', ''Yes'', ''No'', ''OPTION_A'', now() - interval ''3 days'', now() - interval ''2 days'', $2, $3) returning id';
   rs constant text := 'insert into resolutions (id, market_id, mode, status_row, resolution_status, winning_outcome, confidence_score, determination_basis, caveats, thresholds_version) values ($1, $2, ''shadow'', ''complete'', ''RESOLVED'', ''OPTION_A'', 0.95, ''structured'', ''[]'', ''v1'')';
   rc constant text := 'insert into reconciliations (resolution_id, market_id, platform, official_outcome, agreement, final) values ($1, $2, ''custom'', $3, $4, true)';
@@ -250,6 +255,15 @@ begin
   exception when others then out := out || '{"touch_update_refused": true}'; end;
   begin delete from gtm_touches where id = tid; out := out || '{"touch_delete_refused": false}';
   exception when others then out := out || '{"touch_delete_refused": true}'; end;
+  -- idempotency: a retry after a lost response returns the recorded touch; other content under the same id is refused
+  ti := log_touch(lx, 'ops', 'out', 'selftest idempotent touch', null, null, '__selftest_req_1__');
+  out := out || jsonb_build_object('touch_retry_same_id', log_touch(lx, 'ops', 'out', 'selftest idempotent touch', ' ', ' ', '__selftest_req_1__') = ti,
+    'touch_retry_rows', (select count(*) from gtm_touches where request_id = '__selftest_req_1__'));
+  begin perform log_touch(lx, 'ops', 'out', 'selftest other content', null, null, '__selftest_req_1__'); out := out || '{"touch_reuse_refused": false}';
+  exception when unique_violation then out := out || '{"touch_reuse_refused": true}'; end;
+  out := out || jsonb_build_object('blank_request_id_not_deduped',
+    log_touch(lx, 'ops', 'out', 'selftest no key', null, null, '  ') <> log_touch(lx, 'ops', 'out', 'selftest no key', null, null, '  '));
+  tr := log_touch(lx, 'dm', 'out', 'selftest pitch', null, 'selftest: vendor asked for the pitch', '__selftest_req_2__');
 
   -- not evidence: pending, unresolved_by_platform, a test market, a tenant market
   insert into tenants (display_name) values ('__selftest_gtm_tenant__') returning id into t;
@@ -271,6 +285,8 @@ begin
   update leads set deleted_at = now() where id = lx;
   begin perform log_touch(lx, 'reply', 'out', 'selftest reply', null, null); out := out || '{"deleted_lead_refused": false}';
   exception when sqlstate 'RS002' then out := out || '{"deleted_lead_refused": true}'; end;
+  out := out || jsonb_build_object('touch_retry_after_lead_deleted',
+    log_touch(lx, 'dm', 'out', 'selftest pitch', null, 'selftest: vendor asked for the pitch', '__selftest_req_2__') = tr);
 
   -- follow_market
   insert into tenants (display_name) values ('__selftest_gtm_follower__') returning id into tt;
@@ -292,12 +308,43 @@ begin
   res := follow_market(tt, f1, 2);
   select count(*) into n from market_follows where tenant_id = tt and market_id = f1;
   out := out || jsonb_build_object('refollow_after_unfollow', res->>'result', 'follow_rows_kept', n);
+  -- the cap counts follows of open markets: tt follows f1 and f2 (both open), so a third is over a cap of 2 until f2 settles
+  execute mk into f3 using '__selftest_gtm_f3__', null::uuid, 'open';
+  out := out || jsonb_build_object('follow_cap_open_only_before', follow_market(tt, f3, 2)->>'result');
+  update markets set status = 'resolved' where id = f2;
+  res := follow_market(tt, f3, 2);
+  out := out || jsonb_build_object('follow_settled_frees_slot', res->>'result', 'follow_counted_after_settle', (res->>'active')::int);
+
+  -- follow_entitlements: key facts and ranks (created_at set explicitly: now() is one value inside this transaction)
+  insert into tenants (display_name) values ('__selftest_gtm_entitled__') returning id into te;
+  execute mk into e1 using '__selftest_gtm_e1__', null::uuid, 'open';
+  execute mk into e2 using '__selftest_gtm_e2__', null::uuid, 'open';
+  execute mk into e3 using '__selftest_gtm_e3__', null::uuid, 'open';
+  insert into market_follows (tenant_id, market_id, created_at)
+    values (te, e1, now() - interval '3 hours'), (te, e2, now() - interval '2 hours'), (te, e3, now() - interval '1 hour');
+  out := out || jsonb_build_object('ent_plan', (select plan from follow_entitlements(e1) where tenant_id = te),
+    'ent_no_key', (select live_key from follow_entitlements(e1) where tenant_id = te));
+  insert into api_keys (tenant_id, key_hash, key_prefix, expires_at) values (te, '__selftest_gtm_h1__', 'rsl_test_sel...', now() - interval '1 minute');
+  insert into api_keys (tenant_id, key_hash, key_prefix, revoked_at) values (te, '__selftest_gtm_h2__', 'rsl_test_sel...', now());
+  out := out || jsonb_build_object('ent_expired_or_revoked', (select live_key from follow_entitlements(e1) where tenant_id = te));
+  insert into api_keys (tenant_id, key_hash, key_prefix, expires_at) values (te, '__selftest_gtm_h3__', 'rsl_test_sel...', now() + interval '1 day');
+  out := out || jsonb_build_object('ent_live_key', (select live_key from follow_entitlements(e1) where tenant_id = te),
+    'ent_ranks', jsonb_build_array((select open_rank from follow_entitlements(e1) where tenant_id = te),
+      (select open_rank from follow_entitlements(e2) where tenant_id = te), (select open_rank from follow_entitlements(e3) where tenant_id = te)));
+  update markets set status = 'resolved' where id = e1;   -- e1 keeps its rank for its own reveal; e2 and e3 move up
+  out := out || jsonb_build_object('ent_ranks_after_settle', jsonb_build_array((select open_rank from follow_entitlements(e1) where tenant_id = te),
+      (select open_rank from follow_entitlements(e2) where tenant_id = te), (select open_rank from follow_entitlements(e3) where tenant_id = te)),
+    'ent_one_tenant', (select count(*) from follow_entitlements(e2, te)), 'ent_other_tenant', (select count(*) from follow_entitlements(e2, tt)));
+  update tenants set deleted_at = now() where id = te;
+  out := out || jsonb_build_object('ent_deleted_tenant', (select count(*) from follow_entitlements(e2)));
   begin
     set local role anon;
     begin perform log_touch(lc, 'reply', 'out', 'anon', null, null); out := out || '{"anon_log_touch_denied": false}';
     exception when insufficient_privilege then out := out || '{"anon_log_touch_denied": true}'; end;
     begin perform follow_market(tt, f1, null); out := out || '{"anon_follow_denied": false}';
     exception when insufficient_privilege then out := out || '{"anon_follow_denied": true}'; end;
+    begin perform 1 from follow_entitlements(f1); out := out || '{"anon_entitlements_denied": false}';
+    exception when insufficient_privilege then out := out || '{"anon_entitlements_denied": true}'; end;
     begin perform 1 from leads limit 1; out := out || '{"anon_leads_denied": false}';
     exception when insufficient_privilege then out := out || '{"anon_leads_denied": true}'; end;
     reset role;
@@ -385,11 +432,15 @@ end $$;`;
     cold_dm_refused: true, cold_email_refused: true, cold_call_refused: true, blank_override_refused: true, direct_insert_refused: true,
     override_accepted: true, override_stored: "selftest: vendor asked for the pitch", blank_url_stored_null: true,
     reply_out_accepted: true, ops_out_accepted: true, dm_in_accepted: true, touch_update_refused: true, touch_delete_refused: true,
-    non_evidence_refused: true, evidence_accepted: true, deleted_lead_refused: true,
+    touch_retry_same_id: true, touch_retry_rows: 1, touch_reuse_refused: true, blank_request_id_not_deduped: true,
+    non_evidence_refused: true, evidence_accepted: true, deleted_lead_refused: true, touch_retry_after_lead_deleted: true,
     follow_first: "followed", follow_again: "already_following", follow_over_cap: "cap_reached", follow_unlimited: "followed", follow_active: 2,
     follow_test: "not_followable", follow_tenant_market: "not_followable", follow_closed: "market is resolved", follow_missing: "not_followable",
     negative_cap_refused: true, unknown_tenant_refused: true, second_active_refused: true, refollow_after_unfollow: "followed", follow_rows_kept: 2,
-    anon_log_touch_denied: true, anon_follow_denied: true, anon_leads_denied: true,
+    follow_cap_open_only_before: "cap_reached", follow_settled_frees_slot: "followed", follow_counted_after_settle: 2,
+    ent_plan: "free", ent_no_key: false, ent_expired_or_revoked: false, ent_live_key: true, ent_ranks: [1, 2, 3], ent_ranks_after_settle: [1, 1, 2],
+    ent_one_tenant: 1, ent_other_tenant: 0, ent_deleted_tenant: 0,
+    anon_log_touch_denied: true, anon_follow_denied: true, anon_entitlements_denied: true, anon_leads_denied: true,
   });
   console.log("rolled back: nothing persisted from the GTM block");
 

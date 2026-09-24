@@ -66,8 +66,9 @@ export function shadowRevealedPayload(m: MarketRef, official: OfficialRecord, co
 export interface QueueResult { followers: number; rows: Row[]; error: string | null }
 
 /**
- * Queue an event for every follower of a market (at most QUEUE_SUBREQUESTS). A follows read that failed drops the
- * event, so it alerts; the followers can still read the verdict at GET /v1/shadow/:market_id.
+ * Queue an event for every entitled follower of a market (followBlock: an ended evaluation or a follow above a lowered
+ * plan's cap gets nothing; at most QUEUE_SUBREQUESTS). A follows read that failed drops the event, so it alerts; the
+ * followers can still read the verdict at GET /v1/shadow/:market_id.
  */
 export async function queueForFollowers(env: Env, m: MarketRef, eventType: "shadow.committed" | "shadow.revealed", payload: Record<string, unknown>): Promise<QueueResult> {
   const f = await followerTenants(db(env), m.id);

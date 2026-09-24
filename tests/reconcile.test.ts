@@ -214,7 +214,8 @@ describe("runReconcile", () => {
 
     const r1 = await runReconcile(env);
     expect(r1).toMatchObject({ checked: 1, resolved: 1, reconciliations: 2, reveals_recorded: 2, reveals_posted: 0, errors: [] });
-    expect(h.db.calls.filter((c) => c.action === "rpc").map((c) => c.table)).toEqual(["rpc:settle_market"]); // one write request, one transaction
+    // one write request (one transaction), then the read of the market's followers for shadow.revealed
+    expect(h.db.calls.filter((c) => c.action === "rpc").map((c) => c.table)).toEqual(["rpc:settle_market", "rpc:follow_entitlements"]);
     const rec = h.db.tables.reconciliations!;
     expect(rec.map((x) => [x.resolution_id, x.final, x.agreement, x.official_outcome, x.official_label, x.official_at_source])).toEqual([
       ["res-c1", false, "abstained", "OPTION_A", "Yes", "limitless_api_poll"],
@@ -241,7 +242,7 @@ describe("runReconcile", () => {
     expect(h.db.tables.reconciliations).toHaveLength(2);
   });
 
-  it("a settled market's followers get shadow.revealed: queued with the settle, first attempt on what the run has left", async () => {
+  it("a settled market's entitled followers get shadow.revealed: queued with the settle, first attempt on what the run has left", async () => {
     const early = committed("UNRESOLVED", "NONE", "n1"), late = committed("RESOLVED", "OPTION_A", "n2");
     const hooks: Array<Record<string, any>> = [];
     const upstream = globalThis.fetch;
@@ -256,13 +257,22 @@ describe("runReconcile", () => {
         await commitRow("c1", "m1", "2026-09-20T00:00:00.000Z", early, 11), await commitRow("c2", "m1", "2026-09-21T00:00:00.000Z", late, 12),
         await commitRow("c3", "m2", "2026-09-21T00:00:00.000Z", committed("RESOLVED", "OPTION_A", "n3"), 13),
       ],
-      market_follows: [{ tenant_id: "t1", market_id: "m1", deleted_at: null, tenants: { deleted_at: null } }],
-      webhook_endpoints: [{ id: "e1", tenant_id: "t1", url: "https://hooks.example/e1", secret: "whsec_test", active: true, deleted_at: null, consecutive_failures: 0, events: ["shadow.revealed"] }],
+      // t1 pays as it goes; t2 is an evaluation whose only key expired yesterday: its follow ended with the key
+      tenants: [{ id: "t1", plan: "payg", deleted_at: null }, { id: "t2", plan: "free", deleted_at: null }],
+      api_keys: [{ id: "k2", tenant_id: "t2", revoked_at: null, deleted_at: null, expires_at: new Date(Date.now() - 86_400_000).toISOString() }],
+      market_follows: [
+        { id: "f1", tenant_id: "t1", market_id: "m1", created_at: "2026-09-19T00:00:00.000Z", deleted_at: null },
+        { id: "f2", tenant_id: "t2", market_id: "m1", created_at: "2026-09-19T00:00:00.000Z", deleted_at: null },
+      ],
+      webhook_endpoints: [
+        { id: "e1", tenant_id: "t1", url: "https://hooks.example/e1", secret: "whsec_test", active: true, deleted_at: null, consecutive_failures: 0, events: ["shadow.revealed"] },
+        { id: "e2", tenant_id: "t2", url: "https://hooks.example/e2", secret: "whsec_test", active: true, deleted_at: null, consecutive_failures: 0, events: ["shadow.revealed"] },
+      ],
       webhook_deliveries: [],
     });
     const r = await runReconcile(env);
     expect(r).toMatchObject({ resolved: 2, shadow_revealed_queued: 1, errors: [] });
-    expect(h.db.tables.webhook_deliveries!.map((d) => [d.event_type, d.status, d.attempt])).toEqual([["shadow.revealed", "delivered", 1]]);
+    expect(h.db.tables.webhook_deliveries!.map((d) => [d.endpoint_id, d.event_type, d.status, d.attempt])).toEqual([["e1", "shadow.revealed", "delivered", 1]]);
     expect(hooks).toHaveLength(1);
     const data = hooks[0]!.data;
     expect(data).toMatchObject({ market: "limitless:slug-m1", agreement: "agree", official: { outcome: "OPTION_A", label: "Yes", at_source: "limitless_api_poll" } });
@@ -270,7 +280,7 @@ describe("runReconcile", () => {
     for (const c of data.commits) expect(await sha256Hex(c.preimage)).toBe(c.commitment_sha256);
     expect(r.subrequests).toBeLessThanOrEqual(RECONCILE_SUBREQUESTS);
     // m2 has no follower: its settle spent one follows read and queued nothing
-    expect(h.db.calls.filter((c) => c.table === "market_follows")).toHaveLength(2);
+    expect(h.db.calls.filter((c) => c.table === "rpc:follow_entitlements")).toHaveLength(2);
   });
 
   it("the four-request write this replaced collides on uq_reconciliations_final once a newer commit exists", async () => {

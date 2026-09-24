@@ -20,6 +20,12 @@ import { redact } from "../ops/redact";
 export const WEBHOOK_EVENTS = ["market.resolved", "market.unresolved_update", "market.error", "credits.low", "payment.credited", "shadow.committed", "shadow.revealed"] as const;
 export type WebhookEvent = (typeof WEBHOOK_EVENTS)[number];
 
+/**
+ * Pure. Whether an endpoint receives this event: it is in the endpoint's registered events. One rule for the queue and
+ * for the follow route's endpoints_subscribed count, so the count says exactly what enqueueEvent will do.
+ */
+export const subscribes = (e: { events: string[] | null }, eventType: WebhookEvent): boolean => (e.events ?? []).includes(eventType);
+
 const BACKOFF_S = [0, 60, 300, 1800, 7200, 43200, 86400];
 export const MAX_ATTEMPTS = BACKOFF_S.length;
 /** Deliveries per scheduled drain (the 5-minute cron, src/jobs/schedule.ts). */
@@ -68,7 +74,7 @@ export async function enqueueEvent(env: Env, tenants: string | readonly string[]
   const client = db(env);
   const { data: eps, error: readError } = await client.from("webhook_endpoints").select("id, tenant_id, events").in("tenant_id", ids).eq("active", true).is("deleted_at", null);
   if (readError) return lost(`the endpoint read failed (${redact(readError.message)})`);
-  const targets = ((eps ?? []) as Array<{ id: string; tenant_id: string; events: string[] | null }>).filter((e) => (e.events ?? []).includes(eventType));
+  const targets = ((eps ?? []) as Array<{ id: string; tenant_id: string; events: string[] | null }>).filter((e) => subscribes(e, eventType));
   if (!targets.length) return [];
   const sha = await sha256Hex(JSON.stringify(payload));
   const { data, error } = await client.from("webhook_deliveries")

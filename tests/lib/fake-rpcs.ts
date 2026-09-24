@@ -1,8 +1,8 @@
 /**
- * Stand-ins for migration 012's settle_market() and defer_reconcile() and migration 014's follow_market(), step for step
- * in the SQL's order, over the in-memory database (tests/lib/fake-db.ts). They exist so reconcile runs and the follow
- * routes can be tested end to end without Postgres; the SQL itself is proven by scripts/selftest-db.ts. Run inside
- * fakeDb's rpc(): one subrequest, rolled back on error.
+ * Stand-ins for migration 012's settle_market() and defer_reconcile() and migration 014's follow_market() and
+ * follow_entitlements(), step for step in the SQL's order, over the in-memory database (tests/lib/fake-db.ts). They
+ * exist so reconcile runs and the follow routes can be tested end to end without Postgres; the SQL itself is proven by
+ * scripts/selftest-db.ts. Run inside fakeDb's rpc(): one subrequest, rolled back on error.
  */
 import type { FakeDb, FakeDbOptions, Row } from "./fake-db";
 
@@ -66,11 +66,16 @@ export async function deferReconcile(db: FakeDb, a: Record<string, any>): Promis
   return { data: n, error: null };
 }
 
-export const RECONCILE_RPCS: NonNullable<FakeDbOptions["rpc"]> = { settle_market: settleMarket, defer_reconcile: deferReconcile };
+/** What a reconcile run calls: the settle, the deferral, and the follower read of shadow.revealed. */
+export const RECONCILE_RPCS: NonNullable<FakeDbOptions["rpc"]> = { settle_market: settleMarket, defer_reconcile: deferReconcile, follow_entitlements: followEntitlements };
+
+/** A market that counts toward a follow cap: open and not deleted (migration 014). */
+const openMarket = (db: FakeDb, id: string) => (db.tables.markets ?? []).some((m) => m.id === id && m.status === "open" && !m.deleted_at);
 
 /**
  * Stand-in for migration 014's follow_market(), step for step in the SQL's order. The inserted row carries the market
- * embedded as PostgREST's markets(...) select would return it, so reads that embed the market see it.
+ * embedded as PostgREST's markets(...) select would return it, so reads that embed the market see it. The cap counts
+ * active follows of open markets only, reading markets live.
  */
 export async function followMarket(db: FakeDb, a: Record<string, any>): Promise<{ data: any; error: any }> {
   if (a.p_cap !== null && a.p_cap < 0) return fail(`follow_market: p_cap must be >= 0 or null (unlimited), got ${a.p_cap}`);
@@ -80,11 +85,35 @@ export async function followMarket(db: FakeDb, a: Record<string, any>): Promise<
   if (m.status !== "open") return { data: { result: "not_followable", reason: `market is ${m.status}` }, error: null };
   const follows = (db.tables.market_follows ??= []);
   const active = follows.filter((f) => f.tenant_id === a.p_tenant && !f.deleted_at);
+  const counted = active.filter((f) => openMarket(db, f.market_id)).length;
   const existing = active.find((f) => f.market_id === a.p_market);
-  if (existing) return { data: { result: "already_following", follow_id: existing.id, active: active.length }, error: null };
-  if (a.p_cap !== null && active.length >= a.p_cap) return { data: { result: "cap_reached", active: active.length, cap: a.p_cap }, error: null };
-  const row = { id: `follow-${follows.length + 1}`, tenant_id: a.p_tenant, market_id: m.id, created_at: new Date().toISOString(), deleted_at: null,
-    markets: { id: m.id, platform: m.platform, external_id: m.external_id, status: m.status, deadline_utc: m.deadline_utc } };
+  if (existing) return { data: { result: "already_following", follow_id: existing.id, active: counted }, error: null };
+  if (a.p_cap !== null && counted >= a.p_cap) return { data: { result: "cap_reached", active: counted, cap: a.p_cap }, error: null };
+  const row = { id: `follow-${follows.length + 1}`, tenant_id: a.p_tenant, market_id: m.id, created_at: new Date(Date.now() + follows.length).toISOString(), deleted_at: null,
+    markets: { id: m.id, platform: m.platform, external_id: m.external_id, status: m.status, deadline_utc: m.deadline_utc, deleted_at: null } };
   follows.push(row);
-  return { data: { result: "followed", follow_id: row.id, active: active.length + 1 }, error: null };
+  return { data: { result: "followed", follow_id: row.id, active: counted + 1 }, error: null };
 }
+
+/**
+ * Stand-in for migration 014's follow_entitlements(): per active follow of p_market by a live tenant (p_tenant's only
+ * when given), the plan, whether a key is live (not revoked, not deleted, not expired) and the follow's rank, oldest
+ * first (created_at, id), among the tenant's active follows of open markets plus p_market.
+ */
+export async function followEntitlements(db: FakeDb, a: Record<string, any>): Promise<{ data: any; error: any }> {
+  const now = Date.now();
+  const byAge = (x: Row, y: Row) => (x.created_at < y.created_at ? -1 : x.created_at > y.created_at ? 1 : x.id < y.id ? -1 : x.id > y.id ? 1 : 0);
+  const rows = (db.tables.market_follows ?? [])
+    .filter((f) => f.market_id === a.p_market && !f.deleted_at && (a.p_tenant == null || f.tenant_id === a.p_tenant))
+    .flatMap((f) => {
+      const t = (db.tables.tenants ?? []).find((x) => x.id === f.tenant_id && !x.deleted_at);
+      if (!t) return [];
+      const live_key = (db.tables.api_keys ?? []).some((k) => k.tenant_id === f.tenant_id && !k.revoked_at && !k.deleted_at && (!k.expires_at || Date.parse(k.expires_at) > now));
+      const open_rank = (db.tables.market_follows ?? [])
+        .filter((g) => g.tenant_id === f.tenant_id && !g.deleted_at && (g.market_id === a.p_market || openMarket(db, g.market_id)) && byAge(g, f) <= 0).length;
+      return [{ tenant_id: f.tenant_id, follow_id: f.id, plan: t.plan, live_key, open_rank }];
+    });
+  return { data: rows, error: null };
+}
+
+export const FOLLOW_RPCS: NonNullable<FakeDbOptions["rpc"]> = { follow_market: followMarket, follow_entitlements: followEntitlements };

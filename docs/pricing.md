@@ -29,7 +29,7 @@ Web-evidence verdicts are not generally available yet. Until they are, paid plan
 | Growth | $399 / month | 60,000 credits a month | 500 | up to 500 | 300 |
 | Platform | $1,500 to $3,000 / month, invoiced | by agreement | by agreement | unlimited | 600 |
 
-**Free.** An evaluation key (`rsl_test_...`) for structured verdicts, issued to a named integration, with 300 credits. Early reveals are not a Free feature; an evaluation key may follow up to 50 shadow markets while it is valid, so the early reveal can be judged before buying. There are no discounts.
+**Free.** An evaluation key (`rsl_test_...`) for structured verdicts, issued to a named integration, with 300 credits. Early reveals are not a Free feature; an evaluation key may follow up to 50 shadow markets while it is valid, so the early reveal can be judged before buying. When the key expires (30 days after issue) or is revoked, its follows stop: no further `shadow.committed` or `shadow.revealed` webhook is sent. Rotating the key does not extend it: the new key keeps the old key's expiry. There are no discounts.
 
 **Pay as you go.** Credit packs:
 
@@ -53,10 +53,11 @@ Send USDC on Base from the wallet registered on your account to the address `GET
 
 ## Private early reveals
 
-Follow a public shadow market with `POST /v1/markets/{id}/follow` (open, non-test shadow markets only; `DELETE` to stop, `GET /v1/follows` to list). From then on:
+Follow a public shadow market with `POST /v1/markets/{id}/follow` (open, non-test shadow markets only; `DELETE` to stop, `GET /v1/follows` to list). The follow limits in the table count follows of open markets: once a followed market settles, its follow no longer counts. If a plan changes to a lower limit, the oldest follows up to the new limit keep receiving early reveals and the rest stop until you unfollow markets or change plans; `GET /v1/follows` warns when this applies. From then on:
 
 - `GET /v1/shadow/{market_id}` returns every committed verdict for the market, newest first: the verdict, its `commitment_sha256`, when it was committed and posted, and the evidence hashes.
 - A webhook endpoint subscribed to `shadow.committed` receives each new committed verdict as soon as its commitment is recorded; `shadow.revealed` delivers the official outcome, the agreement and the preimage of each commitment once the platform resolves.
+- An endpoint receives only the events it was registered with, and its events cannot be changed later. An endpoint registered before the `shadow.*` events existed is not subscribed to them. The follow response reports `endpoints_subscribed`, the number of your active endpoints that will receive `shadow.committed`, and adds a `warning` when that number is 0. In that case, register an endpoint whose `events` include `shadow.committed` and `shadow.revealed` (`POST /v1/webhooks`).
 
 Early reveals are labeled "private early reveal — excluded from the public record". They never include the nonce or the preimage before the public reveal, so every commitment stays checkable by anyone: `sha256(preimage) = commitment_sha256` at `GET /v1/track-record/verify?hash=`.
 

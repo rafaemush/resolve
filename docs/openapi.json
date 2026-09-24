@@ -1000,7 +1000,7 @@
     },
     "/v1/markets/{id}/follow": {
       "post": {
-        "summary": "Follow a public shadow market (open, not a test market) for the private early reveal: its committed verdicts at GET /v1/shadow/{market_id} and as shadow.committed / shadow.revealed webhooks, labeled \"private early reveal — excluded from the public record\". Idempotent. Active follows per tenant: 50, Growth 500, Platform unlimited (read from the tenant's plan)",
+        "summary": "Follow a public shadow market (open, not a test market) for the private early reveal: its committed verdicts at GET /v1/shadow/{market_id} and as shadow.committed / shadow.revealed webhooks, labeled \"private early reveal — excluded from the public record\". Idempotent. Follows of open markets per tenant: 50, Growth 500, Platform unlimited (read from the tenant's plan); a follow of a settled market does not count. A free-plan (evaluation) follow delivers only while the tenant holds a live key",
         "security": [
           {
             "bearerAuth": []
@@ -1032,7 +1032,7 @@
             }
           },
           "201": {
-            "description": "follow_id, market_id, following, already_following=false, active_follows, follow_limit (null = unlimited), events, read",
+            "description": "follow_id, market_id, following, already_following=false, follows_counted (follows of open markets, what the limit counts), follow_limit (null = unlimited), events, read, endpoints_subscribed (active endpoints that receive shadow.committed), warning (only when endpoints_subscribed is 0)",
             "content": {
               "application/json": {
                 "schema": {
@@ -1052,7 +1052,7 @@
             }
           },
           "403": {
-            "description": "validation_error: follow limit reached (follow_limit, active_follows at top level)",
+            "description": "validation_error: follow limit reached (follow_limit, follows_counted at top level)",
             "content": {
               "application/json": {
                 "schema": {
@@ -1150,7 +1150,7 @@
     },
     "/v1/follows": {
       "get": {
-        "summary": "Active follows, newest first (at most 1000; active_follows is the full count), with the plan's follow_limit",
+        "summary": "Active follows, newest first (at most 1000; active_follows is the full count), with follows_counted (follows of open markets, what the limit counts) and the plan's follow_limit. When follows_counted exceeds the limit (after a plan change), only the oldest follows up to the limit receive early reveals and a warning says so",
         "security": [
           {
             "bearerAuth": []
@@ -1161,7 +1161,7 @@
         ],
         "responses": {
           "200": {
-            "description": "follows[] (follow_id, market_id, followed_at, market platform:external_id, status, deadline_utc), active_follows, follow_limit, truncated",
+            "description": "follows[] (follow_id, market_id, followed_at, market platform:external_id, status, deadline_utc), active_follows, follows_counted, follow_limit, truncated, warning (only when follows_counted > follow_limit)",
             "content": {
               "application/json": {
                 "schema": {
@@ -1185,7 +1185,7 @@
     },
     "/v1/shadow/{market_id}": {
       "get": {
-        "summary": "Private early reveal of a followed market (\"private early reveal — excluded from the public record\"): every committed verdict, newest first, with its commitment_sha256, committed_at, posted state and evidence hashes. Never the nonce or the preimage: those appear only in the public reveal. 404 unless the tenant follows the market",
+        "summary": "Private early reveal of a followed market (\"private early reveal — excluded from the public record\"): every committed verdict, newest first, with its commitment_sha256, committed_at, posted state and evidence hashes. Never the nonce or the preimage: those appear only in the public reveal. 404 unless the tenant follows the market; 403 when the follow is above the plan's follow limit (after a plan change) or a free-plan tenant holds no live key",
         "security": [
           {
             "bearerAuth": []
@@ -1218,6 +1218,16 @@
           },
           "400": {
             "description": "validation_error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "validation_error: the follow is above the plan's follow limit, or the evaluation has ended",
             "content": {
               "application/json": {
                 "schema": {
@@ -1381,7 +1391,7 @@
     },
     "/v1/keys/rotate": {
       "post": {
-        "summary": "Mint a new key; the calling key expires in 24 h",
+        "summary": "Mint a new key; the calling key expires in 24 h, or at its own expiry if that is sooner. Rotation never extends a key: the new key keeps the calling key's expiry (an evaluation key stays inside its 30 days)",
         "security": [
           {
             "bearerAuth": []
@@ -1392,7 +1402,7 @@
         ],
         "responses": {
           "201": {
-            "description": "key (shown once)",
+            "description": "key (shown once), key_id, expires_at (null = never), note",
             "content": {
               "application/json": {
                 "schema": {

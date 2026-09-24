@@ -2,14 +2,15 @@
  * Issue an evaluation key (rsl_test_...) to a named tenant (plan §17.2 #3: the first ask of a prospect is a
  * structured-only test key; §17.3 P7-lite).
  *
- *   npx tsx scripts/issue-test-key.ts --name "Acme Bots" [--plan free] [--credits 300] [--follow <market uuid>,...]
+ *   npx tsx scripts/issue-test-key.ts --name "Acme Bots" [--plan free] [--credits N] [--follow <market uuid>,...]
  *                                     [--expires-days 30] [--dry-run | --apply]
  *
  * Dry run is the default: it reads the database and prints exactly what --apply would do, and writes nothing. --apply:
  *   1. reuses the one live tenant whose display_name equals --name, or creates it (plan from --plan, default free;
  *      watch_limit 5 like POST /internal/tenants). An existing tenant's plan is never changed: a different --plan stops.
- *   2. grants --credits through grant_credits() once per tenant (ledger request_id issue-test-key:<tenant_id>), so a
- *      rerun never grants twice.
+ *   2. grants --credits (default: 300 on the free plan, the evaluation grant of docs/pricing.md; 0 on a paid plan)
+ *      through grant_credits() once per tenant (ledger request_id issue-test-key:<tenant_id>), so a rerun never grants
+ *      twice.
  *   3. follows each --follow market through follow_market() with the tenant's plan cap (the rules of
  *      POST /v1/markets/:id/follow; needs migration 014).
  *   4. mints the key last, the way POST /internal/tenants does (src/api/keys.ts: sha256 stored, 12-char prefix), and
@@ -20,7 +21,7 @@
  */
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { loadEnv, need } from "./lib/env";
-import { grantRequestId, parseTestKeyArgs, UsageError, USAGE, type TestKeyArgs } from "./lib/test-key";
+import { evaluationCredits, grantRequestId, parseTestKeyArgs, UsageError, USAGE, type TestKeyArgs } from "./lib/test-key";
 import { mintKey } from "../src/api/keys";
 import { followCap, followMarket, followRefusal, Plan, type FollowTarget } from "../src/shadow/follows";
 import { redact } from "../src/ops/redact";
@@ -48,6 +49,7 @@ async function main(args: TestKeyArgs): Promise<void> {
   const plan = Plan.safeParse(tenant?.plan ?? args.plan ?? "free");
   if (!plan.success) throw new Stop(`tenant ${tenant?.id} has an unknown plan ${JSON.stringify(tenant?.plan)}`);
   const cap = followCap(plan.data);
+  const credits = evaluationCredits(plan.data, args.credits);
   say(tenant ? `tenant: reuse ${tenant.id} "${tenant.display_name}" (plan ${tenant.plan}, balance ${tenant.credits_balance} credits)` : `tenant: create "${args.name}" (plan ${plan.data}, watch_limit 5)`);
 
   // 2. markets to follow: the same rules as the API, checked before anything is written
@@ -59,15 +61,17 @@ async function main(args: TestKeyArgs): Promise<void> {
       if (refusal) throw new Stop(`--follow ${id}: ${refusal.message}`);
       say(`follow: ${id} (${m!.platform}:${m!.external_id}, ${m!.status})`);
     }
-    say(`follow limit on plan ${plan.data}: ${cap ?? "unlimited"}`);
+    say(`follow limit on plan ${plan.data}: ${cap ?? "unlimited"} follows of open markets${plan.data === "free" ? "; they deliver only while this tenant holds a live key" : ""}`);
   }
 
   // 3. the evaluation grant, once per tenant
   let grant: "none" | "skip" | "grant" = "none";
-  if (args.credits > 0) {
+  if (credits > 0) {
     const prior = tenant ? (check("ledger lookup", await client.from("credit_ledger").select("delta, created_at").eq("tenant_id", tenant.id).eq("reason", "grant").eq("request_id", grantRequestId(tenant.id))) as Array<{ delta: number; created_at: string }>) : [];
     grant = prior.length ? "skip" : "grant";
-    say(grant === "skip" ? `credits: already granted ${prior[0]!.delta} on ${prior[0]!.created_at}; not granted again` : `credits: grant ${args.credits} (grant_credits, once per tenant)`);
+    say(grant === "skip" ? `credits: already granted ${prior[0]!.delta} on ${prior[0]!.created_at}; not granted again` : `credits: grant ${credits}${args.credits === null ? ` (the ${plan.data} plan's default)` : ""} (grant_credits, once per tenant)`);
+  } else {
+    say(`credits: none granted${args.credits === null ? ` (the ${plan.data} plan has no evaluation grant; pass --credits N)` : ""}`);
   }
   const expiresAt = args.expiresDays > 0 ? new Date(Date.now() + args.expiresDays * 86_400_000).toISOString() : null;
   say(`key: mint one rsl_test_ key${expiresAt ? `, expires ${expiresAt}` : ", no expiry"}; shown once`);
@@ -78,8 +82,8 @@ async function main(args: TestKeyArgs): Promise<void> {
     say(`created tenant ${tenant.id}`);
   }
   if (grant === "grant") {
-    const balance = check("grant_credits", await client.rpc("grant_credits", { p_tenant: tenant.id, p_amount: args.credits, p_note: "evaluation grant (scripts/issue-test-key.ts)", p_request_id: grantRequestId(tenant.id) }));
-    say(`granted ${args.credits} credits; balance ${balance}`);
+    const balance = check("grant_credits", await client.rpc("grant_credits", { p_tenant: tenant.id, p_amount: credits, p_note: "evaluation grant (scripts/issue-test-key.ts)", p_request_id: grantRequestId(tenant.id) }));
+    say(`granted ${credits} credits; balance ${balance}`);
   }
   for (const id of args.follow) {
     let a;

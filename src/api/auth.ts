@@ -17,6 +17,8 @@ export interface AuthContext {
   scopes: string[];
   requestsToday: number;
   dailyCap: number;
+  /** api_keys.expires_at of the calling key (null = never); rotation carries it to the new key. */
+  expiresAt: string | null;
 }
 
 interface KeyRecord { id: string; tenant_id: string; environment: "live" | "test"; scopes: string[]; daily_cap: number; expires_at: string | null; revoked_at: string | null; tenants: { plan: AuthContext["plan"]; strict_v0: boolean; deleted_at: string | null } | null }
@@ -62,7 +64,7 @@ export async function authenticate<E extends { Bindings: Env }>(c: Context<E>): 
   if (requestsToday > rec.daily_cap) {
     return { ok: false, response: err(c, "daily_cap_reached", `This key's daily cap (${rec.daily_cap} requests, UTC day) is reached.`, 429, { retryAfterSeconds: secondsToUtcMidnight(), extra: { remaining: 0, resets_at: utcMidnightIso(), retry_after_seconds: secondsToUtcMidnight(), how_to_proceed: "Wait for the UTC day to roll over, or ask for a higher cap." } }) };
   }
-  return { ok: true, auth: { keyId: rec.id, tenantId: rec.tenant_id, plan: rec.tenants.plan, strictV0: rec.tenants.strict_v0, environment: rec.environment, scopes: rec.scopes ?? [], requestsToday, dailyCap: rec.daily_cap } };
+  return { ok: true, auth: { keyId: rec.id, tenantId: rec.tenant_id, plan: rec.tenants.plan, strictV0: rec.tenants.strict_v0, environment: rec.environment, scopes: rec.scopes ?? [], requestsToday, dailyCap: rec.daily_cap, expiresAt: rec.expires_at } };
 }
 
 export function utcMidnightIso(): string { const d = new Date(); d.setUTCHours(24, 0, 0, 0); return d.toISOString(); }

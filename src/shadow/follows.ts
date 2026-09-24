@@ -3,7 +3,11 @@
  * shadow market (tenant_id null, not a test market, open) and reads its committed verdicts before the platform resolves
  * (GET /v1/shadow/:market_id, the shadow.committed webhook). The early reveal is private and labeled: it is never part
  * of the public record, and it never carries the nonce or the preimage, which stay private until the public reveal.
- * Pure rules here (tested in tests/follows.test.ts); the atomic cap + insert is follow_market() (migration 014).
+ * A follow delivers only while it is entitled (followBlock): a free-plan (evaluation) tenant only while it holds a live
+ * key, and every plan only for its oldest follows of open markets up to the plan's cap, so an expired evaluation key or
+ * a lowered plan stops the early reveal instead of leaving it on forever.
+ * Pure rules here (tested in tests/follows.test.ts); the atomic cap + insert is follow_market() and the facts the rules
+ * read are follow_entitlements() (migration 014).
  */
 import { z } from "zod";
 import type { Db } from "../db/supabase";
@@ -16,7 +20,10 @@ export type Plan = z.infer<typeof Plan>;
 
 export const EARLY_REVEAL_LABEL = "private early reveal — excluded from the public record";
 
-/** Active follows per tenant (plan §17.3 P7-lite): 50 by default, 500 on Growth, unlimited (null) on Platform. */
+/**
+ * Active follows of open markets per tenant (plan §17.3 P7-lite): 50 by default, 500 on Growth, unlimited (null) on
+ * Platform. A follow of a settled market does not count: it can produce no further event.
+ */
 export function followCap(plan: Plan): number | null {
   switch (plan) {
     case "platform": return null;
@@ -47,7 +54,7 @@ export function followRefusal(m: FollowTarget | null, tenantId: string): FollowR
   return null;
 }
 
-/** follow_market()'s answer (migration 014). */
+/** follow_market()'s answer (migration 014). active = the tenant's active follows of open markets (what the cap counts). */
 export const FollowAnswer = z.discriminatedUnion("result", [
   z.object({ result: z.literal("followed"), follow_id: z.string(), active: z.number().int() }),
   z.object({ result: z.literal("already_following"), follow_id: z.string(), active: z.number().int() }),
@@ -65,11 +72,48 @@ export async function followMarket(client: Db, tenantId: string, marketId: strin
   return parsed.data;
 }
 
-/** Tenants with an active follow of the market (live tenants only); error when the follows could not be read. */
+/** One row of follow_entitlements() (migration 014): facts about an active follow; followBlock() applies the rules. */
+export const FollowEntitlement = z.object({
+  tenant_id: z.string(),
+  follow_id: z.string(),
+  plan: Plan,
+  /** The tenant holds a key that is not revoked, not deleted and not expired. */
+  live_key: z.boolean(),
+  /** The follow's position, oldest first, among the tenant's follows of open markets plus this market. */
+  open_rank: z.number().int().positive(),
+});
+export type FollowEntitlement = z.infer<typeof FollowEntitlement>;
+
+export type FollowBlock = "evaluation_ended" | "over_follow_limit";
+
+/**
+ * Pure. Why this follow receives nothing now, or null when it delivers. A free-plan follow is part of an evaluation key
+ * and lasts only while a key is live (docs/pricing.md); on every plan only the oldest follows up to the plan's cap
+ * deliver, which is what follow_market() admitted unless the plan was lowered since.
+ */
+export function followBlock(e: FollowEntitlement): FollowBlock | null {
+  if (e.plan === "free" && !e.live_key) return "evaluation_ended";
+  const cap = followCap(e.plan);
+  return cap !== null && e.open_rank > cap ? "over_follow_limit" : null;
+}
+
+/** follow_entitlements() for a market (one tenant's follow only, when tenantId is given); error when it could not be read. */
+export async function followEntitlements(client: Db, marketId: string, tenantId?: string): Promise<{ rows: FollowEntitlement[]; error: string | null }> {
+  const { data, error } = await client.rpc("follow_entitlements", tenantId ? { p_market: marketId, p_tenant: tenantId } : { p_market: marketId });
+  if (error) return { rows: [], error: error.message };
+  const parsed = z.array(FollowEntitlement).safeParse(data ?? []);
+  if (!parsed.success) return { rows: [], error: `follow_entitlements answered ${JSON.stringify(data).slice(0, 200)}` };
+  return { rows: parsed.data, error: null };
+}
+
+/**
+ * Tenants whose follow of the market delivers now (live tenants, followBlock null); error when the follows could not
+ * be read. A follow that is blocked is not an error: its tenant simply gets no event.
+ */
 export async function followerTenants(client: Db, marketId: string): Promise<{ tenants: string[]; error: string | null }> {
-  const { data, error } = await client.from("market_follows").select("tenant_id, tenants!inner(deleted_at)").eq("market_id", marketId).is("deleted_at", null).is("tenants.deleted_at", null);
-  if (error) return { tenants: [], error: error.message };
-  return { tenants: [...new Set(((data ?? []) as Array<{ tenant_id: string }>).map((r) => r.tenant_id))], error: null };
+  const r = await followEntitlements(client, marketId);
+  if (r.error) return { tenants: [], error: r.error };
+  return { tenants: [...new Set(r.rows.filter((e) => followBlock(e) === null).map((e) => e.tenant_id))], error: null };
 }
 
 /** The verdict fields a follower sees: the committed (public-floored) verdict, never the preimage or the nonce. */

@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
 import type { MarketRow } from "../src/ingest/types";
 import { fakeDb, type FakeDb, type Row } from "./lib/fake-db";
+import { followEntitlements } from "./lib/fake-rpcs";
 
 const h = vi.hoisted(() => ({ db: null as unknown as FakeDb }));
 vi.mock("../src/db/supabase", () => ({
@@ -33,7 +34,7 @@ const claim = async (db: FakeDb, a: Record<string, any>) => {
   for (const d of due) Object.assign(d, { status: "delivering", lease_until: new Date(Date.now() + 60_000).toISOString() });
   return { data: structuredClone(due), error: null };
 };
-const newDb = (endpoints: Row[], deliveries: Row[] = []) => fakeDb({ webhook_endpoints: endpoints, webhook_deliveries: deliveries }, {}, { rpc: { claim_webhook_deliveries: claim } });
+const newDb = (endpoints: Row[], deliveries: Row[] = []) => fakeDb({ webhook_endpoints: endpoints, webhook_deliveries: deliveries }, {}, { rpc: { claim_webhook_deliveries: claim, follow_entitlements: followEntitlements } });
 const rows = () => h.db.tables.webhook_deliveries!;
 
 let posts: string[];
@@ -179,14 +180,20 @@ describe("publishShadowCommitted: followers of a public shadow market get the co
   const MARKET = { id: "m1", tenant_id: null, is_test: false, platform: "polymarket", external_id: "551234" } as unknown as MarketRow;
   const COMMIT = { id: "c1", commitment_sha256: "e".repeat(64), committed_at: "2026-10-02T00:00:00.000Z", committed: { preimage_version: "v2", preimage: "p|n0nce", resolution_status: "RESOLVED", winning_outcome: "OPTION_A", confidence_score: 0.95, caveats: [], canonical_sha256: "c".repeat(64), raw_sha256: "d".repeat(64), thresholds_version: "v1", determination_basis: "structured" } } as const;
 
-  it("one row per subscribed endpoint of every active follower of a live tenant; delivered inline", async () => {
-    h.db = newDb([endpoint("e1", "t1"), endpoint("e2", "t2", ["market.resolved"]), endpoint("e3", "t3")]);
+  const DAY = 86_400_000;
+  const follow = (id: string, tenant: string, market = "m1", over: Row = {}): Row => ({ id, tenant_id: tenant, market_id: market, created_at: "2026-09-20T00:00:00.000Z", deleted_at: null, ...over });
+  const key = (tenant: string, over: Row = {}): Row => ({ id: `k-${tenant}-${Math.random()}`, tenant_id: tenant, revoked_at: null, deleted_at: null, expires_at: null, ...over });
+
+  it("one row per subscribed endpoint of every entitled follower of a live tenant; delivered inline", async () => {
+    h.db = newDb([endpoint("e1", "t1"), endpoint("e2", "t2", ["market.resolved"]), endpoint("e3", "t3"), endpoint("e4", "t4")]);
+    h.db.tables.tenants = [{ id: "t1", plan: "payg", deleted_at: null }, { id: "t2", plan: "payg", deleted_at: null }, { id: "t3", plan: "payg", deleted_at: null }, { id: "t4", plan: "payg", deleted_at: "2026-10-01T00:00:00Z" }];
+    h.db.tables.markets = [{ id: "m1", status: "open", deleted_at: null }, { id: "m2", status: "open", deleted_at: null }];
     h.db.tables.market_follows = [
-      { tenant_id: "t1", market_id: "m1", deleted_at: null, tenants: { deleted_at: null } },
-      { tenant_id: "t2", market_id: "m1", deleted_at: null, tenants: { deleted_at: null } }, // no endpoint subscribed to shadow.committed
-      { tenant_id: "t3", market_id: "m1", deleted_at: "2026-10-01T00:00:00Z", tenants: { deleted_at: null } }, // unfollowed
-      { tenant_id: "t4", market_id: "m1", deleted_at: null, tenants: { deleted_at: "2026-10-01T00:00:00Z" } }, // tenant deleted
-      { tenant_id: "t1", market_id: "m2", deleted_at: null, tenants: { deleted_at: null } },
+      follow("f1", "t1"),
+      follow("f2", "t2"), // no endpoint subscribed to shadow.committed
+      follow("f3", "t3", "m1", { deleted_at: "2026-10-01T00:00:00Z" }), // unfollowed
+      follow("f4", "t4"), // tenant deleted
+      follow("f5", "t1", "m2"),
     ];
     const r = await publishShadowCommitted(env, MARKET, COMMIT as never);
     expect(r).toMatchObject({ followers: 2, error: null });
@@ -194,6 +201,37 @@ describe("publishShadowCommitted: followers of a public shadow market get the co
     expect(rows()[0]!.payload).toMatchObject({ market: "polymarket:551234", commitment_sha256: "e".repeat(64), verdict: { winning_outcome: "OPTION_A" } });
     expect(JSON.stringify(rows()[0]!.payload)).not.toContain("n0nce");
     expect(posts).toEqual(["https://hooks.example/e1"]);
+  });
+
+  it("an evaluation (free) tenant gets shadow.committed only while it holds a live key; expired or revoked keys end it", async () => {
+    h.db = newDb([endpoint("e1", "t1"), endpoint("e2", "t2"), endpoint("e3", "t3"), endpoint("e4", "t4")]);
+    h.db.tables.tenants = ["t1", "t2", "t3", "t4"].map((id) => ({ id, plan: "free", deleted_at: null }));
+    h.db.tables.markets = [{ id: "m1", status: "open", deleted_at: null }];
+    h.db.tables.api_keys = [
+      key("t1", { expires_at: new Date(Date.now() + DAY).toISOString() }), // live: day 29 of 30
+      key("t2", { expires_at: new Date(Date.now() - DAY).toISOString() }), // the 30 days are over
+      key("t3", { revoked_at: "2026-10-01T00:00:00Z" }), key("t3", { deleted_at: "2026-10-01T00:00:00Z" }),
+      // t4: no key at all
+    ];
+    h.db.tables.market_follows = [follow("f1", "t1"), follow("f2", "t2"), follow("f3", "t3"), follow("f4", "t4")];
+    const r = await publishShadowCommitted(env, MARKET, COMMIT as never);
+    expect(r).toMatchObject({ followers: 1, error: null });
+    expect(rows().map((x) => x.endpoint_id)).toEqual(["e1"]);
+    expect(posts).toEqual(["https://hooks.example/e1"]);
+    expect(vi.mocked(alert)).not.toHaveBeenCalled(); // an evaluation that ended is not a failure
+  });
+
+  it("after a plan is lowered only the oldest follows of open markets up to the new cap deliver", async () => {
+    // a Growth tenant with 51 follows of open markets moved to Builder (cap 50): the newest one stops; a settled market frees a slot
+    h.db = newDb([endpoint("e1", "t1")]);
+    h.db.tables.tenants = [{ id: "t1", plan: "builder", deleted_at: null }];
+    h.db.tables.markets = Array.from({ length: 52 }, (_, i) => ({ id: `m${i}`, status: i === 51 ? "resolved" : "open", deleted_at: null }));
+    h.db.tables.market_follows = Array.from({ length: 52 }, (_, i) => follow(`f${String(i).padStart(2, "0")}`, "t1", `m${i}`, { created_at: new Date(Date.parse("2026-09-01T00:00:00Z") + i * 60_000).toISOString() }));
+    const newest = { ...MARKET, id: "m50" } as MarketRow;
+    expect((await publishShadowCommitted(env, newest, COMMIT as never)).followers).toBe(0); // rank 51 of open follows
+    expect((await publishShadowCommitted(env, { ...MARKET, id: "m49" } as MarketRow, COMMIT as never)).followers).toBe(1); // rank 50
+    h.db.tables.markets[0]!.status = "resolved"; // the oldest settles: m50 moves up to rank 50
+    expect((await publishShadowCommitted(env, newest, COMMIT as never)).followers).toBe(1);
   });
 
   it("test and tenant markets are skipped without a read", async () => {
@@ -205,8 +243,7 @@ describe("publishShadowCommitted: followers of a public shadow market get the co
 
   it("followers that could not be read: nothing queued, alerted (the verdict stays readable at GET /v1/shadow)", async () => {
     h.db = newDb([endpoint("e1", "t1")]);
-    const from = h.db.client.from;
-    h.db.client.from = ((t: string) => (t === "market_follows" ? { select: () => { const q: any = { eq: () => q, is: () => q, then: (ok: (v: unknown) => unknown) => Promise.resolve({ data: null, error: { message: "permission denied for table market_follows" } }).then(ok) }; return q; } } : from(t))) as never;
+    h.db.options.rpc!.follow_entitlements = async () => ({ data: null, error: { code: "42501", message: "permission denied for function follow_entitlements" } });
     const r = await publishShadowCommitted(env, MARKET, COMMIT as never);
     expect(r.error).toContain("permission denied");
     expect(rows()).toEqual([]);

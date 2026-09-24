@@ -9,7 +9,7 @@
 -- No touch is backfilled: the send status of the 2026-09-22 TypeSafe request is unverified (plan §17.8).
 --
 -- Compatibility with the Worker deployed before this migration (it keeps running until the new one is deployed):
---   * Additive only: three new tables and three new functions. The old Worker never reads or writes them, and no
+--   * Additive only: three new tables and four new functions. The old Worker never reads or writes them, and no
 --     existing table, view, constraint or function is changed.
 begin;
 
@@ -60,6 +60,8 @@ create table if not exists gtm_touches (
   touched_at      timestamptz not null default now(),
   created_at      timestamptz not null default now()
 );
+-- Added on its own so a database that ran the first draft of this migration (commit a5380d3) gains it too.
+alter table gtm_touches add column if not exists request_id text check (request_id is null or length(btrim(request_id)) > 0);
 comment on table gtm_touches is
   'Append-only log of every sales and vendor contact (plan §17.4: "every touch in gtm_touches"). Written through log_touch(); an outbound pitch (direction out, kind dm | email | call) is refused by the gtm_touch_gate trigger until a reconciled row exists on the lead''s platform, unless override_reason says why. UPDATE and DELETE are refused for every role: a wrong row is corrected by a later ops touch. Service role only (RLS).';
 comment on column gtm_touches.id is 'Touch id; log_touch() returns it.';
@@ -71,8 +73,12 @@ comment on column gtm_touches.evidence_url is 'Link to the message, thread, cale
 comment on column gtm_touches.override_reason is 'Why an outbound pitch was sent without a reconciled row on the lead''s platform. Null otherwise; blank is refused (a reason nobody wrote is not a reason).';
 comment on column gtm_touches.touched_at is 'When the touch happened (defaults to the insert time).';
 comment on column gtm_touches.created_at is 'Row insert time.';
+comment on column gtm_touches.request_id is
+  'Caller-chosen idempotency key (log_touch p_request_id): a retry after a lost response returns the touch already recorded instead of writing a second one, which the append-only log could never remove and which would overstate every gate that counts touches (plan §17.7). Null = no deduplication.';
 create index if not exists idx_gtm_touches_lead on gtm_touches (lead_id, touched_at desc);
 comment on index idx_gtm_touches_lead is 'A lead''s touch history, newest first.';
+create unique index if not exists uq_gtm_touches_request on gtm_touches (request_id) where request_id is not null;
+comment on index uq_gtm_touches_request is 'One touch per request_id (log_touch idempotency).';
 
 create or replace function public.gtm_touch_gate() returns trigger language plpgsql set search_path = public as $$
 declare
@@ -109,19 +115,47 @@ create trigger gtm_touches_append_only before update or delete on gtm_touches fo
 comment on trigger gtm_touches_append_only on gtm_touches is 'The touch log is append-only for every role (deny_mutation).';
 select apply_rls('gtm_touches');
 
+-- The first draft of this migration (commit a5380d3) created log_touch without p_request_id. Wherever it ran, that
+-- signature next to the new one would make every call with six or fewer arguments ambiguous ("function log_touch(...)
+-- is not unique"), so it is dropped first; no Worker code calls log_touch.
+drop function if exists public.log_touch(uuid, text, text, text, text, text);
 create or replace function public.log_touch(
-  p_lead uuid, p_kind text, p_direction text, p_summary text, p_evidence_url text default null, p_override_reason text default null)
+  p_lead uuid, p_kind text, p_direction text, p_summary text, p_evidence_url text default null, p_override_reason text default null,
+  p_request_id text default null)
 returns uuid language plpgsql security definer set search_path = public as $$
-declare v_id uuid;
-begin
+declare
   -- Blank strings are absent values: a blank override must not read as a reason, and the gate trigger sees NULL.
-  insert into gtm_touches (lead_id, kind, direction, summary, evidence_url, override_reason)
-  values (p_lead, p_kind, p_direction, p_summary, nullif(btrim(p_evidence_url), ''), nullif(btrim(p_override_reason), ''))
-  returning id into v_id;
-  return v_id;
+  v_url      text := nullif(btrim(p_evidence_url), '');
+  v_override text := nullif(btrim(p_override_reason), '');
+  v_request  text := nullif(btrim(p_request_id), '');
+  v_prev     gtm_touches%rowtype;
+  v_id       uuid;
+begin
+  -- Two passes at most: the second runs only when a concurrent call with the same request_id committed between this
+  -- call's lookup and its insert (ON CONFLICT DO NOTHING waits for it, then inserts nothing).
+  for pass in 1..2 loop
+    if v_request is not null then
+      -- A retry returns the touch already recorded, before the gate runs again: the lead may have been deleted since.
+      select * into v_prev from gtm_touches where request_id = v_request;
+      if found then
+        if (v_prev.lead_id, v_prev.kind, v_prev.direction, v_prev.summary, v_prev.evidence_url, v_prev.override_reason)
+           is distinct from (p_lead, p_kind, p_direction, p_summary, v_url, v_override) then
+          raise exception using errcode = '23505',
+            message = format('log_touch: request_id %s already records touch %s with different content', v_request, v_prev.id);
+        end if;
+        return v_prev.id;
+      end if;
+    end if;
+    insert into gtm_touches (lead_id, kind, direction, summary, evidence_url, override_reason, request_id)
+    values (p_lead, p_kind, p_direction, p_summary, v_url, v_override, v_request)
+    on conflict (request_id) where request_id is not null do nothing
+    returning id into v_id;
+    if v_id is not null then return v_id; end if;
+  end loop;
+  raise exception 'log_touch: request_id % conflicted twice without a readable row', v_request;
 end $$;
-comment on function public.log_touch(uuid, text, text, text, text, text) is
-  'Record one touch and return its id. Refuses (SQLSTATE RS002, from the gtm_touches_gate trigger) an outbound pitch (direction out, kind dm | email | call) while no reconciled row (agree | disagree | abstained | void) exists for a non-test shadow market on the lead''s platform, unless p_override_reason is non-blank; refuses a touch on a deleted lead. Blank evidence_url / override_reason are stored as NULL. service_role only.';
+comment on function public.log_touch(uuid, text, text, text, text, text, text) is
+  'Record one touch and return its id. Refuses (SQLSTATE RS002, from the gtm_touches_gate trigger) an outbound pitch (direction out, kind dm | email | call) while no reconciled row (agree | disagree | abstained | void) exists for a non-test shadow market on the lead''s platform, unless p_override_reason is non-blank; refuses a touch on a deleted lead. Blank evidence_url / override_reason / request_id are stored as NULL. Idempotent on a non-blank p_request_id: a retry returns the touch already recorded (without re-running the gate), and the same request_id with different content is refused (SQLSTATE 23505). service_role only.';
 
 -- 3. market_follows ---------------------------------------------------------------------------------------------------
 create table if not exists market_follows (
@@ -132,7 +166,7 @@ create table if not exists market_follows (
   deleted_at timestamptz
 );
 comment on table market_follows is
-  'A tenant following a public shadow market (tenant_id null, not a test market): it receives the private early reveal (shadow.committed webhook and GET /v1/shadow/:market_id) and the shadow.revealed event. Created through follow_market() (per-tenant cap, one active row per tenant and market); unfollow is a soft delete. Service role only (RLS).';
+  'A tenant following a public shadow market (tenant_id null, not a test market): it receives the private early reveal (shadow.committed webhook and GET /v1/shadow/:market_id) and the shadow.revealed event while the follow is entitled (follow_entitlements: a free-plan tenant only while it holds a live key, and only follows within the plan''s cap). Created through follow_market() (per-tenant cap on follows of open markets, one active row per tenant and market); unfollow is a soft delete. Service role only (RLS).';
 comment on column market_follows.id is 'Follow id.';
 comment on column market_follows.tenant_id is 'The following tenant.';
 comment on column market_follows.market_id is 'The followed shadow market.';
@@ -167,7 +201,11 @@ begin
   if v_market.status <> 'open' then
     return jsonb_build_object('result', 'not_followable', 'reason', 'market is ' || v_market.status);
   end if;
-  select count(*)::integer into v_active from market_follows where tenant_id = p_tenant and deleted_at is null;
+  -- The cap counts follows of open markets only: a settled market can produce no further event, so its follow must
+  -- not hold a slot (a tenant would otherwise hit the cap after about 50 settled markets).
+  select count(*)::integer into v_active
+    from market_follows f join markets m on m.id = f.market_id
+   where f.tenant_id = p_tenant and f.deleted_at is null and m.status = 'open' and m.deleted_at is null;
   select id into v_id from market_follows where tenant_id = p_tenant and market_id = p_market and deleted_at is null;
   if v_id is not null then
     return jsonb_build_object('result', 'already_following', 'follow_id', v_id, 'active', v_active);
@@ -179,16 +217,37 @@ begin
   return jsonb_build_object('result', 'followed', 'follow_id', v_id, 'active', v_active + 1);
 end $$;
 comment on function public.follow_market(uuid, uuid, integer) is
-  'Follow a public shadow market in one transaction: lock the tenant row (concurrent follows serialize, so the cap holds), refuse a market that is not an open, non-test shadow market ({result: not_followable, reason}), answer an existing active follow ({result: already_following, follow_id, active}), refuse past p_cap active follows ({result: cap_reached, active, cap}; p_cap null = unlimited), else insert ({result: followed, follow_id, active}). The Worker derives p_cap from tenants.plan (src/shadow/follows.ts followCap). service_role only.';
+  'Follow a public shadow market in one transaction: lock the tenant row (concurrent follows serialize, so the cap holds), refuse a market that is not an open, non-test shadow market ({result: not_followable, reason}), answer an existing active follow ({result: already_following, follow_id, active}), refuse when p_cap follows of open markets are active ({result: cap_reached, active, cap}; p_cap null = unlimited), else insert ({result: followed, follow_id, active}). active counts the tenant''s active follows of open, undeleted markets only: a follow of a settled market holds no slot. The Worker derives p_cap from tenants.plan (src/shadow/follows.ts followCap). service_role only.';
+
+create or replace function public.follow_entitlements(p_market uuid, p_tenant uuid default null)
+returns table (tenant_id uuid, follow_id uuid, plan text, live_key boolean, open_rank integer)
+language sql stable set search_path = public as $$
+  select f.tenant_id, f.id, t.plan,
+         exists (select 1 from api_keys k
+                  where k.tenant_id = f.tenant_id and k.revoked_at is null and k.deleted_at is null
+                    and (k.expires_at is null or k.expires_at > now())),
+         (select count(*)::integer
+            from market_follows g join markets gm on gm.id = g.market_id
+           where g.tenant_id = f.tenant_id and g.deleted_at is null
+             and (g.market_id = p_market or (gm.status = 'open' and gm.deleted_at is null))
+             and (g.created_at, g.id) <= (f.created_at, f.id))
+    from market_follows f
+    join tenants t on t.id = f.tenant_id and t.deleted_at is null
+   where f.market_id = p_market and f.deleted_at is null and (p_tenant is null or f.tenant_id = p_tenant)
+$$;
+comment on function public.follow_entitlements(uuid, uuid) is
+  'Facts about each active follow of p_market by a live tenant (only p_tenant''s when given): the tenant''s plan; live_key = the tenant holds an api_keys row that is not revoked, not deleted and not expired; open_rank = the follow''s position, oldest first (created_at, id), among the tenant''s active follows of open, undeleted markets plus p_market itself (so a market that has just settled keeps its rank for shadow.revealed). The Worker applies the rules (src/shadow/follows.ts followBlock): a free-plan follow delivers only while live_key, and only follows with open_rank within the plan''s follow cap deliver, so an expired evaluation key or a lowered plan stops the early reveal. service_role only.';
 
 -- 4. least privilege (Supabase default privileges grant anon/authenticated directly; migration 010) ------------------
 revoke all on table leads, gtm_touches, market_follows from public, anon, authenticated;
 grant select, insert, update, delete on table leads, gtm_touches, market_follows to service_role;
 revoke all on function public.gtm_touch_gate() from public, anon, authenticated;
 grant execute on function public.gtm_touch_gate() to service_role;
-revoke all on function public.log_touch(uuid, text, text, text, text, text) from public, anon, authenticated;
-grant execute on function public.log_touch(uuid, text, text, text, text, text) to service_role;
+revoke all on function public.log_touch(uuid, text, text, text, text, text, text) from public, anon, authenticated;
+grant execute on function public.log_touch(uuid, text, text, text, text, text, text) to service_role;
 revoke all on function public.follow_market(uuid, uuid, integer) from public, anon, authenticated;
 grant execute on function public.follow_market(uuid, uuid, integer) to service_role;
+revoke all on function public.follow_entitlements(uuid, uuid) from public, anon, authenticated;
+grant execute on function public.follow_entitlements(uuid, uuid) to service_role;
 
 commit;
