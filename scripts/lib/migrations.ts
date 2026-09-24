@@ -8,6 +8,8 @@
  * --dry-run reads and writes nothing: the ledger table is created only by --apply.
  * --require-applied reads like --dry-run and exits 1 unless every file is applied and nothing drifts: the deploy gate
  * (scripts/deploy.sh) runs it before wrangler, because the Worker it ships may read what a pending migration creates.
+ * It is the production gate (wrangler.toml deploys one Worker), so it names the project it reads and refuses a ledger
+ * that may not be production's (ledgerTargetRefusal); staging's pending list is --dry-run's.
  */
 import { createHash } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
@@ -27,6 +29,36 @@ export function parseMigrateArgs(argv: readonly string[]): Mode {
   const m = argv[0];
   if (m === "--dry-run" || m === "--apply" || m === "--verify-live" || m === "--require-applied") return m;
   throw new UsageError(`unknown argument "${m}"`);
+}
+
+/** Where --require-applied reads the ledger: the effective SUPABASE_PROJECT_REF and what it could have come from. */
+export interface LedgerTarget {
+  ref: string;
+  /** SUPABASE_PROJECT_REF as the shell had it before .env was read (scripts/lib/env.ts never overrides it). */
+  shellRef: string | undefined;
+  /** SUPABASE_PROJECT_REF in .env. */
+  dotenvRef: string | undefined;
+  stagingRef: string | undefined;
+  /** The SUPABASE_URL the scripts use (https://<ref>.supabase.co), shell first, then .env. */
+  supabaseUrl: string | undefined;
+}
+
+/**
+ * Why this ledger cannot approve a production deploy, or null. A shell that still exports staging's ref after a staging
+ * session would otherwise make the gate pass on staging's ledger while production has migrations pending: refused when
+ * the ref is STAGING_SUPABASE_PROJECT_REF, when the shell's ref differs from .env's (the gate does not guess which one
+ * the Worker reads), or when SUPABASE_URL names another Supabase project.
+ */
+export function ledgerTargetRefusal(t: LedgerTarget): string | null {
+  if (t.stagingRef && t.ref === t.stagingRef) return `SUPABASE_PROJECT_REF ${t.ref} is STAGING_SUPABASE_PROJECT_REF: staging's ledger cannot approve a production deploy (unset SUPABASE_PROJECT_REF in this shell)`;
+  if (t.shellRef && t.dotenvRef && t.shellRef !== t.dotenvRef) return `the shell's SUPABASE_PROJECT_REF ${t.shellRef} differs from .env's ${t.dotenvRef}: the gate does not guess which database the Worker reads (unset it in this shell, or fix .env)`;
+  if (t.supabaseUrl) {
+    let host: string;
+    try { host = new URL(t.supabaseUrl).hostname; } catch { return "SUPABASE_URL is not a URL: the gate cannot tell which project the Worker reads"; }
+    const m = /^([a-z0-9]+)\.supabase\.co$/.exec(host);
+    if (m && m[1] !== t.ref) return `SUPABASE_URL names project ${m[1]} but SUPABASE_PROJECT_REF is ${t.ref}: the gate would read another database's ledger`;
+  }
+  return null;
 }
 
 export interface MigrationFile { name: string; body: string; sha256: string }

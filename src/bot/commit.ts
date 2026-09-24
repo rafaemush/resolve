@@ -28,10 +28,11 @@ export const DISCLAIMER = "Informational signal, not financial advice, not an or
 
 /**
  * Public confidence floor (plan §17.3 P2a, §19.2 item 3). During the first 100 public commits, counted by distinct event
- * (commit_context().public_commit_events: events with a commit on a non-test shadow market, so the 24 legs of one ladder
- * are one), a Jev-route RESOLVED verdict whose published confidence is below 0.90 is committed as
- * UNRESOLVED/NONE with this caveat: one wrong public RESOLVED before n=100 is the most damaging event on the record, and
- * abstaining is never wrong on it. The resolutions row keeps the original verdict; payload.committed carries the
+ * (the 24 legs of one ladder are one), a Jev-route RESOLVED verdict whose published confidence is below 0.90 is
+ * committed as UNRESOLVED/NONE with this caveat: one wrong public RESOLVED before n=100 is the most damaging event on the
+ * record, and abstaining is never wrong on it. An event's place is commit_context().public_events_before: the other
+ * events whose first public commit came before this event's first, so every leg of the 100th event is floored, not only
+ * the leg that happened to commit first. The resolutions row keeps the original verdict; payload.committed carries the
  * floored one, and reveal and reconcile read only payload.committed.
  */
 export const PUBLIC_FLOOR = { confidence: 0.9, firstCommits: 100, caveat: "below_public_floor_0.90" } as const;
@@ -100,9 +101,9 @@ export function floorCandidate(c: CommittedFields): boolean {
   return c.determination_basis === "jev" && c.resolution_status === "RESOLVED" && c.confidence_score < PUBLIC_FLOOR.confidence;
 }
 
-/** Pure. publicCommitsSoFar = distinct events with a commit on a non-test shadow market before this one. */
-export function applyPublicFloor(c: CommittedFields, publicCommitsSoFar: number): CommittedFields {
-  if (!floorCandidate(c) || publicCommitsSoFar >= PUBLIC_FLOOR.firstCommits) return c;
+/** Pure. eventsBefore = distinct events whose first public commit came before this market's event's first. */
+export function applyPublicFloor(c: CommittedFields, eventsBefore: number): CommittedFields {
+  if (!floorCandidate(c) || eventsBefore >= PUBLIC_FLOOR.firstCommits) return c;
   const caveats = c.caveats.includes(PUBLIC_FLOOR.caveat) ? c.caveats : [...c.caveats, PUBLIC_FLOOR.caveat];
   return { ...c, resolution_status: "UNRESOLVED", winning_outcome: "NONE", caveats };
 }
@@ -125,13 +126,14 @@ function randomNonce(): string {
 
 /**
  * commit_context() (migration 017): the market's event_key, its latest commit (created_at desc, id desc: the order
- * settle_market makes the final commit), the other open legs of its event, and the distinct events with a public commit.
+ * settle_market makes the final commit), the other open legs of its event, and the event's place in the public record
+ * (distinct other events whose first public commit came before this event's first).
  */
 const CommitContext = z.object({
   event_key: z.string().min(1),
   latest: z.object({ id: z.string(), verdict_signature: z.string().nullable(), created_at: z.string() }).nullable(),
   event_open_markets: z.number().int().nonnegative(),
-  public_commit_events: z.number().int().nonnegative(),
+  public_events_before: z.number().int().nonnegative(),
 });
 type CommitContext = z.infer<typeof CommitContext>;
 
@@ -178,8 +180,8 @@ export async function commitVerdict(env: Env, market: MarketRow, resolutionId: s
     }
     const ctx = read.ctx;
     let fields = committedFields(v);
-    // The floor counts distinct events (plan §17.3): the legs of one ladder are one public call.
-    if (!isTest && floorCandidate(fields)) fields = applyPublicFloor(fields, ctx.public_commit_events);
+    // The floor counts distinct events (plan §17.3): the legs of one ladder are one public call, all floored or none.
+    if (!isTest && floorCandidate(fields)) fields = applyPublicFloor(fields, ctx.public_events_before);
     const signature = verdictSignature({ resolution_status: fields.resolution_status, winning_outcome: fields.winning_outcome, error_reason: fields.resolution_status === "ERROR" ? v.error_reason : null });
     if (ctx.latest?.verdict_signature === signature) return { committed: false, posted: false, reason: "the market's latest commit already has this verdict signature" };
     const batched = !isTest && ctx.event_open_markets > 0;

@@ -16,14 +16,21 @@ export async function commitContext(db: FakeDb, a: Record<string, any>): Promise
   const latest = posts.filter((b) => b.market_id === m.id && b.kind === "commit")
     .sort((x, y) => ts(y) - ts(x) || String(y.id).localeCompare(String(x.id)))[0];
   const live = (x: Row) => !x.is_test && (x.tenant_id ?? null) === null;
-  const publicEvents = new Set(posts.filter((b) => b.kind === "commit").map((b) => markets.find((x) => x.id === b.market_id)).filter((x): x is Row => !!x && live(x)).map((x) => x.event_key));
+  // each event's first public commit; the market's event is placed after every event whose first came strictly before
+  const firsts = new Map<string, number>();
+  for (const b of posts.filter((p) => p.kind === "commit")) {
+    const x = markets.find((y) => y.id === b.market_id);
+    if (!x || !live(x)) continue;
+    firsts.set(x.event_key, Math.min(firsts.get(x.event_key) ?? Infinity, ts(b)));
+  }
+  const own = firsts.get(m.event_key) ?? Infinity;
   return {
     data: {
       market_id: m.id,
       event_key: m.event_key,
       latest: latest ? { id: latest.id, verdict_signature: latest.payload?.verdict_signature ?? null, created_at: latest.created_at } : null,
       event_open_markets: markets.filter((o) => o.event_key === m.event_key && o.id !== m.id && o.status === "open" && !o.deleted_at && live(o)).length,
-      public_commit_events: publicEvents.size,
+      public_events_before: [...firsts].filter(([k, first]) => k !== m.event_key && first < own).length,
     },
     error: null,
   };

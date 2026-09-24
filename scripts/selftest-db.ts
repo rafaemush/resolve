@@ -13,13 +13,16 @@
  *                                                        (soft-deleted afterwards; ledger rows are append-only by design).
  *                                                        Refused unless SUPABASE_PROJECT_REF equals STAGING_SUPABASE_PROJECT_REF.
  *   npx tsx scripts/selftest-db.ts --official            only the official_release block (migration 016)
+ * Every mode prints its target first and refuses before anything runs unless SUPABASE_PROJECT_REF equals
+ * STAGING_SUPABASE_PROJECT_REF or RESOLVE_SELFTEST_NON_PRODUCTION=1 is set (with --psql, only the latter): a block rolls
+ * back, but inside production's transaction it would still take locks and consume sequence values.
  */
 import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { loadEnv } from "./lib/env";
 import { sql } from "./lib/mgmt";
-import { blockRunner, check, nonProductionRefusal, raisedResults, targetIsStaging, UsageError, type BlockRunner } from "./lib/selftest";
+import { blockRunner, check, describeTarget, nonProductionRefusal, raisedResults, targetIsStaging, UsageError, type BlockRunner } from "./lib/selftest";
 
 const FLAGS = ["--all", "--concurrency-probe", "--official", "--psql"] as const;
 
@@ -499,12 +502,12 @@ async function main(): Promise<number> {
     throw e;
   }
   loadEnv();
+  // every mode, before any block runs (the children under --all apply the same rule themselves)
+  console.log(`selftest-db target: ${describeTarget(runner)}`);
+  const refusal = nonProductionRefusal(process.env, runner.via);
+  if (refusal) { console.error(`selftest-db: ${refusal}`); return 2; }
   const psqlArgs = runner.conninfo ? ["--psql", runner.conninfo] : [];
-  if (argv.includes("--official")) {
-    const refusal = nonProductionRefusal();
-    if (refusal) { console.error(`selftest --official: ${refusal}`); return 2; }
-    return (await officialSelftest(runner.run)) ? 1 : 0;
-  }
+  if (argv.includes("--official")) return (await officialSelftest(runner.run)) ? 1 : 0;
   if (argv.includes("--concurrency-probe")) {
     // refused before anything runs: the probe persists rows
     if (runner.via === "psql") { console.error("--concurrency-probe runs through the Management API against staging only; drop --psql"); return 2; }
@@ -606,10 +609,8 @@ const OFFICIAL_SELFTEST_EXPECT: Record<string, unknown> = {
   history_update: "refused", recheck_bad_status: "refused", overwrite_after_recheck: "refused",
 };
 
-/** The migration 016 block; returns the number of failures (a refusal counts as one: it could not look). */
+/** The migration 016 block (main() has refused a production target); returns the number of failures. */
 async function officialSelftest(run: BlockRunner): Promise<number> {
-  const refusal = nonProductionRefusal();
-  if (refusal) { console.error(`FAIL selftest --official: ${refusal}`); return 1; }
   const r = await rollbackBlock(run, "SELFTEST_OFFICIAL", OFFICIAL_SELFTEST_SQL);
   if (!r) return 1;
   const bad = check(r, OFFICIAL_SELFTEST_EXPECT, "official.");

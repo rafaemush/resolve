@@ -33,8 +33,10 @@ function psql(conninfo: string): BlockRunner {
 
 export class UsageError extends Error {}
 
+export type Transport = "psql" | "management_api";
+
 /** `--psql <conninfo>` picks psql; otherwise the Management API. */
-export function blockRunner(argv: readonly string[]): { run: BlockRunner; via: "psql" | "management_api"; conninfo: string | null } {
+export function blockRunner(argv: readonly string[]): { run: BlockRunner; via: Transport; conninfo: string | null } {
   const i = argv.indexOf("--psql");
   if (i < 0) return { run: managementApi, via: "management_api", conninfo: null };
   const conninfo = argv[i + 1];
@@ -67,11 +69,36 @@ export function targetIsStaging(env: NodeJS.ProcessEnv = process.env): boolean {
 }
 
 /**
- * Why a rollback-only block may not run here, or null when it may: the target is staging, or the operator declared a
- * non-production target (RESOLVE_SELFTEST_NON_PRODUCTION=1: a local cluster or another scratch project). A block rolls
- * back, but a test that writes rows inside production's transaction still takes its locks there.
+ * Why a rollback-only block may not run here, or null when it may. Through the Management API: the project .env names
+ * is staging, or the operator declared a non-production target (RESOLVE_SELFTEST_NON_PRODUCTION=1: another scratch
+ * project). Through psql only that declaration counts: SUPABASE_PROJECT_REF says nothing about the connection string. A
+ * block rolls back, but a test that writes rows inside production's transaction still takes its locks there and
+ * consumes its sequence values.
  */
-export function nonProductionRefusal(env: NodeJS.ProcessEnv = process.env): string | null {
-  if (targetIsStaging(env) || env.RESOLVE_SELFTEST_NON_PRODUCTION === "1") return null;
-  return "refused: SUPABASE_PROJECT_REF is not STAGING_SUPABASE_PROJECT_REF and RESOLVE_SELFTEST_NON_PRODUCTION=1 is not set (never run against production)";
+export function nonProductionRefusal(env: NodeJS.ProcessEnv = process.env, via: Transport = "management_api"): string | null {
+  if (env.RESOLVE_SELFTEST_NON_PRODUCTION === "1") return null;
+  if (via === "management_api" && targetIsStaging(env)) return null;
+  return via === "psql"
+    ? "refused: through --psql only RESOLVE_SELFTEST_NON_PRODUCTION=1 declares the connection string a non-production database (never run against production)"
+    : "refused: SUPABASE_PROJECT_REF is not STAGING_SUPABASE_PROJECT_REF and RESOLVE_SELFTEST_NON_PRODUCTION=1 is not set (never run against production)";
+}
+
+/** host[:port][/dbname] of a libpq connection string (URI, key=value or a bare database name), never a user or password. */
+export function conninfoTarget(conninfo: string): string {
+  if (/^postgres(ql)?:\/\//.test(conninfo)) {
+    try {
+      const u = new URL(conninfo);
+      return `${u.hostname || "localhost"}${u.port ? `:${u.port}` : ""}${u.pathname.length > 1 ? u.pathname : ""}`;
+    } catch { return "(unreadable connection URI)"; }
+  }
+  if (!conninfo.includes("=")) return `local socket/${conninfo}`;
+  const kv = new Map([...conninfo.matchAll(/(\w+)\s*=\s*('(?:[^'\\]|\\.)*'|\S+)/g)].map((m) => [m[1]!, m[2]!.replace(/^'|'$/g, "")]));
+  return `${kv.get("host") ?? "local socket"}${kv.has("port") ? `:${kv.get("port")}` : ""}${kv.has("dbname") ? `/${kv.get("dbname")}` : ""}`;
+}
+
+/** The database a run targets, printed before anything runs: the project ref, or the connection's host, port and name. */
+export function describeTarget(runner: { via: Transport; conninfo: string | null }, env: NodeJS.ProcessEnv = process.env): string {
+  if (runner.via === "psql") return `psql ${conninfoTarget(runner.conninfo ?? "")}`;
+  const ref = env.SUPABASE_PROJECT_REF || "(SUPABASE_PROJECT_REF not set)";
+  return `Supabase project ${ref} through the Management API${targetIsStaging(env) ? " (= STAGING_SUPABASE_PROJECT_REF)" : ""}`;
 }

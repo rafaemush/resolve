@@ -259,6 +259,40 @@ describe("commitVerdict: insert first, then post, then the receipt", () => {
     expect(commits().at(-1)!.payload.committed.resolution_status).toBe("RESOLVED");
   });
 
+  /** `events` other events with one committed leg each, their commits at `at`. */
+  const seedEvents = (events: number, at: string) => {
+    for (let e = 0; e < events; e++) {
+      h.db.tables.markets!.push(marketRow(`o${e}`, `polymarket:event:o${e}`, { status: "resolved" }));
+      h.db.tables.bot_posts!.push({ id: `po${e}`, market_id: `o${e}`, kind: "commit", channel: "telegram", dedup_key: `oldo${e}`, created_at: at, payload: {} });
+    }
+  };
+
+  it("every leg of the 100th event is floored, whichever commits first (the first leg does not lift it for its siblings)", async () => {
+    seedEvents(99, "2026-09-01T00:00:00.000Z");
+    const L2 = { ...MARKET, id: "33333333-3333-4333-8333-333333333333", external_id: "will-x-happen-leg-2" } as MarketRow;
+    h.db.tables.markets!.push(marketRow(L2.id, MARKET.event_key!));
+    await commitVerdict(env, MARKET, "r1", verdict({ confidence_score: 0.85 }));
+    tick();
+    await commitVerdict(env, L2, "r2", verdict({ confidence_score: 0.85 }));
+    expect(commits().filter((c) => !c.id.startsWith("po")).map((c) => c.payload.committed.resolution_status)).toEqual(["UNRESOLVED", "UNRESOLVED"]);
+  });
+
+  it("an event among the first 100 stays floored after 100 later events; an event after them is not", async () => {
+    await commitVerdict(env, MARKET, "r1", verdict({ confidence_score: 0.85 }));
+    expect(commits()[0]!.payload.committed.resolution_status).toBe("UNRESOLVED");
+    seedEvents(150, new Date(clock + 3_600_000).toISOString());
+    clock += 7_200_000; tick();
+    const L2 = { ...MARKET, id: "33333333-3333-4333-8333-333333333333", external_id: "will-x-happen-leg-2" } as MarketRow;
+    h.db.tables.markets!.push(marketRow(L2.id, MARKET.event_key!));
+    await commitVerdict(env, L2, "r2", verdict({ confidence_score: 0.85 }));
+    expect(commits().at(-1)!.payload.committed.resolution_status).toBe("UNRESOLVED"); // its event was committed first
+    const F = { ...MARKET, id: "44444444-4444-4444-8444-444444444444", external_id: "another-event", event_key: "limitless:another-event" } as MarketRow;
+    h.db.tables.markets!.push(marketRow(F.id, F.event_key!));
+    tick();
+    await commitVerdict(env, F, "r3", verdict({ confidence_score: 0.85 }));
+    expect(commits().at(-1)!.payload.committed.resolution_status).toBe("RESOLVED"); // 151 events before it
+  });
+
   it("a market whose event has another open leg is recorded pending, batched, and left to the channel poster", async () => {
     h.db.tables.markets!.push(marketRow("leg-2", MARKET.event_key!), marketRow("leg-closed", MARKET.event_key!, { status: "resolved" }), marketRow("leg-test", MARKET.event_key!, { is_test: true }));
     const r = await commitVerdict(env, MARKET, "res1", verdict({ confidence_score: 0.95 }));

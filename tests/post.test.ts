@@ -13,8 +13,9 @@ const h = vi.hoisted(() => ({ db: null as unknown as FakeDb }));
 vi.mock("../src/db/supabase", () => ({ db: () => h.db.client }));
 vi.mock("../src/ops/alerts", () => ({ alert: vi.fn(async () => ({ sent: true, deduped: false })) }));
 
-import { BATCH_MAX_WAIT_S, BATCH_QUIET_S, commitBatchMessages, planCommitPosts, planRevealPosts, postPending, RETRY_AFTER_S, revealBatchMessages, revealLeg, type PendingCommitRow, type PendingRevealRow, type RevealLeg } from "../src/bot/post";
-import { MESSAGE_MAX, PACE } from "../src/bot/channel";
+import { BATCH_MAX_WAIT_S, BATCH_QUIET_S, commitBatchMessages, planCommitPosts, planRevealPosts, postPending, RETRY_AFTER_S, REVEAL_MAX_WAIT_S, revealBatchMessages, revealLeg, revealMessageIds, type PendingCommitRow, type PendingRevealRow, type RevealLeg } from "../src/bot/post";
+import { MESSAGE_MAX, PACE, POSTER_LEASE_S, SEND_WORST_MS } from "../src/bot/channel";
+import { RECHECK_PENDING_S, UNPOSTED_ALERT_MINUTES } from "../src/jobs/reconcile";
 import { buildPreimage, buildReveal, committedFields, type CommittedVerdict, type OfficialRecord } from "../src/bot/commit";
 import { Budget, COST } from "../src/ops/budget";
 import { CHANNEL_POST_LIMITS, CHANNEL_POST_SUBREQUESTS } from "../src/jobs/schedule";
@@ -150,10 +151,27 @@ describe("planRevealPosts (pure)", () => {
   const reveal = (id: string, commitId: string, secondsAgo: number): PendingRevealRow => ({ id, market_id: `m-${id}`, created_at: ago(secondsAgo), commitment_sha256: "a".repeat(64), nonce: "n", payload: { commit_id: commitId }, markets: null });
   it("groups by the commit message answered; a reveal whose commit is unposted waits", () => {
     const commits = new Map([["c1", { channel: "telegram", message_id: 500 }], ["c2", { channel: "telegram", message_id: 500 }], ["c3", { channel: "telegram", message_id: 501 }], ["c4", { channel: "pending", message_id: null }]]);
-    const plan = planRevealPosts([reveal("r3", "c3", 50), reveal("r1", "c1", 90), reveal("r2", "c2", 80), reveal("r4", "c4", 99)], commits, 5);
+    const plan = planRevealPosts([reveal("r3", "c3", 50), reveal("r1", "c1", 90), reveal("r2", "c2", 80), reveal("r4", "c4", 99)], commits, new Map(), T0, 5);
     expect(plan.waiting).toBe(1);
     expect(plan.groups.map((g) => [g.replyTo, g.rows.map((r) => r.id)])).toEqual([[500, ["r1", "r2"]], [501, ["r3"]]]);
-    expect(planRevealPosts([reveal("r1", "c1", 90), reveal("r3", "c3", 50)], commits, 1).groups).toHaveLength(1);
+    expect(planRevealPosts([reveal("r1", "c1", 90), reveal("r3", "c3", 50)], commits, new Map(), T0, 1).groups).toHaveLength(1);
+  });
+
+  it("a message with a leg still open is held until its oldest reveal has waited REVEAL_MAX_WAIT_S", () => {
+    const commits = new Map([["c1", { channel: "telegram", message_id: 500 }], ["c3", { channel: "telegram", message_id: 501 }], ["c4", { channel: "pending", message_id: null }]]);
+    const reveals = [reveal("r1", "c1", REVEAL_MAX_WAIT_S - 1), reveal("r3", "c3", 5), reveal("r4", "c4", 5)];
+    expect(revealMessageIds(reveals, commits)).toEqual([500, 501]);
+    const open = new Map([[500, 1]]);
+    const held = planRevealPosts(reveals, commits, open, T0, 5);
+    expect([held.groups.map((g) => g.replyTo), held.held, held.waiting]).toEqual([[501], 1, 1]);
+    const due = planRevealPosts(reveals, commits, open, T0 + 1000, 5);
+    expect([due.groups.map((g) => g.replyTo), due.held]).toEqual([[500, 501], 0]);
+  });
+
+  it("the hold outlasts one reconcile interval and never trips the 15-minute unposted alert", () => {
+    expect(REVEAL_MAX_WAIT_S).toBeGreaterThan(RECHECK_PENDING_S);
+    // the every-minute poster picks a due message up within a minute
+    expect(REVEAL_MAX_WAIT_S + 60).toBeLessThan(UNPOSTED_ALERT_MINUTES * 60);
   });
 });
 
@@ -161,17 +179,19 @@ describe("postPending", () => {
   const env = { TELEGRAM_BOT_TOKEN: "t", TELEGRAM_CHANNEL_ID: "-100" } as unknown as Env;
   let sent: Array<Record<string, any>>;
   let telegramOk: boolean;
+  /** How long each send takes on the fake clock. */
+  let sendMs: number;
   let clock = T0;
 
   beforeEach(() => {
-    sent = []; telegramOk = true;
+    sent = []; telegramOk = true; sendMs = 1300;
     clock += 3_600_000; // only forward: sendMessage's throttle remembers the last send across tests
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(clock);
     vi.stubGlobal("fetch", async (url: string, init: RequestInit) => {
       if (!String(url).startsWith("https://api.telegram.org/")) throw new Error(`unexpected fetch ${url}`);
       sent.push(JSON.parse(String(init.body)));
-      vi.setSystemTime(Date.now() + 1300); // past the 1.2 s throttle without waiting for it
+      vi.setSystemTime(Date.now() + sendMs); // past the 1.2 s throttle without waiting for it
       return telegramOk
         ? new Response(JSON.stringify({ ok: true, result: { message_id: 800 + sent.length, date: Math.floor(Date.now() / 1000) } }), { status: 200 })
         : new Response(JSON.stringify({ ok: false, description: "Too Many Requests: retry after 30" }), { status: 400 });
@@ -225,6 +245,20 @@ describe("postPending", () => {
     expect(sent).toHaveLength(0);
   });
 
+  it("no send starts with less than SEND_WORST_MS of the lease left: the rest stays pending, never attempted", async () => {
+    sendMs = 20_000; // slow sends: the lease runs out before the four events do
+    const fits = Math.floor((POSTER_LEASE_S * 1000 - SEND_WORST_MS) / sendMs) + 1;
+    expect(fits).toBeLessThan(CHANNEL_POST_LIMITS.commitEvents);
+    h.db = newDb(["a", "b", "c", "d"].map((id, i) => pending(id, 70 + i, `polymarket:${id}`, false)));
+    const r = await postPending(env, budget(), CHANNEL_POST_LIMITS, now());
+    expect(r).toMatchObject({ channel: "claimed", messages: fits, commits_posted: fits, commits_failed: 0, stopped: "lease" });
+    expect(sent).toHaveLength(fits);
+    const left = h.db.tables.bot_posts!.filter((b) => b.channel === "pending");
+    expect(left).toHaveLength(CHANNEL_POST_LIMITS.commitEvents - fits);
+    for (const b of left) expect(b.payload).not.toHaveProperty("post_attempts");
+    expect(Date.parse(h.db.tables.post_leases![0]!.lease_until)).toBeLessThanOrEqual(Date.now()); // released
+  });
+
   it("a failed send records the failure on every leg of the message and stops the run", async () => {
     telegramOk = false;
     h.db = newDb([pending("leg1", 45, CPI, true), pending("leg2", 44, CPI, true), pending("solo", 70, "polymarket:solo", false)]);
@@ -270,6 +304,40 @@ describe("postPending", () => {
       expect(v).toMatchObject({ commitment_sha256: l.commitment, market: l.ref, message_id: 500, revealed: true, reveal_posted: true, nonce: l.nonce, preimage: l.committed.preimage });
       expect(await sha256Hex(String(v.preimage))).toBe(v.commitment_sha256);
     }
+  });
+
+  describe("reveals of a ladder settled across reconcile runs", () => {
+    const setup = async () => {
+      const legs = await Promise.all([0, 1].map((i) => legOf(i, OFFICIAL_NO)));
+      const commit = (i: number, market: Record<string, unknown>): Row => ({ id: `c${i}`, market_id: `m${i}`, kind: "commit", channel: "telegram", message_id: 500, posted_at: ago(7200, now()), created_at: ago(7200, now()), commitment_sha256: legs[i]!.commitment, nonce: legs[i]!.nonce, dedup_key: `c${i}`, payload: {}, markets: { deleted_at: null, ...market } });
+      const reveal = (i: number, secondsAgo: number): Row => {
+        const { payload } = buildReveal({ platform: "polymarket", external_id: String(600000 + i) }, { id: `c${i}`, commitment_sha256: legs[i]!.commitment, nonce: legs[i]!.nonce }, legs[i]!.committed, OFFICIAL_NO, legs[i]!.agreement);
+        return { id: legs[i]!.id, market_id: `m${i}`, kind: "reveal", channel: "pending", created_at: ago(secondsAgo, now()), commitment_sha256: legs[i]!.commitment, nonce: legs[i]!.nonce, dedup_key: `reveal:c${i}`, payload, markets: { platform: "polymarket", external_id: String(600000 + i), event_key: CPI } };
+      };
+      return { legs, commit, reveal };
+    };
+
+    it("a message's reveals wait while another of its legs is open: legs settled in two runs share ONE reply", async () => {
+      const { legs, commit, reveal } = await setup();
+      h.db = newDb([commit(0, { status: "resolved" }), commit(1, { status: "open" }), reveal(0, 30)]);
+      expect(await postPending(env, budget(), CHANNEL_POST_LIMITS, now())).toMatchObject({ channel: "claimed", reveals_held: 1, reveals_posted: 0, messages: 0, errors: [] });
+      expect(sent).toHaveLength(0);
+      // the next reconcile run settles leg 1 (its market closes and its reveal is recorded in one transaction)
+      h.db.tables.bot_posts!.find((b) => b.id === "c1")!.markets.status = "resolved";
+      h.db.tables.bot_posts!.push(reveal(1, 5));
+      expect(await postPending(env, budget(), CHANNEL_POST_LIMITS, now())).toMatchObject({ reveals_held: 0, reveals_posted: 2, messages: 1 });
+      expect(sent.map((s) => s.reply_to_message_id)).toEqual([500]);
+      expect(legsFromText(String(sent[0]!.text)).map((l) => l.ref)).toEqual(legs.map((l) => l.ref));
+    });
+
+    it("a leg that stays open holds the others at most REVEAL_MAX_WAIT_S; a deleted open leg never holds them", async () => {
+      const { commit, reveal } = await setup();
+      h.db = newDb([commit(0, { status: "resolved" }), commit(1, { status: "open" }), reveal(0, REVEAL_MAX_WAIT_S)]);
+      expect(await postPending(env, budget(), CHANNEL_POST_LIMITS, now())).toMatchObject({ reveals_held: 0, reveals_posted: 1, messages: 1 });
+      expect(sent.map((s) => s.reply_to_message_id)).toEqual([500]);
+      h.db = newDb([commit(0, { status: "resolved" }), commit(1, { status: "open", deleted_at: ago(60, now()) }), reveal(0, 30)]);
+      expect(await postPending(env, budget(), CHANNEL_POST_LIMITS, now())).toMatchObject({ reveals_held: 0, reveals_posted: 1 });
+    });
   });
 
   it("a reveal waits while its commit is unposted", async () => {

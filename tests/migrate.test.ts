@@ -6,7 +6,7 @@
 import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
-import { ENSURE_LEDGER, parseMigrateArgs, planMigrations, readMigrationFiles, runMigrations, UsageError, type MigrateIo, type MigrationFile } from "../scripts/lib/migrations";
+import { ENSURE_LEDGER, ledgerTargetRefusal, parseMigrateArgs, planMigrations, readMigrationFiles, runMigrations, UsageError, type MigrateIo, type MigrationFile } from "../scripts/lib/migrations";
 
 const file = (name: string, body: string): MigrationFile => ({ name, body, sha256: createHash("sha256").update(body).digest("hex") });
 const F1 = file("001_a.sql", "create table a ();"), F2 = file("002_b.sql", "create table b ();"), F3 = file("003_c.sql", "create table c ();");
@@ -109,6 +109,23 @@ describe("--require-applied (the deploy gate)", () => {
   it("drift and a ledger row without its file exit 1", async () => {
     expect(await runMigrations("--require-applied", [F1], fakeDb(new Map([[F1.name, "0".repeat(64)]])).io)).toBe(1);
     expect(await runMigrations("--require-applied", [F1], fakeDb(new Map([[F1.name, F1.sha256], ["000_gone.sql", "f".repeat(64)]])).io)).toBe(1);
+  });
+});
+
+describe("ledgerTargetRefusal (--require-applied reads production's ledger or refuses)", () => {
+  const prod = { ref: "prodref", shellRef: undefined, dotenvRef: "prodref", stagingRef: "stagref", supabaseUrl: "https://prodref.supabase.co" };
+  it("production's ref from .env, SUPABASE_URL agreeing: allowed", () => {
+    expect(ledgerTargetRefusal(prod)).toBeNull();
+    expect(ledgerTargetRefusal({ ...prod, shellRef: "prodref", dotenvRef: undefined, supabaseUrl: undefined })).toBeNull(); // CI: no .env
+    expect(ledgerTargetRefusal({ ...prod, supabaseUrl: "https://db.resolve.example" })).toBeNull(); // not a supabase.co host: nothing to compare
+  });
+  it("a staging session left exported can never approve a production deploy", () => {
+    expect(ledgerTargetRefusal({ ...prod, ref: "stagref", shellRef: "stagref" })).toContain("STAGING_SUPABASE_PROJECT_REF");
+    // without STAGING_SUPABASE_PROJECT_REF set: the shell overriding .env is refused, not guessed
+    expect(ledgerTargetRefusal({ ...prod, ref: "stagref", shellRef: "stagref", stagingRef: undefined })).toContain("differs from .env's prodref");
+    // SUPABASE_URL (the database the scripts, and by convention the Worker, use) naming another project
+    expect(ledgerTargetRefusal({ ...prod, ref: "otherref", shellRef: undefined, dotenvRef: "otherref", stagingRef: undefined, supabaseUrl: "https://prodref.supabase.co" })).toContain("SUPABASE_URL names project prodref");
+    expect(ledgerTargetRefusal({ ...prod, supabaseUrl: "not a url" })).toContain("not a URL");
   });
 });
 

@@ -14,13 +14,15 @@
 #   ingestion suite frozen + run, official_release suite frozen + run (all four read files and write nothing, so the
 #   tree check below stays meaningful), mutation harness --strict (a mutation that stays green is red), OpenAPI
 #   document = contract, every migration applied (scripts/migrate.ts --require-applied: reads the ledger only; the Worker
-#   shipped may read what a pending migration creates, so pending, drifted or missing files are red), Worker bundle builds
+#   shipped may read what a pending migration creates, so pending, drifted or missing files are red; it prints the
+#   project it read and is red on a ledger that may not be production's: STAGING_SUPABASE_PROJECT_REF, a shell
+#   SUPABASE_PROJECT_REF that differs from .env's, or a SUPABASE_URL naming another project), Worker bundle builds
 #   (wrangler --dry-run, no upload), and the gates left HEAD and the tree as they found them.
 # DRY_RUN=1 skips only the wrangler deploy and the health check after it. Without Supabase Management API credentials
 # (SUPABASE_PROJECT_REF, SUPABASE_ACCESS_TOKEN in the environment or .env) the migrations gate cannot look: SKIPPED on a
 # dry run, red on a real deploy.
-# Not a gate: scripts/selftest-db.ts. Its rollback-only blocks run against whatever database .env names; run it (and
-# --all for scripts/selftest/*.ts) against staging after applying migrations there.
+# Not a gate: scripts/selftest-db.ts. Its rollback-only blocks refuse any target but staging (or one declared
+# non-production); run it (and --all for scripts/selftest/*.ts) against staging after applying migrations there.
 #
 # Credentials: CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID from the environment, else from this repo's .env. Only
 # those two keys and the non-secret RESOLVE_PUBLIC_URL are read from .env by this shell; no value is ever printed. The
@@ -134,8 +136,9 @@ run_gate() {
   else gate_results+=("FAIL (exit $rc)"); failed=$((failed + 1)); fi
 }
 
-# Every migration file applied to the database .env names, nothing drifted (read-only). Exit 3 = no credentials to
-# look with: a dry run reports it SKIPPED; a real deploy is red, because "could not look" is not "all applied".
+# Every migration file applied to production's ledger, nothing drifted (read-only; the project read is printed, and a
+# staging or ambiguous ref is red). Exit 3 = no credentials to look with: a dry run reports it SKIPPED; a real deploy is
+# red, because "could not look" is not "all applied".
 migrations_applied() {
   local rc=0
   without_cf npx tsx scripts/migrate.ts --require-applied || rc=$?

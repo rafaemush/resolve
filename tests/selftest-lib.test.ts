@@ -3,7 +3,7 @@
  * results a block raised from either transport (Management API JSON error, psql stderr). Nothing here reaches a database.
  */
 import { describe, expect, it } from "vitest";
-import { blockRunner, nonProductionRefusal, raisedResults, targetIsStaging, UsageError } from "../scripts/lib/selftest";
+import { blockRunner, conninfoTarget, describeTarget, nonProductionRefusal, raisedResults, targetIsStaging, UsageError } from "../scripts/lib/selftest";
 
 describe("target guard", () => {
   it("staging only when both refs are set and equal; an explicit non-production declaration also passes", () => {
@@ -15,6 +15,22 @@ describe("target guard", () => {
     expect(nonProductionRefusal({ SUPABASE_PROJECT_REF: "prod", RESOLVE_SELFTEST_NON_PRODUCTION: "1" })).toBeNull();
     expect(nonProductionRefusal({ SUPABASE_PROJECT_REF: "prod", RESOLVE_SELFTEST_NON_PRODUCTION: "true" })).toContain("refused");
     expect(nonProductionRefusal({ SUPABASE_PROJECT_REF: "prod" })).toContain("never run against production");
+  });
+
+  it("through psql only the explicit declaration counts: a staging SUPABASE_PROJECT_REF says nothing about the connection string", () => {
+    expect(nonProductionRefusal({ SUPABASE_PROJECT_REF: "abc", STAGING_SUPABASE_PROJECT_REF: "abc" }, "psql")).toContain("RESOLVE_SELFTEST_NON_PRODUCTION=1");
+    expect(nonProductionRefusal({ RESOLVE_SELFTEST_NON_PRODUCTION: "1" }, "psql")).toBeNull();
+    expect(nonProductionRefusal({ SUPABASE_PROJECT_REF: "abc", STAGING_SUPABASE_PROJECT_REF: "abc" }, "management_api")).toBeNull();
+  });
+
+  it("names the target without a user or a password", () => {
+    expect(describeTarget({ via: "management_api", conninfo: null }, { SUPABASE_PROJECT_REF: "prodref" })).toBe("Supabase project prodref through the Management API");
+    expect(describeTarget({ via: "management_api", conninfo: null }, { SUPABASE_PROJECT_REF: "abc", STAGING_SUPABASE_PROJECT_REF: "abc" })).toContain("(= STAGING_SUPABASE_PROJECT_REF)");
+    expect(describeTarget({ via: "management_api", conninfo: null }, {})).toContain("SUPABASE_PROJECT_REF not set");
+    expect(describeTarget({ via: "psql", conninfo: "postgresql://postgres:s3cret@localhost:5541/resolve" }, {})).toBe("psql localhost:5541/resolve");
+    expect(conninfoTarget("host=db.example port=6543 dbname=postgres user=u password='p w'")).toBe("db.example:6543/postgres");
+    expect(conninfoTarget("resolve")).toBe("local socket/resolve");
+    for (const t of [conninfoTarget("postgresql://postgres:s3cret@localhost:5541/resolve"), conninfoTarget("host=h password=s3cret")]) expect(t).not.toContain("s3cret");
   });
 });
 

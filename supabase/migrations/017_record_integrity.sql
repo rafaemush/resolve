@@ -99,14 +99,24 @@ returns jsonb language sql stable security invoker set search_path = public as $
     'event_open_markets', (select count(*)::integer from markets o
                             where o.event_key = m.event_key and o.id <> m.id and o.status = 'open' and o.deleted_at is null
                               and not o.is_test and o.tenant_id is null),
-    'public_commit_events', (select count(distinct x.event_key)::integer
-                               from bot_posts b join markets x on x.id = b.market_id
-                              where b.kind = 'commit' and not x.is_test and x.tenant_id is null))
+    -- The event's place in the public record: other events whose first public commit came before this event's first
+    -- (before now when it has none). Every leg of an event, and every later commit of it, sees the same count, so the
+    -- floor holds for all of an event that is one of the first 100 (a leg committing first must not lift it for its
+    -- siblings). An event committed later never moves an earlier one; a tie on created_at is not "before": floored.
+    'public_events_before', (
+      with firsts as (
+        select x.event_key, min(b.created_at) as first_at
+          from bot_posts b join markets x on x.id = b.market_id
+         where b.kind = 'commit' and not x.is_test and x.tenant_id is null
+         group by x.event_key)
+      select count(*)::integer from firsts f
+       where f.event_key <> m.event_key
+         and f.first_at < coalesce((select o.first_at from firsts o where o.event_key = m.event_key), 'infinity'::timestamptz)))
     from markets m
    where m.id = p_market;
 $$;
 comment on function public.commit_context(uuid) is
-  'One read for src/bot/commit.ts commitVerdict(): the market''s event_key; its latest commit {id, verdict_signature, created_at} (created_at desc, id desc: the order settle_market makes the final commit), which a new commit is deduped against (dedup_key commit:<market>:after:<latest id | none>); event_open_markets = other open, non-deleted, non-test shadow markets of the same event (> 0: the commit waits for the channel poster, which posts the event''s legs as one message); public_commit_events = distinct events with a commit on a non-test shadow market (the 0.90 public floor holds for the first 100). NULL when the market does not exist. service_role only.';
+  'One read for src/bot/commit.ts commitVerdict(): the market''s event_key; its latest commit {id, verdict_signature, created_at} (created_at desc, id desc: the order settle_market makes the final commit), which a new commit is deduped against (dedup_key commit:<market>:after:<latest id | none>); event_open_markets = other open, non-deleted, non-test shadow markets of the same event (> 0: the commit waits for the channel poster, which posts the event''s legs as one message); public_events_before = distinct events other than this market''s whose first commit on a non-test shadow market came before this event''s first commit (before now when the event has none): the event''s place in the public record, the same for every leg and every later commit of the event (the 0.90 public floor holds while it is < 100). NULL when the market does not exist. service_role only.';
 
 -- 3. the channel poster: one lease, pacing, failure bookkeeping ---------------------------------------------------------
 create table if not exists post_leases (

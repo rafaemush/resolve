@@ -4,7 +4,8 @@
  *   - market_event_key() gives what src/markets/event-key.ts eventKey() gives, case by case; the insert trigger fills an
  *     omitted event_key by that rule and keeps an explicit one; event_key is NOT NULL and fixed once a commit exists;
  *   - commit_context(): the latest commit by created_at (A -> B -> A: the last A), the other open non-test shadow legs of
- *     the event, distinct events with a public commit (legs count once, test markets never); a concurrent duplicate of
+ *     the event, the event's place in the public record (public_events_before: other events whose first public commit
+ *     came first; the same for every leg of an event, never moved by a later or a test event); a concurrent duplicate of
  *     commit:<market>:after:<latest> collides; settle_market refuses a plan that missed the newest commit and settles the
  *     final on it otherwise;
  *   - several pending commits may take one message_id (the 012 trigger, once each); note_post_failure counts attempts;
@@ -14,12 +15,13 @@
  *     and its Wilson interval, and `reportable` is exactly 100 reconciled events (a 100-leg ladder does not open it);
  *   - least privilege: no relation, column, sequence or function in public is usable by anon or authenticated; the
  *     service_role keeps every table privilege and RPC the Worker uses.
- * Refused unless SUPABASE_PROJECT_REF equals STAGING_SUPABASE_PROJECT_REF or RESOLVE_SELFTEST_NON_PRODUCTION=1.
+ * Refused unless SUPABASE_PROJECT_REF equals STAGING_SUPABASE_PROJECT_REF or RESOLVE_SELFTEST_NON_PRODUCTION=1 (with
+ * --psql, only the latter); the target is printed first.
  *   RESOLVE_SELFTEST_NON_PRODUCTION=1 npx tsx scripts/selftest/fixes.ts --psql postgresql://postgres@localhost:5541/resolve
  *   npx tsx scripts/selftest/fixes.ts             (the Management API: the project .env names, staging only)
  */
 import { loadEnv } from "../lib/env";
-import { blockRunner, check, nonProductionRefusal, raisedResults, UsageError } from "../lib/selftest";
+import { blockRunner, check, describeTarget, nonProductionRefusal, raisedResults, UsageError } from "../lib/selftest";
 import { eventKey, type EventKeyInput } from "../../src/markets/event-key";
 
 /** Inputs of the event-key rule; the expected value of each is eventKey() in TypeScript. */
@@ -60,8 +62,8 @@ export const FIXES_BLOCK = `
 do $$
 declare
   out jsonb := '{}'::jsonb;
-  pend0 integer; r jsonb; ctx jsonb; ev0 integer; msgs0 integer; n integer; k integer;
-  m uuid; s uuid; lone uuid; tst uuid; tnt uuid; x uuid; p1 uuid; p2 uuid; q1 uuid; q2 uuid; c1 uuid; c2 uuid; c3 uuid; rows0 integer;
+  pend0 integer; r jsonb; ctx jsonb; ev0 integer; evm integer; msgs0 integer; n integer; k integer;
+  m uuid; s uuid; lone uuid; tst uuid; tstev uuid; tnt uuid; x uuid; p1 uuid; p2 uuid; q1 uuid; q2 uuid; c1 uuid; c2 uuid; c3 uuid; rows0 integer;
   filled text; kept text; b record; a record; g record;
 begin
   -- 0. claim_post_lease with nothing pending takes no lease (checked first, before this block writes pending rows)
@@ -122,7 +124,7 @@ begin
   x := pg_temp.fx_market('__selftest_fx_deleted__', 'fx:E');
   update markets set deleted_at = now() where id = x;
   ctx := commit_context(m);
-  ev0 := (ctx->>'public_commit_events')::integer;
+  ev0 := (ctx->>'public_events_before')::integer; -- fx:E has no commit yet: every other public event is before it
   out := out || jsonb_build_object('ctx_event_key', ctx->>'event_key', 'ctx_no_commit_yet', ctx->'latest' = 'null'::jsonb, 'ctx_open_siblings', (ctx->>'event_open_markets')::integer);
   insert into resolutions (id, market_id, mode, status_row, resolution_status, winning_outcome, confidence_score, determination_basis, caveats, thresholds_version) values
     ('__selftest_fx_a1__', m, 'shadow', 'complete', 'RESOLVED', 'OPTION_A', 0.95, 'structured', '[]', 'v1'),
@@ -141,13 +143,23 @@ begin
   exception when unique_violation then out := out || '{"concurrent_duplicate_refused": true}'; end;
   ctx := commit_context(m);
   out := out || jsonb_build_object('ctx_latest_is_last_a', (ctx->'latest'->>'id')::uuid = c3, 'ctx_latest_signature', ctx->'latest'->>'verdict_signature');
+  -- the public floor's count: fx:E's own commits never count for it, and its open leg s (no commit of its own) sees
+  -- the same place as m, so a leg committing first cannot lift the floor for its siblings
+  evm := (ctx->>'public_events_before')::integer;
+  out := out || jsonb_build_object('floor_own_event_not_counted', evm <= ev0, 'floor_legs_same_place', (commit_context(s)->>'public_events_before')::integer = evm);
   begin update markets set event_key = 'fx:E-moved' where id = m; out := out || '{"event_key_locked_after_commit": false}';
   exception when others then out := out || '{"event_key_locked_after_commit": true}'; end;
   insert into bot_posts (market_id, channel, kind, commitment_sha256, nonce, payload, dedup_key, posted_at) values (s, 'pending', 'commit', repeat('5', 64), 'n', '{}', '__selftest_fx_cs__', null);
   lone := pg_temp.fx_market('__selftest_fx_lone__', 'fx:lone');
   insert into bot_posts (market_id, channel, kind, commitment_sha256, nonce, payload, dedup_key, posted_at) values (lone, 'pending', 'commit', repeat('6', 64), 'n', '{}', '__selftest_fx_cl__', null);
   insert into bot_posts (market_id, channel, kind, commitment_sha256, nonce, payload, dedup_key, posted_at) values (tst, 'none', 'commit', repeat('7', 64), 'n', '{}', '__selftest_fx_ct__', null);
-  out := out || jsonb_build_object('public_events_delta', (commit_context(m)->>'public_commit_events')::integer - ev0);
+  -- a test market's event committed before fx:E is not a public event
+  tstev := pg_temp.fx_market('__selftest_fx_test_ev__', 'fx:T');
+  update markets set is_test = true where id = tstev;
+  insert into bot_posts (market_id, channel, kind, commitment_sha256, nonce, payload, dedup_key, posted_at, created_at)
+    values (tstev, 'none', 'commit', repeat('7', 64), 'n', '{}', '__selftest_fx_cte__', null, now() - interval '10 minutes');
+  out := out || jsonb_build_object('floor_lone_place_delta', (commit_context(lone)->>'public_events_before')::integer - ev0,
+    'floor_place_unmoved', (commit_context(m)->>'public_events_before')::integer = evm);
   -- settle_market: a plan that missed the newest commit is refused; with it, the final is the last A
   out := out || jsonb_build_object('settle_missing_commit', settle_market(m, array[c1, c2], '[]', '[]', 'resolved', 'OPTION_A', now(), null)->>'result');
   r := settle_market(m, array[c1, c2, c3], jsonb_build_array(
@@ -258,7 +270,8 @@ export const FIXES_EXPECT: Record<string, unknown> = {
   fill_by_rule: "polymarket:event:__selftest_ev__", explicit_kept: "fx:explicit", event_key_change_before_commit: true, event_key_null_refused: true,
   ctx_event_key: "fx:E", ctx_no_commit_yet: true, ctx_open_siblings: 1,
   concurrent_duplicate_refused: true, ctx_latest_is_last_a: true, ctx_latest_signature: "RESOLVED|OPTION_A|", event_key_locked_after_commit: true,
-  public_events_delta: 2, settle_missing_commit: "commits_changed", settle_result: "settled", settle_final: "__selftest_fx_a2__",
+  floor_own_event_not_counted: true, floor_legs_same_place: true, floor_lone_place_delta: 1, floor_place_unmoved: true,
+  settle_missing_commit: "commits_changed", settle_result: "settled", settle_final: "__selftest_fx_a2__",
   note_failure_rows: 2, shared_message_rows: 2, note_failure_attempts: 1, note_failure_error: "selftest refused", note_failure_reveal: 1, posted_leg_untouched: 0,
   second_receipt_refused: true,
   paced_at_ceiling: "paced", claimed_under_ceiling: true, window_counts_messages_not_rows: true,
@@ -280,7 +293,8 @@ async function main(): Promise<number> {
     if (e instanceof UsageError) { console.error(e.message); return 2; }
     throw e;
   }
-  const refusal = nonProductionRefusal();
+  console.log(`selftest fixes target: ${describeTarget(runner)}`);
+  const refusal = nonProductionRefusal(process.env, runner.via);
   if (refusal) { console.error(`selftest fixes (migration 017): ${refusal}`); return 2; }
   const raw = await runner.run(FIXES_BLOCK);
   const r = raisedResults("SELFTEST_FIXES", raw);

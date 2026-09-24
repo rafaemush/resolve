@@ -14,7 +14,9 @@
  * Reveals are grouped by the commit message they answer: the legs that share one commit message get ONE reply listing
  * each leg's market, commitment, preimage and nonce (chunked), so each leg's commitment is recomputable from the posted
  * text alone and GET /v1/track-record/verify keeps answering per leg. A reveal whose commit message is its own is posted
- * as its stored text. A reveal never reaches the channel before its commit.
+ * as its stored text. A reveal never reaches the channel before its commit. The legs of a ladder settle in different
+ * reconcile runs (25 markets and one subrequest budget per run, each leg's own backoff), so a message's reveals wait
+ * while another leg of that message is still open, for at most REVEAL_MAX_WAIT_S.
  */
 import { z } from "zod";
 import type { Env } from "../env";
@@ -31,6 +33,13 @@ export const RETRY_AFTER_S = 60;
 export const BATCH_QUIET_S = 30;
 /** An event whose legs keep arriving is posted anyway once its oldest pending leg has waited this long. */
 export const BATCH_MAX_WAIT_S = 120;
+/**
+ * A commit message whose legs are not all settled has its pending reveals held this long at most (from its oldest
+ * pending reveal). Longer than the 10-minute reconcile interval, so legs settled in two consecutive runs share one
+ * reply; shorter than the 15-minute unposted alert (src/jobs/reconcile.ts UNPOSTED_ALERT_MINUTES), which a held reveal
+ * must never trip (tests/post.test.ts checks both).
+ */
+export const REVEAL_MAX_WAIT_S = 660;
 /** Rows read per run; an event cut by the limit is completed next run. */
 export const COMMIT_READ_MAX = 120;
 export const REVEAL_READ_MAX = 60;
@@ -158,22 +167,41 @@ export function revealBatchMessages(eventKey: string, legs: RevealLeg[], limit =
 }
 
 export interface RevealGroup { replyTo: number; rows: PendingRevealRow[] }
+type PostedCommits = ReadonlyMap<string, { channel: string; message_id: number | null }>;
+
+/** Pure. The commit message a pending reveal answers; null while its commit is not posted. */
+function replyToOf(r: PendingRevealRow, commits: PostedCommits): number | null {
+  const c = commits.get(String(r.payload?.commit_id ?? ""));
+  return c && c.channel === "telegram" && c.message_id ? c.message_id : null;
+}
+
+/** Pure. The commit messages the pending reveals answer (the ones whose open legs the poster reads). */
+export function revealMessageIds(reveals: PendingRevealRow[], commits: PostedCommits): number[] {
+  return [...new Set(reveals.map((r) => replyToOf(r, commits)).filter((id): id is number => id !== null))];
+}
 
 /**
  * Pure. Pending reveals grouped by the commit message they answer, fewest failed attempts then oldest first, at most
- * maxGroups. A reveal whose
- * commit is not posted yet waits (a reveal never reaches the channel before its commitment).
+ * maxGroups. A reveal whose commit is not posted yet waits (a reveal never reaches the channel before its commitment).
+ * A message with legs still open (openLegs: message_id -> open markets among its commits) is held, so its legs are
+ * revealed in one reply, until its oldest pending reveal has waited REVEAL_MAX_WAIT_S. No quiet period is needed once
+ * no leg is open: settle_market records a market's reveals in the transaction that closes it.
  */
-export function planRevealPosts(reveals: PendingRevealRow[], commits: ReadonlyMap<string, { channel: string; message_id: number | null }>, maxGroups: number): { groups: RevealGroup[]; waiting: number } {
-  let waiting = 0;
+export function planRevealPosts(reveals: PendingRevealRow[], commits: PostedCommits, openLegs: ReadonlyMap<number, number>, nowMs: number, maxGroups: number): { groups: RevealGroup[]; waiting: number; held: number } {
+  let waiting = 0, held = 0;
   const groups = new Map<number, PendingRevealRow[]>();
   for (const r of [...reveals].sort(byCreated)) {
-    const c = commits.get(String(r.payload?.commit_id ?? ""));
-    if (!c || c.channel !== "telegram" || !c.message_id) { waiting++; continue; }
-    groups.set(c.message_id, [...(groups.get(c.message_id) ?? []), r]);
+    const replyTo = replyToOf(r, commits);
+    if (replyTo === null) { waiting++; continue; }
+    groups.set(replyTo, [...(groups.get(replyTo) ?? []), r]);
   }
-  const out = [...groups].map(([replyTo, rows]) => ({ replyTo, rows })).sort(fairOrder);
-  return { groups: out.slice(0, Math.max(0, maxGroups)), waiting };
+  const ready: RevealGroup[] = [];
+  for (const [replyTo, rows] of groups) {
+    const waited = (nowMs - Date.parse(rows[0]!.created_at)) / 1000;
+    if ((openLegs.get(replyTo) ?? 0) > 0 && waited < REVEAL_MAX_WAIT_S) { held += rows.length; continue; }
+    ready.push({ replyTo, rows });
+  }
+  return { groups: ready.sort(fairOrder).slice(0, Math.max(0, maxGroups)), waiting, held };
 }
 
 const OfficialShape = z.object({
@@ -197,6 +225,8 @@ export interface PostSummary {
   channel: "claimed" | "idle" | "paced" | "busy" | "error" | "unconfigured" | "budget";
   commits_attempted: number; commits_posted: number; commits_failed: number;
   reveals_posted: number; reveals_waiting: number; reveals_failed: number;
+  /** Pending reveals held because another leg of their commit message is still open (at most REVEAL_MAX_WAIT_S). */
+  reveals_held: number;
   messages: number;
   /** Why the run stopped before its limits: budget, pacing ceiling, lease time, or a failed send (Telegram refusing). */
   stopped: "budget" | "paced" | "lease" | "failure" | null;
@@ -241,19 +271,34 @@ async function postCommits(x: Ctx, maxEvents: number, nowMs: number): Promise<vo
   }
 }
 
-async function postReveals(x: Ctx, maxGroups: number): Promise<void> {
-  if (!x.budget.take(2 * COST.db)) { x.out.stopped = "budget"; return; }
+/**
+ * Reads (reserved together, the unneeded ones released): the pending reveals, their commits, and the legs of those
+ * commit messages whose markets are still open (one row per open leg, so the answer is at most the legs of the
+ * messages read). A read that fails stops the reveals for this run: the poster could not look.
+ */
+async function postReveals(x: Ctx, maxGroups: number, nowMs: number): Promise<void> {
+  if (!x.budget.take(3 * COST.db)) { x.out.stopped = "budget"; return; }
   const { data, error } = await x.client.from("bot_posts").select("id, market_id, created_at, commitment_sha256, nonce, payload, markets(platform, external_id, event_key)")
     .eq("kind", "reveal").eq("channel", "pending").order("created_at", { ascending: true }).limit(REVEAL_READ_MAX);
-  if (error) { x.budget.release(COST.db); x.out.errors.push(`pending reveals: ${redact(error.message)}`); return; }
+  if (error) { x.budget.release(2 * COST.db); x.out.errors.push(`pending reveals: ${redact(error.message)}`); return; }
   const reveals = (data ?? []) as unknown as PendingRevealRow[];
-  if (!reveals.length) { x.budget.release(COST.db); return; }
+  if (!reveals.length) { x.budget.release(2 * COST.db); return; }
   const commitIds = [...new Set(reveals.map((r) => String(r.payload?.commit_id ?? "")))].filter(Boolean);
   const { data: commits, error: ce } = await x.client.from("bot_posts").select("id, channel, message_id").in("id", commitIds);
-  if (ce) { x.out.errors.push(`reveal commits: ${redact(ce.message)}`); return; }
+  if (ce) { x.budget.release(COST.db); x.out.errors.push(`reveal commits: ${redact(ce.message)}`); return; }
   const byId = new Map((commits ?? []).map((c) => [c.id as string, c as { channel: string; message_id: number | null }]));
-  const plan = planRevealPosts(reveals, byId, maxGroups);
+  const messageIds = revealMessageIds(reveals, byId);
+  const openLegs = new Map<number, number>();
+  if (!messageIds.length) x.budget.release(COST.db);
+  else {
+    const { data: open, error: oe } = await x.client.from("bot_posts").select("message_id, markets!inner(status, deleted_at)")
+      .eq("kind", "commit").eq("channel", "telegram").in("message_id", messageIds).eq("markets.status", "open").is("markets.deleted_at", null);
+    if (oe) { x.out.errors.push(`reveal legs still open: ${redact(oe.message)}`); return; }
+    for (const o of open ?? []) openLegs.set(Number(o.message_id), (openLegs.get(Number(o.message_id)) ?? 0) + 1);
+  }
+  const plan = planRevealPosts(reveals, byId, openLegs, nowMs, maxGroups);
   x.out.reveals_waiting += plan.waiting;
+  x.out.reveals_held += plan.held;
   for (const g of plan.groups) {
     const legs = g.rows.map((r) => ({ r, leg: g.rows.length > 1 ? revealLeg(r) : null }));
     const batch = legs.filter((l) => l.leg).map((l) => l.leg!);
@@ -267,13 +312,13 @@ async function postReveals(x: Ctx, maxGroups: number): Promise<void> {
 
 /**
  * One poster run: claim the channel (idle, paced or busy: nothing happens), post the ready commits of at most
- * limits.commitEvents events, then the reveals of at most limits.revealGroups commit messages, then release. Never
+ * limits.commitEvents events, then the ready reveals of at most limits.revealGroups commit messages, then release. Never
  * throws for a failed send or read (they are counted and listed); a message builder that would exceed Telegram's limit
- * throws. Subrequests: claim + release 2, commit read 1, reveal reads 2, then COST.telegram + COST.db per message plus
+ * throws. Subrequests: claim + release 2, commit read 1, reveal reads 3, then COST.telegram + COST.db per message plus
  * one alert when a receipt is not saved; everything is reserved from `budget` before it is spent.
  */
 export async function postPending(env: Env, budget: Budget, limits: PostLimits, nowMs = Date.now()): Promise<PostSummary> {
-  const out: PostSummary = { channel: "unconfigured", commits_attempted: 0, commits_posted: 0, commits_failed: 0, reveals_posted: 0, reveals_waiting: 0, reveals_failed: 0, messages: 0, stopped: null, errors: [], send_errors: [] };
+  const out: PostSummary = { channel: "unconfigured", commits_attempted: 0, commits_posted: 0, commits_failed: 0, reveals_posted: 0, reveals_waiting: 0, reveals_held: 0, reveals_failed: 0, messages: 0, stopped: null, errors: [], send_errors: [] };
   if (!telegramConfigured(env)) return out;
   // the claim and its release, reserved together so a claimed lease is always released
   if (!budget.take(2 * COST.db)) { out.channel = "budget"; out.stopped = "budget"; return out; }
@@ -289,7 +334,7 @@ export async function postPending(env: Env, budget: Budget, limits: PostLimits, 
   const x: Ctx = { env, client, budget, session: claim.session, out };
   try {
     if (limits.commitEvents > 0) await postCommits(x, limits.commitEvents, nowMs);
-    if (limits.revealGroups > 0 && out.stopped === null) await postReveals(x, limits.revealGroups);
+    if (limits.revealGroups > 0 && out.stopped === null) await postReveals(x, limits.revealGroups, nowMs);
   } finally {
     await releaseChannel(client, claim.session);
   }

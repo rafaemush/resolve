@@ -155,14 +155,19 @@ describe("migration 016 (static lint; never applied from here)", () => {
     expect(body).toMatch(/create trigger official_corroboration_history_append_only before update or delete on official_corroboration_history\s+for each row execute function public\.deny_mutation\(\)/);
     expect(body).toContain("current_setting('resolve.official_recheck', true)");
   });
-  it("(11) scripts/selftest-db.ts --official: opt-in, refused without a non-production declaration, rollback-only, every expectation produced", () => {
+  it("(11) scripts/selftest-db.ts --official: opt-in, refused on a production target before any block runs, rollback-only, every expectation produced", () => {
     const script = readFileSync(resolve(import.meta.dirname, "../scripts/selftest-db.ts"), "utf8");
     const from = script.indexOf("const OFFICIAL_SELFTEST_SQL = `");
     const block = script.slice(from, script.indexOf("end $$;`;", from));
     expect(block.length).toBeGreaterThan(1000);
     expect(block.trimEnd().endsWith("raise exception 'SELFTEST_OFFICIAL %', out::text;")).toBe(true);
-    // opt-in: --official runs only this block, after the target guard (scripts/lib/selftest.ts, tests/selftest-lib.test.ts)
-    expect(script).toMatch(/if \(argv\.includes\("--official"\)\) \{\s*const refusal = nonProductionRefusal\(\);\s*if \(refusal\) \{[^\n]*return 2; \}/);
+    // opt-in: --official runs only this block, after the target guard that every mode passes first (scripts/lib/selftest.ts,
+    // tests/selftest-lib.test.ts)
+    const main = script.slice(script.indexOf("async function main()"));
+    expect(main).toMatch(/const refusal = nonProductionRefusal\(process\.env, runner\.via\);\s*if \(refusal\) \{[^\n]*return 2; \}/);
+    const guard = main.indexOf("nonProductionRefusal(");
+    expect(guard).toBeGreaterThan(0);
+    for (const run of ['argv.includes("--official")', "rollbackBlocks(", "officialSelftest(", "selftestFiles("]) expect(main.indexOf(run), run).toBeGreaterThan(guard);
     expect(readFileSync(resolve(import.meta.dirname, "../scripts/lib/selftest.ts"), "utf8")).toContain('env.RESOLVE_SELFTEST_NON_PRODUCTION === "1"');
     for (const fn of ["record_official_observation", "claim_official_fetch", "extend_official_fetch", "recheck_official_corroboration"]) expect(block, fn).toContain(`${fn}(`);
     const expectBlock = script.slice(script.indexOf("const OFFICIAL_SELFTEST_EXPECT"), script.indexOf("async function officialSelftest"));
