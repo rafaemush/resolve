@@ -6,7 +6,9 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
+    "deploy": "bash scripts/deploy.sh",
+    "deploy:dry": "DRY_RUN=1 bash scripts/deploy.sh",
+    "deploy:raw": "wrangler deploy",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -14,11 +16,14 @@
     "eval:build": "tsx evals/build.ts",
     "eval:mutate": "tsx evals/mutate.ts",
     "eval:ingest": "tsx evals/ingest.ts",
-    "bench": "tsx evals/bench.ts",
     "openapi": "tsx scripts/openapi.ts",
+    "migrate": "tsx scripts/migrate.ts",
+    "selftest:db": "tsx scripts/selftest-db.ts",
+    "configure:db": "tsx scripts/configure-db.ts",
     "candidates": "tsx scripts/candidates.ts",
     "seed:shadow": "tsx scripts/seed-shadow.ts",
-    "db:push": "supabase db push"
+    "test-key": "tsx scripts/issue-test-key.ts",
+    "wallet:gen": "tsx scripts/gen-wallet.ts"
   },
   "engines": {
     "node": ">=22"

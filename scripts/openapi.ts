@@ -1,6 +1,12 @@
-/** Generate docs/openapi.json + src/generated/openapi.json from the zod contract (zod 4 toJSONSchema). */
+/**
+ * Generate docs/openapi.json + src/generated/openapi.json (served at /openapi.json) from the zod contract (zod 4
+ * toJSONSchema).
+ *   npx tsx scripts/openapi.ts          write both files
+ *   npx tsx scripts/openapi.ts --check  write nothing; exit 1 when either committed file differs from the contract
+ *                                       (deploy gate and CI: a route or schema change ships with its document)
+ */
 import { z } from "zod";
-import { writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { MarketRegistration, Verdict, StrictV0Verdict } from "../src/resolve/schema";
 import { WEBHOOK_EVENTS } from "../src/webhooks/deliver";
 import { EARLY_REVEAL_LABEL } from "../src/shadow/follows";
@@ -46,9 +52,19 @@ const doc = {
     "/health": { get: { summary: "Liveness + one database read", responses: { 200: r("service status") } } },
   },
 };
-mkdirSync("src/generated", { recursive: true });
-mkdirSync("docs", { recursive: true });
+const args = process.argv.slice(2);
+if (args.some((a) => a !== "--check")) { console.error("usage: npx tsx scripts/openapi.ts [--check]"); process.exit(2); }
+const OUTPUTS = ["src/generated/openapi.json", "docs/openapi.json"];
 const json = JSON.stringify(doc, null, 2) + "\n";
-writeFileSync("src/generated/openapi.json", json);
-writeFileSync("docs/openapi.json", json);
-console.log("openapi.json:", Object.keys(doc.paths).length, "paths,", Object.keys(schemas).length, "schemas");
+const summary = `${Object.keys(doc.paths).length} paths, ${Object.keys(schemas).length} schemas`;
+if (args.includes("--check")) {
+  const stale = OUTPUTS.filter((p) => !existsSync(p) || readFileSync(p, "utf8") !== json);
+  for (const p of stale) console.log(`DRIFT ${p}`);
+  if (stale.length) { console.log(`${stale.length} file(s) differ from the contract (${summary}): run npx tsx scripts/openapi.ts and commit`); process.exit(1); }
+  console.log(`openapi.json up to date: ${summary}`);
+} else {
+  mkdirSync("src/generated", { recursive: true });
+  mkdirSync("docs", { recursive: true });
+  for (const p of OUTPUTS) writeFileSync(p, json);
+  console.log(`openapi.json: ${summary}`);
+}

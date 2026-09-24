@@ -25,6 +25,10 @@ Every shadow verdict is recorded first and then posted to the public Telegram ch
 
 A tenant can follow a public shadow market (`POST /v1/markets/{id}/follow`) and receive each committed verdict privately the moment its commitment is recorded: `GET /v1/shadow/{market_id}` and the `shadow.committed` webhook, then `shadow.revealed` when the platform resolves. Early reveals are labeled as excluded from the public record and never carry the nonce or the preimage before the public reveal. Plans and credit prices: [docs/pricing.md](docs/pricing.md).
 
+## Deploying
+
+`pnpm run deploy` (plain `pnpm deploy` is pnpm's own workspace command) runs `scripts/deploy.sh`: it refuses a working tree with uncommitted changes, runs typecheck, the tests, the frozen-suite check, eval replay (a missing Jev fixture is red), the strict mutation harness, the OpenAPI check and a Worker bundle build, deploys only when every gate is green, and then requires `/health` to report the deployed commit as `git_sha`. `pnpm run deploy:dry` runs the same gates without deploying; CI runs them on every push and pull request.
+
 ## Status
 
 Pre-launch. Nothing here is financial advice or an oracle of record.

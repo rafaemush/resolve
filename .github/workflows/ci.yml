@@ -1,6 +1,8 @@
 # Resolve CI (public repo => unlimited minutes). Actions holds exactly two secrets:
 # TYPESAFE_API_KEY (nightly live evals only) and EVAL_REPORT_KEY (insert-only reporting).
 # It never holds the Supabase service_role key or any Cloudflare token.
+# The gate job runs the same gates as scripts/deploy.sh, so a commit CI rejects cannot pass the deploy gate either.
+# Third-party actions are pinned by commit SHA (the tag each SHA was resolved from is in the trailing comment).
 name: ci
 on:
   push:
@@ -9,9 +11,11 @@ on:
   schedule:
     - cron: "0 4 * * *"   # nightly live evals (cost-capped)
   workflow_dispatch:
+# Pushes and PRs cancel their own superseded runs; a scheduled or dispatched run is in a group of its own, so a push to
+# main never cancels a live eval that is already spending money.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
 permissions:
   contents: read
 jobs:
@@ -19,10 +23,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0 (= v4 on 2026-09-24)
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0 (= v4 on 2026-09-24)
         with: { version: 9 }
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0 (= v4 on 2026-09-24)
         with: { node-version: 24, cache: pnpm }
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
@@ -31,15 +35,26 @@ jobs:
         run: pnpm eval:build --check
       - name: frozen ingestion cases match the authored cases and pass (adapters + change projection, no network)
         run: pnpm eval:ingest --check && pnpm eval:ingest
-      - name: failure-injection suite (replay; strict once Jev fixtures are recorded)
-        run: pnpm eval --mode replay --skip-missing
-      - name: mutation harness (every deterministic rail must turn the suite red)
-        run: pnpm eval:mutate --skip-missing
+      - name: failure-injection suite (replay; a missing Jev fixture is a harness error)
+        run: pnpm eval --mode replay
+      - name: mutation harness (every deterministic rail must turn the suite red; any green mutation fails the build)
+        run: pnpm eval:mutate --strict
+      - name: OpenAPI document matches the contract
+        run: pnpm openapi --check
+      - name: Worker bundle builds (wrangler --dry-run; no upload, no credentials)
+        run: pnpm exec wrangler deploy --dry-run --outdir "$RUNNER_TEMP/bundle"
+        env:
+          WRANGLER_SEND_METRICS: "false"
   live-nightly:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # main only: the secrets below never reach a branch or a pull request's code.
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     needs: gate
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # One live run at a time across the whole repo, never cancelled mid-run (a cancelled run spends and records nothing).
+    concurrency:
+      group: live-nightly-evals
+      cancel-in-progress: false
     env:
       TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
       EVAL_REPORT_KEY: ${{ secrets.EVAL_REPORT_KEY }}
@@ -47,13 +62,15 @@ jobs:
       EVAL_LIVE: "1"
       EVAL_RUNNER_REGION: gh_actions_us
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0 (= v4 on 2026-09-24)
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0 (= v4 on 2026-09-24)
         with: { version: 9 }
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0 (= v4 on 2026-09-24)
         with: { node-version: 24, cache: pnpm }
       - run: pnpm install --frozen-lockfile
-      - name: live evals (skips cleanly until the key secret exists)
+      - name: live evals, recorded in eval_runs (a missing secret or a refused report fails the run)
         run: |
-          if [ -z "$TYPESAFE_API_KEY" ]; then echo "TYPESAFE_API_KEY secret not set; skipping live evals"; exit 0; fi
+          for s in TYPESAFE_API_KEY EVAL_REPORT_KEY; do
+            if [ -z "${!s}" ]; then echo "::error::Actions secret $s is not set: the nightly live eval cannot run or be recorded"; exit 1; fi
+          done
           pnpm eval --mode live --max-cost-usd 0.05 --report

@@ -181,11 +181,17 @@ async function main() {
   const rp = resolve(process.cwd(), "evals/reports", `${opts.mode}-${new Date().toISOString().replace(/[:.]/g, "-")}.json`);
   writeFileSync(rp, JSON.stringify(s, null, 1));
   console.log("report:", rp);
-  if (opts.report && process.env.RESOLVE_PUBLIC_URL && process.env.EVAL_REPORT_KEY) {
+  // --report exists to put a row in eval_runs (the nightly's only output): a run that was not recorded is not green.
+  let reportFailed = false;
+  if (opts.report && !(process.env.RESOLVE_PUBLIC_URL && process.env.EVAL_REPORT_KEY)) {
+    console.error("eval-report: --report needs RESOLVE_PUBLIC_URL and EVAL_REPORT_KEY; this run is not in eval_runs");
+    reportFailed = true;
+  } else if (opts.report) {
     const body = { suite_sha256: s.suite_sha256, git_sha: process.env.GITHUB_SHA ?? null, mode: s.mode, model: process.env.JEV_MODEL, cases: s.cases, passed: s.passed, false_resolved: s.false_resolved, recall: s.recall_ab, brier: s.brier, ece: s.ece, p50_ms: s.p50_ms, cost_usd: s.cost_usd, runner_region: process.env.EVAL_RUNNER_REGION ?? "unknown", grader_fail: s.grader_fail, harness_error: s.harness_error, meta: { by_class: s.by_class, skipped: s.skipped } };
     const r = await fetch(`${process.env.RESOLVE_PUBLIC_URL}/internal/eval-report`, { method: "POST", headers: { Authorization: `Bearer ${process.env.EVAL_REPORT_KEY}`, "Content-Type": "application/json" }, body: JSON.stringify(body) });
     console.log("eval-report:", r.status, (await r.text()).slice(0, 200));
+    reportFailed = !r.ok;
   }
-  process.exit(s.grader_fail || s.harness_error || s.false_resolved ? 1 : 0);
+  process.exit(s.grader_fail || s.harness_error || s.false_resolved || reportFailed ? 1 : 0);
 }
 if (process.argv[1] && process.argv[1].endsWith("run.ts")) main().catch((e) => { console.error(String(e)); process.exit(1); });
