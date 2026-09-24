@@ -1,7 +1,8 @@
 /**
  * The every-minute tick and the 10-minute dispatch check (plan §16.4 P0 step 7): which alert each dispatch observation
  * raises (skipped, failure, no row at all, unreadable), that a failed liveness insert alerts, that the healthy tick costs
- * exactly two subrequests, and that "could not count" pg_net failures is never "counted zero".
+ * exactly two subrequests, that "could not count" pg_net failures is never "counted zero", and that the tick at :05,
+ * :15, ... alerts a Limitless recorder with no run for 30 minutes, none at all, or an unreadable one.
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
@@ -26,7 +27,7 @@ vi.mock("../src/db/supabase", () => ({
 }));
 vi.mock("../src/ops/alerts", () => ({ alert: vi.fn(async () => ({ sent: true, deduped: false })), alertMany: vi.fn(async () => ({ sent: [], deduped: [] })) }));
 
-import { runTick, tickAlerts, DISPATCH_LOOKBACK_MINUTES, type DispatchState } from "../src/jobs/tick";
+import { recorderCheckDue, recorderStaleAlert, runTick, tickAlerts, DISPATCH_LOOKBACK_MINUTES, RECORDER_STALE_MINUTES, type DispatchState } from "../src/jobs/tick";
 import { checkDispatchFailures, dispatchCheckAlert, DISPATCH_WINDOW_MINUTES } from "../src/jobs/dispatch";
 import { alert, alertMany } from "../src/ops/alerts";
 
@@ -101,6 +102,70 @@ describe("runTick", () => {
   });
 });
 
+describe("Limitless recorder staleness (the tick at :05, :15, ...)", () => {
+  beforeEach(() => { h.failInsert = null; vi.mocked(alertMany).mockClear(); });
+  const recorderRow = (minutesAgo: number, outcome = "success") => ({ loop_name: "limitless_recorder", outcome, started_at: ago(minutesAgo), error: null, meta: {} });
+
+  it("pure: due only half-way between the recorder's 10-minute dispatches", () => {
+    const at = (m: number) => Date.parse(`2026-10-20T12:${String(m).padStart(2, "0")}:07.000Z`);
+    expect([0, 4, 5, 6, 10, 15, 25, 35, 45, 55, 59].filter((m) => recorderCheckDue(at(m)))).toEqual([5, 15, 25, 35, 45, 55]);
+  });
+
+  it("pure: a run at most 30 min old is quiet; older, none, an unparsable time or an unreadable table alerts (dedup 360)", () => {
+    const now = Date.parse("2026-10-20T12:05:00.000Z");
+    const run = (min: number) => ({ kind: "row" as const, started_at: new Date(now - min * 60_000).toISOString(), outcome: "failure" });
+    expect(RECORDER_STALE_MINUTES).toBe(30);
+    expect(recorderStaleAlert(run(30), now)).toBeNull();
+    const old = recorderStaleAlert(run(31), now)!;
+    expect([old.key, old.dedupMinutes]).toEqual(["limitless_recorder_stale", 360]);
+    expect(old.text).toContain("31 min ago, outcome failure");
+    expect(recorderStaleAlert({ kind: "row", started_at: "garbage", outcome: "success" }, now)!.text).toContain("unparsable time");
+    expect(recorderStaleAlert({ kind: "absent" }, now)!.text).toContain("No Limitless recorder run is recorded");
+    expect(recorderStaleAlert({ kind: "unreadable", error: "permission denied" }, now)!.text).toContain("unobserved: permission denied");
+  });
+
+  it("off (the other nine ticks): no recorder read at all", async () => {
+    h.db = fakeDb({ loop_runs: [dispatchRow("success", 0.5)] });
+    const r = await runTick(env);
+    expect(r.recorder).toBeNull();
+    expect(h.db.calls).toEqual([{ table: "loop_runs", action: "select" }, { table: "loop_runs", action: "insert" }]);
+  });
+
+  it("on, with a recent run: one more read, recorded in the liveness row, no alert", async () => {
+    h.db = fakeDb({ loop_runs: [dispatchRow("success", 0.5), recorderRow(40), recorderRow(5)] });
+    const r = await runTick(env, { checkRecorder: true });
+    expect(r).toMatchObject({ alerts: [], recorder: { kind: "row", outcome: "success" } });
+    expect(h.db.calls).toEqual([{ table: "loop_runs", action: "select" }, { table: "loop_runs", action: "select" }, { table: "loop_runs", action: "insert" }]);
+    expect(h.db.tables.loop_runs!.find((x) => x.loop_name === "worker_liveness")!.meta.recorder).toMatchObject({ kind: "row" });
+    expect(alertMany).not.toHaveBeenCalled();
+  });
+
+  it("on, with no run for 30 minutes or none at all: limitless_recorder_stale, beside the dispatch alerts", async () => {
+    h.db = fakeDb({ loop_runs: [dispatchRow("skipped", 0.5, { error: "worker_base_url not configured" }), recorderRow(35, "failure")] });
+    expect((await runTick(env, { checkRecorder: true })).alerts).toEqual(["dispatch_skipped", "limitless_recorder_stale"]);
+    expect(keys(vi.mocked(alertMany).mock.calls[0]![1]!)).toEqual([["dispatch_skipped", 60], ["limitless_recorder_stale", 360]]);
+    h.db = fakeDb({ loop_runs: [dispatchRow("success", 0.5)] });
+    expect(await runTick(env, { checkRecorder: true })).toMatchObject({ recorder: { kind: "absent" }, alerts: ["limitless_recorder_stale"] });
+  });
+
+  it("on, with loop_runs unreadable: alerted as unobserved, or riding on tick_insert_failed when the insert failed too", async () => {
+    const unreadable = () => {
+      const from = h.db.client.from;
+      let reads = 0;
+      h.db.client.from = ((t: string) => (t === "loop_runs" && ++reads === 2
+        ? { select: () => ({ eq: () => ({ order: () => ({ limit: async () => ({ data: null, error: { message: "permission denied for table loop_runs" } }) }) }) }) }
+        : from(t))) as typeof from;
+    };
+    h.db = fakeDb({ loop_runs: [dispatchRow("success", 0.5)] });
+    unreadable();
+    expect(await runTick(env, { checkRecorder: true })).toMatchObject({ recorder: { kind: "unreadable", error: "permission denied for table loop_runs" }, alerts: ["limitless_recorder_stale"] });
+    h.db = fakeDb({ loop_runs: [dispatchRow("success", 0.5)] });
+    unreadable();
+    h.failInsert = "terminating connection due to administrator command";
+    expect((await runTick(env, { checkRecorder: true })).alerts).toEqual(["tick_insert_failed"]);
+  });
+});
+
 describe("dispatch_failures check", () => {
   beforeEach(() => vi.mocked(alert).mockClear());
   it("pure: zero is quiet, a count alerts, could-not-count is its own alert", () => {
@@ -108,6 +173,13 @@ describe("dispatch_failures check", () => {
     expect(dispatchCheckAlert(3, null)!.key).toBe("dispatch_http_failures");
     expect(dispatchCheckAlert(null, "rpc dispatch_failures: PGRST202")!.key).toBe("dispatch_check_failed");
     expect(dispatchCheckAlert(0, "late error")!.key).toBe("dispatch_check_failed");
+  });
+  it("pure: the count covers internal jobs too, and its breakdown names limitless_record apart from watch polls", () => {
+    const text = dispatchCheckAlert(3, null)!.text;
+    expect(text).toContain("watch polls, or internal jobs such as limitless_record");
+    expect(text).toContain("left join loop_runs d on d.loop_name = 'dispatch_internal'");
+    expect(text).toContain("d.meta->>'request_id' = r.id::text");
+    expect(text).not.toContain("dispatch(es) of watch polls");
   });
 
   const withRpc = (answer: { data: unknown; error: unknown }) => {

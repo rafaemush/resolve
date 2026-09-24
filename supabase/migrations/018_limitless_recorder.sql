@@ -17,7 +17,8 @@
 --
 -- Compatibility with the Worker deployed before this migration (8d67d16; it keeps running until the new one ships):
 --   * everything here is new (a table, a view, three functions, a trigger, a cron job, two app_config keys the Worker
---     writes later); no existing table, function signature or view column changes.
+--     writes later); no existing table, function signature or view column changes. dispatch_failures() (013) only gets
+--     a comment naming both dispatchers it counts.
 --   * the cron job POSTs /internal/limitless/record every 10 minutes; the old Worker has no such route and answers 404,
 --     which pg_net keeps in net._http_response (nothing reads it on the old Worker). The new Worker's 10-minute dispatch
 --     check counts the last 10 minutes, so at most one pre-deploy 404 can raise one dispatch_http_failures alert; deploy
@@ -269,7 +270,11 @@ comment on function public.dispatch_internal(text) is
 revoke all on function public.dispatch_internal(text) from public, anon, authenticated;
 grant execute on function public.dispatch_internal(text) to service_role;
 
--- 5. schedule: every 10 minutes, where pg_cron exists (a local cluster without it still applies this file) ---------
+-- 5. dispatch_failures() (migration 013) counts every pg_net answer, so from here on dispatch_internal's too ----------
+comment on function public.dispatch_failures(integer) is
+  'Count of pg_net answers created in the last p_minutes (1..1440) with status_code >= 400 or an error_msg (transport error, timeout): dispatches that did not produce a recorded run, watch polls (select_due_watches) and internal jobs (dispatch_internal, migration 018) alike; a dispatch_internal loop_runs row keeps its pg_net request id in meta.request_id, which tells the two apart. The Worker answers 200 for any run that recorded its outcome. pg_net keeps answers for a few hours (pg_net.ttl). Raises when pg_net is missing. Called by the Worker''s 10-minute job, which alerts above zero.';
+
+-- 6. schedule: every 10 minutes, where pg_cron exists (a local cluster without it still applies this file) ---------
 do $$
 begin
   if exists (select 1 from pg_extension where extname = 'pg_cron') then

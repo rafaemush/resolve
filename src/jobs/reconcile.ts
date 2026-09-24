@@ -398,10 +398,10 @@ async function discover(env: Env, client: Db, budget: Budget, nowMs: number, out
   }
   const deferrals: Deferral[] = [];
   const due = (markets ?? []) as unknown as MarketRow[];
-  const sightings = await recorderSightings(client, budget, due, out);
+  const sightings = await recorderSightings(env, client, budget, due, out);
   for (const m of due) {
     // Could not read the recorder: settling now could stamp a later official_at than the first sighting, so the
-    // Limitless market waits for the next run (a failed read is in out.errors, so the run records a failure).
+    // Limitless market waits for the next run (a failed read is alerted and in out.errors, so the run records a failure).
     if (m.platform === "limitless" && sightings === null) { deferrals.push(deferral(m, "retry", nowMs)); continue; }
     // one alert per market (a label it cannot map, or a write that failed) is reserved with its check
     if (!budget.take(COST.http + COST.alert)) { out.stopped_by_budget = true; break; }
@@ -425,13 +425,23 @@ async function discover(env: Env, client: Db, budget: Budget, nowMs: number, out
 /**
  * The recorder's first sightings (slug -> resolved_seen_at) for the due Limitless markets, in one read. An empty map when
  * none is due (no read); null when the read failed or the budget could not cover it: could not look, never "none seen".
+ * A failed read holds every due Limitless market, run after run, so it is alerted from an alert reserved with the read
+ * (1 + 5 subrequests; the alert is given back when the read succeeds): a grant change or a renamed column would
+ * otherwise stop every Limitless settlement with no one told.
  */
-async function recorderSightings(client: Db, budget: Budget, due: MarketRow[], out: ReconcileSummary): Promise<Map<string, string> | null> {
-  const slugs = [...new Set(due.filter((m) => m.platform === "limitless").map(limitlessSlug))];
+async function recorderSightings(env: Env, client: Db, budget: Budget, due: MarketRow[], out: ReconcileSummary): Promise<Map<string, string> | null> {
+  const limitless = due.filter((m) => m.platform === "limitless");
+  const slugs = [...new Set(limitless.map(limitlessSlug))];
   if (!slugs.length) return new Map();
-  if (!budget.take(COST.db)) { out.stopped_by_budget = true; return null; }
+  if (!budget.take(COST.db + COST.alert)) { out.stopped_by_budget = true; return null; }
   const { data, error } = await client.from("limitless_markets").select("slug, resolved_seen_at").in("slug", slugs);
-  if (error) { out.errors.push(`recorder sightings: ${redact(error.message)}`); return null; }
+  if (error) {
+    const msg = redact(error.message);
+    out.errors.push(`recorder sightings: ${msg}`);
+    await alert(env, "reconcile_recorder_read", `reconcile could not read limitless_markets (the recorder's first sightings): ${msg}. ${limitless.length} due Limitless market(s) are held, not settled, until it can; every run retries.`, { dedupMinutes: 360 });
+    return null;
+  }
+  budget.release(COST.alert);
   const seen = new Map<string, string>();
   for (const r of (data ?? []) as Array<{ slug: string; resolved_seen_at: string | null }>) if (r.resolved_seen_at) seen.set(r.slug, r.resolved_seen_at);
   return seen;

@@ -2,7 +2,7 @@
  * Reconcile x the Limitless recorder (migration 018, src/jobs/limitless-recorder.ts): a Limitless market's official_at is
  * the earliest sighting of its outcome, the recorder's included, read in one batched select per run; a platform
  * timestamp is never replaced; a recorder read that fails holds the Limitless market instead of settling it with a
- * possibly later time.
+ * possibly later time, and is alerted (every run would hold it again).
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
@@ -16,6 +16,7 @@ vi.mock("../src/db/supabase", () => ({ db: () => h.client ?? h.db.client }));
 vi.mock("../src/ops/alerts", () => ({ alert: vi.fn(async () => ({ sent: true, deduped: false })) }));
 
 import { runReconcile, withFirstSeen, withRecorderSeen, type OfficialState } from "../src/jobs/reconcile";
+import { alert } from "../src/ops/alerts";
 import { buildPreimage, committedFields, type CommittedVerdict } from "../src/bot/commit";
 import { sha256Hex } from "../src/resolve/text";
 import type { Verdict } from "../src/resolve/schema";
@@ -70,6 +71,7 @@ describe("runReconcile with recorder sightings", () => {
   beforeEach(() => {
     fetches = [];
     h.client = null;
+    vi.mocked(alert).mockClear();
     vi.stubGlobal("fetch", async (url: string) => {
       fetches.push(String(url));
       if (String(url).startsWith("https://api.limitless.exchange/markets/")) return new Response(JSON.stringify({ ...FIX.single_clob, status: "RESOLVED", expired: true, winningOutcomeIndex: 0 }), { status: 200 });
@@ -90,6 +92,7 @@ describe("runReconcile with recorder sightings", () => {
     expect(h.db.calls.filter((c) => c.table === "limitless_markets")).toEqual([{ table: "limitless_markets", action: "select" }]);
     expect(h.db.tables.reconciliations![0]).toMatchObject({ official_at: seen, official_at_source: "limitless_api_poll", lead_seconds: Math.round((Date.parse(seen) - Date.parse("2026-09-20T00:00:00.000Z")) / 1000) });
     expect(fetches).toEqual(["https://api.limitless.exchange/markets/the-leg"]);
+    expect(vi.mocked(alert)).not.toHaveBeenCalled();
   });
 
   it("no recorder sighting yet: reconcile's own observation stands", async () => {
@@ -99,7 +102,7 @@ describe("runReconcile with recorder sightings", () => {
     expect(Date.parse(h.db.tables.reconciliations![0]!.official_at)).toBeGreaterThanOrEqual(before - 1000);
   });
 
-  it("a recorder read that fails holds the Limitless market (no GET, no settle, due again at once) and fails the run", async () => {
+  it("a recorder read that fails holds the Limitless market (no GET, no settle, due again at once), alerts and fails the run", async () => {
     h.db = await newDb([]);
     const base = h.db.client;
     h.client = { ...base, from: (t: string) => (t === "limitless_markets" ? { select: () => ({ in: async () => ({ data: null, error: { message: "relation limitless_markets does not exist" } }) }) } : base.from(t)) };
@@ -110,5 +113,8 @@ describe("runReconcile with recorder sightings", () => {
     expect(h.db.tables.reconciliations).toHaveLength(0);
     expect(h.db.tables.markets![0]).toMatchObject({ status: "open", reconcile_attempts: 0 });
     expect(h.db.tables.loop_runs![0]!.outcome).toBe("failure");
+    const calls = vi.mocked(alert).mock.calls.map((c) => [c[1], c[3]?.dedupMinutes]);
+    expect(calls).toEqual([["reconcile_recorder_read", 360]]);
+    expect(vi.mocked(alert).mock.calls[0]![2]).toContain("1 due Limitless market(s) are held");
   });
 });

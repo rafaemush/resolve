@@ -18,7 +18,7 @@ const h = vi.hoisted(() => {
   });
   return { state, job };
 });
-vi.mock("../src/jobs/tick", () => ({ LIVENESS_CRON: "* * * * *", runTick: h.job("liveness", { inserted: true, alerts: [] }) }));
+vi.mock("../src/jobs/tick", () => ({ LIVENESS_CRON: "* * * * *", runTick: h.job("liveness", { inserted: true, alerts: [] }), recorderCheckDue: vi.fn(() => true) }));
 vi.mock("../src/jobs/dispatch", () => ({ checkDispatchFailures: h.job("dispatch_check", { ok: true }) }));
 vi.mock("../src/jobs/reconcile", () => ({ runReconcile: h.job("reconcile", { errors: [], unreachable: 0 }) }));
 vi.mock("../src/jobs/deposits", async (actual) => ({ ...(await actual<typeof import("../src/jobs/deposits")>()), scanDeposits: h.job("deposit_scan", { scanned: true }) }));
@@ -28,6 +28,7 @@ vi.mock("../src/env", () => ({ parseConfig: () => ({}) }));
 vi.mock("../src/ops/alerts", () => ({ alert: vi.fn(async () => ({ sent: true, deduped: false })), alertMany: vi.fn(async () => ({ sent: [], deduped: [] })) }));
 
 import { CRONS, DEPOSIT_SCAN_SUBREQUESTS, jobsForCron, jobExceptionKey, runScheduled, type JobName } from "../src/jobs/schedule";
+import { recorderCheckDue, runTick } from "../src/jobs/tick";
 import { alert } from "../src/ops/alerts";
 import { drainWebhooks, drainSubrequests, DRAIN_MAX } from "../src/webhooks/deliver";
 import { scanDeposits, SCAN_RESERVE } from "../src/jobs/deposits";
@@ -118,6 +119,14 @@ describe("runScheduled", () => {
     h.state.throwIn = "deposit_scan";
     await runScheduled(env, "*/5 * * * *");
     expect(alerts()).toEqual([["job_reconcile_exception", 60], ["job_deposit_scan_exception", 60]]);
+  });
+
+  it("the liveness tick reads the recorder when recorderCheckDue says so for the current time", async () => {
+    const before = Date.now();
+    await runScheduled(env, "* * * * *");
+    expect(h.state.ran).toEqual(["liveness"]);
+    expect(vi.mocked(recorderCheckDue).mock.calls.at(-1)![0]).toBeGreaterThanOrEqual(before);
+    expect(vi.mocked(runTick).mock.calls.at(-1)![1]).toEqual({ checkRecorder: true });
   });
 
   it("a cron nobody routes is alerted, not ignored", async () => {

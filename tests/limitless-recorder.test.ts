@@ -2,7 +2,8 @@
  * Limitless resolution-latency recorder (plan §17.3 P0 row, src/jobs/limitless-recorder.ts): payload parsing on the
  * structure-only fixture (single, group container + legs, AMM, the automationType re-check), the page cursor, the
  * failure streak, and full runs against the in-memory database with a stand-in for record_limitless_observations and a
- * stubbed Limitless API: the checks follow the database's order, the budget holds in the worst case, failures alert.
+ * stubbed Limitless API: the checks follow the database's order, the budget holds in the worst case, failures alert,
+ * no request starts after the run deadline, and the loop_runs row lands before the alert.
  * The SQL merge itself (first sightings kept once, the due order, the guard trigger) is asserted on real Postgres by
  * scripts/selftest/recorder.ts.
  */
@@ -20,7 +21,8 @@ vi.mock("../src/ops/alerts", () => ({
 
 import {
   checkObservation, failureStreak, feedObservations, groupLegs, isVoid, nextPage, observe, parseCursor, runLimitlessRecorder,
-  FAILURES_KEY, MAX_CHECKS_PER_RUN, MAX_GROUP_FETCHES, MAX_PAGE, PAGE_KEY, RECORDER_SUBREQUESTS, type Observation,
+  DISPATCH_TIMEOUT_MS, FAILURES_KEY, FETCH_TIMEOUT_MS, MAX_CHECKS_PER_RUN, MAX_GROUP_FETCHES, MAX_PAGE, PAGE_KEY, RECORDER_SUBREQUESTS,
+  RUN_DEADLINE_MS, type Observation,
 } from "../src/jobs/limitless-recorder";
 import { alertMany } from "../src/ops/alerts";
 import { COST } from "../src/ops/budget";
@@ -86,6 +88,15 @@ describe("payload parsing (structure-only fixture)", () => {
     const f = feedObservations([{ ...FIX.amm, slug: undefined }, { ...FIX.group, markets: [FIX.group.markets[0], badLeg] }, FIX.amm], AT);
     expect(f).toMatchObject({ schema_dropped: 1, legs: 1, legs_dropped: 1, drift: "feed row: slug" });
     expect(f.observations.map((o) => o.slug)).toEqual([FIX.group.slug, FIX.group.markets[0].slug, FIX.amm.slug]);
+  });
+
+  it("expirationTimestamp in another unit (seconds, nanoseconds) is schema drift, never a 1970 date or a thrown RangeError", () => {
+    const ns = { ...FIX.amm, automationType: "manual", slug: "ns", expirationTimestamp: FIX.amm.expirationTimestamp * 1e6 };
+    const s = { ...FIX.amm, automationType: "manual", slug: "s", expirationTimestamp: Math.floor(FIX.amm.expirationTimestamp / 1000) };
+    const f = feedObservations([ns, s, manual(FIX.amm)], AT);
+    expect(f).toMatchObject({ schema_dropped: 2, manual: 1, drift: "feed row: expirationTimestamp" });
+    expect(f.observations.map((o) => o.slug)).toEqual([FIX.amm.slug]);
+    expect(checkObservation("ns", { ...ns, expired: true }, AT)).toMatchObject({ observed: false, meta: { last_error: "schema drift at expirationTimestamp" } });
   });
 
   it("a group row without inline legs is listed for GET /markets/<group slug>; that answer gives the legs", () => {
@@ -312,6 +323,57 @@ describe("runLimitlessRecorder", () => {
     expect(cfg()[PAGE_KEY]).toBe("2");
     expect(h.db.tables.loop_runs![0]).toMatchObject({ outcome: "failure" });
     expect(h.db.tables.loop_runs![0]!.meta).not.toHaveProperty("recorded");
+  });
+
+  it("a nanosecond expirationTimestamp in the feed is recorded as drift: the run records itself, advances and alerts", async () => {
+    newDb({ [PAGE_KEY]: "2" });
+    feed = { data: [...rowsOf(24), { ...FIX.amm, automationType: "manual", slug: "ns", expirationTimestamp: FIX.amm.expirationTimestamp * 1e6 }], totalMarketsCount: 296 };
+    const r = await runLimitlessRecorder(env);
+    expect(r).toMatchObject({ schema_dropped: 1, manual_rows: 24, next_page: 3, recorded: true });
+    expect(cfg()[PAGE_KEY]).toBe("3");
+    expect(h.db.tables.loop_runs![0]).toMatchObject({ outcome: "failure" });
+    expect(alertKeys()).toEqual([["limitless_recorder_schema", 1440]]);
+  });
+
+  it("starts no request after RUN_DEADLINE_MS, so the last one ends inside pg_net's 30 s with room for the writes", async () => {
+    expect(RUN_DEADLINE_MS + FETCH_TIMEOUT_MS).toBeLessThanOrEqual(DISPATCH_TIMEOUT_MS - 10_000);
+    newDb();
+    due = Array.from({ length: 10 }, (_, i) => `exp-${i}`);
+    let clock = Date.parse(AT);
+    const startedAt: number[] = [];
+    const pending = market;
+    market = (slug) => { startedAt.push(clock - Date.parse(AT)); clock += 5_000; return pending(slug); }; // each check takes 5 s
+    const now = vi.spyOn(Date, "now").mockImplementation(() => clock);
+    try {
+      const r = await runLimitlessRecorder(env);
+      expect(r).toMatchObject({ due: 10, stopped_by_deadline: true, recorded: true });
+      expect(r.checked).toBe(startedAt.length);
+      expect(r.checked).toBeLessThan(10);
+      expect(Math.max(...startedAt)).toBeLessThanOrEqual(RUN_DEADLINE_MS);
+      expect(records[1]!.rows).toHaveLength(r.checked); // what was checked is still written
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it("writes its loop_runs row before the alert, and hands the alert to waitUntil when the route gives one", async () => {
+    newDb({ [FAILURES_KEY]: "2" });
+    feed = new Response("bad gateway", { status: 502 });
+    let rowsWhenAlerted = -1;
+    let deliver = () => {};
+    vi.mocked(alertMany).mockImplementationOnce(async (_env, items) => {
+      rowsWhenAlerted = h.db.tables.loop_runs!.length;
+      await new Promise<void>((resolve) => { deliver = resolve; }); // a DM still in flight when the run answers
+      return { sent: items.map((i) => i.key), deduped: [] };
+    });
+    const later: Array<Promise<unknown>> = [];
+    const r = await runLimitlessRecorder(env, { waitUntil: (p) => { later.push(p); } });
+    expect(r).toMatchObject({ recorded: true, alerts: ["limitless_recorder_failing"] });
+    expect(rowsWhenAlerted).toBe(1);
+    expect(h.db.tables.loop_runs![0]!.meta).toMatchObject({ alerts: ["limitless_recorder_failing"], subrequests: r.subrequests });
+    expect(later).toHaveLength(1);
+    deliver();
+    await Promise.all(later);
   });
 
   it("a loop_runs row that cannot be written makes the run unrecorded (the route answers 500)", async () => {

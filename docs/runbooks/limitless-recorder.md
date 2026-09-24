@@ -44,7 +44,9 @@ Each run is its own Worker invocation and stays within 45 subrequests. Everythin
 | `record_limitless_observations(legs + checks)` | 1 |
 | Write `app_config`, the `loop_runs` row (`loop_name = 'limitless_recorder'`), one alert | 2 + 5 |
 
-The feed's `automationType=manual` filter lets other rows through (47 of 296 were `sports` on 2026-09-24). Every row is checked again, and non-manual rows are skipped and counted. `X-API-Key` is sent only when `LIMITLESS_API_KEY` is set. The user agent is `ResolveBot/1.0`. A market is no longer checked 21 days after its expiry with no outcome, the same age at which reconcile closes a market out.
+A run must answer inside `pg_net`'s 30 s timeout. After that `pg_net` hangs up and Cloudflare cancels the invocation, so the run would lose its cursor, its failure count and its `loop_runs` row. So no request starts after 12 s (each has an 8 s timeout, so the last one ends by 20 s). The `loop_runs` row is written before the alert, and the alert (a Telegram DM that can retry for longer than the whole run) goes out under `waitUntil` after the answer.
+
+The feed's `automationType=manual` filter lets other rows through (47 of 296 were `sports` on 2026-09-24). Every row is checked again, and non-manual rows are skipped and counted. An `expirationTimestamp` that is not in milliseconds (for example seconds or nanoseconds) fails the schema: the row is counted as drift and alerted, never stored with a wrong date. `X-API-Key` is sent only when `LIMITLESS_API_KEY` is set. The user agent is `ResolveBot/1.0`. A market is no longer checked 21 days after its expiry with no outcome, the same age at which reconcile closes a market out.
 
 The page cursor goes through the whole feed in about 12 runs, roughly two hours at 296 rows. A market created and expired inside one rotation can be missed. Group legs are observed on every pass of the feed. Single markets drop out of the active feed when they lock, which is why the check phase exists.
 
@@ -58,7 +60,7 @@ The platform resolved the market inside **(`last_pending_at`, `resolved_seen_at`
 - A single market that leaves the feed before `expiration_at` (early resolution) is checked only after `expiration_at` passes. Its window then runs from its last feed sighting, so it is wide but still true.
 - `resolved_seen_at` is the database clock at the write, never earlier than the observation. `last_pending_at` is never later than the platform's read. Both bounds stay on the safe side.
 
-Reconcile takes the earliest of three sightings for a Limitless market: its own, the stored first one, and the recorder's. It reads them in one batched select per run. If that read fails, the Limitless market is held for the next run instead of being settled with a later time.
+Reconcile takes the earliest of three sightings for a Limitless market: its own, the stored first one, and the recorder's. It reads them in one batched select per run. If that read fails, the Limitless market is held for the next run instead of being settled with a later time, and `reconcile_recorder_read` is alerted.
 
 ## Reading the cadence
 
@@ -83,14 +85,13 @@ The same data in SQL: `select * from v_limitless_cadence order by week_start, ca
 |---|---|---|
 | `limitless_recorder_failing` (dedup 6 h) | 3 failed runs in a row, or a failed run whose count could not be read | `select started_at, outcome, error, meta from loop_runs where loop_name = 'limitless_recorder' order by started_at desc limit 10;` |
 | `limitless_recorder_schema` (dedup 24 h) | Limitless answered rows or legs the schema refuses | the `error` of the latest run names the first failing field; update the schema in `src/jobs/limitless-recorder.ts` |
-| `dispatch_http_failures` (dedup 1 h) | the 10-minute dispatch check counts answers ≥ 400 from `pg_net`, this route's included (403 = secret mismatch, 500 = the run could not write its `loop_runs` row) | `select status_code, error_msg, created from net._http_response order by created desc limit 20;` |
+| `limitless_recorder_stale` (dedup 6 h) | the every-minute tick at :05, :15, … finds the newest `limitless_recorder` run older than 30 min, finds none, or cannot read `loop_runs`: the recorder is not running at all (the cron job removed or inactive, `dispatch_internal` skipping or failing, every POST refused) | `select jobname, schedule, active from cron.job where jobname = 'limitless_recorder';` then `select started_at, outcome, error from loop_runs where loop_name = 'dispatch_internal' order by started_at desc limit 5;`. A `skipped` row means `worker_base_url` or the vault secret is missing (`select_due_watches` then skips too, and the tick alerts `dispatch_skipped`); a `failure` row carries the error text; `success` rows mean the POSTs went out, so see `dispatch_http_failures` |
+| `dispatch_http_failures` (dedup 1 h) | the 10-minute dispatch check counts answers ≥ 400 or transport errors from `pg_net`, for watch polls and this route alike (403 = secret mismatch, 500 = the run could not write its `loop_runs` row, a timeout = the run took over 30 s) | the alert carries a breakdown by job: `dispatch_internal` keeps its `pg_net` request id in `loop_runs.meta.request_id`, so the join names `limitless_record` and the rest are watch polls |
+| `reconcile_recorder_read` (dedup 6 h) | reconcile could not read `limitless_markets`, so it holds every due Limitless market and retries each run | the error text (a grant, a renamed column, a stale PostgREST schema cache: `notify pgrst, 'reload schema';`) |
 
 A run where one market's check fails is not a failed run. The error stays on that market's row and the market moves to the back of the queue. A run fails when the feed or a write fails, when every check fails, or when the schema drifts.
 
-Some failures are **not alerted today**:
-
-- **The cron job stops dispatching.** Check `select jobname, schedule, active from cron.job where jobname = 'limitless_recorder';` and `select started_at, outcome, error from loop_runs where loop_name = 'dispatch_internal' order by started_at desc limit 5;`.
-- **`dispatch_internal` stops at the database.** A `skipped` row means `worker_base_url` or the vault secret is missing (`select_due_watches` then skips too, and the every-minute tick alerts on that). A `failure` row carries the error text.
+Right after the recorder's first deploy, run one pass by hand (below): otherwise the tick at the next :05 can find no run yet and raise `limitless_recorder_stale` once.
 
 To run one pass by hand, without printing the key:
 

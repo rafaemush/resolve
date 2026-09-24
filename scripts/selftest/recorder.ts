@@ -10,7 +10,8 @@
  * a later observation never moves them, last_pending_at frozen at the first sighting, a failed check only moves the
  * queue, the last duplicate wins), the due order (never checked first, then least recently checked; containers,
  * outcomes and give-ups excluded), the observed_at guard, the set-once trigger and CHECK, least privilege, comments,
- * the cadence view, and dispatch_internal's signature, skip and failure rows, and the cron job where pg_cron exists.
+ * the cadence view (its week boundary to the second), and dispatch_internal's signature, skip and failure rows, and the
+ * cron job where pg_cron exists.
  */
 import { spawnSync } from "node:child_process";
 import { loadEnv } from "../lib/env";
@@ -37,6 +38,12 @@ begin
     (p || 'old', 'selftest-rec', 'single', now() - interval '1 day', now() - interval '2 hours', 1, now() - interval '3 hours');
   insert into limitless_markets (slug, category, market_type, expiration_at, resolved_seen_at, meta) values
     (p || 'void', 'selftest-rec', 'single', now() - interval '1 day', now() - interval '2 hours', '{"void": true}');
+  -- the cadence week boundary (no expiry, so never due): created at this week's Monday 00:00 UTC counts as created in
+  -- the week of first sight; one second earlier, or three days earlier, is the previous week's backfill
+  insert into limitless_markets (slug, category, market_type, platform_created_at) values
+    (p || 'wk-start', 'selftest-rec', 'single', date_trunc('week', now() at time zone 'utc') at time zone 'utc'),
+    (p || 'wk-prev-1s', 'selftest-rec', 'single', date_trunc('week', now() at time zone 'utc') at time zone 'utc' - interval '1 second'),
+    (p || 'wk-prev-3d', 'selftest-rec', 'single', date_trunc('week', now() at time zone 'utc') at time zone 'utc' - interval '3 days');
 
   -- 1. a feed page: singles, a group with legs (one resolved), a group without legs, an old sighting seen again
   r1 := record_limitless_observations(jsonb_build_array(
@@ -227,7 +234,7 @@ const EXPECT: Record<string, unknown> = {
   move_sighting: "refused", change_index: "refused", index_after_void: "refused", index_without_sighting: "refused",
   set_from_null: "allowed", meta_on_resolved: "allowed",
   final_due: [`${P}c2`, `${P}g1-a`], due_limit: 1,
-  cadence: { first_seen: 10, created_in_week: 1, expiring_45d: 3, legs: 3 },
+  cadence: { first_seen: 13, created_in_week: 2, expiring_45d: 3, legs: 3 }, // created_in_week: s-exp and wk-start, never wk-prev-*
   service_role_select: true, service_role_view: true, service_role_insert: "denied", service_role_update: "denied", service_role_rpc: "allowed",
   anon_table: "denied", anon_view: "denied", anon_rpc: "denied", anon_dispatch: "denied",
   authenticated_denied: true, service_role_dispatch: true, public_execute: 0, definer_search_path: true, forced_rls: true, view_security_invoker: true, uncommented: 0,

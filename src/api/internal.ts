@@ -57,11 +57,12 @@ export const LIMITLESS_RECORD_ID = "limitless_record";
  * pg_net -> one Limitless recorder run (dispatch_internal, every 10 min; src/jobs/limitless-recorder.ts). Like a watch
  * poll, a run that recorded its loop_runs row answers 200 whatever its outcome (failures are alerted by the recorder's
  * own streak); only a run that could not record itself answers 500, which dispatch_failures() (migration 013) counts.
+ * The run's alert goes out under waitUntil, after the answer: pg_net hangs up at 30 s.
  */
 internal.post("/limitless/record", async (c) => {
   const denied = await dispatchDenied(c, LIMITLESS_RECORD_ID);
   if (denied) return denied;
-  const r = await runLimitlessRecorder(c.env);
+  const r = await runLimitlessRecorder(c.env, { waitUntil: waitUntilOf(c) });
   return ok(c, r, r.recorded ? 200 : 500);
 });
 

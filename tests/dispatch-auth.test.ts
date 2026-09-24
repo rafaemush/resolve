@@ -11,7 +11,7 @@ import type { Env } from "../src/env";
 vi.mock("../src/ingest/watch", () => ({ runWatch: vi.fn(async () => ({ recorded: true, outcome: "no_op" })) }));
 vi.mock("../src/jobs/limitless-recorder", () => ({ runLimitlessRecorder: vi.fn(async () => ({ recorded: true, errors: [] })) }));
 
-import { verifyDispatchSignature, SIGNATURE_TOLERANCE_MS } from "../src/api/dispatch-auth";
+import { verifyDispatchSignature } from "../src/api/dispatch-auth";
 import { internal, LIMITLESS_RECORD_ID } from "../src/api/internal";
 import { runWatch } from "../src/ingest/watch";
 import { runLimitlessRecorder } from "../src/jobs/limitless-recorder";
@@ -33,11 +33,13 @@ describe("verifyDispatchSignature", () => {
     expect(await verifyDispatchSignature(SECRET, "limitless_record", sign("limitless_record", minute, "other-secret"), minute, now)).toEqual({ ok: false, reason: "invalid" });
     expect(await verifyDispatchSignature(SECRET, "limitless_record", sign("limitless_record", minute), "2026-10-20T12:01", now)).toEqual({ ok: false, reason: "invalid" });
   });
-  it("only within ±3 minutes of the dispatch minute", async () => {
+  it("only within ±3 minutes of the dispatch minute (the literal spec, not the constant, so widening it goes red)", async () => {
     const t = Date.parse(minute + ":00Z");
-    expect(await verifyDispatchSignature(SECRET, "x", sign("x", minute), minute, t + SIGNATURE_TOLERANCE_MS)).toEqual({ ok: true });
-    expect(await verifyDispatchSignature(SECRET, "x", sign("x", minute), minute, t + SIGNATURE_TOLERANCE_MS + 1)).toEqual({ ok: false, reason: "stale" });
-    expect(await verifyDispatchSignature(SECRET, "x", sign("x", minute), minute, t - SIGNATURE_TOLERANCE_MS - 1)).toEqual({ ok: false, reason: "stale" });
+    const threeMin = 180_000;
+    expect(await verifyDispatchSignature(SECRET, "x", sign("x", minute), minute, t + threeMin)).toEqual({ ok: true });
+    expect(await verifyDispatchSignature(SECRET, "x", sign("x", minute), minute, t - threeMin)).toEqual({ ok: true });
+    expect(await verifyDispatchSignature(SECRET, "x", sign("x", minute), minute, t + threeMin + 1)).toEqual({ ok: false, reason: "stale" });
+    expect(await verifyDispatchSignature(SECRET, "x", sign("x", minute), minute, t - threeMin - 1)).toEqual({ ok: false, reason: "stale" });
     expect(await verifyDispatchSignature(SECRET, "x", sign("x", "garbage"), "garbage", now)).toEqual({ ok: false, reason: "stale" });
   });
   it("missing headers, or no secret configured, never pass", async () => {
@@ -86,6 +88,17 @@ describe("signed internal routes", () => {
       });
     });
   }
+
+  it("the recorder run gets the invocation's waitUntil, so its alert goes out after the answer", async () => {
+    const waitUntil = vi.fn();
+    const ctx = { waitUntil, passThroughOnException: () => {}, props: {} };
+    const res = await internal.request("/limitless/record", { method: "POST", headers: signed(LIMITLESS_RECORD_ID) }, env, ctx as never);
+    expect(res.status).toBe(200);
+    const opts = vi.mocked(runLimitlessRecorder).mock.calls[0]![1];
+    const p = Promise.resolve();
+    opts!.waitUntil!(p);
+    expect(waitUntil).toHaveBeenCalledWith(p);
+  });
 
   it("a recorder run that could not write its loop_runs row answers 500, so dispatch_failures() counts it", async () => {
     vi.mocked(runLimitlessRecorder).mockResolvedValueOnce({ recorded: false, errors: [] } as never);

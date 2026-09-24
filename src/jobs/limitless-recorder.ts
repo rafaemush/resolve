@@ -17,6 +17,9 @@
  *   end     2  app_config upsert and the loop_runs row, plus one alertMany() (5), all reserved before any work
  * Worst case 1 + 1 + 4 + 1 + 25 + 1 + 2 + 5 = 40 of 45. CPU (Workers Free: 10 ms): a feed page is ~350 KB of JSON,
  * 0.6 ms to JSON.parse on the founder's machine (2026-09-24 capture); the schemas keep only the fields below.
+ * Wall time: pg_net hangs up after 30 s and Cloudflare then cancels the invocation, so no request starts after
+ * RUN_DEADLINE_MS, the loop_runs row (which decides the answer) is written before the alert, and the alert (a Telegram
+ * DM that can take longer than the whole run) goes out under waitUntil when the route gives one.
  * The marketResolved websocket (exact resolutionDate) needs a Durable Object on Workers Paid:
  * docs/runbooks/limitless-recorder.md.
  */
@@ -26,6 +29,7 @@ import { db, type Db } from "../db/supabase";
 import { alertMany, type AlertItem } from "../ops/alerts";
 import { Budget, COST } from "../ops/budget";
 import { redact } from "../ops/redact";
+import type { WaitUntil } from "../webhooks/deliver";
 import { CLOSE_OUT_DAYS } from "./reconcile";
 
 /** 5 below Workers Free's 50 per invocation: a miscount here can never cost the run its loop_runs row. */
@@ -39,19 +43,35 @@ export const MAX_GROUP_FETCHES = 4;
 export const MAX_CHECKS_PER_RUN = 25;
 /** Stop checking a market this long after its expiry with no outcome: reconcile closes it out at the same age. */
 export const GIVE_UP_DAYS = CLOSE_OUT_DAYS;
+/** loop_name of every run's row; the liveness tick alerts when the newest is stale (src/jobs/tick.ts). */
+export const RECORDER_LOOP = "limitless_recorder";
 export const PAGE_KEY = "limitless_recorder_page";
 export const FAILURES_KEY = "limitless_recorder_failures";
 export const FAILING_ALERT_RUNS = 3;
 export const FAILING_DEDUP_MINUTES = 360;
 export const SCHEMA_DEDUP_MINUTES = 1440;
-/** pg_net waits 30 s for the answer; no new request starts after this. */
-export const RUN_DEADLINE_MS = 20_000;
-const FETCH_TIMEOUT_MS = 8000;
+/**
+ * pg_net's timeout for this dispatch (dispatch_internal, migration 018). Past it pg_net hangs up and Cloudflare cancels
+ * an HTTP-triggered invocation whose client is gone: the run would end without its cursor, streak or loop_runs row.
+ */
+export const DISPATCH_TIMEOUT_MS = 30_000;
+/**
+ * No request starts after this, so the last one ends by RUN_DEADLINE_MS + FETCH_TIMEOUT_MS = 20 s and leaves 10 s of
+ * DISPATCH_TIMEOUT_MS for the three writes after it (the checks, app_config, loop_runs).
+ */
+export const RUN_DEADLINE_MS = 12_000;
+export const FETCH_TIMEOUT_MS = 8000;
 const UA = "ResolveBot/1.0";
 /** The loop_runs row, the app_config write and one alertMany(), reserved before any work. */
 const END_RESERVE = 2 * COST.db + COST.alert;
 
 const Slug = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,199}$/);
+/**
+ * Milliseconds since the epoch, 2001-09-09 to year 5138. A value in seconds or nanoseconds (a unit drift) is schema
+ * drift, counted and alerted: never a 1970 expiry, and never a RangeError from toISOString() that stops every run on
+ * the same page (Date ends at 8.64e15 ms).
+ */
+const EpochMs = z.number().int().min(1e12).max(1e14);
 /** The fields the recorder keeps from a Limitless market object (feed row, group leg or GET /markets/<slug>). */
 const MarketObject = z.object({
   id: z.union([z.number(), z.string()]).nullish(),
@@ -63,7 +83,7 @@ const MarketObject = z.object({
   groupId: z.union([z.number(), z.string()]).nullish(),
   status: z.string().nullish(),
   expired: z.boolean().nullish(),
-  expirationTimestamp: z.number().nullish(),
+  expirationTimestamp: EpochMs.nullish(),
   createdAt: z.string().nullish(),
   winningOutcomeIndex: z.number().int().nonnegative().nullish(),
   payoutNumerators: z.array(z.union([z.number(), z.string()])).nullish(),
@@ -220,7 +240,9 @@ export interface RecorderSummary {
   schema_dropped: number; legs_dropped: number; containers_without_legs: number; groups_fetched: number;
   observations: number; inserted: number; updated: number; newly_expired: number; newly_resolved: number;
   due: number; checked: number; check_errors: number;
-  consecutive_failures: number | null; alerts: string[];
+  consecutive_failures: number | null;
+  /** Keys raised this run, raised after the loop_runs row; delivery and dedup are in the alerts table. */
+  alerts: string[];
   stopped_by_budget: boolean; stopped_by_deadline: boolean; subrequests: number;
   /** false when the run's loop_runs row could not be written: the route answers 500 so dispatch_failures() counts it. */
   recorded: boolean;
@@ -260,7 +282,7 @@ async function record(client: Db, rows: Observation[], dueLimit: number): Promis
   }
 }
 
-export async function runLimitlessRecorder(env: Env): Promise<RecorderSummary> {
+export async function runLimitlessRecorder(env: Env, opts: { waitUntil?: WaitUntil } = {}): Promise<RecorderSummary> {
   const started = Date.now();
   const client = db(env);
   const budget = new Budget(RECORDER_SUBREQUESTS);
@@ -359,7 +381,7 @@ export async function runLimitlessRecorder(env: Env): Promise<RecorderSummary> {
     else tally(r);
   }
 
-  // end: cursor, failure streak, alerts, loop_runs (reserved up front) ---------------------------------------------
+  // end: cursor, failure streak, loop_runs, then alerts (reserved up front) ---------------------------------------
   const failed = out.errors.length > 0;
   const streak = failureStreak(previousFailures, failed);
   out.consecutive_failures = streak.failures;
@@ -379,21 +401,27 @@ export async function runLimitlessRecorder(env: Env): Promise<RecorderSummary> {
     key: "limitless_recorder_schema", dedupMinutes: SCHEMA_DEDUP_MINUTES,
     text: `Limitless answered ${out.schema_dropped} feed row(s) and ${out.legs_dropped} group leg(s) the recorder's schema refuses (page ${out.page}${feed?.drift ? `, first: ${feed.drift}` : ""}). Those markets are not recorded until src/jobs/limitless-recorder.ts reads the new shape.`,
   });
-  if (alerts.length) out.alerts = (await alertMany(env, alerts)).sent;
-  else budget.release(COST.alert);
+  out.alerts = alerts.map((a) => a.key);
+  if (!alerts.length) budget.release(COST.alert);
 
   out.subrequests = budget.used;
   const rows = out.inserted + out.updated;
   const { errors, recorded: _unknownYet, ...meta } = out;
   try {
     const { error } = await client.from("loop_runs").insert({
-      loop_name: "limitless_recorder", outcome: errors.length ? "failure" : rows > 0 ? "success" : "no_op", rows_written: rows,
+      loop_name: RECORDER_LOOP, outcome: errors.length ? "failure" : rows > 0 ? "success" : "no_op", rows_written: rows,
       duration_ms: Date.now() - started, error: errors.length ? errors.join(" | ").slice(0, 2000) : null, meta,
     });
     out.recorded = !error;
     if (error) console.error(JSON.stringify({ level: "error", job: "limitless_recorder", error: redact(error.message) }));
   } catch (e) {
     console.error(JSON.stringify({ level: "error", job: "limitless_recorder", error: redact(String(e)) }));
+  }
+  // After the row: alertMany never throws, and a slow DM (3 attempts of up to 8 s) must not cost the run its answer.
+  if (alerts.length) {
+    const sending = alertMany(env, alerts);
+    if (opts.waitUntil) opts.waitUntil(sending);
+    else await sending;
   }
   return out;
 }
