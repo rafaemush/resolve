@@ -4,6 +4,8 @@ import type { Env } from "../env";
 import { ok, err } from "./envelope";
 import { db } from "../db/supabase";
 import { CommittedVerdict, type Agreement, type OfficialRecord } from "../bot/commit";
+import { botPageHtml } from "./bot";
+import { botUa } from "../ops/ua";
 
 type Vars = { requestId: string; schemaVersion: string };
 export const pub = new Hono<{ Bindings: Env; Variables: Vars }>();
@@ -89,6 +91,12 @@ pub.get("/v1/track-record/verify", async (c) => {
   const { data: reveal, error: re } = await client.from("bot_posts").select("channel, message_id, telegram_date, payload").eq("kind", "reveal").eq("dedup_key", `reveal:${commit.id}`).maybeSingle();
   if (re) return err(c, "UPSTREAM_UNAVAILABLE", "track record store unavailable", 503);
   return ok(c, shapeVerify(commit as unknown as VerifyCommit, (reveal as VerifyReveal | null) ?? null));
+});
+
+/** What ResolveBot fetches and how to opt out: the page its user agent links to (public HTML, no auth, no database). */
+pub.get("/bot", (c) => {
+  c.header("Cache-Control", "public, max-age=3600");
+  return c.html(botPageHtml(botUa(c.env)));
 });
 
 /** Echo receivers for webhook self-tests (public, no state). */

@@ -34,7 +34,8 @@ import { buildPreimage, committedFields, DISCLAIMER, type CommittedVerdict, type
 import { sha256Hex } from "../src/resolve/text";
 
 const M = "22222222-2222-4222-8222-222222222222";
-const MARKET = { id: M, platform: "polymarket" as const, external_id: "551234", status: "open" as const, deadline_utc: "2026-10-20T00:00:00.000Z" };
+const CID = `0x${"ab".repeat(32)}`;
+const MARKET = { id: M, platform: "polymarket" as const, external_id: "551234", status: "open" as const, deadline_utc: "2026-10-20T00:00:00.000Z", option_a: "Yes", option_b: "No", condition_id: CID, meta: { slug: "cpi-above-3", event_id: "60182" } };
 const NONCE = "0123456789abcdef01234567";
 
 function committed(over: Partial<Verdict> = {}): CommittedVerdict {
@@ -132,6 +133,7 @@ describe("shadow response and event payloads never carry the nonce or the preima
       commitment_sha256: "e".repeat(64), committed_at: "2026-10-02T00:00:00.000Z",
       verdict: { resolution_status: "RESOLVED", winning_outcome: "OPTION_A", confidence_score: 0.95, caveats: ["claimed_at_display_only"], determination_basis: "structured", thresholds_version: "v1" },
       evidence: { raw_sha256: "d".repeat(64), canonical_sha256: "c".repeat(64) },
+      venue: { platform: "polymarket", condition_id: CID, slug: "cpi-above-3", event_id: "60182", proposed_outcome_label: "Yes" },
       label: EARLY_REVEAL_LABEL, disclaimer: DISCLAIMER,
     });
     expect(JSON.stringify(p)).not.toContain(NONCE);
@@ -146,10 +148,12 @@ describe("shadow response and event payloads never carry the nonce or the preima
       { commitment_sha256: "0".repeat(64), committed_at: "2026-10-02T00:00:00.000Z", agreement: "agree", final: true, committed: null }, // unprovable: never revealed
     ]);
     expect(p).toMatchObject({ market: "polymarket:551234", official, agreement: "agree", disclaimer: DISCLAIMER });
+    // the final commit is unprovable: nothing of it is revealed, so the venue object proposes nothing
+    expect(p.venue).toEqual({ platform: "polymarket", condition_id: CID, slug: "cpi-above-3", event_id: "60182", proposed_outcome_label: null });
     const [a, b] = p.commits as Row[];
-    expect(a).toMatchObject({ agreement: "abstained", final: false, revealed: true, preimage: early.preimage, verdict: { resolution_status: "UNRESOLVED" } });
+    expect(a).toMatchObject({ agreement: "abstained", final: false, revealed: true, preimage: early.preimage, verdict: { resolution_status: "UNRESOLVED" }, evidence: { raw_sha256: "d".repeat(64), canonical_sha256: "c".repeat(64) } });
     expect(await sha256Hex(String(a!.preimage))).toBe(a!.commitment_sha256);
-    expect(b).toMatchObject({ agreement: "agree", final: true, revealed: false, preimage: null, verdict: null });
+    expect(b).toMatchObject({ agreement: "agree", final: true, revealed: false, preimage: null, verdict: null, evidence: null });
     expect(JSON.stringify(p)).not.toContain(late.preimage);
   });
 });

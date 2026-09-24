@@ -35,6 +35,11 @@ import { redact } from "../ops/redact";
 import { Budget, COST, DISPATCH_CHECK_SUBREQUESTS, EXCEPTION_RESERVE, INVOCATION_SUBREQUESTS } from "../ops/budget";
 import { queueForFollowers, shadowRevealedPayload, QUEUE_SUBREQUESTS, type RevealedCommit } from "../shadow/events";
 import { deliverInline } from "../webhooks/deliver";
+import { botUa } from "../ops/ua";
+import { limitlessLabels, limitlessOutcomeAt, limitlessSlug, mapOfficialLabel } from "../markets/outcomes";
+
+// The label mapping moved to src/markets/outcomes.ts (shared with the venue-shaped payloads); re-exported for callers.
+export { limitlessSlug, mapOfficialLabel, normalizeLabel } from "../markets/outcomes";
 
 /**
  * Of Workers Free's 50 subrequests per invocation: the 10-minute invocation runs the pg_net dispatch check first and
@@ -55,7 +60,6 @@ export const RECHECK_PENDING_S = 600;
 export const RECHECK_MAX_S = 6 * 3600;
 /** gamma closed with no umaResolutionStatus at all for this long is no longer "pending": someone has to look. */
 export const UMA_SILENT_DAYS = 7;
-const UA = "ResolveBot/1.0";
 const FETCH_TIMEOUT_MS = 8000;
 
 export type OfficialState =
@@ -65,22 +69,6 @@ export type OfficialState =
   | { kind: "unreachable"; detail: string };
 
 type Options = Pick<MarketRow, "option_a" | "option_b">;
-
-/** NFKC, lower case, every run of non letters/digits collapsed to one space. "Yes." and "YES" are both "yes". */
-export function normalizeLabel(s: string): string {
-  return s.normalize("NFKC").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
-}
-
-/**
- * Strict label mapping: the official label must equal one registered option after normalization. A "Yes" label maps
- * only to an option whose text is "Yes"; a market registered as "Merged by Oct 1" / "Not merged" never matches it.
- * Identical options, an empty label or no match -> null (the caller abstains and alerts).
- */
-export function mapOfficialLabel(label: string, m: Options): "OPTION_A" | "OPTION_B" | null {
-  const l = normalizeLabel(label), a = normalizeLabel(m.option_a), b = normalizeLabel(m.option_b);
-  if (!l || a === b) return null;
-  return l === a ? "OPTION_A" : l === b ? "OPTION_B" : null;
-}
 
 /** gamma serializes outcomes / outcomePrices either as arrays or as JSON strings of arrays. */
 function stringArray(v: unknown): string[] {
@@ -151,19 +139,6 @@ const LimitlessMarket = z.object({
 });
 
 /**
- * Outcome labels by index from the market's own data: outcomeTokens when present (["Yes","No"]); otherwise tokens
- * {yes, no} (single CLOB markets and group legs), whose index order is YES = 0, NO = 1: Limitless documents winningIndex
- * "0 = YES, 1 = NO" (developers/websocket/market-lifecycle.md) and prices[] follows it (the 2026-09-23 sample: the
- * Senate legs price Democratic [0.625, 0.375] and Republican [0.375, 0.625]). AMM markets expose only positionIds,
- * no labels: null, so they abstain and alert rather than guess.
- */
-function limitlessLabels(j: z.infer<typeof LimitlessMarket>): string[] | null {
-  if (j.outcomeTokens && j.outcomeTokens.length >= 2) return j.outcomeTokens;
-  if (j.tokens && "yes" in j.tokens && "no" in j.tokens) return ["Yes", "No"];
-  return null;
-}
-
-/**
  * Pure: GET /markets/{slug} JSON -> official state. Resolved when winningOutcomeIndex is a number; equal positive
  * payoutNumerators with no index = VOID (CTF 50-50). The REST object has no resolution timestamp and updatedAt is not
  * one (plan §17.1), so official_at is the observation time, labeled limitless_api_poll (withFirstSeen swaps in an
@@ -190,20 +165,14 @@ export function limitlessOfficial(json: unknown, m: Options, slug: string, obser
   if (!labels) return { kind: "unmappable", label: null, source_url: sourceUrl, detail: `no outcome labels in the market object (tradeType AMM?); index ${idx}` };
   const label = labels[idx];
   if (label === undefined) return { kind: "unmappable", label: null, source_url: sourceUrl, detail: `winningOutcomeIndex ${idx} outside ${labels.length} outcomes` };
-  const outcome = mapOfficialLabel(label, m);
+  // the same mapping the venue payload proposes an index with (src/markets/outcomes.ts)
+  const outcome = limitlessOutcomeAt(idx, labels, m);
   if (!outcome) return { kind: "unmappable", label, source_url: sourceUrl, detail: `official label "${label}" matches neither option` };
   return { kind: "resolved", official: official(outcome, label), detail: `resolved ${label}` };
 }
 
-/** The Limitless slug: an importer-supplied meta slug, else external_id. */
-export function limitlessSlug(m: Pick<MarketRow, "external_id" | "meta">): string {
-  const meta = m.meta ?? {};
-  for (const k of ["limitless_slug", "slug"]) { const v = meta[k]; if (typeof v === "string" && v.trim()) return v.trim(); }
-  return m.external_id;
-}
-
 async function officialFor(env: Env, m: MarketRow, observedAt: string): Promise<OfficialState> {
-  const get = (url: string, headers: Record<string, string> = {}) => fetch(url, { headers: { Accept: "application/json", "User-Agent": UA, ...headers }, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+  const get = (url: string, headers: Record<string, string> = {}) => fetch(url, { headers: { Accept: "application/json", "User-Agent": botUa(env), ...headers }, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
   try {
     switch (m.platform) {
       case "polymarket": {

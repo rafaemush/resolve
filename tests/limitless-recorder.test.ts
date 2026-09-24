@@ -26,6 +26,7 @@ import {
 } from "../src/jobs/limitless-recorder";
 import { alertMany } from "../src/ops/alerts";
 import { COST } from "../src/ops/budget";
+import { RESOLVE_BOT_UA } from "../src/ops/ua";
 
 const FIX = LIMITLESS as Record<string, any>;
 const AT = "2026-10-20T12:00:00.000Z";
@@ -221,10 +222,15 @@ describe("runLimitlessRecorder", () => {
     expect(cfg()[PAGE_KEY]).toBe("1");
   });
 
-  it("sends ResolveBot/1.0, and X-API-Key only when LIMITLESS_API_KEY is non-empty", async () => {
+  it("sends ResolveBot's one UA (wrangler RESOLVE_BOT_UA, else the shared constant), and X-API-Key only when LIMITLESS_API_KEY is non-empty", async () => {
     newDb();
     await runLimitlessRecorder(env);
-    expect(fetches[0]!.headers).toEqual({ Accept: "application/json", "User-Agent": "ResolveBot/1.0" });
+    expect(fetches[0]!.headers).toEqual({ Accept: "application/json", "User-Agent": RESOLVE_BOT_UA });
+    expect(RESOLVE_BOT_UA).toBe("ResolveBot/1.0 (+https://resolve.rafaemush.workers.dev/bot)");
+    fetches = [];
+    newDb();
+    await runLimitlessRecorder({ LIMITLESS_API_KEY: "", RESOLVE_BOT_UA: "ResolveBot/1.0 (+configured)" } as unknown as Env);
+    expect(fetches[0]!.headers["User-Agent"]).toBe("ResolveBot/1.0 (+configured)");
     fetches = [];
     newDb();
     await runLimitlessRecorder({ LIMITLESS_API_KEY: "lmts_test_key_0000" } as unknown as Env);

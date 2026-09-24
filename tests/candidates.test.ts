@@ -238,7 +238,7 @@ describe("Limitless: feed to entries", () => {
     const l = legs[0]!;
     expect(l.category).toBe("official_release");
     expect(l.checkability).toBe(4);
-    expect(l.registration.meta).toEqual({ slug: "25-bps-decrease-1", category: "official_release", condition_id: COND(51), group_id: "10013448" });
+    expect(l.registration.meta).toEqual({ slug: "25-bps-decrease-1", category: "official_release", condition_id: COND(51), group_id: "10013448", group_slug: "fed-decision-in-october-1" });
     expect(l.registration.market).toMatchObject({ platform: "limitless", option_a: "Yes", option_b: "No", event_statement: "Fed Decision in October? — 25 bps decrease", deadline_utc: "2026-10-28T23:59:00.000Z", negative_rule: "explicit_negative" });
     expect(MarketRegistration.safeParse(l.registration.market).success).toBe(true);
     for (const e of b.entries) expect(e.needs_review.slice(0, 2)).toEqual(["anchors", "event_statement"]);

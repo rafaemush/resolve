@@ -23,7 +23,7 @@ Every shadow verdict is recorded first and then posted to the public Telegram ch
 
 ## Early reveals and pricing
 
-A tenant can follow a public shadow market (`POST /v1/markets/{id}/follow`) and receive each committed verdict privately the moment its commitment is recorded: `GET /v1/shadow/{market_id}` and the `shadow.committed` webhook, then `shadow.revealed` when the platform resolves. Early reveals are labeled as excluded from the public record and never carry the nonce or the preimage before the public reveal. Plans and credit prices: [docs/pricing.md](docs/pricing.md).
+A tenant can follow a public shadow market (`POST /v1/markets/{id}/follow`) and receive each committed verdict privately the moment its commitment is recorded: `GET /v1/shadow/{market_id}` and the `shadow.committed` webhook, then `shadow.revealed` when the platform resolves. Early reveals are labeled as excluded from the public record and never carry the nonce or the preimage before the public reveal. Both events carry a `venue` object in the platform's own identifiers (a Limitless slug, condition id and proposed `winningOutcomeIndex`; a Polymarket condition id, slug, event id and proposed outcome label), and `GET /v1/shadow/export` returns every followed market as CSV or JSON. Plans and credit prices: [docs/pricing.md](docs/pricing.md); the venue offers: [docs/pilot-pack.md](docs/pilot-pack.md). What the fetcher requests and how a site opts out: `GET /bot`.
 
 ## Deploying
 

@@ -2,7 +2,10 @@
  * shadow.committed and shadow.revealed: the follower webhooks of the private early reveal (plan §17.3 P7-lite).
  * shadow.committed goes out right after a commit row exists (the verdict, its commitment hash and the evidence hashes,
  * never the preimage or the nonce); shadow.revealed goes out when the reconcile settles the market (official outcome,
- * agreement, and the preimage of every commit that is revealed publicly). Payload builders are pure.
+ * agreement, and the preimage of every commit that is revealed publicly). Both carry a `venue` object in the platform's
+ * own identifiers (src/shadow/venue.ts: Limitless slug, conditionId and a proposed winningOutcomeIndex; Polymarket
+ * conditionId, slug, event id and the proposed outcome label), proposed only for a RESOLVED commit. Payload builders
+ * are pure.
  */
 import type { Env } from "../env";
 import { db } from "../db/supabase";
@@ -13,8 +16,11 @@ import { COST } from "../ops/budget";
 import { redact } from "../ops/redact";
 import { deliverInline, enqueueEvent, type WaitUntil } from "../webhooks/deliver";
 import { EARLY_REVEAL_LABEL, followerTenants, shadowVerdict } from "./follows";
+import { venuePayload, type VenueMarket } from "./venue";
 
 type MarketRef = Pick<MarketRow, "id" | "platform" | "external_id">;
+/** What a payload names: the market, and the options and platform identifiers its venue object is built from. */
+export type PayloadMarket = MarketRef & VenueMarket;
 type Row = Record<string, unknown>;
 
 /**
@@ -30,13 +36,17 @@ type Row = Record<string, unknown>;
  */
 export const QUEUE_SUBREQUESTS = 3 * COST.db + COST.alert;
 
-/** Pure: the shadow.committed payload. The committed verdict is the one the commitment binds (after the public floor). */
-export function shadowCommittedPayload(m: MarketRef, c: { commitment_sha256: string; committed_at: string; committed: CommittedFields }): Record<string, unknown> {
+/**
+ * Pure: the shadow.committed payload. The committed verdict is the one the commitment binds (after the public floor);
+ * the venue object proposes that verdict in the platform's identifiers (null proposal unless it is RESOLVED).
+ */
+export function shadowCommittedPayload(m: PayloadMarket, c: { commitment_sha256: string; committed_at: string; committed: CommittedFields }): Record<string, unknown> {
   return {
     market_id: m.id, platform: m.platform, external_id: m.external_id, market: marketRef(m),
     commitment_sha256: c.commitment_sha256, committed_at: c.committed_at,
     verdict: shadowVerdict(c.committed),
     evidence: { raw_sha256: c.committed.raw_sha256, canonical_sha256: c.committed.canonical_sha256 },
+    venue: venuePayload(m, c.committed),
     label: EARLY_REVEAL_LABEL,
     disclaimer: DISCLAIMER,
   };
@@ -46,18 +56,22 @@ export function shadowCommittedPayload(m: MarketRef, c: { commitment_sha256: str
 export interface RevealedCommit { commitment_sha256: string; committed_at: string; agreement: Agreement; final: boolean; committed: CommittedVerdict | null }
 
 /**
- * Pure: the shadow.revealed payload. agreement is the market's one public agreement (the final commit's). A commit
- * whose preimage does not hash to its commitment is never revealed (reconcile alerts it), so it carries no preimage.
+ * Pure: the shadow.revealed payload. agreement is the market's one public agreement (the final commit's), and the venue
+ * object proposes the final commit's verdict. A commit whose preimage does not hash to its commitment is never revealed
+ * (reconcile alerts it), so it carries no preimage, no verdict, no evidence hashes and no proposal.
  */
-export function shadowRevealedPayload(m: MarketRef, official: OfficialRecord, commits: RevealedCommit[]): Record<string, unknown> {
+export function shadowRevealedPayload(m: PayloadMarket, official: OfficialRecord, commits: RevealedCommit[]): Record<string, unknown> {
+  const final = commits.find((c) => c.final) ?? null;
   return {
     market_id: m.id, platform: m.platform, external_id: m.external_id, market: marketRef(m),
     official: { outcome: official.outcome, label: official.label, at: official.at, at_source: official.at_source, source_url: official.source_url },
-    agreement: commits.find((c) => c.final)?.agreement ?? null,
+    agreement: final?.agreement ?? null,
+    venue: venuePayload(m, final?.committed ?? null),
     commits: commits.map((c) => ({
       commitment_sha256: c.commitment_sha256, committed_at: c.committed_at, agreement: c.agreement, final: c.final,
       revealed: c.committed !== null,
       verdict: c.committed ? shadowVerdict(c.committed) : null,
+      evidence: c.committed ? { raw_sha256: c.committed.raw_sha256, canonical_sha256: c.committed.canonical_sha256 } : null,
       preimage: c.committed?.preimage ?? null,
     })),
     how_to_verify: "sha256(preimage) = commitment_sha256; the preimage's last field is the nonce.",

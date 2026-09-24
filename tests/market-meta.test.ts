@@ -31,7 +31,7 @@ describe("mergeMeta", () => {
     const r = mergeMeta({ condition_id: CID, slug: "s", group_id: 10014423, event_id: "60182", neg_risk: true, registration_reasons: ["forged"], volume: 12 });
     expect(r).toEqual({ ok: true, meta: { condition_id: CID.toLowerCase(), slug: "s", group_id: "10014423", event_id: "60182", neg_risk: true }, dropped: ["registration_reasons", "volume"] });
     expect(mergeMeta(undefined)).toEqual({ ok: true, meta: {}, dropped: [] });
-    expect(META_KEYS).toEqual(["condition_id", "slug", "question_id", "neg_risk", "limitless_slug", "group_id", "event_id", "category"]);
+    expect(META_KEYS).toEqual(["condition_id", "slug", "question_id", "neg_risk", "limitless_slug", "group_id", "group_slug", "event_id", "category"]);
   });
 
   it("refuses a whitelisted key of the wrong type and a non-object", () => {

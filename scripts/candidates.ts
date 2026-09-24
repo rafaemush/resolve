@@ -21,8 +21,9 @@ import { CandidateFile, HOW_TO_APPROVE, type CandidateEntry, type CandidatePlatf
 import { buildPolymarket } from "./lib/candidates-polymarket";
 import { buildLimitless, createdSince } from "./lib/candidates-limitless";
 import { checkCandidateFile, SHADOW_VOLUME_CAP_USD } from "./lib/seed-shadow";
+import { RESOLVE_BOT_UA } from "../src/ops/ua";
 
-const UA = "ResolveBot/1.0";
+const UA = RESOLVE_BOT_UA;
 const GAMMA = "https://gamma-api.polymarket.com/markets/keyset";
 const LIMITLESS = "https://api.limitless.exchange/markets/active";
 const MAX_PAGES = 400;

@@ -53,7 +53,7 @@ app.post("/internal/tick", async (c) => {
 });
 
 app.get("/openapi.json", (c) => c.json(openapi));
-app.route("/", pub);            // public: /v1/track-record, /v1/track-record/verify, /echo (registered before the authenticated /v1 router)
+app.route("/", pub);            // public: /v1/track-record, /v1/track-record/verify, /bot, /echo (registered before the authenticated /v1 router)
 app.route("/internal", internal);
 v1.route("/webhooks", webhooks);
 app.route("/v1", v1);

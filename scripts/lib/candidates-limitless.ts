@@ -122,7 +122,8 @@ const zeroCats = (): Record<LimitlessCategory, number> => ({ official_release: 0
 const usd = (l: LimitlessLeg) => { const v = Number(l.volumeFormatted ?? 0); return Number.isFinite(v) ? Math.round(v * 100) / 100 : 0; };
 /**
  * Reconcile reads the labels from the registered market's own object (GET /markets/{slug}): outcomeTokens, or tokens
- * {yes, no} (src/jobs/reconcile.ts limitlessLabels). A group's outcomeTokens are not on its legs, so they do not count.
+ * {yes, no} (src/markets/outcomes.ts limitlessLabels, shared with the venue payload). A group's outcomeTokens are not on
+ * its legs, so they do not count.
  */
 const labelled = (leg: LimitlessLeg) => (leg.outcomeTokens?.length ?? 0) >= 2 || (!!leg.tokens && "yes" in leg.tokens && "no" in leg.tokens);
 
@@ -177,7 +178,7 @@ export function buildLimitless(raw: unknown[], w: LimitlessWindow): LimitlessBui
       if (!leg.conditionId) needs.push("meta.condition_id");
       const meta: Record<string, unknown> = { slug: leg.slug, category };
       if (leg.conditionId) meta.condition_id = leg.conditionId;
-      if (group) meta.group_id = row.id;
+      if (group) { meta.group_id = row.id; meta.group_slug = row.slug; }
       entries.push({
         approved: false,
         needs_review: needs,

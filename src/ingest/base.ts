@@ -3,6 +3,7 @@ import type { WatchRow, FetchOutcome } from "./types";
 import type { Resolver } from "../resolve/schema";
 import { earlierMatches, nextEarlierMatches } from "./matches";
 import { BudgetExhausted, COST, type Budget } from "../ops/budget";
+import { RESOLVE_BOT_UA } from "../ops/ua";
 
 interface RpcOk<T> { result: T }
 interface RpcErr { error: { code: number; message: string } }
@@ -13,7 +14,7 @@ export function baseCallUrl(env: Env): string { return env.ALCHEMY_BASE_HTTP_URL
 export const baseRpcUrl = baseCallUrl;
 
 export async function rpc<T>(url: string, method: string, params: unknown[]): Promise<T> {
-  const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json", "User-Agent": "ResolveBot/1.0" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }), signal: AbortSignal.timeout(8000) });
+  const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json", "User-Agent": RESOLVE_BOT_UA }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }), signal: AbortSignal.timeout(8000) });
   if (!res.ok) throw new Error(`rpc ${method} HTTP ${res.status}`);
   const j = (await res.json()) as RpcOk<T> | RpcErr;
   if ("error" in j) throw new Error(`rpc ${method}: ${j.error.code} ${j.error.message}`);

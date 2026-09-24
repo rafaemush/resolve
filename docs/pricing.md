@@ -41,13 +41,13 @@ Web-evidence verdicts are not generally available yet. Until they are, paid plan
 
 Register the wallet you pay from: `GET /v1/account/wallet/challenge?address=<your address>` returns a message; sign it with that wallet (`personal_sign`) and send the signature with `POST /v1/account/wallet` within 10 minutes. Then send USDC on Base from that wallet to the address `GET /v1/payments/address` returns. The deposit is credited once Base marks its block safe (typically 5 to 10 minutes), at the rate of the tier its amount reaches: 100 credits per USDC, 110 from $250, 120 from $1,000 (amount x rate, rounded down), so each pack above arrives as one ledger entry. A deposit from an unregistered wallet is held until it is matched to your account. A `payment.credited` webhook reports each credit, and `credits.low` warns once when a charge leaves your balance below 500 credits (again after your next purchase).
 
-**Pilot pack ($1,000, 30 days, for a venue).** Private early reveals for every market you name, webhooks in your platform's payload shape, a weekly reconciliation report for your markets (commit time, official time, lead time, agreement, share of web-evidence verdicts), and a named contact. Paid in USDC against an invoice, with a W-8BEN and a one-page pilot letter. Resolve is operated by its founder as an individual until its operating entity exists; the invoice, the W-8BEN and the letter are issued on that basis.
+**Pilot pack ($1,000, 30 days, for a venue).** Private early reveals for every market you name, webhooks in your platform's payload shape, a weekly reconciliation report for your markets (commit time, official time, lead time, agreement, share of web-evidence verdicts), and a named contact. Paid in USDC against an invoice, with a W-8BEN and a one-page pilot letter (details: [pilot-pack.md](pilot-pack.md)). Resolve is operated by its founder as an individual until its operating entity exists; the invoice, the W-8BEN and the letter are issued on that basis.
 
 **Design Partner ($750 / month).** Prepaid monthly in USDC, month to month: custom sources for one platform, early reveals for all of that platform's markets, the weekly reconciliation report. No SLA and no master agreement; it converts to Platform once the operating entity exists.
 
 **Builder ($99 / month).** 12,000 credits, 50 watches, webhooks, and private early reveals on up to 50 followed markets; the Builder offer covers Polymarket long-tail markets.
 
-**Growth ($399 / month).** 60,000 credits, 500 watches, 300 requests per minute per key, up to 500 follows. Bulk export is planned and not available yet.
+**Growth ($399 / month).** 60,000 credits, 500 watches, 300 requests per minute per key, up to 500 follows. Bulk export of the whole record is planned and not available yet; every plan can export its own followed markets with `GET /v1/shadow/export` (CSV or JSON).
 
 **Platform ($1,500 to $3,000 / month).** Invoiced under a master services agreement: typically $2,000 a month for a resolution desk and $3,000 a month with a creator-market settlement path. Lead time is measured and reported; there is no lead-time guarantee before 100 reconciled markets. Available once Resolve's operating entity exists and counsel has signed off.
 
@@ -57,6 +57,8 @@ Follow a public shadow market with `POST /v1/markets/{id}/follow` (open, non-tes
 
 - `GET /v1/shadow/{market_id}` returns every committed verdict for the market, newest first: the verdict, its `commitment_sha256`, when it was committed and posted, and the evidence hashes.
 - A webhook endpoint subscribed to `shadow.committed` receives each new committed verdict as soon as its commitment is recorded; `shadow.revealed` delivers the official outcome, the agreement and the preimage of each commitment once the platform resolves.
+- Both events carry a `venue` object in the platform's own identifiers: on Limitless `slug`, `group_slug`, `condition_id` and `proposed_winning_outcome_index` (0 = YES, 1 = NO); on Polymarket `condition_id`, `slug`, `event_id` and `proposed_outcome_label`. The proposal is `null` unless the committed verdict is RESOLVED.
+- `GET /v1/shadow/export?platform=&since=&format=csv` (or `json`) returns one row per followed market: the latest commitment, its verdict and evidence hashes, and once the platform resolves the market, the official outcome, its time and source, the agreement and the lead time.
 - An endpoint receives only the events it was registered with, and its events cannot be changed later. An endpoint registered before the `shadow.*` events existed is not subscribed to them. The follow response reports `endpoints_subscribed`, the number of your active endpoints that will receive `shadow.committed`, and adds a `warning` when that number is 0. In that case, register an endpoint whose `events` include `shadow.committed` and `shadow.revealed` (`POST /v1/webhooks`).
 
 Early reveals are labeled "private early reveal — excluded from the public record". They never include the nonce or the preimage before the public reveal, so every commitment stays checkable by anyone: `sha256(preimage) = commitment_sha256` at `GET /v1/track-record/verify?hash=`.
@@ -67,6 +69,6 @@ Early reveals are labeled "private early reveal — excluded from the public rec
 - No lead-time claim before lead time has been measured on at least 30 distinct events.
 - Resolve is an informational signal: not financial advice and not an oracle of record.
 
-## Status (2026-09-24)
+## Status (2026-09-25)
 
-In the API: verdicts, watches, webhooks with the first delivery attempt at the event, follows, `GET /v1/shadow`, and the `shadow.committed` / `shadow.revealed` events. Prepared per customer, not self-serve yet: venue-shaped payloads, the weekly reconciliation report, monthly plan debits, pack bonuses and bulk export.
+In the API: verdicts, watches, webhooks with the first delivery attempt at the event, follows, `GET /v1/shadow`, the `shadow.committed` / `shadow.revealed` events with a `venue` object in the platform's own identifiers (Limitless slug, condition id and proposed `winningOutcomeIndex`; Polymarket condition id, slug, event id and proposed outcome label), and the export of your followed markets (`GET /v1/shadow/export`). Prepared per customer, not self-serve yet: the weekly reconciliation report, monthly plan debits, pack bonuses and bulk export of the whole record.

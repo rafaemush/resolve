@@ -26,6 +26,9 @@
     "candidates": "tsx scripts/candidates.ts",
     "seed:shadow": "tsx scripts/seed-shadow.ts",
     "test-key": "tsx scripts/issue-test-key.ts",
+    "touch": "tsx scripts/log-touch.ts",
+    "leads": "tsx scripts/leads.ts",
+    "venue:report": "tsx scripts/venue-report.ts",
     "wallet:gen": "tsx scripts/gen-wallet.ts"
   },
   "engines": {

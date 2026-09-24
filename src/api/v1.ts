@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { z } from "zod";
 import type { Env } from "../env";
 import { parseConfig } from "../env";
-import { ok, err, waitUntilOf } from "./envelope";
+import { ok, err, requestId, waitUntilOf } from "./envelope";
 import { authenticate, rateLimit, extractApiKey, invalidateKeyCache, type AuthContext } from "./auth";
 import { db, rpc, type Db } from "../db/supabase";
 import { MarketRegistration, EvidenceInput, type Verdict } from "../resolve/schema";
@@ -18,8 +18,10 @@ import type { MarketRow } from "../ingest/types";
 import { alert } from "../ops/alerts";
 import { redact } from "../ops/redact";
 import { mintKey, rotationExpiry } from "./keys";
-import { followBlock, followCap, followEntitlements, followMarket, followRefusal, Plan, shapeShadow, type FollowAnswer, type FollowTarget, type ShadowCommitRow, type ShadowMarket } from "../shadow/follows";
+import { followBlock, followCap, followEntitlements, followMarket, followRefusal, Plan, shapeShadow, EARLY_REVEAL_LABEL, type FollowAnswer, type FollowTarget, type ShadowCommitRow, type ShadowMarket } from "../shadow/follows";
 import { subscribes } from "../webhooks/deliver";
+import { chunks, entitledFollows, exportCsv, exportRows, EXPORT_COLUMNS, EXPORT_ROW_CAP, EXPORT_VIEW_COLUMNS, ExportQuery, type ExportFollow, type ExportViewRow } from "../shadow/export";
+import { DISCLAIMER } from "../bot/commit";
 import { noteCharge } from "../billing/events";
 import { effectiveTiers, packQuotes, paygRate } from "../billing/tiers";
 import { challengeMessage, newNonce, registerAnswer, signedBy, REGISTER_RESULTS, SIGNATURE, WALLET_ADDRESS, type RegisterResult } from "../billing/wallet";
@@ -359,6 +361,45 @@ v1.get("/follows", async (c) => {
   return ok(c, {
     follows, active_follows: active, follows_counted: counted.count, follow_limit: limit, truncated: active > follows.length,
     ...(over ? { warning: `${counted.count} follows of open markets exceed this plan's limit of ${limit}: only the ${limit} oldest receive early reveals. Unfollow markets or change plans.` } : {}),
+  });
+});
+
+/**
+ * Bulk export of the tenant's followed markets (plan §17.3 P7-lite): one row per entitled follow, from v_venue_report
+ * (migration 021). Registered before /shadow/:market_id so "export" is never read as a market id. Subrequests:
+ * EXPORT_SUBREQUESTS (src/shadow/export.ts). CSV (RFC 4180, header row) or the JSON envelope.
+ */
+v1.get("/shadow/export", async (c) => {
+  const q = ExportQuery.safeParse({ platform: c.req.query("platform") || undefined, since: c.req.query("since") || undefined, format: c.req.query("format") || undefined });
+  if (!q.success) return err(c, "validation_error", q.error.issues.map((i) => `${i.path.join(".") || "query"}: ${i.message}`).join("; ").slice(0, 400), 400);
+  const auth = c.get("auth");
+  const client = db(c.env);
+  const [plan, { data, error }] = await Promise.all([
+    tenantPlan(client, auth.tenantId),
+    client.from("market_follows").select("id, market_id, created_at, markets(platform, status, deleted_at)")
+      .eq("tenant_id", auth.tenantId).is("deleted_at", null).order("created_at", { ascending: true }).limit(EXPORT_ROW_CAP),
+  ]);
+  if (error || "error" in plan) return storeDown(c, "follow store");
+  const follows = (data ?? []) as unknown as ExportFollow[];
+  // The oldest EXPORT_ROW_CAP follows are read, so their entitlement is exact; a newer one is not exported, and says so.
+  const truncated = follows.length >= EXPORT_ROW_CAP;
+  // An authenticated caller holds a live key: the evaluation rule is met for the calling tenant.
+  const ids = entitledFollows(follows, plan.plan, true).filter((f) => !q.data.platform || f.markets?.platform === q.data.platform).map((f) => f.market_id);
+  const reads = await Promise.all(chunks(ids).map((part) => client.from("v_venue_report").select(EXPORT_VIEW_COLUMNS.join(", ")).in("market_id", part)));
+  if (reads.some((r) => r.error)) return storeDown(c, "report store");
+  const rows = exportRows(reads.flatMap((r) => (r.data ?? []) as unknown as ExportViewRow[]), q.data);
+  if (q.data.format === "csv") {
+    c.header("X-Request-Id", requestId(c));
+    c.header("Content-Type", "text/csv; charset=utf-8");
+    c.header("Content-Disposition", 'attachment; filename="resolve-shadow-export.csv"');
+    c.header("X-Resolve-Truncated", truncated ? "true" : "false");
+    return c.body(exportCsv(rows), 200);
+  }
+  return ok(c, {
+    rows, count: rows.length, columns: EXPORT_COLUMNS, truncated, filters: { platform: q.data.platform ?? null, since: q.data.since ?? null },
+    label: EARLY_REVEAL_LABEL,
+    note: `One row per followed market you are entitled to (the oldest ${EXPORT_ROW_CAP} follows are read${truncated ? "; newer follows are not in this export" : ""}): the latest commitment, its verdict and evidence hashes, and once the platform resolves the market, the official outcome, its time and source, the agreement and lead_seconds. Never the nonce or the preimage: those appear only in the public reveal, and sha256(preimage) = commitment_sha256 at GET /v1/track-record/verify?hash=.`,
+    disclaimer: DISCLAIMER,
   });
 });
 

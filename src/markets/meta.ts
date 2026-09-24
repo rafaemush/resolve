@@ -21,6 +21,8 @@ export const MarketMeta = z.object({
   /** Read first by reconcile's limitlessSlug(): the leg slug when external_id is something else. */
   limitless_slug: text(300),
   group_id: platformId,
+  /** The Limitless group (container) slug of a leg: the venue-shaped payload's group_slug (src/shadow/venue.ts). */
+  group_slug: text(300),
   event_id: platformId,
   category: text(100),
 }).partial();

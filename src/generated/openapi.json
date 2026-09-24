@@ -1294,6 +1294,90 @@
         }
       }
     },
+    "/v1/shadow/export": {
+      "get": {
+        "summary": "Export the followed markets this account is entitled to (the same rule as GET /v1/shadow/{market_id}: the plan's follow limit, and a live key on the free plan), one row per market, labeled \"private early reveal — excluded from the public record\": the latest commitment_sha256, committed_at, committed_status and committed_outcome, the evidence hashes, the number of commits, and once the platform resolves the market, official_outcome, official_at, official_at_source (gamma_closed_time is the platform's timestamp; limitless_api_poll and first_observed_poll are the first poll that saw the outcome, so lead_seconds is an upper bound), agreement and lead_seconds. Never the nonce or the preimage. The oldest 1000 follows are read (truncated says when there are more). format=csv answers RFC 4180 CSV with a header row (Content-Type text/csv; X-Resolve-Truncated); the default is the JSON envelope",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "platform",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "polymarket",
+                "limitless",
+                "custom"
+              ]
+            }
+          },
+          {
+            "name": "since",
+            "in": "query",
+            "description": "A UTC day (YYYY-MM-DD) or an ISO 8601 time: rows whose latest commit or final reconciliation was recorded at or after it",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "format",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "json",
+                "csv"
+              ],
+              "default": "json"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "JSON: rows[] (market_id, platform, external_id, event_key, venue_slug, status, committed_at, commitment_sha256, committed_status, committed_outcome, evidence_raw_sha256, evidence_canonical_sha256, n_commits, official_outcome, official_at, official_at_source, agreement, lead_seconds), count, columns, truncated, filters, label, note, disclaimer; or the same rows as CSV",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              },
+              "text/csv": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "validation_error: platform, since or format",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "UPSTREAM_UNAVAILABLE: the follows or the report view could not be read (never an empty export)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/shadow/{market_id}": {
       "get": {
         "summary": "Private early reveal of a followed market (\"private early reveal — excluded from the public record\"): every committed verdict, newest first, with its commitment_sha256, committed_at, posted state and evidence hashes. Never the nonce or the preimage: those appear only in the public reveal. 404 unless the tenant follows the market; 403 when the follow is above the plan's follow limit (after a plan change) or a free-plan tenant holds no live key",
@@ -1942,6 +2026,23 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/bot": {
+      "get": {
+        "summary": "What ResolveBot fetches and why, how it stays polite (declared user agent, robots.txt, per-host spacing, conditional requests) and how to opt out (public HTML, no auth)",
+        "responses": {
+          "200": {
+            "description": "text/html",
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }

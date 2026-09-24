@@ -21,6 +21,7 @@ import { solanaRpcUrl } from "../ingest/solana";
 import { discardBody } from "../ingest/http";
 import { parseOfficialRef } from "../resolve/official";
 import { RegistrationError } from "./policy";
+import { RESOLVE_BOT_UA } from "../ops/ua";
 
 /** One watch as register_market inserts it. */
 export interface WatchSpec { source_kind: WatchSourceKind; source_ref: Record<string, unknown>; cursor: Record<string, unknown>; poll_interval_s: number }
@@ -62,7 +63,7 @@ export async function verifySolanaAccount(url: string, account: string): Promise
   let body: { result?: { value?: { executable?: unknown } | null }; error?: { code?: number; message?: string } };
   try {
     const res = await fetch(url, {
-      method: "POST", headers: { "Content-Type": "application/json", "User-Agent": "ResolveBot/1.0" },
+      method: "POST", headers: { "Content-Type": "application/json", "User-Agent": RESOLVE_BOT_UA },
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "getAccountInfo", params: [account, { encoding: "base64", dataSlice: { offset: 0, length: 0 } }] }),
       signal: AbortSignal.timeout(SOLANA_VERIFY_TIMEOUT_MS),
     });

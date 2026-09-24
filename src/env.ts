@@ -3,6 +3,8 @@
  * (`wrangler secret put`). parseConfig() refuses to run without the values the
  * money and safety paths depend on, and parses every number once.
  */
+import { botUa } from "./ops/ua";
+
 export interface Env {
   RAW: R2Bucket;
   BACKUPS: R2Bucket;
@@ -104,7 +106,7 @@ export function parseConfig(env: Env): Config {
     usdcContract: (env.USDC_BASE_CONTRACT || "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913").toLowerCase(),
     baseFallbackUrl: env.BASE_FALLBACK_HTTP_URL || "https://mainnet.base.org",
     solanaFallbackUrl: env.SOLANA_FALLBACK_HTTP_URL || "https://api.mainnet-beta.solana.com",
-    botUa: env.RESOLVE_BOT_UA || "ResolveBot/1.0",
+    botUa: botUa(env),
     publicUrl: env.RESOLVE_PUBLIC_URL ? env.RESOLVE_PUBLIC_URL.replace(/\/+$/, "") : null,
     gitSha: env.GIT_SHA || "dev",
   };

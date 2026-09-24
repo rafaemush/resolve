@@ -31,6 +31,7 @@ import { Budget, COST } from "../ops/budget";
 import { redact } from "../ops/redact";
 import type { WaitUntil } from "../webhooks/deliver";
 import { CLOSE_OUT_DAYS } from "./reconcile";
+import { botUa } from "../ops/ua";
 
 /** 5 below Workers Free's 50 per invocation: a miscount here can never cost the run its loop_runs row. */
 export const RECORDER_SUBREQUESTS = 45;
@@ -61,7 +62,6 @@ export const DISPATCH_TIMEOUT_MS = 30_000;
  */
 export const RUN_DEADLINE_MS = 12_000;
 export const FETCH_TIMEOUT_MS = 8000;
-const UA = "ResolveBot/1.0";
 /** The loop_runs row, the app_config write and one alertMany(), reserved before any work. */
 const END_RESERVE = 2 * COST.db + COST.alert;
 
@@ -256,7 +256,7 @@ const RecordAnswer = z.object({
 
 function limitlessHeaders(env: Env): Record<string, string> {
   const key = env.LIMITLESS_API_KEY?.trim();
-  return { Accept: "application/json", "User-Agent": UA, ...(key ? { "X-API-Key": key } : {}) };
+  return { Accept: "application/json", "User-Agent": botUa(env), ...(key ? { "X-API-Key": key } : {}) };
 }
 
 type Got = { ok: true; json: unknown } | { ok: false; status: number | null; error: string };

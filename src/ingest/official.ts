@@ -8,13 +8,15 @@
 import { hostAllowed, sameAtPrecision, reading, type OfficialCorroboration, type OfficialSeriesId } from "../resolve/official";
 import { sha256Hex } from "../resolve/text";
 import { discardBody, retryAfterSeconds } from "./http";
+import { RESOLVE_BOT_UA } from "../ops/ua";
 import {
   parseBlsRelease, parseBlsApi, blsApiYoy, findFomcStatement, parseFomcStatement, fredValueOn, findEcbDecision, parseEcbRelease,
   parseEcbDfrCsv, parseBoeRss, iadbValueOn, parseBokDecisionRss, parseBokGdpRss, parseEcosRows, parseBcbHistory, bytesInclude, usDayLabel,
   type DocObservation, type DocParse,
 } from "./official-parse";
 
-export const OFFICIAL_UA = "ResolveBot/1.0 (+https://resolve.rafaemush.workers.dev/bot)";
+/** The official-release fetcher sends ResolveBot's one UA (src/ops/ua.ts). */
+export const OFFICIAL_UA = RESOLVE_BOT_UA;
 const FETCH_TIMEOUT_MS = 8000;
 const MAX_BODY = 2 * 1024 * 1024; // the BoK decision feed is ~0.9 MB
 /** Redirects are followed by hand, each Location checked (https, series allowlist) before it is requested. */
