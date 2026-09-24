@@ -1,7 +1,7 @@
 /**
  * Register the founder-approved entries of a curated candidate file as shadow markets (plan §16.4 P5 step 3-4).
  *
- *   npx tsx scripts/seed-shadow.ts docs/shadow-markets/<file>.json [--check | --dry-run (default) | --apply]
+ *   npx tsx scripts/seed-shadow.ts private/shadow-markets/<file>.json [--check | --dry-run (default) | --apply]
  *
  * --check    offline: every entry against the rules of scripts/lib/seed-shadow.ts (MarketRegistration, the meta whitelist,
  *            condition_id on Polymarket, the $50k cap, is_test false, a future deadline, a declarative deadline-free

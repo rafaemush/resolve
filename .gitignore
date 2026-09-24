@@ -21,3 +21,7 @@ evals/.cache/
 .vscode/
 *.log
 coverage/
+
+# founder-only working files: shadow-market candidate and leg files copy platform market texts
+# (Limitless "Platform Content", Polymarket rules) that may not be republished without permission
+private/

@@ -2,8 +2,8 @@
  * Shadow-market candidates for founder approval (plan §16.4 P5, §17.3 P5, §19.2 item 4). Replaces
  * scripts/polymarket-candidates.ts, which walked gamma by ascending volume and returned 0 candidates from 300 markets.
  *
- *   npx tsx scripts/candidates.ts polymarket [--days 21] [--max-volume 50000] [--out docs/shadow-markets] [--force]
- *   npx tsx scripts/candidates.ts limitless  [--days 45] [--max-volume 50000] [--out docs/shadow-markets] [--force]
+ *   npx tsx scripts/candidates.ts polymarket [--days 21] [--max-volume 50000] [--out private/shadow-markets] [--force]
+ *   npx tsx scripts/candidates.ts limitless  [--days 45] [--max-volume 50000] [--out private/shadow-markets] [--force]
  *
  * Read-only public GETs, nothing else: gamma /markets/keyset (closed=false, volume_num_max, end_date_min=now,
  * end_date_max=now+days, include_tag=true, 100 per page) or Limitless /markets/active?automationType=manual (25 per
@@ -35,7 +35,7 @@ interface Args { platform: CandidatePlatform; days: number; maxVolume: number; o
 function parseArgs(argv: string[]): Args {
   const platform = argv[0];
   if (platform !== "polymarket" && platform !== "limitless") throw new UsageError(`first argument must be polymarket or limitless, got "${platform ?? ""}"`);
-  const out: Args = { platform, days: platform === "polymarket" ? 21 : 45, maxVolume: SHADOW_VOLUME_CAP_USD, out: "docs/shadow-markets", force: false };
+  const out: Args = { platform, days: platform === "polymarket" ? 21 : 45, maxVolume: SHADOW_VOLUME_CAP_USD, out: "private/shadow-markets", force: false };
   for (let i = 1; i < argv.length; i++) {
     const flag = argv[i]!;
     if (flag === "--force") { out.force = true; continue; }
