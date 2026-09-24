@@ -5,7 +5,7 @@
  * representative leg, the leg count and a suggested registration. Pure: scripts/candidates.ts does the fetching.
  */
 import { z } from "zod";
-import { conditionText, officialReleaseKind, PRICE_WORDING, scanSources, sourceRefs, suggestAnchors, toIso, type CandidateEntry, type SourceScan } from "./candidates";
+import { conditionText, isPriceThreshold, officialReleaseKind, scanSources, sourceRefs, suggestAnchors, toIso, type CandidateEntry, type SourceScan } from "./candidates";
 
 /** The gamma fields this module reads; everything else on the row is ignored. */
 export const GammaRow = z.object({
@@ -70,7 +70,7 @@ export function classifyGamma(row: GammaRow, w: Window): Classified {
   if (outcomesOf(row.outcomes).length !== 2) return ex("not_binary");
   const tags = (row.tags ?? []).map((t) => t.slug.toLowerCase());
   if (tags.some((t) => SPORT_TAGS.has(t))) return ex("sports");
-  if (tags.some((t) => PRICE_TAGS.has(t)) || PRICE_WORDING.test(row.question)) return ex("price");
+  if (tags.some((t) => PRICE_TAGS.has(t)) || isPriceThreshold(row.question)) return ex("price");
   const e = eventOf(row);
   const subject = `${row.question}\n${e?.title ?? ""}`;
   const scan = scanSources(subject, [row.description], [row.resolutionSource, e?.resolutionSource]);
@@ -164,7 +164,9 @@ export function buildPolymarket(raw: unknown[], w: Window): PolymarketBuild {
 
     const cond = conditionText(r.description ?? "", r.question);
     const yesNo = outcomes[0]!.trim().toLowerCase() === "yes" && outcomes[1]!.trim().toLowerCase() === "no";
-    const needs = ["anchors"];
+    // The platform's question ("Will the 5-year Treasury yield dip below 4.52% in September?") is only a starting point:
+    // Jev's options are built from event_statement (src/resolve/jev.ts), which must be a declarative, deadline-free fact.
+    const needs = ["anchors", "event_statement"];
     if (!yesNo) needs.push("positive_option");
     if (cond.truncated) needs.push("condition");
     if (rep.scan.bareDomain || rep.scan.primary.some((c) => !c.url.startsWith("https://"))) needs.push("sources");

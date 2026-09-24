@@ -4,16 +4,21 @@
  *   npx tsx scripts/seed-shadow.ts docs/shadow-markets/<file>.json [--check | --dry-run (default) | --apply]
  *
  * --check    offline: every entry against the rules of scripts/lib/seed-shadow.ts (MarketRegistration, the meta whitelist,
- *            condition_id on Polymarket, the $50k cap, is_test false, a future deadline, https sources, needs_review
- *            empty once approved, no duplicates). Exit 1 when an approved entry fails.
+ *            condition_id on Polymarket, the $50k cap, is_test false, a future deadline, a declarative deadline-free
+ *            event_statement, https sources, needs_review empty once approved, no duplicates). Exit 1 when an approved
+ *            entry fails.
  * --dry-run  --check, then read-only: asks the Worker for its registration contract (an empty POST that it refuses with
  *            400 before any write) and reads production (service role, SELECT only) to show, per approved entry, whether
- *            it would be registered or skipped because (platform, external_id) already exists as a shadow market.
+ *            it would be registered or skipped because (platform, external_id) already exists as a shadow market. An
+ *            existing market is verified like a new one (below); one that is not the approved entry is listed as BROKEN
+ *            and the exit code is 1.
  * --apply    the same, then for each approved entry not yet present: POST <RESOLVE_PUBLIC_URL, else
  *            https://resolve.rafaemush.workers.dev>/internal/markets {market, meta, is_test: false} with ADMIN_API_KEY,
  *            and read the row back from the database (not from the Worker's answer) to confirm platform, external_id,
- *            is_test, condition_id and every meta key landed. Stops at the first failure; rerunning skips what exists, so
- *            the command is idempotent. An entry whose sources the Worker refuses (robots) is registered as
+ *            is_test, condition_id, every meta key and the sources landed, and that an open market has one active watch
+ *            per source. Stops at the first failure; rerunning skips what exists once the same check passes on it (a
+ *            market left without its watches by a failed or timed-out registration stops the rerun, named), so the
+ *            command is idempotent. An entry whose sources the Worker refuses (robots) is registered as
  *            unsupported_source by the Worker and reported; it has no watches.
  * Secrets (ADMIN_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY) are read from .env by scripts/lib/env.ts and never
  * printed. The founder's ISP blocks *.workers.dev: set RESOLVE_PUBLIC_URL to a reachable host (the custom domain).
@@ -25,6 +30,7 @@ import { loadEnv, need } from "./lib/env";
 import { checkCandidateFile, parseSeedArgs, UsageError, USAGE, verifyRow, type FileCheck, type SeedArgs, type ShadowRow } from "./lib/seed-shadow";
 import { CandidateFile, type CandidateEntry } from "./lib/candidates";
 import { mergeMeta, META_KEYS } from "../src/markets/meta";
+import { MarketRegistration } from "../src/resolve/schema";
 import { redact } from "../src/ops/redact";
 
 const DEFAULT_WORKER = "https://resolve.rafaemush.workers.dev";
@@ -67,11 +73,20 @@ async function preflight(worker: string, adminKey: string): Promise<void> {
 }
 
 async function findShadow(client: SupabaseClient, platform: string, externalId: string): Promise<ShadowRow | null> {
-  const { data, error } = await client.from("markets").select("id, platform, external_id, status, is_test, condition_id, meta").eq("platform", platform).eq("external_id", externalId).is("tenant_id", null).is("deleted_at", null);
+  const { data, error } = await client.from("markets").select("id, platform, external_id, status, is_test, condition_id, meta, sources").eq("platform", platform).eq("external_id", externalId).is("tenant_id", null).is("deleted_at", null);
   if (error) throw new Stop(`markets read for ${platform}:${externalId}: ${redact(error.message)}`);
   if ((data ?? []).length > 1) throw new Stop(`${platform}:${externalId} exists ${data!.length} times as a shadow market; resolve that by hand first`);
   return ((data ?? [])[0] as ShadowRow | undefined) ?? null;
 }
+
+/** Active, not deleted watches of a market: the ones select_due_watches() will lease. */
+async function activeWatches(client: SupabaseClient, marketId: string): Promise<number> {
+  const { count, error } = await client.from("watches").select("id", { count: "exact", head: true }).eq("market_id", marketId).eq("active", true).is("deleted_at", null);
+  if (error || count === null) throw new Stop(`watches read for market ${marketId}: ${redact(error?.message ?? "no count returned")}`);
+  return count;
+}
+
+const REPAIR = "a registration that stopped part-way or an entry edited after registering; repair or soft-delete that market by hand, then rerun";
 
 async function register(worker: string, adminKey: string, entry: CandidateEntry): Promise<z.infer<typeof Registered>["data"]> {
   const r = await fetch(`${worker}/internal/markets`, {
@@ -105,24 +120,37 @@ async function main(args: SeedArgs): Promise<number> {
 
   const file = CandidateFile.parse(json);
   const platform = file.header.platform;
-  let registered = 0, skipped = 0, unsupported = 0;
+  let registered = 0, skipped = 0, unsupported = 0, broken = 0;
   for (const [index, entry] of file.entries.entries()) {
     if (!entry.approved) continue;
     const externalId = String(entry.registration.market.external_id);
-    const existing = await findShadow(client, platform, externalId);
-    if (existing) { skipped++; say(`skip     #${index} ${platform}:${externalId} exists as ${existing.id} (${existing.status})`); continue; }
-    if (args.mode !== "apply") { say(`register #${index} ${platform}:${externalId}`); continue; }
+    // checkCandidateFile already parsed both for every approved entry, so these cannot fail here.
     const meta = mergeMeta(entry.registration.meta);
     if (!meta.ok) throw new Stop(`#${index}: meta: ${meta.error}`);
+    const want = { platform, externalId, meta: meta.meta, sources: MarketRegistration.parse(entry.registration.market).sources };
+    const existing = await findShadow(client, platform, externalId);
+    if (existing) {
+      // An existing row is verified like a new one: skipping it unchecked would count a market that never polls as present.
+      const problems = verifyRow(existing, await activeWatches(client, existing.id), want);
+      if (problems.length) {
+        const line = `#${index} ${platform}:${externalId} exists as ${existing.id} (${existing.status}) but is not the approved entry: ${problems.join("; ")} (${REPAIR})`;
+        if (args.mode === "apply") throw new Stop(line);
+        broken++; say(`BROKEN   ${line}`); continue;
+      }
+      skipped++; say(`skip     #${index} ${platform}:${externalId} exists as ${existing.id} (${existing.status}), verified`); continue;
+    }
+    if (args.mode !== "apply") { say(`register #${index} ${platform}:${externalId}`); continue; }
     const r = await register(worker, adminKey, entry);
-    const problems = verifyRow(await findShadow(client, platform, externalId), platform, externalId, meta.meta);
+    const row = await findShadow(client, platform, externalId);
+    const problems = verifyRow(row, row ? await activeWatches(client, row.id) : 0, want);
     if (r.existing) say(`note     #${index} the Worker found ${r.market_id} already registered (created since the read above)`);
-    if (problems.length) throw new Stop(`#${index} ${platform}:${externalId} (${r.market_id}) did not land as sent: ${problems.join("; ")}`);
+    if (problems.length) throw new Stop(`#${index} ${platform}:${externalId} (${r.market_id}) did not land as sent: ${problems.join("; ")} (${REPAIR})`);
     if (r.status === "unsupported_source") { unsupported++; say(`UNSUPPORTED #${index} ${platform}:${externalId} ${r.market_id}: ${r.reasons.join(" | ")} (registered, no watches)`); }
     else { registered++; say(`registered #${index} ${platform}:${externalId} ${r.market_id} (${r.watches.length} watch${r.watches.length === 1 ? "" : "es"})`); }
   }
-  say(args.mode === "apply" ? `done: ${registered} registered, ${unsupported} unsupported_source, ${skipped} already present` : `dry run: ${skipped} already present; the rest would be registered`);
-  return 0;
+  if (args.mode === "apply") { say(`done: ${registered} registered, ${unsupported} unsupported_source, ${skipped} already present and verified`); return 0; }
+  say(`dry run: ${skipped} already present and verified, ${broken} present but not as approved; the rest would be registered`);
+  return broken ? 1 : 0;
 }
 
 let args: SeedArgs;

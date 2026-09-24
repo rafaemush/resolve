@@ -174,7 +174,55 @@ export function scanSources(subject: string, texts: Array<string | null | undefi
  * Price-threshold wording (plan §16.4 P5: excluded until the price_touch rail exists): "reach $150,000", "close above
  * $6,000", "Price Over/Under $933.63", "valuation be less than $500B", "Up or Down", "all-time high".
  */
-export const PRICE_WORDING = /\b(up or down|all[- ]time high|price of|over\/under)\b|\b(reach|hit|dip to|close (above|below|at)|trade (above|below)|above|below|between|less than|more than|greater than|at least|over|under)\s+\$\s?\d|\b(price|valuation|index|market cap|fdv)\b[^?]*\$\s?\d/i;
+const PRICE_WORDING = /\b(up or down|all[- ]time high|price of|over\/under)\b|\b(reach|hit|dip to|close (above|below|at)|trade (above|below)|above|below|between|less than|more than|greater than|at least|over|under)\s+\$\s?\d|\b(price|valuation|index|market cap|fdv)\b[^?]*\$\s?\d/i;
+
+/**
+ * A threshold on a number, with or without "$": "dip below 4.52%", "hit 5.50%", "at least 2.2M", "close above 6,000",
+ * "4.5% or higher". Group 1 or 2 holds a percentage / basis-point unit when there is one.
+ */
+const THRESHOLD = /\b(?:hit|reach(?:es)?|touch(?:es)?|exceeds?|surpass(?:es)?|(?:dips?|drops?|falls?|rises?|climbs?|goes|go|closes?|ends?|settles?|trades?|finish(?:es)?)\s+(?:above|below|at|to|under|over)|above|below|at least|at most|between|over|under|less than|more than|greater than)\s+[\d.,]*\d\s?(%|bps\b|basis points?)?|[\d.,]*\d\s?(%|bps\b|basis points?)?\s+or\s+(?:higher|more|above|lower|less|below)\b/gi;
+/** A bond or note yield: a market rate, quoted in percent. */
+const YIELD = /\byields?\b/i;
+/** Named index levels (a newspaper or company that shares a name, "Nikkei Asia", "Dow Inc", is not one). */
+const INDEX_LEVEL = /\b(S&P 500|SPX|Nasdaq[- ](?:100|Composite)|NDX|Dow Jones|DJIA|Russell 2000|VIX|DXY|dollar index|Nikkei (?:225|average|index)|FTSE 100|DAX|CAC 40|Hang Seng|KOSPI|Sensex|Nifty 50|Euro Stoxx 50|Stoxx 600)(?![\w])/i;
+const FX_WORDS = /\b(exchange rates?|forex|fx rates?)\b/i;
+/** ISO codes are matched in capitals only, so the English words "try" and "won" never count as a currency. */
+const CURRENCY_CODES = /\b(USD|EUR|GBP|JPY|CNY|CNH|RMB|INR|PKR|IRR|TRY|RUB|KRW|BRL|MXN|ARS|CAD|AUD|CHF|ZAR|NGN|UAH|ILS)\b/g;
+/** Longest names first, so "Canadian dollars" is one currency (CAD), never CAD plus a bare "dollars". */
+const CURRENCY_NAMES: Array<[RegExp, string]> = [
+  [/\b(?:US|U\.S\.|American) dollars?\b/gi, "USD"], [/\bCanadian dollars?\b/gi, "CAD"], [/\bAustralian dollars?\b/gi, "AUD"],
+  [/\bPakistani rupees?\b/gi, "PKR"], [/\bIndian rupees?\b/gi, "INR"], [/\bMexican pesos?\b/gi, "MXN"], [/\bArgentine pesos?\b/gi, "ARS"],
+  [/\bKorean won\b/gi, "KRW"], [/\bBrazilian reais\b|\bBrazilian real\b|\breais\b/gi, "BRL"], [/\bSouth African rand\b/gi, "ZAR"], [/\bSwiss francs?\b/gi, "CHF"],
+  [/\b(?:pounds? sterling|British pounds?|sterling)\b/gi, "GBP"], [/\b(?:Japanese )?yen\b/gi, "JPY"], [/\b(?:Chinese )?(?:yuan|renminbi)\b/gi, "CNY"],
+  [/\b(?:Iranian )?rials?\b/gi, "IRR"], [/\b(?:Turkish )?lira\b/gi, "TRY"], [/\b(?:Russian )?ro?ubles?\b/gi, "RUB"], [/\beuros?\b/gi, "EUR"],
+  [/\bnaira\b/gi, "NGN"], [/\bhryvnias?\b/gi, "UAH"], [/\bshekels?\b/gi, "ILS"], [/\brupees?\b/gi, "INR"], [/\bpesos?\b/gi, "MXN"], [/\bdollars?\b/gi, "USD"],
+];
+
+/** Pure. The distinct currencies a text names; a name is blanked once counted so a shorter name cannot count it again. */
+export function currenciesIn(text: string): Set<string> {
+  const out = new Set<string>();
+  for (const m of text.matchAll(CURRENCY_CODES)) out.add(m[1]!);
+  let rest = text;
+  for (const [re, code] of CURRENCY_NAMES) rest = rest.replace(re, (m) => { out.add(code); return " ".repeat(m.length); });
+  return out;
+}
+
+/**
+ * Pure. Price-threshold markets, excluded until the price_touch rail exists (plan §16.4 P5, §17.3 P1a): "$" wording
+ * (PRICE_WORDING), or a threshold on a market rate written without "$": a yield in percent ("Will the 5-year Treasury
+ * yield dip below 4.52% in September?"), an exchange rate ("Will USD be at least 2.2M Iranian rials on September 30?":
+ * two currencies, "exchange rate" or "forex") or a named index level ("S&P 500 close above 6,000"). Routed to jev_web
+ * with absence_after_deadline, an any-touch question would turn "no page shows the touch" into NO. The subject has to be
+ * a market rate, so an official print that carries a percentage (unemployment rate, CPI, GDP growth, a vote share, a
+ * central-bank rate decision) is not caught.
+ */
+export function isPriceThreshold(text: string): boolean {
+  if (PRICE_WORDING.test(text)) return true;
+  const thresholds = [...text.matchAll(THRESHOLD)];
+  if (!thresholds.length) return false;
+  if (YIELD.test(text) && thresholds.some((m) => (m[1] ?? m[2]) !== undefined)) return true;
+  return INDEX_LEVEL.test(text) || FX_WORDS.test(text) || currenciesIn(text).size >= 2;
+}
 
 // ---------------------------------------------------------------------------------------------------------------
 // Official releases (the P1a official_release rail's scope: plan §17.3)
@@ -280,3 +328,6 @@ export const CandidateHeader = z.object({
 
 export const CandidateFile = z.object({ header: CandidateHeader, entries: z.array(CandidateEntry) });
 export type CandidateFile = z.infer<typeof CandidateFile>;
+
+/** header.how_to_approve of every candidate file: the founder's instructions, next to the entries they apply to. */
+export const HOW_TO_APPROVE = "For each market to seed: edit every field listed under needs_review (anchors must appear in the source page; sources must be https pages that state the outcome; event_statement must be a declarative fact with no deadline, never the platform's question: \"Will Pacifica launch a token by September 30, 2026?\" becomes \"Pacifica launched its token\", because the resolver asks the model whether that sentence has occurred and checks the deadline itself), empty needs_review, set approved: true. Then run npx tsx scripts/seed-shadow.ts <this file> --check, then --dry-run, then --apply. Unapproved entries are never registered.";

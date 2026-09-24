@@ -6,7 +6,7 @@
  * does the fetching.
  */
 import { z } from "zod";
-import { conditionText, officialReleaseKind, PRICE_WORDING, scanSources, sourceRefs, stripHtml, suggestAnchors, toIso, type CandidateEntry, type OfficialKind, type SourceScan } from "./candidates";
+import { conditionText, isPriceThreshold, officialReleaseKind, scanSources, sourceRefs, stripHtml, suggestAnchors, toIso, type CandidateEntry, type OfficialKind, type SourceScan } from "./candidates";
 
 const LimitlessLeg = z.object({
   slug: z.string().min(1),
@@ -63,7 +63,7 @@ export function classifyLimitless(m: ClassifyInput): { category: LimitlessCatego
   const official = officialReleaseKind(text);
   if (official) return { category: "official_release", official };
   if (cats.includes("pre-tge") || PRE_TGE_TEXT.test(text)) return { category: "pre_tge", official: null };
-  if (LADDER_TEXT.test(text) || PRICE_WORDING.test(text)) return { category: "price", official: null };
+  if (LADDER_TEXT.test(text) || isPriceThreshold(text)) return { category: "price", official: null };
   if (cats.includes("company news") || cats.includes("earnings") || COMPANY_TEXT.test(text)) return { category: "company_news", official: null };
   if (cats.includes("politics")) return { category: "politics", official: null };
   if (cats.includes("specials")) return { category: "specials", official: null };
@@ -168,7 +168,9 @@ export function buildLimitless(raw: unknown[], w: LimitlessWindow): LimitlessBui
       if (volume > w.maxVolume) counts.over_volume_cap_legs++;
       const cond = conditionText(desc, statement);
       const deadline = new Date(legExp).toISOString();
-      const needs = ["anchors"];
+      // "Fed Decision in October? — 25 bps decrease" is a title, not a fact: Jev's options are built from event_statement
+      // (src/resolve/jev.ts), which the founder rewrites as a declarative, deadline-free statement.
+      const needs = ["anchors", "event_statement"];
       if (!scan.tier || scan.bareDomain || scan.primary.some((c) => !c.url.startsWith("https://"))) needs.push("sources");
       if (!hasLabels) needs.push("options");
       if (cond.truncated) needs.push("condition");

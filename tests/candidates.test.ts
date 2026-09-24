@@ -1,10 +1,12 @@
 /**
  * scripts/candidates.ts pipeline (plan §16.4 P5, §17.3 P5), pure and offline: gamma rows are deduped by event with one
- * representative leg, sports / price-threshold / X-only / sourceless markets are excluded, and the Limitless feed is
- * classified (official_release for macro prints, central-bank decisions and election results) with one entry per leg.
+ * representative leg, sports / price-threshold (with or without "$": yields, exchange rates, index levels) / X-only /
+ * sourceless markets are excluded, every suggested event_statement is listed under needs_review, and the Limitless feed
+ * is classified (official_release for macro prints, central-bank decisions and election results) with one entry per leg.
  */
 import { describe, expect, it } from "vitest";
-import { classifyUrl, extractUrls, officialReleaseKind, scanSources, stripHtml, suggestAnchors } from "../scripts/lib/candidates";
+import { classifyUrl, currenciesIn, extractUrls, isPriceThreshold, officialReleaseKind, scanSources, stripHtml, suggestAnchors } from "../scripts/lib/candidates";
+import { eventStatementProblem } from "../scripts/lib/seed-shadow";
 import { buildPolymarket, classifyGamma, GammaRow } from "../scripts/lib/candidates-polymarket";
 import { buildLimitless, checkability, classifyLimitless, createdSince } from "../scripts/lib/candidates-limitless";
 import { MarketRegistration } from "../src/resolve/schema";
@@ -79,6 +81,37 @@ describe("Polymarket: exclusions", () => {
     expect(classifyGamma(parse(gamma({ id: "5" })), W)).toMatchObject({ kind: "kept" });
   });
 
+  it("excludes yield, exchange-rate and index-level thresholds written without a $, and keeps official prints that carry a %", () => {
+    // Live gamma questions of 2026-09-24 (six Treasury-yield events, two USD/IRR events), tagged economy/finance, not price.
+    const rates = [
+      "Will the 5-year Treasury yield dip below 4.52% in September?", "Will the 30-year Treasury yield hit 5.50% in September?",
+      "Will the 10-year Treasury yield dip below 4.76% in September?", "Will USD be at least 2.2M Iranian rials on September 30?",
+      "Will USD be between 2.5M and 2.8M Iranian rials on September 30?", "Will USD/JPY close above 150 on October 9?",
+      "Will the EUR/USD exchange rate be above 1.20 on October 1?", "Will the S&P 500 close above 6,000 on October 9?",
+      "Will the 10-year yield be 4.5% or higher on September 30?",
+    ];
+    for (const [i, question] of rates.entries()) {
+      expect(isPriceThreshold(question), question).toBe(true);
+      expect(classifyGamma(parse(gamma({ id: String(40 + i), question, tags: [{ slug: "economy" }, { slug: "finance" }, { slug: "treasuries" }] })), W)).toMatchObject({ kind: "excluded", reason: "price" });
+    }
+    const official = [
+      "Will the September 2026 unemployment rate be 4.1%?", "Will Core PCE MoM be 0.3% in August?", "Will Canada's GDP growth rate MoM in July 2026 be between 0.2% and 0.3%?",
+      "Will Lula win 44% or more of the valid vote in the first round of the 2026 Brazilian presidential election?", "Will voter turnout in the 2026 Quebec general election be less than 58%?",
+      "Will the Reserve Bank of India make no change to the policy repo rate at the October meeting?", "Will the Bank of Japan raise rates above 0.75% in October?",
+      "Will Japan's trade surplus exceed 1 trillion yen in September?", "Will euro area inflation be above 2% in September?",
+      "Will FX renew Shogun for more than 3 seasons?", "Will more than 5 companies list on the Nikkei Asia 300?",
+      // A yield in bushels is a USDA statistic, not a market rate: only a yield in percent or bps counts.
+      "Will the USDA estimate the 2026 corn yield above 180 bushels per acre?",
+    ];
+    for (const question of official) expect(isPriceThreshold(question), question).toBe(false);
+  });
+
+  it("counts one currency per name, codes only in capitals", () => {
+    expect([...currenciesIn("Will USD be at least 2.2M Iranian rials?")].sort()).toEqual(["IRR", "USD"]);
+    expect([...currenciesIn("more than 10 billion Canadian dollars")]).toEqual(["CAD"]);
+    expect([...currenciesIn("Will Apple try to buy it for 3 billion dollars?")]).toEqual(["USD"]);
+  });
+
   it("flags requires_x when X is the only concrete source, and keeps a market that also names a primary source", () => {
     const xOnly = gamma({ id: "6", question: "Will Elon Musk post about Mars on Oct 1?", tags: [{ slug: "tech" }], description: "Resolves per posts on X by @elonmusk (https://x.com/elonmusk)." });
     expect(classifyGamma(parse(xOnly), W)).toMatchObject({ kind: "excluded", reason: "requires_x" });
@@ -121,7 +154,9 @@ describe("Polymarket: dedupe by event", () => {
   it("suggests a registration the Worker schema accepts, with condition_id and the event carried in meta", () => {
     for (const e of b.entries) {
       expect(e.approved).toBe(false);
-      expect(e.needs_review).toContain("anchors");
+      // The suggested statement is the platform's question: never approvable as it stands.
+      expect(e.needs_review.slice(0, 2)).toEqual(["anchors", "event_statement"]);
+      expect(eventStatementProblem(String(e.registration.market.event_statement))).not.toBeNull();
       expect(MarketRegistration.safeParse(e.registration.market).success).toBe(true);
       expect(e.registration.is_test).toBe(false);
     }
@@ -206,6 +241,8 @@ describe("Limitless: feed to entries", () => {
     expect(l.registration.meta).toEqual({ slug: "25-bps-decrease-1", category: "official_release", condition_id: COND(51), group_id: "10013448" });
     expect(l.registration.market).toMatchObject({ platform: "limitless", option_a: "Yes", option_b: "No", event_statement: "Fed Decision in October? — 25 bps decrease", deadline_utc: "2026-10-28T23:59:00.000Z", negative_rule: "explicit_negative" });
     expect(MarketRegistration.safeParse(l.registration.market).success).toBe(true);
+    for (const e of b.entries) expect(e.needs_review.slice(0, 2)).toEqual(["anchors", "event_statement"]);
+    expect(eventStatementProblem(String(l.registration.market.event_statement))).toMatch(/question mark/);
     const amm = b.entries.find((e) => e.registration.market.external_id === "amm-1")!;
     expect(amm).toMatchObject({ checkability: 0, category: "sports" });
     expect(amm.needs_review).toContain("options");

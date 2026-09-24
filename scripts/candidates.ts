@@ -17,7 +17,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 
 import { join, resolve } from "node:path";
 import { z } from "zod";
 import { loadEnv } from "./lib/env";
-import { CandidateFile, type CandidateEntry, type CandidatePlatform } from "./lib/candidates";
+import { CandidateFile, HOW_TO_APPROVE, type CandidateEntry, type CandidatePlatform } from "./lib/candidates";
 import { buildPolymarket } from "./lib/candidates-polymarket";
 import { buildLimitless, createdSince } from "./lib/candidates-limitless";
 import { checkCandidateFile, SHADOW_VOLUME_CAP_USD } from "./lib/seed-shadow";
@@ -126,8 +126,6 @@ function previousScan(dir: string, today: string): { file: string; generatedAt: 
   const at = Date.parse(String((JSON.parse(readFileSync(join(dir, last), "utf8")) as { header?: { generated_at?: unknown } }).header?.generated_at ?? ""));
   return Number.isFinite(at) ? { file: last, generatedAt: new Date(at) } : null;
 }
-
-const HOW_TO_APPROVE = "For each market to seed: edit every field listed under needs_review (anchors must appear in the source page; sources must be https pages that state the outcome), empty needs_review, set approved: true. Then run npx tsx scripts/seed-shadow.ts <this file> --check, then --dry-run, then --apply. Unapproved entries are never registered.";
 
 async function main(a: Args): Promise<void> {
   loadEnv();

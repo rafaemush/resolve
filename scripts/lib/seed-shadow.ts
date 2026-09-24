@@ -55,8 +55,9 @@ export interface FileCheck {
  * Pure. Every entry is checked (so the founder sees what an approval would run into); only approved entries can block.
  * Rules: the registration parses with MarketRegistration (the Worker's own schema) and names the file's platform; meta
  * holds only whitelisted keys of the right type (src/markets/meta.ts), and a Polymarket entry carries meta.condition_id;
- * volume <= $50k; is_test is false; the deadline is in the future; every web source is https; an approved entry has
- * nothing left under needs_review; no (platform, external_id) appears twice.
+ * volume <= $50k; is_test is false; the deadline is in the future; event_statement is a declarative, deadline-free fact
+ * (eventStatementProblem); every web source is https; an approved entry has nothing left under needs_review; no
+ * (platform, external_id) appears twice.
  */
 export function checkCandidateFile(json: unknown, now: Date): FileCheck {
   const parsed = CandidateFile.safeParse(json);
@@ -68,6 +69,34 @@ export function checkCandidateFile(json: unknown, now: Date): FileCheck {
   const entries = parsed.data.entries.map((e, index) => checkEntry(e, index, platform, now, seen));
   const approved = entries.filter((e) => e.approved);
   return { platform, fileErrors: [], entries, approved: approved.length, approvedInvalid: approved.filter((e) => e.errors.length).length };
+}
+
+/** Interrogative openers, capitalized as a sentence starts: "WHO declared ..." (the organization) is not "Who ...". */
+const INTERROGATIVE = /^[\s"'\u201c(]*([Ww]ill|[Ww]ould|[Ww]hich|[Ww]hat|[Ww]hom?|[Ww]hose|[Ww]hen|[Ww]here|[Ww]hy|[Hh]ow|[Ii]s|[Aa]re|[Ww]as|[Ww]ere|[Dd]oes|[Dd]o|[Dd]id|[Hh]as|[Hh]ave|[Hh]ad|[Cc]an|[Cc]ould|[Ss]hould|[Ss]hall)\b/;
+/** Month names as written in a date (capitalized), so "signed by Janet Yellen" or "by decision" never reads as a date. */
+const MONTH = "(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sept?|Oct|Nov|Dec)\\.?";
+/**
+ * Deadline wording: "by September 30", "before the deadline", "no later than 2026-10-01", "by the end of Q3", "until 1
+ * October". A month counts only before a day, a year or the end of a clause, so "backed by May Holdings" is not a date.
+ */
+const DEADLINE = new RegExp(`\\b(?:[Bb]y|[Bb]efore|[Uu]ntil|[Nn]o later than|[Pp]rior to)\\s+(?:the\\s+)?(?:[Dd]eadline|[Ee]nd of|[Cc]lose of|${MONTH}(?=\\s+\\d|\\s*[,.;:)]|\\s*$)|\\d{4}-\\d{2}-\\d{2}|\\d{1,2}(?:st|nd|rd|th)?\\s+(?:of\\s+)?${MONTH}(?![a-z]))`);
+const URLS = /https?:\/\/\S+/g;
+
+/**
+ * Pure. Why an event_statement cannot go to Jev as written, or null. jevOptionStatements() builds both options from it
+ * ("The event has occurred: <event_statement>"), so it must be a declarative fact with no deadline (column comment on
+ * markets.event_statement): a question is not a fact ("Will ...?", "Fed Decision in October? — 25 bps decrease"), and
+ * deadline wording moved jev-1.13.0 to NOT_DETERMINABLE on explicit evidence (src/resolve/jev.ts, live probe
+ * 2026-09-23). The deadline is enforced by the time-window precheck. A "?" inside a URL does not count.
+ */
+export function eventStatementProblem(statement: string): string | null {
+  const text = statement.replace(URLS, " ");
+  if (text.includes("?")) return "contains a question mark: write it as a declarative fact";
+  const q = INTERROGATIVE.exec(text);
+  if (q) return `starts with "${q[1]}": write it as a declarative fact, not a question`;
+  const d = DEADLINE.exec(text);
+  if (d) return `names a deadline ("${d[0]}"): the deadline is deadline_utc, checked in code`;
+  return null;
 }
 
 function checkEntry(e: CandidateEntry, index: number, platform: CandidatePlatform, now: Date, seen: Map<string, number>): EntryCheck {
@@ -82,6 +111,9 @@ function checkEntry(e: CandidateEntry, index: number, platform: CandidatePlatfor
       if ((s.kind === "web_fetch" || s.kind === "web_render") && !s.ref.startsWith("https://")) errors.push(`source ${s.ref} is not https`);
     }
   }
+  // Checked whatever else fails, so one --check run shows every field the founder still has to rewrite.
+  const statement = typeof e.registration.market.event_statement === "string" ? eventStatementProblem(e.registration.market.event_statement) : null;
+  if (statement) errors.push(`event_statement ${statement}`);
   const meta = mergeMeta(e.registration.meta);
   if (!meta.ok) errors.push(`meta: ${meta.error}`);
   else {
@@ -99,19 +131,32 @@ function checkEntry(e: CandidateEntry, index: number, platform: CandidatePlatfor
 }
 
 /** The columns seed-shadow reads back from markets. */
-export interface ShadowRow { id: string; platform: string; external_id: string; status: string; is_test: boolean; condition_id: string | null; meta: Record<string, unknown> | null }
+export interface ShadowRow { id: string; platform: string; external_id: string; status: string; is_test: boolean; condition_id: string | null; meta: Record<string, unknown> | null; sources: unknown }
+
+/** What an approved entry registers: the row must show exactly this. */
+export interface ExpectedShadow { platform: string; externalId: string; meta: MarketMeta; sources: ReadonlyArray<{ kind: string; ref: string }> }
+
+const sourceKeys = (sources: unknown): string[] =>
+  (Array.isArray(sources) ? sources : []).map((s: { kind?: unknown; ref?: unknown }) => `${String(s?.kind)} ${String(s?.ref)}`).sort();
 
 /**
- * Pure. What the database row must show after --apply registered an entry (read from the database, never taken from the
- * Worker's answer): the same platform and external_id, is_test false, condition_id and every whitelisted meta key as
- * sent. Empty = verified.
+ * Pure. What the database row must show for an approved entry, read from the database and never taken from the Worker's
+ * answer, both right after --apply registered it and when a rerun finds it already there: the same platform and
+ * external_id, is_test false, condition_id, every whitelisted meta key and the sources as sent, and, while the market is
+ * open, one active watch per source. registerMarket inserts the market first and its watches one by one afterwards, so a
+ * watch insert that failed (or a client timeout mid-request) leaves an open market that polls fewer sources or none;
+ * a rerun must name it instead of counting it as already present. Other statuses have no active watches by design
+ * (unsupported_source never gets any; terminal statuses deactivate them). Empty = verified.
  */
-export function verifyRow(row: ShadowRow | null, platform: string, externalId: string, meta: MarketMeta): string[] {
+export function verifyRow(row: ShadowRow | null, activeWatches: number, want: ExpectedShadow): string[] {
   if (!row) return ["no row found after registration"];
   const out: string[] = [];
-  if (row.platform !== platform || row.external_id !== externalId) out.push(`row is ${row.platform}:${row.external_id}`);
+  if (row.platform !== want.platform || row.external_id !== want.externalId) out.push(`row is ${row.platform}:${row.external_id}`);
   if (row.is_test !== false) out.push("is_test is not false");
-  if ((meta.condition_id ?? null) !== (row.condition_id ?? null)) out.push(`condition_id ${row.condition_id ?? "null"} != ${meta.condition_id ?? "null"}`);
-  for (const [k, v] of Object.entries(meta)) if (row.meta?.[k] !== v) out.push(`meta.${k} is ${JSON.stringify(row.meta?.[k])}, expected ${JSON.stringify(v)}`);
+  if ((want.meta.condition_id ?? null) !== (row.condition_id ?? null)) out.push(`condition_id ${row.condition_id ?? "null"} != ${want.meta.condition_id ?? "null"}`);
+  for (const [k, v] of Object.entries(want.meta)) if (row.meta?.[k] !== v) out.push(`meta.${k} is ${JSON.stringify(row.meta?.[k])}, expected ${JSON.stringify(v)}`);
+  const have = sourceKeys(row.sources), sent = sourceKeys(want.sources);
+  if (have.join("\n") !== sent.join("\n")) out.push(`sources are [${have.join(", ")}], the entry lists [${sent.join(", ")}]`);
+  if (row.status === "open" && activeWatches !== have.length) out.push(`open with ${activeWatches} active watch${activeWatches === 1 ? "" : "es"} for ${have.length} source${have.length === 1 ? "" : "s"}`);
   return out;
 }
