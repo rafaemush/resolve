@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { z } from "zod";
 import type { Env } from "../env";
 import { parseConfig } from "../env";
 import { ok, err, waitUntilOf } from "./envelope";
@@ -6,6 +7,7 @@ import { safeEqual, bearer } from "./admin";
 import { hmacHex } from "../resolve/text";
 import { runWatch } from "../ingest/watch";
 import { registerMarket } from "../markets/register";
+import { mergeMeta, META_KEYS } from "../markets/meta";
 import { db, rpc } from "../db/supabase";
 import { makeJevCaller } from "../jev/client";
 import { mintKey } from "./keys";
@@ -39,14 +41,34 @@ internal.post("/watch/:id", async (c) => {
   return ok(c, s, s.recorded === false ? 500 : 200);
 });
 
+/**
+ * Admin registration (scripts/seed-shadow.ts, plan §16.4 P5). Strict at the top level, so a misspelled "is_test" is a 400
+ * rather than a real market on the public record; inside meta, keys outside the whitelist (src/markets/meta.ts) are
+ * dropped and reported in meta_dropped. 201 for a new market, 200 when (tenant, platform, external_id) already existed
+ * (nothing written: existing, meta_applied [] and the stored is_test say so). A body error answers with the accepted
+ * fields and meta keys: seed-shadow sends an empty body first and refuses to register through a Worker whose whitelist
+ * differs from its own (an older Worker would store the market and silently drop its meta).
+ */
+const InternalMarketBody = z.strictObject({
+  market: z.unknown().refine((v) => v !== undefined && v !== null, "required"),
+  tenant_id: z.uuid().nullish(),
+  meta: z.unknown().optional(),
+  is_test: z.boolean().optional(),
+});
+
 internal.post("/markets", async (c) => {
   if (!isAdmin(c)) return err(c, "forbidden", "admin key required", 403);
   const cfg = parseConfig(c.env);
-  const body = (await c.req.json().catch(() => null)) as { market?: unknown; tenant_id?: string | null } | null;
-  if (!body?.market) return err(c, "validation_error", "body.market required", 400);
+  const body = InternalMarketBody.safeParse(await c.req.json().catch(() => null));
+  if (!body.success) {
+    const message = body.error.issues.map((i) => `body${i.path.length ? "." + i.path.join(".") : ""}: ${i.message}`).join("; ").slice(0, 400);
+    return err(c, "validation_error", message, 400, { extra: { accepted_fields: Object.keys(InternalMarketBody.shape), meta_keys: META_KEYS } });
+  }
+  const meta = mergeMeta(body.data.meta);
+  if (!meta.ok) return err(c, "validation_error", `body.meta: ${meta.error}`.slice(0, 400), 400);
   try {
-    const r = await registerMarket(c.env, cfg, body.market, body.tenant_id ?? null);
-    return ok(c, r, 201);
+    const r = await registerMarket(c.env, cfg, body.data.market, body.data.tenant_id ?? null, { meta: meta.meta, isTest: body.data.is_test ?? false });
+    return ok(c, { market_id: r.marketId, status: r.status, reasons: r.reasons, watches: r.watches, existing: r.existing, is_test: r.isTest, meta_applied: r.metaApplied, meta_dropped: meta.dropped }, r.existing ? 200 : 201);
   } catch (e) {
     return err(c, "validation_error", String(e).slice(0, 400), 400);
   }

@@ -16,6 +16,8 @@
     "eval:ingest": "tsx evals/ingest.ts",
     "bench": "tsx evals/bench.ts",
     "openapi": "tsx scripts/openapi.ts",
+    "candidates": "tsx scripts/candidates.ts",
+    "seed:shadow": "tsx scripts/seed-shadow.ts",
     "db:push": "supabase db push"
   },
   "engines": {

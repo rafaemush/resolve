@@ -3,21 +3,44 @@ import { db } from "../db/supabase";
 import { MarketRegistration, type MarketRegistration as Reg } from "../resolve/schema";
 import { robotsAllows } from "../ingest/web";
 import { baseRpcUrl, getBlock, blockAtOrAfter, hasCode } from "../ingest/base";
+import type { MarketMeta } from "./meta";
 
-export interface RegisterResult { marketId: string; status: "open" | "unsupported_source"; reasons: string[]; watches: Array<{ id: string; source_kind: string }> }
+export interface RegisterResult {
+  marketId: string;
+  status: "open" | "unsupported_source";
+  reasons: string[];
+  watches: Array<{ id: string; source_kind: string }>;
+  /** true: the (tenant, platform, external_id) market already existed and nothing was written (meta and is_test included). */
+  existing: boolean;
+  /** Whitelisted meta keys written by this call (src/markets/meta.ts); empty for an existing market. */
+  metaApplied: string[];
+  /** markets.is_test of the returned row. */
+  isTest: boolean;
+}
+
+export interface RegisterOptions {
+  createWatches?: boolean;
+  /** Importer metadata, already validated by mergeMeta(); merged into markets.meta, condition_id also into its column. */
+  meta?: MarketMeta;
+  /** markets.is_test (migration 012): a test market is never posted, reconciled or counted on the public record. */
+  isTest?: boolean;
+}
 
 /** Validate, run registration-time source checks (robots, contract code), insert the market and one watch per source. */
-export async function registerMarket(env: Env, cfg: Config, input: unknown, tenantId: string | null, opts: { createWatches?: boolean } = {}): Promise<RegisterResult> {
+export async function registerMarket(env: Env, cfg: Config, input: unknown, tenantId: string | null, opts: RegisterOptions = {}): Promise<RegisterResult> {
   const reg: Reg = MarketRegistration.parse(input);
   const client = db(env);
-  // Idempotent registration: the same (tenant, platform, external_id) returns the existing market.
+  // Idempotent registration: the same (tenant, platform, external_id) returns the existing market. A repeat never rewrites
+  // it: meta and is_test of a market that may already carry a public commit stay as first registered.
   {
-    let q = client.from("markets").select("id, status, meta").eq("platform", reg.platform).eq("external_id", reg.external_id).is("deleted_at", null);
+    let q = client.from("markets").select("id, status, meta, is_test").eq("platform", reg.platform).eq("external_id", reg.external_id).is("deleted_at", null);
     q = tenantId ? q.eq("tenant_id", tenantId) : q.is("tenant_id", null);
-    const { data: existing } = await q.maybeSingle();
+    const { data: existing, error: ee } = await q.maybeSingle();
+    // A failed lookup must not fall through to an insert: that is how a duplicate market would be born.
+    if (ee) throw new Error(`markets lookup: ${ee.message}`);
     if (existing) {
       const { data: ws } = await client.from("watches").select("id, source_kind").eq("market_id", existing.id).is("deleted_at", null);
-      return { marketId: existing.id as string, status: existing.status as "open" | "unsupported_source", reasons: ((existing.meta as { registration_reasons?: string[] })?.registration_reasons) ?? [], watches: (ws ?? []).map((w) => ({ id: w.id as string, source_kind: w.source_kind as string })) };
+      return { marketId: existing.id as string, status: existing.status as "open" | "unsupported_source", reasons: ((existing.meta as { registration_reasons?: string[] })?.registration_reasons) ?? [], watches: (ws ?? []).map((w) => ({ id: w.id as string, source_kind: w.source_kind as string })), existing: true, metaApplied: [], isTest: existing.is_test === true };
     }
   }
   const reasons: string[] = [];
@@ -48,12 +71,14 @@ export async function registerMarket(env: Env, cfg: Config, input: unknown, tena
     }
   }
   if (!watchSpecs.length) status = "unsupported_source";
+  const meta: MarketMeta = opts.meta ?? {};
   const { data: m, error } = await client.from("markets").insert({
     tenant_id: tenantId, platform: reg.platform, external_id: reg.external_id, condition: reg.condition, event_statement: reg.event_statement,
     option_a: reg.option_a, option_b: reg.option_b, positive_option: reg.positive_option, anchors: reg.anchors, sources: reg.sources,
     resolver: reg.resolver ?? null, negative_rule: reg.negative_rule, allow_prerelease: reg.allow_prerelease, open_at: reg.open_at, deadline_utc: reg.deadline_utc,
-    grace_seconds: reg.grace_seconds, status, meta: { registration_reasons: reasons },
-  }).select("id").single();
+    grace_seconds: reg.grace_seconds, status, meta: { ...meta, registration_reasons: reasons },
+    condition_id: meta.condition_id ?? null, is_test: opts.isTest ?? false,
+  }).select("id, is_test").single();
   if (error || !m) throw new Error(`markets insert: ${error?.message ?? "no row"}`);
   const nearDeadline = Date.parse(reg.deadline_utc) - Date.now() < 24 * 3600 * 1000;
   const watches: RegisterResult["watches"] = [];
@@ -64,5 +89,5 @@ export async function registerMarket(env: Env, cfg: Config, input: unknown, tena
       watches.push({ id: data.id as string, source_kind: data.source_kind as string });
     }
   }
-  return { marketId: m.id as string, status, reasons, watches };
+  return { marketId: m.id as string, status, reasons, watches, existing: false, metaApplied: Object.keys(meta).sort(), isTest: m.is_test === true };
 }
