@@ -5,6 +5,7 @@ import { MAX_EARLIER_MATCHES, nextEarlierMatches } from "../src/ingest/matches";
 import type { WatchRow } from "../src/ingest/types";
 import { processDeposits, toDepositLog, type DepositLog } from "../src/jobs/deposits";
 import { redact } from "../src/ops/redact";
+import { Budget, BudgetExhausted } from "../src/ops/budget";
 import { resolveMarket } from "../src/resolve";
 import { DEFAULT_THRESHOLDS } from "../src/resolve/thresholds";
 import type { EvidenceInput, Resolver } from "../src/resolve/schema";
@@ -94,6 +95,16 @@ describe("logsWindow", () => {
     expect(err).toBeInstanceOf(LogsUnavailableError);
     expect((err as LogsUnavailableError).rangeErrors).toBe(true);
   });
+  it("on a budget, every RPC is reserved first; running out is budgetExhausted, not every provider failing", async () => {
+    const calls = stubRpc((u) => { if (u === A.url) throw new Error("rate limited"); return header(9_000); });
+    const budget = new Budget(2);
+    const err = await logsWindow([A, B], 100, { address: "0xabc" }, 2000, budget).catch((e) => e);
+    expect(err).toBeInstanceOf(LogsUnavailableError);
+    expect((err as LogsUnavailableError).budgetExhausted).toBe(true);
+    expect((err as LogsUnavailableError).errors[0]).toContain("a.example: Error: rpc eth_getBlockByNumber");
+    expect(calls.map((c) => `${c.url} ${c.method}`)).toEqual([`${A.url} eth_getBlockByNumber`, `${B.url} eth_getBlockByNumber`]); // B's eth_getLogs never sent
+    expect(budget.used).toBe(2);
+  });
   it("classifies range errors from the providers we probed", () => {
     expect(isRangeError("rpc eth_getLogs: -32600 You can make eth_getLogs requests with up to a 10 block range")).toBe(true);
     expect(isRangeError("rpc eth_getLogs: -32614 eth_getLogs is limited to a 2,000 range")).toBe(true);
@@ -174,6 +185,10 @@ describe("processDeposits (money: never skip a deposit)", () => {
   it("never moves the cursor backwards when the first block of the window fails", async () => {
     const r = await processDeposits([d(11, 0)], 10, 20, async () => { throw new Error("db down"); });
     expect(r.cursor).toBe(10);
+  });
+  it("running out of budget stops before that log's block without calling it a failed credit", async () => {
+    const r = await processDeposits([d(11, 0), d(15, 0), d(15, 1)], 10, 20, async (x) => { if (x.logIndex === 1) throw new BudgetExhausted("crediting"); return "credited"; });
+    expect(r).toMatchObject({ cursor: 14, failed: null, stoppedAt: { block: 15, logIndex: 1 }, counts: { credited: 2 } });
   });
   it("skips zero-value transfers (address-poisoning spam) without calling the ledger", async () => {
     const credit = vi.fn(async () => "credited");

@@ -3,6 +3,9 @@
  * Jev accounting (jev_calls, jev_spend_daily, breaker updates) and the resolutions row.
  * The breaker opening, the ceiling refusing a Jev call and a gate or accounting write that failed are operator alerts:
  * each turns every Jev-routed verdict into "could not look" (or leaves spend unenforced) until someone acts.
+ * The Jev accounting runs whether or not the resolutions row could be written: a call that was made is spend and
+ * breaker state even when its verdict was lost. A lost verdict is alerted and thrown as ResolutionNotRecordedError, so
+ * the caller refunds the charge instead of answering a verdict that does not exist.
  */
 import type { Env, Config } from "../env";
 import { db, rpc } from "../db/supabase";
@@ -64,6 +67,20 @@ export interface RuntimeInput {
 
 export interface RuntimeOutput { result: ResolveResult; resolutionId: string; jevCalls: number; jevCostUsd: number }
 
+/** No verdict row exists for this resolution (the write failed, or the resolver threw); already alerted. */
+export class ResolutionNotRecordedError extends Error {
+  constructor(message: string) { super(message); this.name = "ResolutionNotRecordedError"; }
+}
+
+/** The operator alert for a verdict that was computed (or attempted) and not recorded (pure). */
+function notRecordedAlert(o: Pick<RuntimeInput, "tenantId" | "marketId" | "mode">, resolutionId: string, why: string, stub: string | null): AlertItem {
+  return {
+    key: "resolution_write_failed", dedupMinutes: JEV_ALERT_DEDUP_MINUTES,
+    text: `A ${o.mode} resolution for market ${o.marketId}${o.tenantId ? ` (tenant ${o.tenantId})` : ""} was not recorded: ${why}. No verdict exists for request ${resolutionId}; the caller refunds its charge${stub ? `; ${stub}` : ""}.`,
+    meta: { request_id: resolutionId, tenant_id: o.tenantId, market_id: o.marketId, mode: o.mode },
+  };
+}
+
 export async function resolveWithRuntime(env: Env, cfg: Config, o: RuntimeInput): Promise<RuntimeOutput> {
   const client = db(env);
   const th = thresholdsFromEnv(env as unknown as Record<string, string | undefined>, cfg.thresholdsVersion);
@@ -86,23 +103,36 @@ export async function resolveWithRuntime(env: Env, cfg: Config, o: RuntimeInput)
   const live = makeJevCaller({ apiKey: env.TYPESAFE_API_KEY ?? "", timeoutMs: cfg.jevTimeoutMs, onAttempt: (i) => attempts.push(i) });
   const caller = async (req: Parameters<typeof live>[0]) => { if (o.beforeJev) await o.beforeJev(); return live(req); };
 
-  const result = await resolveMarket({ marketId: o.marketId, market: o.market, evidence: o.evidence, thresholds: th, spotlightSecret: env.SPOTLIGHT_SECRET, model: cfg.jevModel, now: o.now, jevBlocked }, { jev: caller });
-
-  const v = result.verdict;
   const resolutionId = o.requestId ?? crypto.randomUUID().replace(/-/g, "");
-  const row = {
-    tenant_id: o.tenantId, api_key_id: o.apiKeyId, market_id: o.marketId, evidence_id: o.evidenceId, mode: o.mode, status_row: "complete",
-    resolution_status: v.resolution_status, winning_outcome: v.winning_outcome, confidence_score: v.confidence_score,
-    error_code: v.error_code, error_reason: v.error_reason, caveats: v.caveats, determination_basis: v.determination_basis, checks: v.checks,
-    jev_answers: result.jev?.response?.answers ?? null, jev_model: v.jev_model, thresholds_version: v.thresholds_version,
-    credits_charged: o.creditsCharged, duration_ms: v.latency_ms, jev_ms: result.jev?.latencyMs ?? null, completed_at: new Date().toISOString(),
-  };
-  if (o.requestId) {
-    const { error } = await client.from("resolutions").update(row).eq("id", o.requestId);
-    if (error) throw new Error(`resolutions update: ${error.message}`);
-  } else {
-    const { error } = await client.from("resolutions").insert({ id: resolutionId, ...row });
-    if (error) throw new Error(`resolutions insert: ${error.message}`);
+  let result: ResolveResult | null = null;
+  let notRecorded: string | null = null;
+  try {
+    result = await resolveMarket({ marketId: o.marketId, market: o.market, evidence: o.evidence, thresholds: th, spotlightSecret: env.SPOTLIGHT_SECRET, model: cfg.jevModel, now: o.now, jevBlocked }, { jev: caller });
+    const v = result.verdict;
+    const row = {
+      tenant_id: o.tenantId, api_key_id: o.apiKeyId, market_id: o.marketId, evidence_id: o.evidenceId, mode: o.mode, status_row: "complete",
+      resolution_status: v.resolution_status, winning_outcome: v.winning_outcome, confidence_score: v.confidence_score,
+      error_code: v.error_code, error_reason: v.error_reason, caveats: v.caveats, determination_basis: v.determination_basis, checks: v.checks,
+      jev_answers: result.jev?.response?.answers ?? null, jev_model: v.jev_model, thresholds_version: v.thresholds_version,
+      credits_charged: o.creditsCharged, duration_ms: v.latency_ms, jev_ms: result.jev?.latencyMs ?? null, completed_at: new Date().toISOString(),
+    };
+    const { error } = o.requestId
+      ? await client.from("resolutions").update(row).eq("id", o.requestId)
+      : await client.from("resolutions").insert({ id: resolutionId, ...row });
+    if (error) notRecorded = `resolutions ${o.requestId ? "update" : "insert"}: ${redact(error.message).slice(0, 200)}`;
+  } catch (e) {
+    notRecorded = `${result ? "resolutions write" : "resolver"} threw: ${redact(String(e)).slice(0, 200)}`;
+  }
+
+  // A stub left 'pending' makes every replay of its Idempotency-Key answer "still in flight"; 'failed' is the truth.
+  let stub: string | null = null;
+  if (notRecorded && o.requestId) {
+    try {
+      const { error } = await client.from("resolutions").update({ status_row: "failed", completed_at: new Date().toISOString() }).eq("id", o.requestId).eq("status_row", "pending");
+      stub = error ? `the pending stub could not be marked failed either (${redact(error.message).slice(0, 120)}), so replays of its Idempotency-Key answer 202 until it is` : "the stub is marked failed";
+    } catch (e) {
+      stub = `marking the stub failed threw (${redact(String(e)).slice(0, 120)})`;
+    }
   }
 
   let cost = 0;
@@ -110,24 +140,31 @@ export async function resolveWithRuntime(env: Env, cfg: Config, o: RuntimeInput)
   const accountingErrors: string[] = [];
   const failedStep = (step: string) => (e: unknown) => { accountingErrors.push(`${step}: ${redact(String(e)).slice(0, 160)}`); };
   if (attempts.length) {
+    const model = result?.jev?.response?.model ?? cfg.jevModel;
+    // jev_calls.resolution_id references resolutions(id): no row was inserted when the insert itself failed.
+    const callsResolutionId = notRecorded && !o.requestId ? null : resolutionId;
     const rows = attempts.map((a) => {
-      const c = jevCostUsd(result.jev?.response?.model ?? cfg.jevModel, cfg.jevModel, a.inputTokens, cfg.jevUsdPerMtok);
+      const c = jevCostUsd(model, cfg.jevModel, a.inputTokens, cfg.jevUsdPerMtok);
       cost += c;
-      return { resolution_id: resolutionId, surface: o.mode === "shadow" ? "shadow" : "resolve", model: result.jev?.response?.model ?? cfg.jevModel, input_tokens: a.inputTokens, output_tokens: a.outputTokens, cost_usd: c, http_status: a.status, latency_ms: a.latencyMs, error: a.error ?? null };
+      return { resolution_id: callsResolutionId, surface: o.mode === "shadow" ? "shadow" : "resolve", model, input_tokens: a.inputTokens, output_tokens: a.outputTokens, cost_usd: c, http_status: a.status, latency_ms: a.latencyMs, error: a.error ?? null };
     });
     const { error: callsError } = await client.from("jev_calls").insert(rows);
     if (callsError) accountingErrors.push(`jev_calls insert: ${redact(callsError.message).slice(0, 160)}`);
     const tokens = attempts.reduce((n, a) => n + a.inputTokens, 0);
     if (tokens > 0 || cost > 0) await rpc(client, "record_jev_spend", { p_input_tokens: tokens, p_usd: cost }).catch(failedStep("record_jev_spend"));
-    const failed = result.jev?.error !== undefined && !(result.jev?.error?.includes("BUDGET") ?? false);
+    // Without a result (the resolver threw) the last attempt says how the call went.
+    const failed = result ? result.jev?.error !== undefined && !result.jev.error.includes("BUDGET") : attempts.at(-1)?.error !== undefined;
+    const succeeded = result ? !!result.jev?.response : !failed;
     if (failed) breakerOpened = (await rpc<boolean>(client, "upstream_record_failure", { p_name: "jev", p_threshold: BREAKER_THRESHOLD, p_open_seconds: BREAKER_OPEN_SECONDS }).catch(failedStep("upstream_record_failure"))) === true;
-    else if (result.jev?.response) await rpc(client, "upstream_record_success", { p_name: "jev" }).catch(failedStep("upstream_record_success"));
+    else if (succeeded) await rpc(client, "upstream_record_success", { p_name: "jev" }).catch(failedStep("upstream_record_success"));
   }
   const alerts = jevAlerts({
-    gate: jevBlocked, route: result.route, gatesError, breakerOpened, spendTodayUsd, ceilingUsd: cfg.jevDailyUsdCeiling,
-    lastJevError: result.jev?.error ? redact(result.jev.error).slice(0, 200) : null, accountingErrors,
+    gate: jevBlocked, route: result?.route ?? (attempts.length ? "jev" : "precheck"), gatesError, breakerOpened, spendTodayUsd, ceilingUsd: cfg.jevDailyUsdCeiling,
+    lastJevError: result?.jev?.error ? redact(result.jev.error).slice(0, 200) : (attempts.at(-1)?.error ? redact(attempts.at(-1)!.error!).slice(0, 200) : null), accountingErrors,
   });
+  if (notRecorded) alerts.push(notRecordedAlert(o, resolutionId, notRecorded, stub));
   if (alerts.length) await alertMany(env, alerts);
+  if (notRecorded || !result) throw new ResolutionNotRecordedError(`request ${resolutionId}: ${notRecorded ?? "no result"}`);
   return { result, resolutionId, jevCalls: attempts.length, jevCostUsd: cost };
 }
 

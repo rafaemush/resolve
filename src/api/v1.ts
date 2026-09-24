@@ -4,11 +4,11 @@ import type { Env } from "../env";
 import { parseConfig } from "../env";
 import { ok, err } from "./envelope";
 import { authenticate, rateLimit, extractApiKey, invalidateKeyCache, type AuthContext } from "./auth";
-import { db, rpc } from "../db/supabase";
+import { db, rpc, type Db } from "../db/supabase";
 import { MarketRegistration, EvidenceInput, type Verdict } from "../resolve/schema";
 import { planRoute } from "../resolve";
 import { thresholdsFromEnv } from "../resolve/thresholds";
-import { resolveWithRuntime, JevUnavailableError } from "../resolve/runtime";
+import { resolveWithRuntime, JevUnavailableError, type RuntimeOutput } from "../resolve/runtime";
 import { toStrictV0 } from "../resolve/verdict";
 import { registerMarket } from "../markets/register";
 import { runWatch } from "../ingest/watch";
@@ -75,6 +75,23 @@ function verdictResponse(c: Parameters<typeof ok>[0], auth: AuthContext, v: Verd
   return ok(c, { ...v, ...extra });
 }
 
+/**
+ * Money path: the tenant pays for a verdict, not for our outage. refund_credits is idempotent per request; a refund
+ * that fails is alerted per request (refund it by hand until P3's refund_pending job).
+ */
+async function refundOrAlert(env: Env, client: Db, requestId: string, tenantId: string, charged: number, why: string): Promise<number> {
+  return rpc<number>(client, "refund_credits", { p_request_id: requestId }).catch(async (e) => {
+    await alert(env, `refund_failed_${requestId}`, `refund_credits failed for request ${requestId} (tenant ${tenantId}, ${charged} credit(s) charged for ${why}): ${redact(String(e)).slice(0, 200)}. Refund it by hand.`, { dedupMinutes: 1440, meta: { request_id: requestId, tenant_id: tenantId, credits: charged } });
+    return 0;
+  });
+}
+
+/** A replayed key whose request failed before its verdict was recorded: no verdict will ever exist under that key. */
+function notRecordedReplay(c: Parameters<typeof ok>[0], id: string, refunded: unknown) {
+  const credits = Number(refunded ?? 0);
+  return err(c, "UPSTREAM_UNAVAILABLE", `request ${id} failed before its verdict was recorded${credits > 0 ? ` and its ${credits} credit(s) were refunded` : ""}; send it again with a new Idempotency-Key`, 503, { retryAfterSeconds: 30, extra: { error_reason: "VERDICT_NOT_RECORDED" } });
+}
+
 v1.post("/resolve", async (c) => {
   const cfg = parseConfig(c.env);
   const auth = c.get("auth");
@@ -90,6 +107,7 @@ v1.post("/resolve", async (c) => {
     const { data: r } = await client.from("resolutions").select("*").eq("id", id).maybeSingle();
     if (r) {
       c.header("X-Idempotent-Replay", "true");
+      if (r.status_row === "failed") return notRecordedReplay(c, id, r.credits_refunded);
       if (r.status_row !== "complete") return ok(c, { request_id: id, status_row: r.status_row, message: "original request still in flight" }, 202);
       const { data: t } = await client.from("tenants").select("credits_balance").eq("id", auth.tenantId).single();
       return ok(c, { request_id: id, ...rowToVerdict(r), replayed: true, credits_charged: r.credits_charged, credits_refunded: r.credits_refunded, balance: t?.credits_balance ?? null });
@@ -155,21 +173,23 @@ v1.post("/resolve", async (c) => {
   if (br.replayed) {
     const { data: r } = await client.from("resolutions").select("*").eq("id", br.request_id).single();
     c.header("X-Idempotent-Replay", "true");
+    if (r?.status_row === "failed") return notRecordedReplay(c, br.request_id, r.credits_refunded);
     if (!r || r.status_row !== "complete") return ok(c, { request_id: br.request_id, status_row: r?.status_row ?? "pending", message: "original request still in flight" }, 202);
     return ok(c, { request_id: br.request_id, ...rowToVerdict(r), replayed: true, credits_charged: r.credits_charged, balance: br.balance });
   }
   if (!br.ok) return err(c, "insufficient_credits", `This request costs ${amount} credit(s); balance is ${br.balance}. Top up at GET /v1/payments/address.`, 402, { extra: { balance: br.balance, price_credits: amount, route: plan.route } });
 
   // 4. resolve
-  const rt = await resolveWithRuntime(c.env, cfg, { marketId: market.id, market, evidence, evidenceId, mode: "tenant", tenantId: auth.tenantId, apiKeyId: auth.keyId, requestId: br.request_id, creditsCharged: br.charged });
-  let refunded = 0;
-  if (rt.result.verdict.error_code === "UPSTREAM_UNAVAILABLE" && br.charged > 0) {
-    refunded = await rpc<number>(client, "refund_credits", { p_request_id: br.request_id }).catch(async (e) => {
-      // Money path: the tenant was charged for a verdict that could not look. Refund by hand until P3's refund_pending job.
-      await alert(c.env, `refund_failed_${br.request_id}`, `refund_credits failed for request ${br.request_id} (tenant ${auth.tenantId}, ${br.charged} credit(s) charged for an UPSTREAM_UNAVAILABLE verdict): ${redact(String(e)).slice(0, 200)}. Refund it by hand.`, { dedupMinutes: 1440, meta: { request_id: br.request_id, tenant_id: auth.tenantId, credits: br.charged } });
-      return 0;
-    });
+  let rt: RuntimeOutput;
+  try {
+    rt = await resolveWithRuntime(c.env, cfg, { marketId: market.id, market, evidence, evidenceId, mode: "tenant", tenantId: auth.tenantId, apiKeyId: auth.keyId, requestId: br.request_id, creditsCharged: br.charged });
+  } catch {
+    // ResolutionNotRecordedError, the runtime's only throw: it alerted, ran the Jev accounting and marked the stub failed.
+    const refunded = br.charged > 0 ? await refundOrAlert(c.env, client, br.request_id, auth.tenantId, br.charged, "a verdict that was not recorded") : 0;
+    return err(c, "UPSTREAM_UNAVAILABLE", `the verdict for request ${br.request_id} could not be recorded${refunded > 0 ? `; the ${refunded} credit(s) charged were refunded` : ""}. Send the request again with a new Idempotency-Key.`, 503, { retryAfterSeconds: 30, extra: { error_reason: "VERDICT_NOT_RECORDED", credits_refunded: refunded } });
   }
+  let refunded = 0;
+  if (rt.result.verdict.error_code === "UPSTREAM_UNAVAILABLE" && br.charged > 0) refunded = await refundOrAlert(c.env, client, br.request_id, auth.tenantId, br.charged, "an UPSTREAM_UNAVAILABLE verdict");
   return verdictResponse(c, auth, rt.result.verdict, { request_id: br.request_id, credits_charged: br.charged - refunded, credits_refunded: refunded, balance: br.balance + refunded, route: plan.route });
 });
 

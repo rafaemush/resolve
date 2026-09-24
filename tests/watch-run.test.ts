@@ -335,6 +335,25 @@ describe("a verdict that could not look is never consumed (Jev gated, over budge
     expect(enqueueEvent).not.toHaveBeenCalled();
     expect(alert).not.toHaveBeenCalled();
   });
+
+  it("tenant market: a verdict the runtime could not record (it threw after the charge) is refunded too", async () => {
+    resetWatch({ markets: { ...market(7 * 86_400_000), tenant_id: "33333333-3333-4333-8333-333333333333" } });
+    h.rpc.mockImplementation(async (_c: unknown, fn: string) => {
+      if (fn === "begin_resolution") return [{ request_id: "stub2", ok: true, charged: 5 }];
+      if (fn === "refund_credits") return 5;
+      throw new Error(`rpc ${fn} not expected`);
+    });
+    vi.mocked(resolveWithRuntime).mockImplementationOnce(async (_env, _cfg, o) => {
+      await o.beforeJev!();
+      throw new Error("request r1: resolutions insert: canceling statement due to statement timeout");
+    });
+    serve(200, JSON.stringify(pr(1)));
+    const r = await runWatch(env(), cfg, WATCH_ID);
+    expect(r.outcome).toBe("failure");
+    expect(r.detail).toContain("resolutions insert");
+    expect(h.rpc.mock.calls.map((c) => c[1])).toEqual(["begin_resolution", "refund_credits"]);
+    expect(h.state.watch.last_canonical_hash).toBeNull(); // the change stays pending: the next poll resolves it again
+  });
 });
 
 describe("dispatch outcome (migration 013: dispatch_failures() counts pg_net answers >= 400)", () => {

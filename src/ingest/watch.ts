@@ -269,10 +269,10 @@ export async function runWatch(env: Env, cfg: Config, watchId: string): Promise<
    * bill-then-run charged the tenant before Jev refused; the tenant pays for a verdict, not for our outage (the
    * /v1/resolve path refunds the same way). refund_credits is idempotent per request; a failure is alerted.
    */
-  const refund = async (requestId: string, resolutionId: string): Promise<void> => {
+  const refund = async (requestId: string, resolutionId: string | null): Promise<void> => {
     try {
       const refunded = await rpc<number>(client, "refund_credits", { p_request_id: requestId });
-      if (refunded > 0) {
+      if (refunded > 0 && resolutionId) {
         const { error: re } = await client.from("resolutions").update({ credits_refunded: refunded }).eq("id", resolutionId);
         if (re) throw new Error(`resolutions ${resolutionId} credits_refunded: ${re.message}`);
       }
@@ -281,9 +281,11 @@ export async function runWatch(env: Env, cfg: Config, watchId: string): Promise<
     }
   };
   let looked = true;
+  let recorded = false;
   try {
     const evInput: EvidenceInput = { ...ev }; // precheck treats a web observed_at as claimed_at and uses fetched_at
     const rt = await resolveWithRuntime(env, cfg, { marketId: market.id, market, evidence: evInput, evidenceId, mode, tenantId: market.tenant_id, apiKeyId: null, requestId: null, creditsCharged: charged, beforeJev });
+    recorded = true;
     rows++;
     summary.verdict = `${rt.result.verdict.resolution_status}/${rt.result.verdict.winning_outcome}${rt.result.verdict.error_reason ? "/" + rt.result.verdict.error_reason : ""}`;
     summary.resolution_id = rt.resolutionId;
@@ -301,6 +303,8 @@ export async function runWatch(env: Env, cfg: Config, watchId: string): Promise<
       await enqueueEvent(env, market.tenant_id, type, { market_id: market.id, external_id: market.external_id, request_id: rt.resolutionId, verdict: v });
     }
   } catch (e) {
+    // The runtime threw ResolutionNotRecordedError (alerted there): no verdict row exists, so the charge bought nothing.
+    if (!recorded && charged > 0 && chargeRequestId) await refund(chargeRequestId, null);
     return fail(`resolve: ${String(e).slice(0, 300)}`);
   }
   if (!looked) {

@@ -13,6 +13,7 @@ import { randomKeyBody } from "./v1";
 import { runReconcile } from "../jobs/reconcile";
 import { scanDeposits } from "../jobs/deposits";
 import { drainWebhooks } from "../webhooks/deliver";
+import { Budget, INVOCATION_SUBREQUESTS } from "../ops/budget";
 
 type Vars = { requestId: string; schemaVersion: string };
 export const internal = new Hono<{ Bindings: Env; Variables: Vars }>();
@@ -83,7 +84,8 @@ internal.post("/tenants", async (c) => {
 });
 
 internal.post("/reconcile", async (c) => { if (!isAdmin(c)) return err(c, "forbidden", "admin key required", 403); return ok(c, await runReconcile(c.env)); });
-internal.post("/deposits/scan", async (c) => { if (!isAdmin(c)) return err(c, "forbidden", "admin key required", 403); return ok(c, await scanDeposits(c.env, parseConfig(c.env))); });
+// Its own invocation and the scan never throws, so it gets every subrequest: the way past a block too big for the cron's share.
+internal.post("/deposits/scan", async (c) => { if (!isAdmin(c)) return err(c, "forbidden", "admin key required", 403); return ok(c, await scanDeposits(c.env, parseConfig(c.env), new Budget(INVOCATION_SUBREQUESTS))); });
 internal.post("/webhooks/drain", async (c) => { if (!isAdmin(c)) return err(c, "forbidden", "admin key required", 403); return ok(c, await drainWebhooks(c.env, 10)); });
 
 /** Read the R2 diagnostics the scheduled handler writes when an insert fails. */

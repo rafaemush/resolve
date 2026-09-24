@@ -1,7 +1,8 @@
 /**
  * Webhook drain (plan §16.4 P0 step 7, P3 step 4 DLQ alert): a delivery moving to dlq alerts per endpoint
  * (webhook_dlq_<endpoint_id>, dedup 6 h) in one alertMany() per run, a claim or bookkeeping failure alerts, an
- * endpoint that could not be read is not called dead, and the drain claims only what its fixed budget can finish.
+ * endpoint that could not be read is not called dead, the drain claims only what its fixed budget can finish, and a
+ * row whose claiming run died ('delivering' long after its lease) is requeued, delivered and alerted.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
@@ -32,7 +33,7 @@ vi.mock("../src/db/supabase", () => ({
 }));
 vi.mock("../src/ops/alerts", () => ({ alert: vi.fn(async () => ({ sent: true, deduped: false })), alertMany: vi.fn(async () => ({ sent: [], deduped: [] })) }));
 
-import { drainWebhooks, dlqAlerts, drainSubrequests, enqueueEvent, DRAIN_MAX, MAX_ATTEMPTS, DLQ_DEDUP_MINUTES } from "../src/webhooks/deliver";
+import { drainWebhooks, dlqAlerts, drainSubrequests, enqueueEvent, DRAIN_MAX, MAX_ATTEMPTS, DLQ_DEDUP_MINUTES, STALE_DELIVERING_MINUTES } from "../src/webhooks/deliver";
 import { alert, alertMany } from "../src/ops/alerts";
 import { Budget, COST } from "../src/ops/budget";
 
@@ -125,9 +126,55 @@ describe("drainWebhooks", () => {
   it("a smaller budget claims fewer rows, never more than it can finish", async () => {
     const seen: number[] = [];
     h.db = fakeDb({ webhook_endpoints: [endpoint("e1")], webhook_deliveries: Array.from({ length: 6 }, (_, i) => delivery(`d${i}`, "e1", 0)) }, {}, { rpc: { claim_webhook_deliveries: async (db, a) => { seen.push(a.p_max); return claim(db, a); } } });
-    const r = await drainWebhooks(env, 10, new Budget(COST.db + COST.alert + 2 * 4));
+    const r = await drainWebhooks(env, 10, new Budget(2 * COST.db + COST.alert + 2 * 4));
     expect(seen).toEqual([2]);
     expect(r).toMatchObject({ claimed: 2, delivered: 2 });
+  });
+});
+
+describe("drainWebhooks: a delivery whose claiming run died", () => {
+  let posts: string[];
+  beforeEach(() => {
+    posts = []; h.failEndpointRead = false; h.failEndpointList = false;
+    vi.mocked(alertMany).mockClear();
+    vi.stubGlobal("fetch", async (url: string) => { posts.push(String(url)); return new Response("ok", { status: 200 }); });
+  });
+  afterEach(() => vi.unstubAllGlobals());
+  const leased = (minutesAgo: number) => new Date(Date.now() - minutesAgo * 60_000).toISOString();
+
+  it("is requeued and delivered in the same run, and alerted; a live lease is left alone", async () => {
+    h.db = fakeDb({ webhook_endpoints: [endpoint("e1")], webhook_deliveries: [
+      { ...delivery("dead", "e1", 1), status: "delivering", lease_until: leased(STALE_DELIVERING_MINUTES + 1) },
+      { ...delivery("live", "e1", 0), status: "delivering", lease_until: leased(-1) }, // claimed seconds ago by a run still going
+    ] }, {}, { rpc: { claim_webhook_deliveries: claim } });
+    const r = await drainWebhooks(env, DRAIN_MAX);
+    expect(r).toMatchObject({ requeued: 1, claimed: 1, delivered: 1, errors: 0, alerts: ["webhook_stuck_delivering"] });
+    expect(posts).toEqual(["https://hooks.example/e1"]);
+    expect(h.db.tables.webhook_deliveries!.map((d) => [d.id, d.status, d.attempt])).toEqual([["dead", "delivered", 2], ["live", "delivering", 0]]);
+    const [item] = vi.mocked(alertMany).mock.calls[0]![1]!;
+    expect(item).toMatchObject({ key: "webhook_stuck_delivering", dedupMinutes: 60, meta: { deliveries: ["dead"] } });
+    const used = h.db.calls.length + posts.length + vi.mocked(alertMany).mock.calls.length * COST.alert;
+    expect(used).toBeLessThanOrEqual(drainSubrequests(DRAIN_MAX));
+  });
+
+  it("a lease that expired less than the margin ago is not requeued (the old Worker's run may still be delivering it)", async () => {
+    h.db = fakeDb({ webhook_endpoints: [endpoint("e1")], webhook_deliveries: [{ ...delivery("recent", "e1", 0), status: "delivering", lease_until: leased(STALE_DELIVERING_MINUTES - 1) }] }, {}, { rpc: { claim_webhook_deliveries: claim } });
+    const r = await drainWebhooks(env, DRAIN_MAX);
+    expect(r).toMatchObject({ requeued: 0, claimed: 0, alerts: [] });
+    expect(h.db.tables.webhook_deliveries![0]!.status).toBe("delivering");
+  });
+
+  it("a sweep the database refuses is a drain error, alerted", async () => {
+    h.db = fakeDb({ webhook_endpoints: [], webhook_deliveries: [] }, {}, { rpc: { claim_webhook_deliveries: claim } });
+    const client = h.db.client;
+    h.db = { ...h.db, client: { ...client, from: (t: string) => {
+      const q = client.from(t);
+      if (t !== "webhook_deliveries") return q;
+      return new Proxy(q, { get: (o, k) => (k === "update" ? () => { const f: any = { eq: () => f, lt: () => f, select: () => Promise.resolve({ data: null, error: { message: "permission denied for table webhook_deliveries" } }) }; return f; } : Reflect.get(o, k)) });
+    } } } as FakeDb;
+    const r = await drainWebhooks(env, DRAIN_MAX);
+    expect(r).toMatchObject({ requeued: 0, errors: 1, alerts: ["webhook_drain_errors"] });
+    expect(vi.mocked(alertMany).mock.calls[0]![1]![0]!.text).toContain("stale 'delivering' sweep: permission denied");
   });
 });
 

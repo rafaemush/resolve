@@ -1,7 +1,9 @@
 /**
  * In-memory stand-in for the PostgREST query shapes the commit/reconcile code uses: select (eq on a column or an
- * embedded "a.b" path, in, lte, gte, is null, order, limit, single, maybeSingle, head count), insert (+ select().single()),
- * upsert with onConflict/ignoreDuplicates, update, and rpc() through test-supplied stand-ins. Unique columns and partial
+ * embedded "a.b" path, in, lt, lte, gte, is null, order, limit, single, maybeSingle, head count), insert (+ select().single()),
+ * upsert (on onConflict, else the table's primary key: FakeDbOptions.primaryKey, default "id"; ignoreDuplicates skips,
+ * otherwise the row is merged like ON CONFLICT DO UPDATE), update (+ select() returns the updated rows), and rpc()
+ * through test-supplied stand-ins. Unique columns and partial
  * unique indexes (e.g. uq_reconciliations_final) answer 23505 like Postgres; an ON CONFLICT target covers only its own
  * column, exactly as in Postgres. Every executed query or rpc is one entry in `calls`, so a test can count
  * subrequests; the queries an rpc stand-in runs internally are not. Triggers are not emulated: scripts/selftest-db.ts
@@ -13,7 +15,7 @@ type Filter = (r: Row) => boolean;
 /** At most one row per value of `col` among the rows matching `where` (CREATE UNIQUE INDEX ... (col) WHERE ...). */
 export interface PartialUnique { name: string; col: string; where: (r: Row) => boolean }
 export type RpcStandIn = (db: FakeDb, args: Record<string, any>) => Promise<{ data: any; error: any }>;
-export interface FakeDbOptions { partialUnique?: Record<string, PartialUnique[]>; rpc?: Record<string, RpcStandIn> }
+export interface FakeDbOptions { partialUnique?: Record<string, PartialUnique[]>; rpc?: Record<string, RpcStandIn>; primaryKey?: Record<string, string> }
 
 export interface FakeDb {
   tables: Record<string, Row[]>;
@@ -46,10 +48,15 @@ class Query implements PromiseLike<{ data: any; error: any; count?: number | nul
     return this;
   }
   insert(rows: Row | Row[]) { this.action = "insert"; this.payload = Array.isArray(rows) ? rows : [rows]; return this; }
-  upsert(rows: Row | Row[], opts: { onConflict: string; ignoreDuplicates?: boolean }) { this.action = "upsert"; this.payload = Array.isArray(rows) ? rows : [rows]; this.conflict = { col: opts.onConflict, ignore: !!opts.ignoreDuplicates }; return this; }
+  upsert(rows: Row | Row[], opts: { onConflict?: string; ignoreDuplicates?: boolean } = {}) {
+    this.action = "upsert"; this.payload = Array.isArray(rows) ? rows : [rows];
+    this.conflict = { col: opts.onConflict ?? this.db.options.primaryKey?.[this.table] ?? "id", ignore: !!opts.ignoreDuplicates };
+    return this;
+  }
   update(patch: Row) { this.action = "update"; this.patch = patch; return this; }
   eq(col: string, v: unknown) { this.filters.push((r) => path(r, col) === v); return this; }
   in(col: string, vs: unknown[]) { this.filters.push((r) => vs.includes(path(r, col))); return this; }
+  lt(col: string, v: string) { this.filters.push((r) => path(r, col) != null && String(path(r, col)) < v); return this; }
   lte(col: string, v: string) { this.filters.push((r) => String(path(r, col)) <= v); return this; }
   gte(col: string, v: string) { this.filters.push((r) => String(path(r, col)) >= v); return this; }
   is(col: string, v: null) { this.filters.push((r) => (path(r, col) ?? null) === v); return this; }
@@ -82,9 +89,13 @@ class Query implements PromiseLike<{ data: any; error: any; count?: number | nul
     if (this.action === "insert" || this.action === "upsert") {
       const inserted: Row[] = [];
       for (const p of this.payload) {
-        if (this.conflict && this.rows().some((r) => r[this.conflict!.col] === p[this.conflict!.col])) {
-          if (this.conflict.ignore) continue;
-          return { data: null, error: { code: "42P10", message: "fake: upsert update path not emulated" } };
+        // NULL never conflicts, as in Postgres.
+        const existing = this.conflict && p[this.conflict.col] != null ? this.rows().find((r) => r[this.conflict!.col] === p[this.conflict!.col]) : undefined;
+        if (existing) {
+          if (this.conflict!.ignore) continue;
+          Object.assign(existing, structuredClone(p));
+          inserted.push(existing);
+          continue;
         }
         const c = this.conflictOn(p, uniq) ?? this.partialConflict(p, null);
         if (c) return dup(c);
@@ -99,7 +110,7 @@ class Query implements PromiseLike<{ data: any; error: any; count?: number | nul
     if (this.action === "update") {
       for (const r of matched) { const c = this.partialConflict({ ...r, ...this.patch }, r); if (c) return dup(c); }
       for (const r of matched) Object.assign(r, structuredClone(this.patch));
-      return { data: null, error: null };
+      return { data: this.returning ? structuredClone(matched) : null, error: null };
     }
     if (this.head) return { data: null, error: null, count: matched.length };
     let out = [...matched];

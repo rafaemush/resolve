@@ -2,6 +2,7 @@ import type { Env } from "../env";
 import type { WatchRow, FetchOutcome } from "./types";
 import type { Resolver } from "../resolve/schema";
 import { earlierMatches, nextEarlierMatches } from "./matches";
+import { BudgetExhausted, COST, type Budget } from "../ops/budget";
 
 interface RpcOk<T> { result: T }
 interface RpcErr { error: { code: number; message: string } }
@@ -79,7 +80,10 @@ export const isRangeError = (e: unknown): boolean => RANGE_ERROR.test(String(e))
 export interface LogsWindow { provider: string; safe: BlockHeader; from: number; to: number; logs: RawLog[]; notModified: boolean; errors: string[] }
 
 export class LogsUnavailableError extends Error {
-  constructor(public readonly errors: string[]) { super(`no Base logs provider answered: ${errors.join(" | ").slice(0, 400)}`); }
+  /** budgetExhausted: the caller's subrequest budget ran out before a provider answered (not every provider was asked). */
+  constructor(public readonly errors: string[], public readonly budgetExhausted = false) {
+    super(`${budgetExhausted ? "subrequest budget ran out before a Base logs provider answered" : "no Base logs provider answered"}: ${errors.join(" | ").slice(0, 400)}`);
+  }
   get rangeErrors(): boolean { return this.errors.some((e) => isRangeError(e)); }
 }
 
@@ -89,19 +93,24 @@ export class LogsUnavailableError extends Error {
  * it has not reached. A range error halves the window on that provider (at most 3 times);
  * any other error moves to the next provider. Throws LogsUnavailableError when all fail.
  * The caller must advance its cursor to the returned `to`, never to its own estimate.
+ * With a budget, every RPC reserves one subrequest before it is sent (worst case providers x 5, too much to reserve
+ * up front); the budget running out throws LogsUnavailableError with budgetExhausted set.
  */
 export async function logsWindow(
   providers: LogsProvider[], fromBlock: number,
-  filter: { address: string; topics?: Array<string | null> }, chunk = 2000,
+  filter: { address: string; topics?: Array<string | null> }, chunk = 2000, budget?: Budget,
 ): Promise<LogsWindow> {
   const errors: string[] = [];
+  const reserve = (what: string) => budget?.need(COST.http, what);
   for (const p of providers) {
     try {
+      reserve(`the safe header from ${hostOf(p.url)}`);
       const safe = await getBlock(p.url, "safe");
       if (safe.number <= fromBlock) return { provider: p.url, safe, from: fromBlock + 1, to: fromBlock, logs: [], notModified: true, errors };
       let span = Math.max(1, Math.min(chunk, p.maxRange));
       for (let attempt = 0; ; attempt++) {
         const to = Math.min(safe.number, fromBlock + span);
+        reserve(`eth_getLogs on ${hostOf(p.url)}`);
         try {
           const logs = await rpc<RawLog[]>(p.url, "eth_getLogs", [{ ...filter, fromBlock: hex(fromBlock + 1), toBlock: hex(to) }]);
           if (!Array.isArray(logs)) throw new Error("eth_getLogs returned a non-array result");
@@ -116,6 +125,7 @@ export async function logsWindow(
         }
       }
     } catch (e) {
+      if (e instanceof BudgetExhausted) throw new LogsUnavailableError([...errors, e.message], true);
       errors.push(`${hostOf(p.url)}: ${String(e).slice(0, 160)}`);
     }
   }

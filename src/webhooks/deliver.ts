@@ -12,8 +12,15 @@ export const MAX_ATTEMPTS = BACKOFF_S.length;
 export const DRAIN_MAX = 5;
 /** Worst case of one delivery: endpoint read, the POST, the delivery update, the endpoint update. */
 export const DELIVERY_COST = 3 * COST.db + COST.http;
-/** The drain's budget: the claim, `max` deliveries and one alertMany() that carries every alert of the run. */
-export const drainSubrequests = (max: number): number => COST.db + max * DELIVERY_COST + COST.alert;
+/**
+ * claim_webhook_deliveries() takes only 'pending' rows, so a row whose claiming run died before writing an outcome
+ * (CPU limit, isolate eviction, a call that hung) would never be delivered. The drain requeues a 'delivering' row whose
+ * 60 s lease expired this long ago: far past any healthy run (a drain claims at most 10 rows, each POST capped at 10 s).
+ * A run still alive that late costs one duplicate delivery, which the receiver drops by X-Resolve-Event-Id.
+ */
+export const STALE_DELIVERING_MINUTES = 15;
+/** The drain's budget: the stale sweep, the claim, `max` deliveries and one alertMany() that carries every alert of the run. */
+export const drainSubrequests = (max: number): number => 2 * COST.db + max * DELIVERY_COST + COST.alert;
 /** A dead endpoint DLQs one delivery per event; one DM per endpoint per 6 h is enough to act on. */
 export const DLQ_DEDUP_MINUTES = 360;
 
@@ -36,7 +43,7 @@ export async function enqueueEvent(env: Env, tenantId: string, eventType: string
   return targets.length;
 }
 
-export interface DrainSummary { claimed: number; delivered: number; failed: number; dlq: number; errors: number; claim_error: string | null; alerts: string[] }
+export interface DrainSummary { requeued: number; claimed: number; delivered: number; failed: number; dlq: number; errors: number; claim_error: string | null; alerts: string[] }
 interface Dlq { endpoint: string; tenant: string; delivery: string; reason: string }
 
 /** One alert per endpoint that DLQ'd deliveries this run (key webhook_dlq_<endpoint_id>). Pure. */
@@ -55,18 +62,22 @@ type Row = Record<string, unknown>;
 interface Run { out: DrainSummary; dlqs: Dlq[]; problems: string[] }
 
 /**
- * Claims only what the budget can finish: claim_webhook_deliveries() never re-claims a 'delivering' row, so a row
- * claimed and not processed would be stuck. Every alert of the run (DLQ per endpoint, claim and bookkeeping failures)
- * goes out in one alertMany() reserved before the claim.
+ * Requeues stale 'delivering' rows (STALE_DELIVERING_MINUTES), then claims only what the budget can finish, so a row
+ * this run claims is never left for the sweep. Every alert of the run (DLQ per endpoint, requeued rows, claim and
+ * bookkeeping failures) goes out in one alertMany() reserved before the sweep.
  */
 export async function drainWebhooks(env: Env, max = 10, budget: Budget = new Budget(drainSubrequests(max))): Promise<DrainSummary> {
   const client = db(env);
-  const run: Run = { out: { claimed: 0, delivered: 0, failed: 0, dlq: 0, errors: 0, claim_error: null, alerts: [] }, dlqs: [], problems: [] };
+  const run: Run = { out: { requeued: 0, claimed: 0, delivered: 0, failed: 0, dlq: 0, errors: 0, claim_error: null, alerts: [] }, dlqs: [], problems: [] };
   const { out } = run;
-  if (!budget.take(COST.db + COST.alert)) return out;
+  const fixed = 2 * COST.db + COST.alert;
+  if (!budget.take(fixed)) return out;
   const n = Math.min(max, Math.floor(budget.left / DELIVERY_COST));
-  if (n < 1 || !budget.take(n * DELIVERY_COST)) { budget.release(COST.db + COST.alert); return out; }
+  if (n < 1 || !budget.take(n * DELIVERY_COST)) { budget.release(fixed); return out; }
 
+  // Before the claim, so a requeued row is delivered by this same run.
+  const requeued = await requeueStale(client, run);
+  out.requeued = requeued.length;
   let rows: Row[] = [];
   try { rows = await rpc<Row[]>(client, "claim_webhook_deliveries", { p_max: n }); }
   catch (e) { out.claim_error = redact(String(e)).slice(0, 300); }
@@ -75,21 +86,32 @@ export async function drainWebhooks(env: Env, max = 10, budget: Budget = new Bud
     const state = { settled: false };
     try { await deliverOne(client, d, run, state); }
     catch (e) {
-      // A row left 'delivering' is never claimed again: hand it back unless its outcome was already written.
+      // A row left 'delivering' waits STALE_DELIVERING_MINUTES for the sweep: hand it back now unless its outcome was written.
       problem(run, `delivery ${String(d.id)}: ${redact(String(e)).slice(0, 200)}`);
       if (!state.settled) await write(run, `delivery ${String(d.id)} release`, client.from("webhook_deliveries").update({ status: "pending", lease_until: null }).eq("id", d.id as string));
     }
   }
 
   const items = dlqAlerts(run.dlqs);
+  if (requeued.length) items.push({ key: "webhook_stuck_delivering", dedupMinutes: 60, meta: { deliveries: requeued }, text: `${requeued.length} webhook deliver${requeued.length === 1 ? "y was" : "ies were"} still 'delivering' ${STALE_DELIVERING_MINUTES} min after the lease expired: the run that claimed ${requeued.length === 1 ? "it" : "them"} died before writing an outcome (CPU limit, eviction or a hung call). Requeued as 'pending' at the same attempt, so the tenant gets the event now (receivers drop duplicates by X-Resolve-Event-Id). The same ids alerting again means the delivery itself kills the drain: move it to dlq by hand. Deliveries: ${requeued.slice(0, 20).join(", ")}` });
   if (out.claim_error) items.push({ key: "webhook_claim_failed", dedupMinutes: 60, text: `claim_webhook_deliveries failed; no webhook is being delivered until it recovers: ${out.claim_error}` });
-  if (run.problems.length) items.push({ key: "webhook_drain_errors", dedupMinutes: 60, text: `${run.problems.length} webhook drain step(s) failed. A delivery left in 'delivering' is never claimed again (claim_webhook_deliveries takes only 'pending'); set it back to 'pending' by id. ${run.problems.slice(0, 5).join("; ")}` });
+  if (run.problems.length) items.push({ key: "webhook_drain_errors", dedupMinutes: 60, text: `${run.problems.length} webhook drain step(s) failed. A delivery left in 'delivering' is requeued by the drain ${STALE_DELIVERING_MINUTES} min after its lease expired. ${run.problems.slice(0, 5).join("; ")}` });
   if (items.length) { await alertMany(env, items); out.alerts = items.map((i) => i.key); }
   else budget.release(COST.alert);
   return out;
 }
 
 function problem(run: Run, text: string): void { run.out.errors++; run.problems.push(text); }
+
+/** 'delivering' rows whose lease expired STALE_DELIVERING_MINUTES ago go back to 'pending' (one UPDATE); their ids. */
+async function requeueStale(client: Db, run: Run): Promise<string[]> {
+  const cutoff = new Date(Date.now() - STALE_DELIVERING_MINUTES * 60_000).toISOString();
+  const { data, error } = await client.from("webhook_deliveries")
+    .update({ status: "pending", lease_until: null, last_error: `requeued: still 'delivering' ${STALE_DELIVERING_MINUTES} min after its lease expired` })
+    .eq("status", "delivering").lt("lease_until", cutoff).select("id");
+  if (error) { problem(run, `stale 'delivering' sweep: ${redact(error.message)}`); return []; }
+  return ((data ?? []) as Array<{ id: unknown }>).map((r) => String(r.id));
+}
 
 async function write(run: Run, what: string, q: PromiseLike<{ error: { message: string } | null }>): Promise<void> {
   const { error } = await q;

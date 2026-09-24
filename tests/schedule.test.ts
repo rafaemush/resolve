@@ -21,15 +21,17 @@ const h = vi.hoisted(() => {
 vi.mock("../src/jobs/tick", () => ({ LIVENESS_CRON: "* * * * *", runTick: h.job("liveness", { inserted: true, alerts: [] }) }));
 vi.mock("../src/jobs/dispatch", () => ({ checkDispatchFailures: h.job("dispatch_check", { ok: true }) }));
 vi.mock("../src/jobs/reconcile", () => ({ runReconcile: h.job("reconcile", { errors: [], unreachable: 0 }) }));
-vi.mock("../src/jobs/deposits", () => ({ scanDeposits: h.job("deposit_scan", { scanned: true }) }));
-vi.mock("../src/webhooks/deliver", () => ({ DRAIN_MAX: 5, drainWebhooks: h.job("webhook_drain", { claim_error: null, errors: 0 }) }));
+vi.mock("../src/jobs/deposits", async (actual) => ({ ...(await actual<typeof import("../src/jobs/deposits")>()), scanDeposits: h.job("deposit_scan", { scanned: true }) }));
+// The drain's budget arithmetic stays real (the deposit scan's share is derived from it); only the run is stubbed.
+vi.mock("../src/webhooks/deliver", async (actual) => ({ ...(await actual<typeof import("../src/webhooks/deliver")>()), drainWebhooks: h.job("webhook_drain", { claim_error: null, errors: 0 }) }));
 vi.mock("../src/env", () => ({ parseConfig: () => ({}) }));
-vi.mock("../src/ops/alerts", () => ({ alert: vi.fn(async () => ({ sent: true, deduped: false })) }));
+vi.mock("../src/ops/alerts", () => ({ alert: vi.fn(async () => ({ sent: true, deduped: false })), alertMany: vi.fn(async () => ({ sent: [], deduped: [] })) }));
 
-import { CRONS, jobsForCron, jobExceptionKey, runScheduled, type JobName } from "../src/jobs/schedule";
+import { CRONS, DEPOSIT_SCAN_SUBREQUESTS, jobsForCron, jobExceptionKey, runScheduled, type JobName } from "../src/jobs/schedule";
 import { alert } from "../src/ops/alerts";
-import { drainWebhooks } from "../src/webhooks/deliver";
-import { COST, DISPATCH_CHECK_SUBREQUESTS, EXCEPTION_RESERVE, INVOCATION_SUBREQUESTS } from "../src/ops/budget";
+import { drainWebhooks, drainSubrequests, DRAIN_MAX } from "../src/webhooks/deliver";
+import { scanDeposits, SCAN_RESERVE } from "../src/jobs/deposits";
+import { Budget, COST, DISPATCH_CHECK_SUBREQUESTS, EXCEPTION_RESERVE, INVOCATION_SUBREQUESTS } from "../src/ops/budget";
 
 const env = {} as Env;
 const alerts = () => vi.mocked(alert).mock.calls.map((c) => [c[1], c[3]?.dedupMinutes]);
@@ -68,15 +70,19 @@ describe("exception alert keys", () => {
 
 describe("per-invocation subrequest budgets (Workers Free: 50)", async () => {
   const { RECONCILE_SUBREQUESTS } = await vi.importActual<typeof import("../src/jobs/reconcile")>("../src/jobs/reconcile");
-  const { drainSubrequests, DRAIN_MAX } = await vi.importActual<typeof import("../src/webhooks/deliver")>("../src/webhooks/deliver");
   it("10-minute invocation: dispatch check + reconcile + one exception alert fit", () => {
     expect(DISPATCH_CHECK_SUBREQUESTS).toBe(COST.db + COST.alert);
     expect(DISPATCH_CHECK_SUBREQUESTS + RECONCILE_SUBREQUESTS + EXCEPTION_RESERVE).toBeLessThanOrEqual(INVOCATION_SUBREQUESTS);
   });
-  it("5-minute invocation: the drain's fixed budget leaves room for the deposit scan and one exception alert", () => {
+  it("5-minute invocation: the drain's fixed budget + the deposit scan's budget + one exception alert = 50", () => {
     expect(DRAIN_MAX).toBe(5);
-    expect(drainSubrequests(DRAIN_MAX)).toBe(26);
-    expect(INVOCATION_SUBREQUESTS - drainSubrequests(DRAIN_MAX) - EXCEPTION_RESERVE).toBeGreaterThanOrEqual(19);
+    expect(drainSubrequests(DRAIN_MAX)).toBe(2 * COST.db + DRAIN_MAX * (3 * COST.db + COST.http) + COST.alert); // sweep + claim + 5 x 4 + one alertMany
+    expect(drainSubrequests(DRAIN_MAX) + DEPOSIT_SCAN_SUBREQUESTS + EXCEPTION_RESERVE).toBe(INVOCATION_SUBREQUESTS);
+    // The scan's reserve, its cursor read and one window's minimum (safe header, eth_getLogs, cursor write) fit.
+    expect(DEPOSIT_SCAN_SUBREQUESTS).toBeGreaterThanOrEqual(SCAN_RESERVE + COST.db + 2 * COST.http + COST.db);
+  });
+  it("the manual drain (POST /internal/webhooks/drain, max 10) fits one invocation", () => {
+    expect(drainSubrequests(10)).toBeLessThanOrEqual(INVOCATION_SUBREQUESTS);
   });
 });
 
@@ -88,6 +94,10 @@ describe("runScheduled", () => {
     expect(h.state.ran).toEqual(["webhook_drain", "deposit_scan"]);
     expect(r.jobs.map((j) => [j.job, j.ok])).toEqual([["webhook_drain", true], ["deposit_scan", true]]);
     expect(vi.mocked(drainWebhooks).mock.calls[0]![1]).toBe(5);
+    // The scan runs on the invocation's remainder, not unbounded.
+    const scanBudget = vi.mocked(scanDeposits).mock.calls.at(-1)![2] as Budget;
+    expect(scanBudget).toBeInstanceOf(Budget);
+    expect(scanBudget.limit).toBe(DEPOSIT_SCAN_SUBREQUESTS);
     expect(alerts()).toEqual([]);
   });
 

@@ -1,6 +1,7 @@
 /**
  * alert() / alertMany() (plan §16.4 P0 step 7): per-key dedup windows read in one query, one insert and one DM for any
- * number of alerts (so a fixed subrequest budget can carry them), redaction, and a lost DM reported as not sent.
+ * number of alerts (so a fixed subrequest budget can carry them), redaction, a lost DM reported as not sent, and the
+ * in-isolate fallback when the alerts table itself cannot be read (a tick alerting every minute during the outage).
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
@@ -59,6 +60,28 @@ describe("alertMany", () => {
     await alert(env, "k", "failed with apikey_ABCDEFGH12345678 and https://base-mainnet.g.alchemy.com/v2/secretkey123");
     expect(h.db.tables.alerts![0]!.text).not.toMatch(/ABCDEFGH12345678|secretkey123/);
     expect(dms()[0]).not.toMatch(/ABCDEFGH12345678|secretkey123/);
+  });
+
+  it("an unreadable alerts table (the outage itself) still dedups per isolate: one DM, not one per tick", async () => {
+    const down = { message: "connect ECONNREFUSED (database paused)" };
+    const refused = () => { const q: any = { select: () => q, in: () => q, gte: () => Promise.resolve({ data: null, error: down }), insert: () => Promise.resolve({ error: down }) }; return q; };
+    h.db = { client: { from: refused } } as unknown as FakeDb;
+    const tick = { key: "tick_insert_failed_outage", text: "liveness row refused", dedupMinutes: 30 };
+    expect(await alertMany(env, [tick])).toEqual({ sent: ["tick_insert_failed_outage"], deduped: [] });
+    expect(await alertMany(env, [tick])).toEqual({ sent: [], deduped: ["tick_insert_failed_outage"] });
+    expect(dms()).toHaveLength(1);
+    // A different key in the same outage is news.
+    expect((await alertMany(env, [{ key: "dispatch_absent_outage", text: "x" }])).sent).toEqual(["dispatch_absent_outage"]);
+  });
+
+  it("a DM that did not go out is not remembered: the next attempt in the outage tries again", async () => {
+    const down = { message: "connect ECONNREFUSED" };
+    const refused = () => { const q: any = { select: () => q, in: () => q, gte: () => Promise.resolve({ data: null, error: down }), insert: () => Promise.resolve({ error: down }) }; return q; };
+    h.db = { client: { from: refused } } as unknown as FakeDb;
+    h.dm = { ok: false, error: "Too Many Requests" };
+    expect((await alertMany(env, [{ key: "k_unsent", text: "t" }])).sent).toEqual([]);
+    h.dm = { ok: true };
+    expect((await alertMany(env, [{ key: "k_unsent", text: "t" }])).sent).toEqual(["k_unsent"]);
   });
 
   it("a DM Telegram refused is not reported as sent, and the row is still written", async () => {

@@ -3,7 +3,7 @@
  * Never throws: an alert that cannot be delivered is logged, and the caller's work continues.
  */
 import type { Env } from "../env";
-import { db } from "../db/supabase";
+import { db, type Db } from "../db/supabase";
 import { alertOperator } from "../bot/telegram";
 import { redact } from "./redact";
 
@@ -18,6 +18,19 @@ const DM_MAX = 4000;
 
 const log = (job: string, key: string, e: unknown) => console.error(JSON.stringify({ level: "error", job, key, error: redact(String(e)).slice(0, 300) }));
 
+/**
+ * When this isolate last DMed each key. Read only when the alerts table cannot be (often the very outage being alerted,
+ * which the every-minute tick raises every minute): the dedup window then holds per isolate instead of not at all. Best
+ * effort: a fresh isolate starts empty and alerts, the safe side.
+ */
+const sentHere = new Map<string, number>();
+const SENT_HERE_MAX = 500;
+function rememberSent(key: string, at: number): void {
+  sentHere.delete(key); // re-insert so the oldest entry is the first one evicted
+  sentHere.set(key, at);
+  if (sentHere.size > SENT_HERE_MAX) sentHere.delete(sentHere.keys().next().value!);
+}
+
 export async function alert(env: Env, key: string, text: string, opts: AlertOptions = {}): Promise<{ sent: boolean; deduped: boolean }> {
   const r = await alertMany(env, [{ key, text, dedupMinutes: opts.dedupMinutes, meta: opts.meta }]);
   return { sent: r.sent.length > 0, deduped: r.deduped.length > 0 };
@@ -27,7 +40,8 @@ export async function alert(env: Env, key: string, text: string, opts: AlertOpti
  * Any number of alerts for the subrequests of one (COST.alert): one dedup read over every key, one insert of the rows
  * not deduped, one DM carrying them all. A job with a fixed subrequest budget (the webhook drain) raises a per-key alert
  * for each thing that went wrong this way. Each item keeps its own dedup window; a key repeated in `items` is alerted
- * once (first text wins). An unreadable dedup state alerts anyway: a duplicate DM beats a silent failure.
+ * once (first text wins). An unreadable dedup table falls back to what this isolate sent; beyond that it alerts
+ * anyway: a duplicate DM beats a silent failure.
  */
 export async function alertMany(env: Env, items: AlertItem[]): Promise<AlertManyResult> {
   const byKey = new Map<string, AlertItem>();
@@ -37,21 +51,28 @@ export async function alertMany(env: Env, items: AlertItem[]): Promise<AlertMany
   const now = Date.now();
   const windowMs = (i: AlertItem) => (i.dedupMinutes ?? DEFAULT_DEDUP_MINUTES) * 60_000;
   const body = (i: AlertItem) => redact(i.text).slice(0, TEXT_MAX);
+  const within = (i: AlertItem, at: number | undefined) => at !== undefined && at >= now - windowMs(i);
   let fresh = unique;
+  let client: Db | null = null;
   try {
-    const client = db(env);
+    client = db(env);
     const since = new Date(now - Math.max(...unique.map(windowMs))).toISOString();
     const { data: recent, error: readError } = await client.from("alerts").select("key, created_at").in("key", unique.map((i) => i.key)).gte("created_at", since);
-    if (readError) log("alert_dedup", unique[0]!.key, readError.message);
+    if (readError) throw new Error(readError.message);
     const last = new Map<string, number>();
     for (const r of (recent ?? []) as Array<{ key: string; created_at: string }>) last.set(r.key, Math.max(last.get(r.key) ?? 0, Date.parse(r.created_at)));
-    fresh = unique.filter((i) => !(last.has(i.key) && last.get(i.key)! >= now - windowMs(i)));
-    if (fresh.length) {
+    fresh = unique.filter((i) => !within(i, last.get(i.key)));
+  } catch (e) {
+    log("alert_dedup", unique[0]!.key, e);
+    fresh = unique.filter((i) => !within(i, sentHere.get(i.key)));
+  }
+  if (fresh.length && client) {
+    try {
       const { error } = await client.from("alerts").insert(fresh.map((i) => ({ key: i.key, text: body(i), meta: i.meta ?? {} })));
       if (error) log("alert", fresh[0]!.key, error.message);
+    } catch (e) {
+      log("alert", fresh[0]!.key, e);
     }
-  } catch (e) {
-    log("alert", unique[0]!.key, e);
   }
   const deduped = unique.filter((i) => !fresh.includes(i)).map((i) => i.key);
   if (!fresh.length) return { sent: [], deduped };
@@ -59,7 +80,10 @@ export async function alertMany(env: Env, items: AlertItem[]): Promise<AlertMany
   const dm = fresh.map((i) => `[resolve] ${i.key}\n${body(i).slice(0, share)}`).join("\n\n");
   try {
     const r = await alertOperator(env, dm);
-    if (r.ok) return { sent: fresh.map((i) => i.key), deduped };
+    if (r.ok) {
+      for (const i of fresh) rememberSent(i.key, now);
+      return { sent: fresh.map((i) => i.key), deduped };
+    }
     log("alert_dm", fresh[0]!.key, r.error);
   } catch (e) {
     log("alert_dm", fresh[0]!.key, e);

@@ -826,7 +826,7 @@
             }
           },
           "503": {
-            "description": "UPSTREAM_UNAVAILABLE (billing or model); no credits charged",
+            "description": "UPSTREAM_UNAVAILABLE: billing or model unavailable (no credits charged), or error_reason VERDICT_NOT_RECORDED: the verdict could not be stored, the charge is refunded (credits_refunded) and a replay of that Idempotency-Key answers the same; retry with a new key",
             "content": {
               "application/json": {
                 "schema": {

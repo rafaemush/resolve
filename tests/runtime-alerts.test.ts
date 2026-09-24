@@ -1,15 +1,26 @@
 /**
  * Jev gate alerts in the runtime (plan §16.4 P0 step 7): the breaker opening (upstream_record_failure answers true), the
  * daily USD ceiling refusing a Jev call, an unreadable gate and a failed accounting write each raise an operator alert;
- * a verdict that never needed Jev raises none. The Jev request itself is untouched (fixtures are keyed by its hash).
+ * a verdict that never needed Jev raises none. A resolutions row that cannot be written still leaves the Jev call
+ * ledgered (spend, breaker), is alerted, and throws so the caller refunds. The Jev request itself is untouched
+ * (fixtures are keyed by its hash).
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Config, Env } from "../src/env";
 import { fakeDb, type FakeDb } from "./lib/fake-db";
 
-const h = vi.hoisted(() => ({ db: null as unknown as FakeDb }));
+const h = vi.hoisted(() => ({ db: null as unknown as FakeDb, refuseVerdictRow: null as string | null }));
 vi.mock("../src/db/supabase", () => ({
-  db: () => h.db.client,
+  db: () => ({
+    ...h.db.client,
+    // Postgres refusing the verdict row (a CHECK, a timeout); a plain status update (the stub marked failed) still works.
+    from: (t: string) => {
+      const q = h.db.client.from(t);
+      if (t !== "resolutions" || !h.refuseVerdictRow) return q;
+      const refused = () => { const f: any = { eq: () => f, then: (ok: any, no: any) => Promise.resolve({ data: null, error: { code: "23514", message: h.refuseVerdictRow } }).then(ok, no) }; return f; };
+      return new Proxy(q, { get: (o, k) => (k === "insert" ? refused : k === "update" ? (patch: Record<string, unknown>) => (patch.status_row === "complete" ? refused() : o.update(patch)) : Reflect.get(o, k)) });
+    },
+  }),
   rpc: async (client: FakeDb["client"], fn: string, args: Record<string, unknown>) => {
     const { data, error } = await client.rpc(fn, args);
     if (error) throw new Error(`rpc ${fn}: ${error.code ?? ""} ${error.message}`);
@@ -18,7 +29,7 @@ vi.mock("../src/db/supabase", () => ({
 }));
 vi.mock("../src/ops/alerts", () => ({ alert: vi.fn(async () => ({ sent: true, deduped: false })), alertMany: vi.fn(async () => ({ sent: [], deduped: [] })) }));
 
-import { resolveWithRuntime, jevAlerts, BREAKER_THRESHOLD, BREAKER_OPEN_SECONDS, type JevAlertInput } from "../src/resolve/runtime";
+import { resolveWithRuntime, jevAlerts, BREAKER_THRESHOLD, BREAKER_OPEN_SECONDS, ResolutionNotRecordedError, type JevAlertInput } from "../src/resolve/runtime";
 import { MarketRegistration, EvidenceInput } from "../src/resolve/schema";
 import { alertMany } from "../src/ops/alerts";
 
@@ -113,5 +124,44 @@ describe("resolveWithRuntime alerts", () => {
     await resolveWithRuntime(env, cfg, input);
     expect(jevHits).toBe(2);
     expect(alerted()).toEqual(["jev_gates_unreadable"]);
+  });
+});
+
+describe("a verdict that cannot be recorded", () => {
+  const usage = JSON.stringify({ error: "overloaded", usage: { input_tokens: 1_000, output_tokens: 0 } });
+  const spend: unknown[] = [];
+  const breaker: unknown[] = [];
+  const rpcs = { check_gates: async () => ({ data: { jev_breaker_open: false, jev_spend_today_usd: 0.1 }, error: null }), record_jev_spend: async (_db: FakeDb, a: Record<string, unknown>) => { spend.push(a); return { data: null, error: null }; }, upstream_record_failure: async (_db: FakeDb, a: Record<string, unknown>) => { breaker.push(a); return { data: false, error: null }; } };
+  beforeEach(() => {
+    spend.length = 0; breaker.length = 0;
+    vi.mocked(alertMany).mockClear();
+    vi.stubGlobal("fetch", async () => new Response(usage, { status: 529 }));
+  });
+  afterEach(() => { vi.unstubAllGlobals(); h.refuseVerdictRow = null; });
+
+  it("/v1/resolve stub: the Jev call is still ledgered, the stub is marked failed, resolution_write_failed is raised, and it throws", async () => {
+    h.refuseVerdictRow = "new row for relation \"resolutions\" violates check constraint";
+    h.db = fakeDb({ resolutions: [{ id: "req1", status_row: "pending", tenant_id: "t1" }], jev_calls: [] }, {}, { rpc: rpcs });
+    const err = await resolveWithRuntime(env, { ...cfg, jevPaidRoutesEnabled: true }, { ...input, mode: "tenant", tenantId: "t1", requestId: "req1", creditsCharged: 5 }).catch((e) => e);
+    expect(err).toBeInstanceOf(ResolutionNotRecordedError);
+    expect(h.db.tables.jev_calls!.map((c) => c.resolution_id)).toEqual(["req1", "req1"]);
+    expect(spend).toEqual([{ p_input_tokens: 2_000, p_usd: expect.any(Number) }]);
+    expect(breaker).toHaveLength(1);
+    expect(h.db.tables.resolutions![0]).toMatchObject({ id: "req1", status_row: "failed" });
+    expect(alerted()).toEqual(["resolution_write_failed"]);
+    const item = vi.mocked(alertMany).mock.calls[0]![1]!.find((i) => i.key === "resolution_write_failed")!;
+    expect(item).toMatchObject({ dedupMinutes: 60, meta: { request_id: "req1", tenant_id: "t1" } });
+    expect(item.text).toContain("violates check constraint");
+    expect(item.text).toContain("the stub is marked failed");
+  });
+
+  it("a watch or shadow insert that fails: jev_calls carry no dangling resolution id, and it is alerted", async () => {
+    h.refuseVerdictRow = "canceling statement due to statement timeout";
+    h.db = fakeDb({ resolutions: [], jev_calls: [] }, {}, { rpc: rpcs });
+    await expect(resolveWithRuntime(env, cfg, input)).rejects.toBeInstanceOf(ResolutionNotRecordedError);
+    expect(h.db.tables.jev_calls!.map((c) => c.resolution_id)).toEqual([null, null]);
+    expect(spend).toHaveLength(1);
+    expect(h.db.tables.resolutions).toEqual([]);
+    expect(alerted()).toEqual(["resolution_write_failed"]);
   });
 });
