@@ -13,11 +13,15 @@ import { makeJevCaller } from "../jev/client";
 import { mintKey } from "./keys";
 import { runReconcile } from "../jobs/reconcile";
 import { scanDeposits } from "../jobs/deposits";
-import { drainWebhooks } from "../webhooks/deliver";
+import { drainWebhooks, publishEvent } from "../webhooks/deliver";
 import { alert } from "../ops/alerts";
 import { Budget, INVOCATION_SUBREQUESTS } from "../ops/budget";
 import { OfficialSeries } from "../resolve/schema";
 import { CorroborationStatus, hostAllowed, type OfficialCorroboration } from "../resolve/official";
+import { redact } from "../ops/redact";
+import { MatchBody, MatchRow, matchRefusal } from "../billing/match";
+import { paymentCreditedPayload } from "../billing/events";
+import { formatUsdc, parseUsdc } from "../billing/tiers";
 
 type Vars = { requestId: string; schemaVersion: string };
 export const internal = new Hono<{ Bindings: Env; Variables: Vars }>();
@@ -148,6 +152,41 @@ internal.post("/official/recheck", async (c) => {
 internal.post("/reconcile", async (c) => { if (!isAdmin(c)) return err(c, "forbidden", "admin key required", 403); return ok(c, await runReconcile(c.env)); });
 // Its own invocation and the scan never throws, so it gets every subrequest: the way past a block too big for the cron's share.
 internal.post("/deposits/scan", async (c) => { if (!isAdmin(c)) return err(c, "forbidden", "admin key required", 403); return ok(c, await scanDeposits(c.env, parseConfig(c.env), new Budget(INVOCATION_SUBREQUESTS))); });
+/**
+ * Credit an unmatched USDC deposit to the tenant that sent it (migration 020 match_deposit; plan §16.4 P3 step 3): the
+ * sender wallet was not registered, so the scan recorded it 'unmatched' and alerted deposit_unmatched. Only an unmatched
+ * deposit is matched, at the tier rate for its amount, once: a retry answers the same row with replayed=true and writes,
+ * alerts and emits nothing. A new match alerts the operator (every manual credit is on the record, not only in the
+ * database) and sends payment.credited to the tenant. Subrequests: the RPC, the alert (5), and payment.credited queued
+ * with its first attempt under waitUntil (2 + 14), 22 of the invocation's 50.
+ */
+internal.post("/deposits/match", async (c) => {
+  if (!isAdmin(c)) return err(c, "forbidden", "admin key required", 403);
+  const parsed = MatchBody.safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) return err(c, "validation_error", parsed.error.issues.map((i) => `${i.path.join(".") || "body"}: ${i.message}`).join("; ").slice(0, 400), 400);
+  const b = parsed.data;
+  const tx = b.tx_hash.toLowerCase();
+  const who = `admin_api:${b.actor}`;
+  const { data, error } = await db(c.env).rpc("match_deposit", { p_tx_hash: tx, p_log_index: b.log_index, p_tenant: b.tenant_id, p_actor: who, p_reason: b.reason });
+  if (error) {
+    const r = matchRefusal(error.code);
+    return err(c, r.code, `match_deposit: ${redact(error.message)}`.slice(0, 400), r.status);
+  }
+  const row = MatchRow.safeParse(Array.isArray(data) ? data[0] : data);
+  if (!row.success) {
+    // The transaction may have committed: a retry reads the match back (replayed) and never credits twice.
+    await alert(c.env, `deposit_match_unreadable_${tx}_${b.log_index}`, `match_deposit answered ${redact(JSON.stringify(data)).slice(0, 300)} for ${tx}#${b.log_index} (tenant ${b.tenant_id}); the match may be recorded. Retry POST /internal/deposits/match to read it back.`, { dedupMinutes: 60 });
+    return err(c, "internal_error", "match_deposit answered an unreadable row; the match may be recorded: retry to read it back (a retry never credits twice)", 500);
+  }
+  const m = row.data;
+  const amount = formatUsdc(parseUsdc(m.amount_usdc));
+  let queued: number | null = null;
+  if (!m.replayed) {
+    await alert(c.env, `deposit_matched_${tx}_${b.log_index}`, `Deposit ${tx}#${b.log_index} (${amount} USDC) matched by ${b.actor} to tenant ${m.tenant_id}: ${m.credits} credits at ${m.credits_per_usdc} credits/USDC, balance now ${m.balance_after}. Reason: ${b.reason}`, { dedupMinutes: 1440, meta: { tx_hash: tx, log_index: b.log_index, tenant_id: m.tenant_id, credits: m.credits, actor: who } });
+    queued = (await publishEvent(c.env, m.tenant_id, "payment.credited", paymentCreditedPayload({ tx_hash: tx, log_index: b.log_index, amount_usdc: amount, credits: m.credits, balance_after: m.balance_after }), { waitUntil: waitUntilOf(c) })).queued;
+  }
+  return ok(c, { tx_hash: tx, log_index: b.log_index, ...m, amount_usdc: amount, payment_event: m.replayed ? "not sent again: the deposit was already credited to this tenant" : `queued for ${queued} endpoint(s)` });
+});
 internal.post("/webhooks/drain", async (c) => { if (!isAdmin(c)) return err(c, "forbidden", "admin key required", 403); return ok(c, await drainWebhooks(c.env, 10)); });
 
 /** Read the R2 diagnostics the scheduled handler writes when an insert fails. */

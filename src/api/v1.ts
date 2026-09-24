@@ -19,6 +19,9 @@ import { redact } from "../ops/redact";
 import { mintKey, rotationExpiry } from "./keys";
 import { followBlock, followCap, followEntitlements, followMarket, followRefusal, Plan, shapeShadow, type FollowAnswer, type FollowTarget, type ShadowCommitRow, type ShadowMarket } from "../shadow/follows";
 import { subscribes } from "../webhooks/deliver";
+import { noteCharge } from "../billing/events";
+import { effectiveTiers, packQuotes, paygRate } from "../billing/tiers";
+import { challengeMessage, newNonce, registerAnswer, signedBy, REGISTER_RESULTS, SIGNATURE, WALLET_ADDRESS, type RegisterResult } from "../billing/wallet";
 
 type Vars = { requestId: string; schemaVersion: string; auth: AuthContext };
 export const v1 = new Hono<{ Bindings: Env; Variables: Vars }>();
@@ -196,6 +199,12 @@ v1.post("/resolve", async (c) => {
   }
   let refunded = 0;
   if (rt.result.verdict.error_code === "UPSTREAM_UNAVAILABLE" && br.charged > 0) refunded = await refundOrAlert(c.env, client, br.request_id, auth.tenantId, br.charged, "an UPSTREAM_UNAVAILABLE verdict");
+  // The charge stands: credits.low once per crossing, off the response path (noteCharge: 1 subrequest, 3 at the crossing).
+  if (br.charged - refunded > 0) {
+    const low = noteCharge(c.env, auth.tenantId, br.request_id);
+    const wu = waitUntilOf(c);
+    if (wu) wu(low); else await low;
+  }
   return verdictResponse(c, auth, rt.result.verdict, { request_id: br.request_id, credits_charged: br.charged - refunded, credits_refunded: refunded, balance: br.balance + refunded, route: plan.route });
 });
 
@@ -369,7 +378,7 @@ v1.get("/resolutions/:id", async (c) => {
 });
 v1.get("/account", async (c) => {
   const auth = c.get("auth");
-  const { data: t } = await db(c.env).from("tenants").select("id, display_name, plan, credits_balance, watch_limit, strict_v0, wallet_address, created_at").eq("id", auth.tenantId).single();
+  const { data: t } = await db(c.env).from("tenants").select("id, display_name, plan, credits_balance, low_credit_notified_at, watch_limit, strict_v0, wallet_address, created_at").eq("id", auth.tenantId).single();
   return ok(c, { tenant: t, key: { id: auth.keyId, environment: auth.environment, requests_today: auth.requestsToday, daily_cap: auth.dailyCap } });
 });
 v1.get("/usage", async (c) => {
@@ -386,11 +395,90 @@ v1.get("/usage", async (c) => {
   for (const r of res ?? []) { const k = `${r.determination_basis ?? "precheck"}/${r.resolution_status}`; byBasis[k] = (byBasis[k] ?? 0) + 1; }
   return ok(c, { window_days: days, credits_by_reason: byReason, resolutions_by_route: byBasis, recent_ledger: (ledger ?? []).slice(0, 50) });
 });
+/**
+ * Where and how to pay, with the rates the database credits at (app_config payg_tiers, else the flat CREDITS_PER_USDC
+ * credit_from_deposit is passed) and the plan §11 packs they buy. Tiers the database would refuse are never quoted.
+ */
 v1.get("/payments/address", async (c) => {
   const cfg = parseConfig(c.env);
-  const { data: t } = await db(c.env).from("tenants").select("wallet_address").eq("id", c.get("auth").tenantId).single();
   if (!c.env.USDC_RECEIVING_ADDRESS) return err(c, "UPSTREAM_UNAVAILABLE", "USDC deposits are not enabled yet; contact support for a credit grant.", 503);
-  return ok(c, { chain: "base", token: "USDC", token_contract: cfg.usdcContract, receiving_address: c.env.USDC_RECEIVING_ADDRESS, registered_sender_wallet: t?.wallet_address ?? null, credits_per_usdc: cfg.creditsPerUsdc, confirmation_policy: "credited when the transfer's block is at or below Base's `safe` tag (typically 5-10 minutes); deposits from an unregistered wallet are held until mapped" });
+  const client = db(c.env);
+  const [{ data: t }, { data: row, error: ce }] = await Promise.all([
+    client.from("tenants").select("wallet_address").eq("id", c.get("auth").tenantId).single(),
+    client.from("app_config").select("value").eq("key", "payg_tiers").maybeSingle(),
+  ]);
+  if (ce) return storeDown(c, "pricing");
+  const eff = effectiveTiers((row?.value as string | undefined) ?? null, cfg.creditsPerUsdc);
+  if ("error" in eff) {
+    await alert(c.env, "payg_tiers_invalid", `${eff.error}. payg_credits_per_usdc() refuses it too, so no deposit is credited until app_config payg_tiers is fixed.`, { dedupMinutes: 60 });
+    return err(c, "UPSTREAM_UNAVAILABLE", "pricing is unavailable; retry shortly", 503);
+  }
+  const tiers = [...eff.tiers].sort((a, b) => b.min_usdc - a.min_usdc);
+  return ok(c, {
+    chain: "base", token: "USDC", token_contract: cfg.usdcContract, receiving_address: c.env.USDC_RECEIVING_ADDRESS, registered_sender_wallet: t?.wallet_address ?? null,
+    credits_per_usdc: paygRate(0n, tiers), payg_tiers: tiers, packs: packQuotes(tiers),
+    confirmation_policy: "credited when the transfer's block is at or below Base's `safe` tag (typically 5-10 minutes) at the rate of the tier its amount reaches (floor(amount x credits_per_usdc)); deposits from an unregistered wallet are held until mapped",
+    register_wallet: "GET /v1/account/wallet/challenge?address=<your 0x address>, sign the message with that wallet (personal_sign), then POST /v1/account/wallet {challenge_id, signature}",
+  });
+});
+
+// ---- signed wallet registration (plan §16.4 P3 step 3) ------------------------------------------------------------
+
+const WalletAddress = z.string().regex(WALLET_ADDRESS, "address must be 0x followed by 40 hex characters");
+const WalletBody = z.strictObject({
+  challenge_id: z.uuid(),
+  signature: z.string().regex(SIGNATURE, "signature must be the 65-byte 0x-hex personal_sign signature"),
+});
+const RegisterRow = z.object({ result: z.enum(REGISTER_RESULTS), address: z.string().nullable(), previous_address: z.string().nullable() });
+
+/** A single-use challenge for the wallet the tenant sends USDC from. One subrequest: the insert. */
+v1.get("/account/wallet/challenge", async (c) => {
+  const a = WalletAddress.safeParse(c.req.query("address"));
+  if (!a.success) return err(c, "validation_error", `address: ${a.error.issues[0]?.message ?? "required"}`, 400);
+  const tenantId = c.get("auth").tenantId;
+  const address = a.data.toLowerCase();
+  const nonce = newNonce();
+  const issuedAt = new Date().toISOString();
+  const message = challengeMessage({ tenantId, address, nonce, issuedAt });
+  const { data, error } = await db(c.env).from("wallet_challenges").insert({ tenant_id: tenantId, address, nonce, message }).select("id, expires_at").single();
+  if (error || !data) return storeDown(c, "wallet challenge store (no challenge was issued)");
+  return ok(c, {
+    challenge_id: data.id, address, message, nonce, issued_at: issuedAt, expires_at: data.expires_at,
+    sign: "EIP-191 personal_sign of `message`, exactly as given, with the wallet at `address` (the one that will send USDC)",
+    submit: "POST /v1/account/wallet {challenge_id, signature}; the challenge is single use",
+  });
+});
+
+/**
+ * Register the wallet that signed the challenge. Subrequests: the challenge read, then register_wallet() (single use,
+ * refuses an address another tenant holds, one transaction). The signature is checked here, between the two.
+ */
+v1.post("/account/wallet", async (c) => {
+  const b = WalletBody.safeParse(await c.req.json().catch(() => null));
+  if (!b.success) return err(c, "validation_error", b.error.issues.map((i) => `${i.path.join(".") || "body"}: ${i.message}`).join("; ").slice(0, 400), 400);
+  const tenantId = c.get("auth").tenantId;
+  const client = db(c.env);
+  const refuse = (r: Exclude<RegisterResult, "registered">, address: string | null) => {
+    const x = registerAnswer(r, address);
+    return err(c, x.status === 404 ? "not_found" : "validation_error", x.message, x.status, { extra: { error_reason: x.reason } });
+  };
+  const { data: ch, error } = await client.from("wallet_challenges").select("id, address, message, expires_at, used_at").eq("id", b.data.challenge_id).eq("tenant_id", tenantId).maybeSingle();
+  if (error) return storeDown(c, "wallet challenge store");
+  if (!ch) return refuse("not_found", null);
+  if (ch.used_at) return refuse("used", ch.address as string);
+  if (Date.parse(ch.expires_at as string) <= Date.now()) return refuse("expired", ch.address as string);
+  if (!(await signedBy(ch.address as string, ch.message as string, b.data.signature))) {
+    return err(c, "validation_error", `the signature is not ${ch.address}'s personal_sign of this challenge's message: sign the message exactly as issued, with that wallet`, 400, { extra: { error_reason: "bad_signature" } });
+  }
+  let row: z.infer<typeof RegisterRow>;
+  try {
+    const out = await rpc<unknown>(client, "register_wallet", { p_challenge: ch.id, p_tenant: tenantId });
+    row = RegisterRow.parse(Array.isArray(out) ? out[0] : out);
+  } catch {
+    return storeDown(c, "wallet registration (nothing was registered)");
+  }
+  if (row.result !== "registered") return refuse(row.result, row.address);
+  return ok(c, { wallet_address: row.address, previous_wallet_address: row.previous_address, registered: true, message: registerAnswer("registered", row.address).message });
 });
 v1.post("/keys/rotate", async (c) => {
   const auth = c.get("auth");

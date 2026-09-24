@@ -1377,7 +1377,7 @@
     },
     "/v1/account": {
       "get": {
-        "summary": "Tenant, plan, credits, key usage",
+        "summary": "Tenant, plan, credits, the registered sender wallet (wallet_address), when the last credits.low notice went out (low_credit_notified_at, cleared by any purchase or grant), key usage",
         "security": [
           {
             "bearerAuth": []
@@ -1393,6 +1393,161 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/account/wallet/challenge": {
+      "get": {
+        "summary": "Issue a single-use wallet registration challenge (valid 10 minutes) for the wallet this account sends USDC from. The message to sign is exactly \"Resolve wallet registration\ntenant: <tenant_id>\naddress: <lowercase address>\nnonce: <nonce>\nissued: <ISO time>\"",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "address",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^0x[0-9a-fA-F]{40}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "challenge_id, address (lowercase), message, nonce, issued_at, expires_at, sign, submit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "validation_error: address missing or not 0x + 40 hex",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "UPSTREAM_UNAVAILABLE: no challenge was issued",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/account/wallet": {
+      "post": {
+        "summary": "Register the wallet that signed a challenge (EIP-191 personal_sign of the challenge message; externally owned accounts only). USDC it sends to the receiving address is then credited to this account; it replaces a previously registered wallet",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": []
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "challenge_id",
+                  "signature"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "challenge_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "signature": {
+                    "type": "string",
+                    "pattern": "^0x[0-9a-fA-F]{130}$"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "wallet_address, previous_wallet_address, registered=true",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "validation_error: malformed body, or error_reason bad_signature (the signature does not recover to the challenge's address)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not_found: no such challenge for this account",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "validation_error with error_reason challenge_used (single use) or wallet_taken (registered to another account)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "validation_error with error_reason challenge_expired",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "UPSTREAM_UNAVAILABLE: nothing was registered",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
                 }
               }
             }
@@ -1437,7 +1592,7 @@
     },
     "/v1/payments/address": {
       "get": {
-        "summary": "USDC (Base) receiving address, credits per USDC, confirmation policy (safe tag)",
+        "summary": "USDC (Base) receiving address, the PAYG tiers the deposit is credited at (a deposit gets the rate of the highest tier its amount reaches: floor(amount x credits_per_usdc)), the packs they buy, the registered sender wallet, confirmation policy (safe tag). Deposits emit payment.credited",
         "security": [
           {
             "bearerAuth": []
@@ -1448,7 +1603,7 @@
         ],
         "responses": {
           "200": {
-            "description": "payment instructions",
+            "description": "chain, token, token_contract, receiving_address, registered_sender_wallet, credits_per_usdc (base rate), payg_tiers[] {min_usdc, credits_per_usdc}, packs[] {usdc, credits, credits_per_usdc}, confirmation_policy, register_wallet",
             "content": {
               "application/json": {
                 "schema": {
@@ -1458,7 +1613,7 @@
             }
           },
           "503": {
-            "description": "deposits not enabled",
+            "description": "deposits not enabled, or pricing unavailable",
             "content": {
               "application/json": {
                 "schema": {

@@ -58,6 +58,38 @@ export type WaitUntil = (p: Promise<unknown>) => void;
 
 type Row = Record<string, unknown>;
 
+/** One event for one tenant (queueEvents). */
+export interface EventItem { tenant: string; eventType: WebhookEvent; payload: Record<string, unknown> }
+/** Queued rows, or why nothing was queued. "No subscribed endpoint" is not an error: rows [] and error null. */
+export interface QueueOutcome { rows: Row[]; error: string | null }
+
+/**
+ * Queue events in one endpoint read and one insert whatever their number: one delivery ('pending', attempt 0) per event
+ * and active endpoint of its tenant that subscribes to its type. No alert of its own, for a job that carries every alert
+ * of its run in one alertMany() (the deposit scan); enqueueEvent is the alerting form. At most 2 subrequests.
+ */
+export async function queueEvents(env: Env, items: readonly EventItem[]): Promise<QueueOutcome> {
+  const tenants = [...new Set(items.map((i) => i.tenant))];
+  if (!tenants.length) return { rows: [], error: null };
+  const client = db(env);
+  const { data: eps, error: readError } = await client.from("webhook_endpoints").select("id, tenant_id, events").in("tenant_id", tenants).eq("active", true).is("deleted_at", null);
+  if (readError) return { rows: [], error: `the endpoint read failed (${redact(readError.message)})` };
+  const endpoints = (eps ?? []) as Array<{ id: string; tenant_id: string; events: string[] | null }>;
+  const rows: Row[] = [];
+  const shas = new Map<Record<string, unknown>, string>(); // one hash per payload: enqueueEvent fans one out to many tenants
+  for (const i of items) {
+    const targets = endpoints.filter((e) => e.tenant_id === i.tenant && subscribes(e, i.eventType));
+    if (!targets.length) continue;
+    const sha = shas.get(i.payload) ?? await sha256Hex(JSON.stringify(i.payload));
+    shas.set(i.payload, sha);
+    for (const e of targets) rows.push({ endpoint_id: e.id, tenant_id: e.tenant_id, event_type: i.eventType, payload: i.payload, payload_sha256: sha, status: "pending", attempt: 0 });
+  }
+  if (!rows.length) return { rows: [], error: null };
+  const { data, error } = await client.from("webhook_deliveries").insert(rows).select("*");
+  if (error) return { rows: [], error: `the insert of ${rows.length} deliver${rows.length === 1 ? "y" : "ies"} failed (${redact(error.message)})` };
+  return { rows: (data ?? []) as Row[], error: null };
+}
+
 /**
  * Queue one delivery per active endpoint of these tenants that subscribes to the event; returns the inserted rows
  * ('pending', attempt 0). "No subscribed endpoint" and "could not read the endpoints" differ: the second drops the
@@ -65,23 +97,12 @@ type Row = Record<string, unknown>;
  */
 export async function enqueueEvent(env: Env, tenants: string | readonly string[], eventType: WebhookEvent, payload: Record<string, unknown>): Promise<Row[]> {
   const ids = [...new Set(typeof tenants === "string" ? [tenants] : tenants)];
-  if (!ids.length) return [];
-  const who = ids.length === 1 ? `tenant ${ids[0]}` : `${ids.length} tenants`;
-  const lost = async (why: string) => {
-    await alert(env, "webhook_enqueue_failed", `${eventType} for ${who} was not queued: ${why}. The event is lost unless it is re-emitted.`, { dedupMinutes: 60, meta: { tenant_ids: ids.slice(0, 20), event_type: eventType } });
-    return [] as Row[];
-  };
-  const client = db(env);
-  const { data: eps, error: readError } = await client.from("webhook_endpoints").select("id, tenant_id, events").in("tenant_id", ids).eq("active", true).is("deleted_at", null);
-  if (readError) return lost(`the endpoint read failed (${redact(readError.message)})`);
-  const targets = ((eps ?? []) as Array<{ id: string; tenant_id: string; events: string[] | null }>).filter((e) => subscribes(e, eventType));
-  if (!targets.length) return [];
-  const sha = await sha256Hex(JSON.stringify(payload));
-  const { data, error } = await client.from("webhook_deliveries")
-    .insert(targets.map((e) => ({ endpoint_id: e.id, tenant_id: e.tenant_id, event_type: eventType, payload, payload_sha256: sha, status: "pending", attempt: 0 })))
-    .select("*");
-  if (error) return lost(`the insert for ${targets.length} endpoint(s) failed (${redact(error.message)})`);
-  return (data ?? []) as Row[];
+  const q = await queueEvents(env, ids.map((tenant) => ({ tenant, eventType, payload })));
+  if (q.error) {
+    const who = ids.length === 1 ? `tenant ${ids[0]}` : `${ids.length} tenants`;
+    await alert(env, "webhook_enqueue_failed", `${eventType} for ${who} was not queued: ${q.error}. The event is lost unless it is re-emitted.`, { dedupMinutes: 60, meta: { tenant_ids: ids.slice(0, 20), event_type: eventType } });
+  }
+  return q.rows;
 }
 
 export interface DrainSummary { requeued: number; claimed: number; delivered: number; failed: number; dlq: number; errors: number; claim_error: string | null; alerts: string[] }

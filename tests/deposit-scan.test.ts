@@ -3,15 +3,25 @@
  * of one scan is counted against the 5-minute invocation's share (DEPOSIT_SCAN_SUBREQUESTS). Before, the scan took no
  * budget, so a catch-up backlog or a run of range errors spent the invocation's 50 and its own alerts and loop_runs row
  * were the calls that failed. Money rule throughout: a deposit is never skipped, whatever the budget cuts.
+ * payment.credited (migration 020): the deposits a scan credits are announced in one batch after it, reserved with the
+ * scan's first credit, so the budget never runs out between a credit and its event.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Config, Env } from "../src/env";
 import type { RawLog } from "../src/ingest/base";
 import { fakeDb, type FakeDb } from "./lib/fake-db";
+import { creditFromDeposit, MIGRATION_020_CONFIG } from "./lib/fake-money";
 
-const h = vi.hoisted(() => ({ db: null as unknown as FakeDb }));
+const h = vi.hoisted(() => ({ db: null as unknown as FakeDb, failLedgerRead: false }));
 vi.mock("../src/db/supabase", () => ({
-  db: () => h.db.client,
+  db: () => ({
+    ...h.db.client,
+    from: (t: string) => {
+      const q = h.db.client.from(t);
+      if (t !== "credit_ledger" || !h.failLedgerRead) return q;
+      return new Proxy(q, { get: (o, k) => (k === "then" ? (ok: (v: unknown) => unknown) => Promise.resolve({ data: null, error: { message: "statement timeout" } }).then(ok) : Reflect.get(o, k)) });
+    },
+  }),
   rpc: async (client: FakeDb["client"], fn: string, args: Record<string, unknown>) => {
     const { data, error } = await client.rpc(fn, args);
     if (error) throw new Error(`rpc ${fn}: ${error.code ?? ""} ${error.message}`);
@@ -24,6 +34,7 @@ import { scanDeposits } from "../src/jobs/deposits";
 import { DEPOSIT_SCAN_SUBREQUESTS } from "../src/jobs/schedule";
 import { alertMany } from "../src/ops/alerts";
 import { Budget, COST, INVOCATION_SUBREQUESTS } from "../src/ops/budget";
+import { PAYMENT_EVENTS_COST } from "../src/billing/events";
 
 const TRANSFER = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 const RECEIVER = "0x00000000000000000000000000000000000000aa";
@@ -33,8 +44,9 @@ const topic = (addr: string) => "0x" + addr.replace(/^0x/, "").padStart(64, "0")
 const env = { USDC_RECEIVING_ADDRESS: RECEIVER } as unknown as Env;
 const cfg = { usdcContract: USDC, creditsPerUsdc: 1000 } as Config;
 
-/** A USDC Transfer to the receiver; `from` 0x...bad lands as 'unmatched'. */
-function deposit(block: number, logIndex: number, from = "0x00000000000000000000000000000000000000f1"): RawLog {
+const TENANT_WALLET = "0x00000000000000000000000000000000000000f1";
+/** A USDC Transfer to the receiver of 2.5 USDC; from the tenant's wallet unless `from` says otherwise ('unmatched'). */
+function deposit(block: number, logIndex: number, from = TENANT_WALLET): RawLog {
   return { address: USDC, topics: [TRANSFER, topic(from), topic(RECEIVER)], data: hex(2_500_000n), blockNumber: hex(block), transactionHash: `0x${block.toString(16)}${logIndex.toString(16).padStart(4, "0")}`, logIndex: hex(logIndex) };
 }
 
@@ -61,16 +73,20 @@ beforeEach(() => {
 });
 afterEach(() => vi.unstubAllGlobals());
 
-function newDb(cursor: number) {
-  h.db = fakeDb({ app_config: [{ key: "usdc_cursor_block", value: String(cursor) }], loop_runs: [] }, {}, {
+function newDb(cursor: number, endpoints = false) {
+  h.failLedgerRead = false;
+  h.db = fakeDb({
+    app_config: [{ key: "usdc_cursor_block", value: String(cursor) }, ...structuredClone(MIGRATION_020_CONFIG)], loop_runs: [],
+    tenants: [{ id: "t1", wallet_address: TENANT_WALLET, credits_balance: 0, deleted_at: null }], usdc_deposits: [], credit_ledger: [],
+    webhook_endpoints: endpoints ? [{ id: "e1", tenant_id: "t1", active: true, deleted_at: null, events: ["payment.credited"] }] : [], webhook_deliveries: [],
+  }, {}, {
     primaryKey: { app_config: "key" },
     rpc: {
-      // INSERT-first like the real credit_from_deposit: a replay answers 'duplicate'.
-      credit_from_deposit: async (_db, a) => {
+      // migration 020's credit_from_deposit (INSERT-first: a replay answers 'duplicate'), counting what reached it
+      credit_from_deposit: async (db, a) => {
         const k = `${a.p_tx_hash}#${a.p_log_index}`;
-        const n = (credits.get(k) ?? 0) + 1;
-        credits.set(k, n);
-        return { data: [{ status: n > 1 ? "duplicate" : a.p_from.endsWith("bad") ? "unmatched" : "credited" }], error: null };
+        credits.set(k, (credits.get(k) ?? 0) + 1);
+        return creditFromDeposit(db, a);
       },
     },
   });
@@ -167,6 +183,44 @@ describe("scanDeposits on the 5-minute invocation's budget", () => {
     expect(manual.r).toMatchObject({ scanned: true, stopped_by_budget: false, detail: "caught up" });
     expect(cursorNow()).toBe(1_500);
     expect(credits.size).toBe(14);
+  });
+
+  it("payment.credited: every credit of the scan in one batch after it, with the ledger's balance_after, inside the budget", async () => {
+    chain = { safe: 1_500, logs: [deposit(1_100, 0), deposit(1_100, 1), deposit(1_200, 0, "0x0000000000000000000000000000000000000bad"), deposit(1_300, 2)] };
+    newDb(1_000, true);
+    const { r, used } = await scan();
+    expect(used).toBeLessThanOrEqual(DEPOSIT_SCAN_SUBREQUESTS);
+    expect(r).toMatchObject({ scanned: true, detail: "caught up", credited: 3 });
+    expect(h.db.tables.webhook_deliveries!.map((d) => [d.event_type, d.payload])).toEqual([
+      ["payment.credited", { tx_hash: "0x44c0000", log_index: 0, amount_usdc: "2.5", credits: 250, balance_after: 250 }],
+      ["payment.credited", { tx_hash: "0x44c0001", log_index: 1, amount_usdc: "2.5", credits: 250, balance_after: 500 }],
+      ["payment.credited", { tx_hash: "0x5140002", log_index: 2, amount_usdc: "2.5", credits: 250, balance_after: 750 }],
+    ]);
+    expect(h.db.tables.loop_runs![0]!.meta).toMatchObject({ payment_events_queued: 3 });
+    expect(r.alerts).toEqual(["deposit_unmatched"]);
+    // cursor read, safe header, eth_getLogs, 4 credits, cursor write, the batch (ledger read, endpoints read, insert), loop_runs, one alert
+    expect(used).toBe(3 + 4 + 1 + PAYMENT_EVENTS_COST + 1 + COST.alert);
+  });
+
+  it("a batch that cannot be queued is alerted; the credits and the cursor stand", async () => {
+    chain = { safe: 1_500, logs: [deposit(1_100, 0)] };
+    newDb(1_000, true);
+    h.failLedgerRead = true;
+    const { r } = await scan();
+    expect(r).toMatchObject({ scanned: true, credited: 1, to: 1_500 });
+    expect(alertKeys()).toEqual(["payment_event_failed"]);
+    expect(vi.mocked(alertMany).mock.calls[0]![1]![0]!.text).toContain("the purchase ledger read failed (statement timeout)");
+    expect(h.db.tables.tenants![0]!.credits_balance).toBe(250);
+    expect(cursorNow()).toBe(1_500);
+  });
+
+  it("a scan that credits nothing gives the batch reservation back", async () => {
+    chain = { safe: 1_500, logs: [deposit(1_100, 0, "0x0000000000000000000000000000000000000bad")] };
+    newDb(1_000, true);
+    const { r, used } = await scan();
+    expect(r).toMatchObject({ scanned: true, credited: 0, alerts: ["deposit_unmatched"] });
+    expect(r.subrequests).toBe(used);
+    expect(h.db.tables.webhook_deliveries).toEqual([]);
   });
 
   it("a healthy scan with nothing new spends only what it needs and releases the alert reserve", async () => {
