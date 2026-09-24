@@ -2,8 +2,9 @@
  * Reconcile shadow commits against the platform of record, then reveal (plan §16.4 P2 step 2, §17.3 P2a).
  *
  * One run (the 10-minute cron, or POST /internal/reconcile), inside one subrequest budget:
- *   1. re-post commits still pending after 60 s (retryUnposted);
- *   2. post at most 5 pending reveals as replies to their commits;
+ *   1-2. the channel poster (src/bot/post.ts, the same run the every-minute cron makes, under the same channel lease):
+ *      pending commits of at most 5 events (the legs of an event as one message), then the pending reveals of at most
+ *      5 commit messages as replies to them;
  *   3. alert when a commit or reveal is still pending after 15 minutes;
  *   4. discovery: non-test shadow markets past their deadline whose reconcile_next_at is due, longest-waiting first, at
  *      most 25. A market the run does not settle (platform pending, label unmappable, platform unreachable, a failed
@@ -23,7 +24,8 @@ import { z } from "zod";
 import type { Env } from "../env";
 import { db, type Db } from "../db/supabase";
 import { sha256Hex } from "../resolve/text";
-import { buildReveal, committedOf, marketRef, postPendingReveals, retryUnposted, type Agreement, type CommitRow, type CommittedVerdict, type OfficialRecord, type ResolutionFallback } from "../bot/commit";
+import { buildReveal, committedOf, marketRef, type Agreement, type CommitRow, type CommittedVerdict, type OfficialRecord, type ResolutionFallback } from "../bot/commit";
+import { postPending } from "../bot/post";
 import type { MarketRow } from "../ingest/types";
 import { alert } from "../ops/alerts";
 import { redact } from "../ops/redact";
@@ -37,7 +39,9 @@ import { deliverInline } from "../webhooks/deliver";
  */
 export const RECONCILE_SUBREQUESTS = INVOCATION_SUBREQUESTS - DISPATCH_CHECK_SUBREQUESTS - EXCEPTION_RESERVE;
 export const MARKETS_PER_RUN = 25;
+/** Commit messages whose pending reveals one run posts (the legs of an event that share a commit message are one). */
 export const MAX_REVEALS_PER_RUN = 5;
+/** Events whose pending commits one run posts (the every-minute poster normally has posted them already). */
 export const MAX_RETRIES_PER_RUN = 5;
 /** No official outcome this long after the deadline: the market closes as closed_unresolved (agreement unresolved_by_platform). */
 export const CLOSE_OUT_DAYS = 21;
@@ -327,11 +331,13 @@ export async function runReconcile(env: Env): Promise<ReconcileSummary> {
     else out.errors.push(`alert ${key} not sent: subrequest budget`);
   };
 
-  const rt = await retryUnposted(env, MAX_RETRIES_PER_RUN, budget);
-  out.retried = rt.attempted; out.retry_posted = rt.posted;
-  const rv = await postPendingReveals(env, budget, MAX_REVEALS_PER_RUN);
-  out.reveals_posted = rv.posted; out.reveals_waiting = rv.waiting;
-  if (rt.stopped || rv.stopped) out.stopped_by_budget = true;
+  const posted = await postPending(env, budget, { commitEvents: MAX_RETRIES_PER_RUN, revealGroups: MAX_REVEALS_PER_RUN });
+  out.retried = posted.commits_attempted; out.retry_posted = posted.commits_posted;
+  out.reveals_posted = posted.reveals_posted; out.reveals_waiting = posted.reveals_waiting;
+  if (posted.stopped === "budget") out.stopped_by_budget = true;
+  // a failed send is recorded on its rows (post_error) and alerted by alertStalePending after 15 minutes; a read or a
+  // claim that failed means the poster could not look
+  out.errors.push(...posted.errors.map((e) => `channel poster: ${e}`));
   await alertStalePending(client, budget, say, out);
   await discover(env, client, budget, started, out, queued);
   if (out.unreachable) await say("reconcile_unreachable", `reconcile could not read ${out.unreachable} platform answer(s): ${out.errors.slice(0, 3).join("; ")}`, 360);
@@ -469,7 +475,7 @@ async function settle(env: Env, client: Db, budget: Budget, m: MarketRow, offici
     if (!c.provable) return [];
     const { payload } = buildReveal(m, c.db, c.committed, official, p.row.agreement);
     // A commit that was never public (channel none) gets a recorded, never-posted reveal; otherwise the reveal waits
-    // pending until postPendingReveals replies to the posted commit.
+    // pending until the channel poster (src/bot/post.ts) replies to the posted commit.
     const channel = c.db.channel === "none" ? "none" : "pending";
     return [{ resolution_id: c.resolution_id, channel, reply_to_message_id: c.db.message_id, commitment_sha256: c.db.commitment_sha256, nonce: c.db.nonce, payload, dedup_key: `reveal:${c.id}` }];
   });

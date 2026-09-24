@@ -94,10 +94,28 @@ describe("runMigrations", () => {
   });
 });
 
+describe("--require-applied (the deploy gate)", () => {
+  it("exit 0 only when every file is applied; pending exits 1; nothing is ever written", async () => {
+    const all = fakeDb(new Map([[F1.name, F1.sha256], [F2.name, F2.sha256]]));
+    expect(await runMigrations("--require-applied", [F1, F2], all.io)).toBe(0);
+    expect(all.lines.at(-1)).toBe("all 2 migrations applied");
+    const pending = fakeDb(new Map([[F1.name, F1.sha256]]));
+    expect(await runMigrations("--require-applied", [F1, F2, F3], pending.io)).toBe(1);
+    expect(pending.lines.at(-1)).toContain("2 pending");
+    const none = fakeDb(null);
+    expect(await runMigrations("--require-applied", [F1], none.io)).toBe(1);
+    for (const db of [all, pending, none]) expect(db.writes()).toEqual([]);
+  });
+  it("drift and a ledger row without its file exit 1", async () => {
+    expect(await runMigrations("--require-applied", [F1], fakeDb(new Map([[F1.name, "0".repeat(64)]])).io)).toBe(1);
+    expect(await runMigrations("--require-applied", [F1], fakeDb(new Map([[F1.name, F1.sha256], ["000_gone.sql", "f".repeat(64)]])).io)).toBe(1);
+  });
+});
+
 describe("parseMigrateArgs", () => {
   it("one mode, dry run by default; anything else stops", () => {
     expect(parseMigrateArgs([])).toBe("--dry-run");
-    for (const m of ["--dry-run", "--apply", "--verify-live"] as const) expect(parseMigrateArgs([m])).toBe(m);
+    for (const m of ["--dry-run", "--apply", "--verify-live", "--require-applied"] as const) expect(parseMigrateArgs([m])).toBe(m);
     for (const argv of [["--aply"], ["--apply", "--dry-run"], ["apply"], ["--apply=1"]]) expect(() => parseMigrateArgs(argv), argv.join(" ")).toThrow(UsageError);
   });
 });

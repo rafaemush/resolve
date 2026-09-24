@@ -11,10 +11,16 @@
 #
 # Gates (all of them run, so one run shows every red; any red stops the deploy). CI runs the same ones:
 #   typecheck, vitest, frozen eval suite = authored cases, eval replay (no --skip-missing: a missing Jev fixture is red),
-#   mutation harness --strict (a mutation that stays green is red), OpenAPI document = contract, Worker bundle builds
+#   ingestion suite frozen + run, official_release suite frozen + run (all four read files and write nothing, so the
+#   tree check below stays meaningful), mutation harness --strict (a mutation that stays green is red), OpenAPI
+#   document = contract, every migration applied (scripts/migrate.ts --require-applied: reads the ledger only; the Worker
+#   shipped may read what a pending migration creates, so pending, drifted or missing files are red), Worker bundle builds
 #   (wrangler --dry-run, no upload), and the gates left HEAD and the tree as they found them.
-# Not a gate yet: selftest-db's rollback-only block (plan §16.4 P0 step 4). It runs against whatever database .env names
-# and its concurrency probe persists rows, so it joins once staging exists and the script is split (P0 steps 3, 10).
+# DRY_RUN=1 skips only the wrangler deploy and the health check after it. Without Supabase Management API credentials
+# (SUPABASE_PROJECT_REF, SUPABASE_ACCESS_TOKEN in the environment or .env) the migrations gate cannot look: SKIPPED on a
+# dry run, red on a real deploy.
+# Not a gate: scripts/selftest-db.ts. Its rollback-only blocks run against whatever database .env names; run it (and
+# --all for scripts/selftest/*.ts) against staging after applying migrations there.
 #
 # Credentials: CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID from the environment, else from this repo's .env. Only
 # those two keys and the non-secret RESOLVE_PUBLIC_URL are read from .env by this shell; no value is ever printed. The
@@ -108,19 +114,36 @@ gate_names=()
 gate_results=()
 gate_secs=()
 failed=0
+skipped_notes=()
 
 # Run one gate (a command with both Cloudflare values defined as empty, or a function of this script) and record
-# PASS/FAIL and the time taken.
+# PASS/FAIL/SKIPPED and the time taken. A function gate that could not look sets `skipped` to the reason and returns 0.
 without_cf() { env CLOUDFLARE_API_TOKEN= CLOUDFLARE_ACCOUNT_ID= "$@"; }
+skipped=""
 run_gate() {
   local name=$1 t0=$SECONDS rc=0
   shift
   say ""
   say "=== gate: $name: $*"
+  skipped=""
   if declare -F "$1" >/dev/null; then "$@" || rc=$?; else without_cf "$@" || rc=$?; fi
   gate_names+=("$name")
   gate_secs+=("$((SECONDS - t0))")
-  if [ "$rc" -eq 0 ]; then gate_results+=("PASS"); else gate_results+=("FAIL (exit $rc)"); failed=$((failed + 1)); fi
+  if [ -n "$skipped" ]; then gate_results+=("SKIPPED"); skipped_notes+=("$name: $skipped")
+  elif [ "$rc" -eq 0 ]; then gate_results+=("PASS")
+  else gate_results+=("FAIL (exit $rc)"); failed=$((failed + 1)); fi
+}
+
+# Every migration file applied to the database .env names, nothing drifted (read-only). Exit 3 = no credentials to
+# look with: a dry run reports it SKIPPED; a real deploy is red, because "could not look" is not "all applied".
+migrations_applied() {
+  local rc=0
+  without_cf npx tsx scripts/migrate.ts --require-applied || rc=$?
+  if [ "$rc" -eq 3 ] && [ "$dry" = 1 ]; then
+    skipped="no Supabase Management API credentials here; a real deploy refuses until the ledger can be read"
+    return 0
+  fi
+  return "$rc"
 }
 
 tree_unchanged() {
@@ -135,8 +158,13 @@ run_gate "typecheck" npx tsc --noEmit
 run_gate "vitest" npx vitest run
 run_gate "eval suite frozen" npx tsx evals/build.ts --check
 run_gate "eval replay" npx tsx evals/run.ts --mode replay
+run_gate "ingest frozen" npx tsx evals/ingest.ts --check
+run_gate "ingest suite" npx tsx evals/ingest.ts
+run_gate "official frozen" npx tsx evals/official.ts --check
+run_gate "official suite" npx tsx evals/official.ts
 run_gate "mutations strict" npx tsx evals/mutate.ts --strict
 run_gate "openapi" npx tsx scripts/openapi.ts --check
+run_gate "migrations applied" migrations_applied
 run_gate "worker bundle" npx wrangler deploy --dry-run --env-file "$no_env" --outdir "$tmp/bundle" --var "GIT_SHA:$head_sha"
 run_gate "tree unchanged" tree_unchanged
 
@@ -145,11 +173,12 @@ say "gate summary: HEAD ${head_sha:0:12}$([ "$dry" = 1 ] && echo ", DRY_RUN=1")"
 for i in "${!gate_names[@]}"; do
   printf '  %-15s %-20s %4ss\n' "${gate_results[$i]}" "${gate_names[$i]}" "${gate_secs[$i]}"
 done
+for note in ${skipped_notes[@]+"${skipped_notes[@]}"}; do say "  skipped $note"; done
 if [ "$failed" -gt 0 ]; then
   say "$failed of ${#gate_names[@]} gates red: nothing deployed"
   exit 1
 fi
-say "all ${#gate_names[@]} gates green"
+say "all ${#gate_names[@]} gates green${skipped_notes[0]+ (${#skipped_notes[@]} skipped on this dry run)}"
 say "cloudflare credentials: CLOUDFLARE_API_TOKEN $cf_token_src, CLOUDFLARE_ACCOUNT_ID $cf_account_src$([ "$cf_token_src" = "not set" ] && echo " (wrangler deploy will use wrangler login)")"
 
 if [ "$dry" = 1 ]; then

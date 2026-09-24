@@ -1,23 +1,29 @@
 /**
  * Commit-reveal (plan §16.4 P2 step 1, §17.3 P2a): preimage v2 recomputed by a third party from the reveal text alone,
- * the public confidence floor, insert-first ordering, the retry selection and v1 fallbacks.
+ * the public confidence floor (counted by distinct event since migration 017), insert-first ordering, dedup against the
+ * market's latest commit only (A -> B -> A is committed again), the legs of an event left to the channel poster, the
+ * channel lease and pacing on the inline post, and v1 fallbacks. The channel poster itself: tests/post.test.ts.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
 import type { Verdict } from "../src/resolve/schema";
 import type { MarketRow } from "../src/ingest/types";
 import { fakeDb, type FakeDb } from "./lib/fake-db";
+import { POST_RPCS } from "./lib/fake-post-rpcs";
 
 const h = vi.hoisted(() => ({ db: null as unknown as FakeDb }));
 vi.mock("../src/db/supabase", () => ({ db: () => h.db.client }));
 vi.mock("../src/ops/alerts", () => ({ alert: vi.fn(async () => ({ sent: true, deduped: false })) }));
 
-import { applyPublicFloor, buildPreimage, buildReveal, commitVerdict, committedFields, committedOf, floorCandidate, MARKET_NOT_OPEN_SQLSTATE, PUBLIC_FLOOR, retryCandidates, retryUnposted, type CommittedVerdict, type OfficialRecord } from "../src/bot/commit";
+import { applyPublicFloor, buildPreimage, buildReveal, commitDedupKey, commitVerdict, committedFields, committedOf, floorCandidate, MARKET_NOT_OPEN_SQLSTATE, PUBLIC_FLOOR, type CommittedVerdict, type OfficialRecord } from "../src/bot/commit";
+import { PACE } from "../src/bot/channel";
 import { alert } from "../src/ops/alerts";
 import { sha256Hex } from "../src/resolve/text";
 
 const CANON = "c".repeat(64), RAW = "d".repeat(64);
-const MARKET = { id: "22222222-2222-4222-8222-222222222222", platform: "limitless", external_id: "will-x-happen-1790000000000", option_a: "Yes", option_b: "No", status: "open", is_test: false } as unknown as MarketRow;
+const MARKET = { id: "22222222-2222-4222-8222-222222222222", platform: "limitless", external_id: "will-x-happen-1790000000000", option_a: "Yes", option_b: "No", status: "open", is_test: false, event_key: "limitless:will-x-happen-1790000000000" } as unknown as MarketRow;
+/** A markets row as commit_context() reads it. */
+const marketRow = (id: string, eventKey: string, over: Record<string, unknown> = {}) => ({ id, platform: "limitless", external_id: id, status: "open", is_test: false, tenant_id: null, deleted_at: null, event_key: eventKey, ...over });
 
 function verdict(over: Partial<Verdict> = {}): Verdict {
   return {
@@ -106,27 +112,23 @@ describe("public confidence floor (plan §17.3 P2a)", () => {
   });
 });
 
-describe("retryCandidates (pure)", () => {
-  const now = Date.parse("2026-10-01T12:00:00Z");
-  const row = (id: string, secondsAgo: number, over: Record<string, unknown> = {}) => ({ id, kind: "commit", channel: "pending", created_at: new Date(now - secondsAgo * 1000).toISOString(), payload: {}, ...over });
-
-  it("picks pending commits older than 60 s, oldest first, at most max", () => {
-    const rows = [row("young", 30), row("b", 120), row("a", 600), row("posted", 900, { channel: "telegram" }), row("reveal", 900, { kind: "reveal" }), row("c", 61), row("d", 60)];
-    expect(retryCandidates(rows, now, 5).map((r) => r.id)).toEqual(["a", "b", "c", "d"]);
-    expect(retryCandidates(rows, now, 2).map((r) => r.id)).toEqual(["a", "b"]);
-    expect(retryCandidates(rows, now, 0)).toEqual([]);
-  });
-});
-
 describe("commitVerdict: insert first, then post, then the receipt", () => {
   const env = { TELEGRAM_BOT_TOKEN: "t", TELEGRAM_CHANNEL_ID: "-100" } as unknown as Env;
   let sent: Array<Record<string, unknown>>;
   let telegramOk: boolean;
+  // Only ever forward: sendMessage's throttle remembers the last send across tests.
+  let clock = Date.parse("2026-10-01T12:00:00.000Z");
+  /** Each commit a few seconds after the previous one, as separate invocations are (created_at orders the commits). */
+  const tick = () => { clock += 5000; vi.setSystemTime(clock); };
+  const commits = () => h.db.tables.bot_posts!.filter((b) => b.kind === "commit");
 
   beforeEach(() => {
-    h.db = fakeDb({ bot_posts: [] }, { bot_posts: ["dedup_key"] });
+    h.db = fakeDb({ bot_posts: [], markets: [marketRow(MARKET.id, MARKET.event_key!)] }, { bot_posts: ["dedup_key"] }, { rpc: POST_RPCS });
     sent = [];
     telegramOk = true;
+    clock += 60_000;
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(clock);
     vi.mocked(alert).mockClear();
     vi.stubGlobal("fetch", async (url: string, init: RequestInit) => {
       if (!String(url).startsWith("https://api.telegram.org/")) throw new Error(`unexpected fetch ${url}`);
@@ -134,24 +136,27 @@ describe("commitVerdict: insert first, then post, then the receipt", () => {
       expect(h.db.tables.bot_posts!.length).toBeGreaterThan(0);
       sent.push(JSON.parse(String(init.body)));
       return telegramOk
-        ? new Response(JSON.stringify({ ok: true, result: { message_id: 77, date: 1790000000 } }), { status: 200 })
+        ? new Response(JSON.stringify({ ok: true, result: { message_id: 76 + sent.length, date: Math.floor(Date.now() / 1000) } }), { status: 200 })
         : new Response(JSON.stringify({ ok: false, description: "Bad Request: chat not found" }), { status: 400 });
     });
   });
-  afterEach(() => vi.unstubAllGlobals());
+  afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers(); });
 
-  it("records a pending row, posts it, then fills only the delivery columns", async () => {
+  it("records a pending row, posts it under the channel lease, then fills only the delivery columns", async () => {
     const r = await commitVerdict(env, MARKET, "res1", verdict({ confidence_score: 0.95 }));
     expect(r).toMatchObject({ committed: true, posted: true, reason: "posted" });
-    expect(h.db.calls.map((c) => `${c.table}.${c.action}`)).toEqual(["bot_posts.insert", "bot_posts.update"]);
+    expect(h.db.calls.map((c) => `${c.table}.${c.action}`)).toEqual(["rpc:commit_context.rpc", "bot_posts.insert", "rpc:claim_post_lease.rpc", "bot_posts.update", "rpc:release_post_lease.rpc"]);
     const row = h.db.tables.bot_posts![0]!;
     // what the private early reveal sends followers: the recorded row, its commitment and the committed verdict
     expect(r.commit).toEqual({ id: row.id, commitment_sha256: row.commitment_sha256, committed_at: row.created_at, committed: row.payload.committed });
-    expect(row).toMatchObject({ kind: "commit", channel: "telegram", message_id: 77, telegram_date: new Date(1790000000 * 1000).toISOString(), posted_at: new Date(1790000000 * 1000).toISOString() });
+    expect(row).toMatchObject({ kind: "commit", channel: "telegram", message_id: 77, dedup_key: commitDedupKey(MARKET.id, null), payload: { batched: false } });
+    expect(row.telegram_date).toBe(new Date(Math.floor(clock / 1000) * 1000).toISOString());
+    expect(row.posted_at).toBe(row.telegram_date);
     expect(row.payload.committed.preimage_version).toBe("v2");
     expect(await sha256Hex(row.payload.committed.preimage)).toBe(row.commitment_sha256);
     expect(String(sent[0]!.text)).toContain("market limitless:will-x-happen-1790000000000");
     expect(String(sent[0]!.text)).not.toContain(row.nonce); // the nonce stays private until the reveal
+    expect(Date.parse(h.db.tables.post_leases![0]!.lease_until)).toBeLessThanOrEqual(Date.now()); // released
   });
 
   it("a failed post leaves the row pending with post_error and post_attempts", async () => {
@@ -162,11 +167,71 @@ describe("commitVerdict: insert first, then post, then the receipt", () => {
     expect(h.db.tables.bot_posts![0]).toMatchObject({ channel: "pending", message_id: null, posted_at: null, payload: { post_error: "Bad Request: chat not found", post_attempts: 1 } });
   });
 
-  it("the same verdict signature is committed once (unique dedup_key), with no second post", async () => {
+  it("the latest commit's verdict signature is not committed again, whatever the confidence", async () => {
     await commitVerdict(env, MARKET, "res1", verdict({ confidence_score: 0.95 }));
+    tick();
     const again = await commitVerdict(env, MARKET, "res2", verdict({ confidence_score: 0.97 }));
-    expect(again).toEqual({ committed: false, posted: false, reason: "already committed for this verdict signature" });
+    expect(again).toEqual({ committed: false, posted: false, reason: "the market's latest commit already has this verdict signature" });
     expect(sent).toHaveLength(1);
+  });
+
+  it("A -> B -> A: a verdict that returns to an earlier signature is committed again and is the latest commit", async () => {
+    const A = () => verdict({ confidence_score: 0.95, determination_basis: "structured" });
+    const B = () => verdict({ resolution_status: "UNRESOLVED", winning_outcome: "NONE", confidence_score: 0.5, determination_basis: "structured", caveats: ["no_anchor"] });
+    expect((await commitVerdict(env, MARKET, "r1", A())).committed).toBe(true);
+    tick();
+    expect((await commitVerdict(env, MARKET, "r2", B())).committed).toBe(true);
+    tick();
+    const back = await commitVerdict(env, MARKET, "r3", A());
+    expect(back).toMatchObject({ committed: true, posted: true });
+    const [c1, c2, c3] = commits();
+    expect([c1!.dedup_key, c2!.dedup_key, c3!.dedup_key]).toEqual([commitDedupKey(MARKET.id, null), commitDedupKey(MARKET.id, c1!.id), commitDedupKey(MARKET.id, c2!.id)]);
+    expect(commits().map((c) => c.payload.verdict_signature)).toEqual(["RESOLVED|OPTION_A|", "UNRESOLVED|NONE|", "RESOLVED|OPTION_A|"]);
+    // the reconcile settles the latest commit (created_at, then id): the market's current verdict, A
+    const latest = [...commits()].sort((x, y) => Date.parse(y.created_at) - Date.parse(x.created_at))[0]!;
+    expect(latest.id).toBe(c3!.id);
+    expect(sent.map((s) => String(s.text).includes(c3!.commitment_sha256))).toEqual([false, false, true]);
+    tick();
+    expect((await commitVerdict(env, MARKET, "r4", A())).committed).toBe(false); // A again right after A: deduped
+  });
+
+  it("a floored UNRESOLVED after a public RESOLVED is committed (the retraction reaches the channel), and RESOLVED again after it", async () => {
+    expect((await commitVerdict(env, MARKET, "r1", verdict({ confidence_score: 0.95 }))).committed).toBe(true); // Jev >= 0.90: not floored
+    tick();
+    const floored = await commitVerdict(env, MARKET, "r2", verdict({ confidence_score: 0.85 }));
+    expect(floored).toMatchObject({ committed: true, posted: true });
+    expect(commits()[1]!.payload.committed).toMatchObject({ resolution_status: "UNRESOLVED", winning_outcome: "NONE", caveats: ["claimed_at_display_only", PUBLIC_FLOOR.caveat] });
+    tick();
+    expect((await commitVerdict(env, MARKET, "r3", verdict({ confidence_score: 0.86 }))).committed).toBe(false); // floored again = the latest
+    tick();
+    expect((await commitVerdict(env, MARKET, "r4", verdict({ confidence_score: 0.96 }))).committed).toBe(true);
+    expect(commits().map((c) => c.payload.committed.resolution_status)).toEqual(["RESOLVED", "UNRESOLVED", "RESOLVED"]);
+    expect(sent).toHaveLength(3);
+  });
+
+  it("a concurrent commit that lands after the read collides on the dedup key; the new verdict is compared with it", async () => {
+    const other = async (signature: string) => {
+      const real = h.db.client.rpc;
+      let first = true;
+      h.db.client.rpc = async (fn, args) => {
+        const r = await real(fn, args);
+        if (fn === "commit_context" && first) {
+          first = false; // another invocation commits right after this one read "no commit yet"
+          h.db.tables.bot_posts!.push({ id: `other-${signature}`, market_id: MARKET.id, kind: "commit", channel: "telegram", created_at: new Date(Date.now() + 1).toISOString(), dedup_key: commitDedupKey(MARKET.id, null), payload: { verdict_signature: signature } });
+        }
+        return r;
+      };
+    };
+    await other("RESOLVED|OPTION_A|");
+    const same = await commitVerdict(env, MARKET, "res1", verdict({ confidence_score: 0.95 }));
+    expect(same).toMatchObject({ committed: false, reason: "the market's latest commit already has this verdict signature" });
+    expect(commits()).toHaveLength(1);
+
+    h.db = fakeDb({ bot_posts: [], markets: [marketRow(MARKET.id, MARKET.event_key!)] }, { bot_posts: ["dedup_key"] }, { rpc: POST_RPCS });
+    await other("UNRESOLVED|NONE|");
+    const differs = await commitVerdict(env, MARKET, "res1", verdict({ confidence_score: 0.95 }));
+    expect(differs).toMatchObject({ committed: true });
+    expect(commits().at(-1)!.dedup_key).toBe(commitDedupKey(MARKET.id, "other-UNRESOLVED|NONE|"));
   });
 
   it("applies the public floor to the committed verdict, not to the resolutions row", async () => {
@@ -174,14 +239,49 @@ describe("commitVerdict: insert first, then post, then the receipt", () => {
     expect(r.committed).toBe(true);
     const row = h.db.tables.bot_posts![0]!;
     expect(row.payload.committed).toMatchObject({ resolution_status: "UNRESOLVED", winning_outcome: "NONE", caveats: ["claimed_at_display_only", PUBLIC_FLOOR.caveat] });
-    expect(row.dedup_key).toBe(`commit:${MARKET.id}:UNRESOLVED|NONE|`);
-    expect(h.db.calls[0]).toEqual({ table: "bot_posts", action: "select" }); // the public-commit count
+    expect(row.payload.verdict_signature).toBe("UNRESOLVED|NONE|");
   });
 
-  it("the floor lifts after 100 public commits on non-test markets", async () => {
-    h.db.tables.bot_posts = Array.from({ length: 100 }, (_, i) => ({ id: `p${i}`, kind: "commit", channel: "telegram", dedup_key: `old${i}`, markets: { is_test: false } }));
+  it("the floor counts distinct events: 100 commits on the legs of 10 ladders keep it; 100 events lift it", async () => {
+    const seed = (events: number, legs: number) => {
+      for (let e = 0; e < events; e++) for (let l = 0; l < legs; l++) {
+        const id = `m${e}-${l}`;
+        h.db.tables.markets!.push(marketRow(id, `polymarket:event:${e}`, { status: "resolved" }));
+        h.db.tables.bot_posts!.push({ id: `p${e}-${l}`, market_id: id, kind: "commit", channel: "telegram", dedup_key: `old${e}-${l}`, created_at: "2026-09-01T00:00:00.000Z", payload: {} });
+      }
+    };
+    seed(10, 10);
     await commitVerdict(env, MARKET, "res1", verdict({ confidence_score: 0.85 }));
-    expect(h.db.tables.bot_posts!.at(-1)!.payload.committed.resolution_status).toBe("RESOLVED");
+    expect(commits().at(-1)!.payload.committed.resolution_status).toBe("UNRESOLVED");
+    h.db = fakeDb({ bot_posts: [], markets: [marketRow(MARKET.id, MARKET.event_key!)] }, { bot_posts: ["dedup_key"] }, { rpc: POST_RPCS });
+    seed(100, 1);
+    await commitVerdict(env, MARKET, "res1", verdict({ confidence_score: 0.85 }));
+    expect(commits().at(-1)!.payload.committed.resolution_status).toBe("RESOLVED");
+  });
+
+  it("a market whose event has another open leg is recorded pending, batched, and left to the channel poster", async () => {
+    h.db.tables.markets!.push(marketRow("leg-2", MARKET.event_key!), marketRow("leg-closed", MARKET.event_key!, { status: "resolved" }), marketRow("leg-test", MARKET.event_key!, { is_test: true }));
+    const r = await commitVerdict(env, MARKET, "res1", verdict({ confidence_score: 0.95 }));
+    expect(r).toMatchObject({ committed: true, posted: false });
+    expect(r.reason).toContain(`event ${MARKET.event_key} has 1 other open market(s)`);
+    expect(h.db.tables.bot_posts![0]).toMatchObject({ channel: "pending", payload: { batched: true } });
+    expect(sent).toHaveLength(0);
+    expect(h.db.calls.map((c) => c.table)).toEqual(["rpc:commit_context", "bot_posts"]); // no lease taken
+  });
+
+  it("the inline post waits for the poster when the channel is at its pacing ceiling or held by another poster", async () => {
+    const recent = new Date(Date.now() - 10_000).toISOString();
+    h.db.tables.bot_posts!.push(...Array.from({ length: PACE.messages }, (_, i) => ({ id: `q${i}`, market_id: "x", kind: i % 2 ? "reveal" : "commit", channel: "telegram", message_id: 1000 + i, posted_at: recent, created_at: recent, dedup_key: `q${i}`, payload: {} })));
+    const paced = await commitVerdict(env, MARKET, "res1", verdict({ confidence_score: 0.95 }));
+    expect(paced).toMatchObject({ committed: true, posted: false });
+    expect(paced.reason).toContain("channel paced");
+    expect(sent).toHaveLength(0);
+
+    h.db = fakeDb({ bot_posts: [], markets: [marketRow(MARKET.id, MARKET.event_key!)], post_leases: [{ channel: "telegram_public", holder: "someone-else", lease_until: new Date(Date.now() + 30_000).toISOString() }] }, { bot_posts: ["dedup_key"] }, { rpc: POST_RPCS });
+    const busy = await commitVerdict(env, MARKET, "res1", verdict({ confidence_score: 0.95 }));
+    expect(busy.reason).toContain("channel busy");
+    expect(h.db.tables.bot_posts![0]).toMatchObject({ channel: "pending" });
+    expect(sent).toHaveLength(0);
   });
 
   it("test markets are recorded with channel none and never posted", async () => {
@@ -209,15 +309,11 @@ describe("commitVerdict: insert first, then post, then the receipt", () => {
     expect(vi.mocked(alert).mock.calls[0]![1]).toBe(`commit_insert_${MARKET.id}`);
   });
 
-  it("retryUnposted re-posts a commit pending for more than 60 s", async () => {
-    telegramOk = false;
-    await commitVerdict(env, MARKET, "res1", verdict({ confidence_score: 0.95 }));
-    h.db.tables.bot_posts![0]!.created_at = new Date(Date.now() - 120_000).toISOString();
-    telegramOk = true;
-    const r = await retryUnposted(env, 5);
-    expect(r).toMatchObject({ attempted: 1, posted: 1, failed: 0 });
-    expect(h.db.tables.bot_posts![0]).toMatchObject({ channel: "telegram", message_id: 77 });
-    expect(sent).toHaveLength(2);
-    expect(sent[1]!.text).toBe(sent[0]!.text); // the stored text, byte for byte
+  it("an unreadable latest commit is alerted and nothing is recorded (the dedup cannot be decided)", async () => {
+    h.db.client.rpc = async () => ({ data: null, error: { code: "57014", message: "statement timeout" } });
+    const r = await commitVerdict(env, MARKET, "res1", verdict({ confidence_score: 0.95 }));
+    expect(r).toMatchObject({ committed: false, posted: false });
+    expect(h.db.tables.bot_posts).toHaveLength(0);
+    expect(vi.mocked(alert).mock.calls[0]![1]).toBe(`commit_insert_${MARKET.id}`);
   });
 });

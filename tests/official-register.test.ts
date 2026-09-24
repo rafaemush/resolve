@@ -161,8 +161,9 @@ describe("migration 016 (static lint; never applied from here)", () => {
     const block = script.slice(from, script.indexOf("end $$;`;", from));
     expect(block.length).toBeGreaterThan(1000);
     expect(block.trimEnd().endsWith("raise exception 'SELFTEST_OFFICIAL %', out::text;")).toBe(true);
-    expect(script).toContain('if (!process.argv.includes("--official")) main()');
-    expect(script).toContain('process.env.RESOLVE_SELFTEST_NON_PRODUCTION !== "1"');
+    // opt-in: --official runs only this block, after the target guard (scripts/lib/selftest.ts, tests/selftest-lib.test.ts)
+    expect(script).toMatch(/if \(argv\.includes\("--official"\)\) \{\s*const refusal = nonProductionRefusal\(\);\s*if \(refusal\) \{[^\n]*return 2; \}/);
+    expect(readFileSync(resolve(import.meta.dirname, "../scripts/lib/selftest.ts"), "utf8")).toContain('env.RESOLVE_SELFTEST_NON_PRODUCTION === "1"');
     for (const fn of ["record_official_observation", "claim_official_fetch", "extend_official_fetch", "recheck_official_corroboration"]) expect(block, fn).toContain(`${fn}(`);
     const expectBlock = script.slice(script.indexOf("const OFFICIAL_SELFTEST_EXPECT"), script.indexOf("async function officialSelftest"));
     const keys = [...expectBlock.slice(expectBlock.indexOf("= {")).matchAll(/[{,]\s*([a-z_]+): /g)].map((m) => m[1]!);

@@ -1,37 +1,34 @@
 /**
- * Exercises the billing RPCs, the commit-reveal trigger and the public view (migration 012), the dispatch
- * observability of migration 013, and the no-cold-pitch gate and follows of migration 014, each inside a DO block that
- * always raises at the end, so the whole thing rolls back and nothing persists. The raised message carries the assertion results. Then a real concurrency probe: 10 parallel begin_resolution calls with one
- * Idempotency-Key against a __selftest__ tenant (soft-deleted afterwards; ledger rows are append-only by design).
- * Point it at staging: the concurrency probe persists rows.
+ * Rollback-only database self-test (the default): the billing RPCs, the commit-reveal trigger and the public view
+ * (migration 012), the dispatch observability of migration 013, and the no-cold-pitch gate and follows of migration 014,
+ * each inside a DO block that always raises at the end, so the whole thing rolls back and nothing persists. The raised
+ * message carries the assertion results.
+ *   npx tsx scripts/selftest-db.ts                       rollback-only blocks, through the Management API (.env's project)
+ *   npx tsx scripts/selftest-db.ts --psql <conninfo>     the same blocks through psql (a local throwaway cluster)
+ *   npx tsx scripts/selftest-db.ts --all                 also every scripts/selftest/*.ts (other packages' blocks; each
+ *                                                        is a child process, its PASS/FAIL lines are aggregated) and the
+ *                                                        official_release block; --psql is passed on to them
+ *   npx tsx scripts/selftest-db.ts --concurrency-probe   also the one PERSISTING test: 10 parallel begin_resolution calls
+ *                                                        with one Idempotency-Key against a __selftest__ tenant
+ *                                                        (soft-deleted afterwards; ledger rows are append-only by design).
+ *                                                        Refused unless SUPABASE_PROJECT_REF equals STAGING_SUPABASE_PROJECT_REF.
+ *   npx tsx scripts/selftest-db.ts --official            only the official_release block (migration 016)
  */
+import { spawnSync } from "node:child_process";
+import { existsSync, readdirSync } from "node:fs";
+import { resolve } from "node:path";
 import { loadEnv } from "./lib/env";
 import { sql } from "./lib/mgmt";
+import { blockRunner, check, nonProductionRefusal, raisedResults, targetIsStaging, UsageError, type BlockRunner } from "./lib/selftest";
 
-loadEnv();
+const FLAGS = ["--all", "--concurrency-probe", "--official", "--psql"] as const;
 
 /** Run a DO block that ends with raise exception '<tag> <json>' and return the parsed json (null when absent). */
-async function rollbackBlock(tag: string, block: string): Promise<Record<string, unknown> | null> {
-  let msg = "";
-  try { await sql(block); } catch (e) { msg = String(e); }
-  let inner = msg;
-  const j = msg.indexOf("{");
-  if (j >= 0) { try { inner = String(JSON.parse(msg.slice(j)).message ?? msg); } catch { /* keep raw */ } }
-  const m = inner.match(new RegExp(`${tag} (\\{.*\\})`, "s"));
-  if (!m) { console.error(`${tag} did not return results:`, msg.slice(0, 800)); return null; }
-  return JSON.parse(m[1]!) as Record<string, unknown>;
-}
-
-/** Print PASS/FAIL per expected key ("a.b" reads a nested key); returns the number of failures. */
-function check(r: Record<string, unknown>, expect: Record<string, unknown>): number {
-  let bad = 0;
-  for (const [k, v] of Object.entries(expect)) {
-    const got = k.includes(".") ? (r[k.split(".")[0]!] as Record<string, unknown> | undefined)?.[k.split(".")[1]!] : r[k];
-    const ok = JSON.stringify(got) === JSON.stringify(v);
-    if (!ok) bad++;
-    console.log(`${ok ? "PASS" : "FAIL"} ${k} = ${JSON.stringify(got)}${ok ? "" : ` (expected ${JSON.stringify(v)})`}`);
-  }
-  return bad;
+async function rollbackBlock(run: BlockRunner, tag: string, block: string): Promise<Record<string, unknown> | null> {
+  const raw = await run(block);
+  const r = raisedResults(tag, raw);
+  if (!r) console.error(`FAIL ${tag} did not return results:`, raw.slice(0, 800));
+  return r;
 }
 
 /**
@@ -353,8 +350,8 @@ begin
   raise exception 'SELFTEST_GTM %', out::text;
 end $$;`;
 
-async function main() {
-  const block = `
+/** The billing RPCs: begin_resolution replay and refusal, refunds once, deposits credited once, unmatched and dust. */
+const BILLING_BLOCK = `
 do $$
 declare t uuid; k uuid; r1 record; r2 record; r3 record; r4 record; ref1 int; ref2 int; d1 record; d2 record; d3 record; out jsonb;
 begin
@@ -382,9 +379,13 @@ begin
     'final_balance', (select credits_balance from tenants where id = t));
   raise exception 'SELFTEST %', out::text;
 end $$;`;
-  const r = await rollbackBlock("SELFTEST", block);
-  if (!r) process.exit(1);
-  const expect: Record<string, unknown> = {
+
+/** The rollback-only blocks; returns the number of failures (a block that returned nothing counts as one). */
+async function rollbackBlocks(run: BlockRunner): Promise<number> {
+  let bad = 0;
+  const r = await rollbackBlock(run, "SELFTEST", BILLING_BLOCK);
+  if (!r) return 1;
+  bad += check(r, {
     "r1.replayed": false, "r1.ok": true, "r1.balance": 2, "r1.charged": 5,
     "r2.replayed": true, "r2.ok": true, "r2.same_id": true, "r2.charged": 5,
     "r3.replayed": false, "r3.ok": false, "r3.balance": 2,
@@ -392,12 +393,11 @@ end $$;`;
     "charge_rows": 1, "refund1": 5, "refund2": 0, "refund_rows": 1, "pending_stubs_left": 0,
     "deposit1": "credited", "deposit1_credits": 250, "deposit2": "duplicate", "deposit3": "unmatched",
     "final_balance": 257,
-  };
-  let bad = check(r, expect);
+  });
   console.log("rolled back: nothing persisted from the DO block");
 
-  const p2a = await rollbackBlock("SELFTEST_P2A", P2A_BLOCK);
-  if (!p2a) process.exit(1);
+  const p2a = await rollbackBlock(run, "SELFTEST_P2A", P2A_BLOCK);
+  if (!p2a) return bad + 1;
   bad += check(p2a, {
     smoke_insert_is_test: true,
     pending_failed_attempt_allowed: true, pending_sha_change_refused: true, pending_committed_change_refused: true,
@@ -417,16 +417,16 @@ end $$;`;
   });
   console.log("rolled back: nothing persisted from the P2a block");
 
-  const ops = await rollbackBlock("SELFTEST_OPS", OPS_BLOCK);
-  if (!ops) process.exit(1);
+  const ops = await rollbackBlock(run, "SELFTEST_OPS", OPS_BLOCK);
+  if (!ops) return bad + 1;
   bad += check(ops, {
     throw_returns: 0, throw_outcome: "failure", throw_sqlstate: "22P02", throw_has_error: true,
     dispatch_failures_is_count: true, bad_window_refused: true, anon_dispatch_failures_denied: true, anon_select_due_watches_denied: true,
   });
   console.log("rolled back: nothing persisted from the ops block");
 
-  const gtm = await rollbackBlock("SELFTEST_GTM", GTM_BLOCK);
-  if (!gtm) process.exit(1);
+  const gtm = await rollbackBlock(run, "SELFTEST_GTM", GTM_BLOCK);
+  if (!gtm) return bad + 1;
   bad += check(gtm, {
     custom_prior_evidence: false,
     cold_dm_refused: true, cold_email_refused: true, cold_call_refused: true, blank_override_refused: true, direct_insert_refused: true,
@@ -443,8 +443,14 @@ end $$;`;
     anon_log_touch_denied: true, anon_follow_denied: true, anon_entitlements_denied: true, anon_leads_denied: true,
   });
   console.log("rolled back: nothing persisted from the GTM block");
+  return bad;
+}
 
-  // concurrency probe (persists rows on a __selftest__ tenant; tenant soft-deleted after)
+/**
+ * The one test that persists rows: 10 parallel begin_resolution calls with one Idempotency-Key must charge once. Staging
+ * only, through the Management API (parallel requests are the point).
+ */
+async function concurrencyProbe(): Promise<number> {
   const [t] = await sql<{ id: string }>("insert into tenants (display_name, credits_balance) values ('__selftest_concurrency__', 100) returning id");
   const tid = t!.id;
   const calls = Array.from({ length: 10 }, () => sql<{ request_id: string; replayed: boolean; charged: number }>(`select * from begin_resolution('${tid}'::uuid, null, 'concurrent-key', 5, null, 'eval')`));
@@ -455,20 +461,73 @@ end $$;`;
   const ok = cnt!.charges === 1 && cnt!.balance === 95 && errors === 0;
   console.log(`${ok ? "PASS" : "FAIL"} concurrency: 10 parallel calls -> charge_rows=${cnt!.charges} balance=${cnt!.balance} replayed=${replayed} errors=${errors}`);
   await sql(`update tenants set deleted_at = now() where id='${tid}'`);
-  if (bad || !ok) process.exit(1);
+  return ok ? 0 : 1;
 }
-// --official runs only the migration 016 block below; the default run above is unchanged.
-if (!process.argv.includes("--official")) main().catch((e) => { console.error(String(e)); process.exit(1); });
+
+/**
+ * --all: every scripts/selftest/*.ts as a child process (each applies its own target guard), with --psql passed on.
+ * A child's PASS/FAIL lines are counted; a child that exits non-zero, or prints no PASS line, fails the run: a refusal
+ * or a crash is "could not look", never green.
+ */
+function selftestFiles(psqlArgs: string[]): number {
+  const dir = resolve(process.cwd(), "scripts/selftest");
+  const files = existsSync(dir) ? readdirSync(dir).filter((f) => f.endsWith(".ts")).sort() : [];
+  const tsx = resolve(process.cwd(), "node_modules/.bin/tsx");
+  let failedFiles = 0;
+  for (const f of files) {
+    const r = spawnSync(tsx, [resolve(dir, f), ...psqlArgs], { encoding: "utf8", env: process.env });
+    const lines = `${r.stdout ?? ""}${r.stderr ?? ""}`.split("\n").filter(Boolean);
+    for (const l of lines) console.log(`  [${f}] ${l}`);
+    const pass = lines.filter((l) => l.startsWith("PASS")).length, fail = lines.filter((l) => l.startsWith("FAIL")).length;
+    const ok = r.status === 0 && fail === 0 && pass > 0;
+    if (!ok) failedFiles++;
+    console.log(`${ok ? "PASS" : "FAIL"} scripts/selftest/${f}: ${pass} passed, ${fail} failed, exit ${r.status ?? r.error?.message ?? "?"}`);
+  }
+  console.log(`scripts/selftest: ${files.length - failedFiles} of ${files.length} file(s) green`);
+  return failedFiles;
+}
+
+async function main(): Promise<number> {
+  const argv = process.argv.slice(2);
+  const unknown = argv.filter((a, i) => a.startsWith("--") && !(FLAGS as readonly string[]).includes(a) && argv[i - 1] !== "--psql");
+  let runner: ReturnType<typeof blockRunner>;
+  try {
+    if (unknown.length) throw new UsageError(`unknown flag(s): ${unknown.join(" ")} (accepted: ${FLAGS.join(" ")})`);
+    runner = blockRunner(argv);
+  } catch (e) {
+    if (e instanceof UsageError) { console.error(e.message); return 2; }
+    throw e;
+  }
+  loadEnv();
+  const psqlArgs = runner.conninfo ? ["--psql", runner.conninfo] : [];
+  if (argv.includes("--official")) {
+    const refusal = nonProductionRefusal();
+    if (refusal) { console.error(`selftest --official: ${refusal}`); return 2; }
+    return (await officialSelftest(runner.run)) ? 1 : 0;
+  }
+  if (argv.includes("--concurrency-probe")) {
+    // refused before anything runs: the probe persists rows
+    if (runner.via === "psql") { console.error("--concurrency-probe runs through the Management API against staging only; drop --psql"); return 2; }
+    if (!targetIsStaging()) { console.error("--concurrency-probe refused: it persists rows, and SUPABASE_PROJECT_REF is not STAGING_SUPABASE_PROJECT_REF"); return 2; }
+  }
+  let bad = await rollbackBlocks(runner.run);
+  if (argv.includes("--concurrency-probe")) bad += await concurrencyProbe();
+  if (argv.includes("--all")) {
+    bad += await officialSelftest(runner.run);
+    bad += selftestFiles(psqlArgs);
+  }
+  return bad ? 1 : 0;
+}
 
 // =====================================================================================================================
 // official_release (migration 016): rollback-only assertions.
-//   RESOLVE_SELFTEST_NON_PRODUCTION=1 pnpm tsx scripts/selftest-db.ts --official
-// Kept in its own block (main's part of this file changes independently). Everything runs inside one DO block that
-// always ends with RAISE, so nothing persists; still, it is refused unless the operator declares a non-production
-// target, and it has never been run against production. It asserts: first print wins, revision_differs, the guard
-// trigger's refusals (UPDATE of the observation, DELETE, corroboration overwrite) and its one allowance (from null),
-// service_role write denial with read + RPC access, the fetch lease and its extension, and the audited re-check
-// (history appended before the supersede, value untouched, history append-only, guard re-armed afterwards).
+//   RESOLVE_SELFTEST_NON_PRODUCTION=1 pnpm tsx scripts/selftest-db.ts --official   (also part of --all)
+// Everything runs inside one DO block that always ends with RAISE, so nothing persists; still, it is refused unless the
+// target is staging or the operator declares a non-production target, and it has never been run against production.
+// It asserts: first print wins, revision_differs, the guard trigger's refusals (UPDATE of the observation, DELETE,
+// corroboration overwrite) and its one allowance (from null), service_role write denial with read + RPC access, the
+// fetch lease and its extension, and the audited re-check (history appended before the supersede, value untouched,
+// history append-only, guard re-armed afterwards).
 // =====================================================================================================================
 const OFFICIAL_SELFTEST_SQL = `
 do $$
@@ -547,27 +606,15 @@ const OFFICIAL_SELFTEST_EXPECT: Record<string, unknown> = {
   history_update: "refused", recheck_bad_status: "refused", overwrite_after_recheck: "refused",
 };
 
-async function officialSelftest(): Promise<void> {
-  if (process.env.RESOLVE_SELFTEST_NON_PRODUCTION !== "1") {
-    console.error("selftest --official: refused. Set RESOLVE_SELFTEST_NON_PRODUCTION=1 only when SUPABASE_PROJECT_REF names a staging or local database (the block rolls back, but it is never run against production).");
-    process.exit(2);
-  }
-  let msg = "";
-  try { await sql(OFFICIAL_SELFTEST_SQL); } catch (e) { msg = String(e); }
-  let inner = msg;
-  const j = msg.indexOf("{");
-  if (j >= 0) { try { inner = String(JSON.parse(msg.slice(j)).message ?? msg); } catch { /* keep raw */ } }
-  const m = inner.match(/SELFTEST_OFFICIAL (\{.*\})/s);
-  if (!m) { console.error("official selftest did not return results:", msg.slice(0, 800)); process.exit(1); }
-  let r: Record<string, unknown>;
-  try { r = JSON.parse(m[1]!); } catch { console.error("official selftest: unreadable results", m[1]!.slice(0, 400)); process.exit(1); }
-  let bad = 0;
-  for (const [k, v] of Object.entries(OFFICIAL_SELFTEST_EXPECT)) {
-    const ok = JSON.stringify(r[k]) === JSON.stringify(v);
-    if (!ok) bad++;
-    console.log(`${ok ? "PASS" : "FAIL"} official.${k} = ${JSON.stringify(r[k])}${ok ? "" : ` (expected ${JSON.stringify(v)})`}`);
-  }
+/** The migration 016 block; returns the number of failures (a refusal counts as one: it could not look). */
+async function officialSelftest(run: BlockRunner): Promise<number> {
+  const refusal = nonProductionRefusal();
+  if (refusal) { console.error(`FAIL selftest --official: ${refusal}`); return 1; }
+  const r = await rollbackBlock(run, "SELFTEST_OFFICIAL", OFFICIAL_SELFTEST_SQL);
+  if (!r) return 1;
+  const bad = check(r, OFFICIAL_SELFTEST_EXPECT, "official.");
   console.log("rolled back: nothing persisted from the official DO block");
-  if (bad) process.exit(1);
+  return bad;
 }
-if (process.argv.includes("--official")) officialSelftest().catch((e) => { console.error(String(e)); process.exit(1); });
+
+main().then((code) => process.exit(code), (e) => { console.error(String(e)); process.exit(1); });

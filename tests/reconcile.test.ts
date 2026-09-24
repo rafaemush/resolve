@@ -10,7 +10,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
 import type { MarketRow } from "../src/ingest/types";
 import { fakeDb, type FakeDb } from "./lib/fake-db";
-import { RECONCILE_RPCS, RECONCILIATION_FINAL, settleMarket } from "./lib/fake-rpcs";
+import { RECONCILE_RPCS as SETTLE_RPCS, RECONCILIATION_FINAL, settleMarket } from "./lib/fake-rpcs";
+import { POST_RPCS } from "./lib/fake-post-rpcs";
 import LIMITLESS from "./fixtures/limitless-markets.json";
 
 const h = vi.hoisted(() => ({ db: null as unknown as FakeDb }));
@@ -169,7 +170,9 @@ function market(id: string, over: Partial<MarketRow> = {}): Record<string, unkno
 }
 /** A watch that has finished its post-deadline poll. */
 const watch = (id: string, marketId: string, over: Record<string, unknown> = {}) => ({ id, market_id: marketId, active: true, deleted_at: null, last_polled_at: new Date().toISOString(), consecutive_errors: 0, ...over });
-/** The production shapes: unique columns, uq_reconciliations_final, and the two RPCs. */
+/** What a reconcile run calls: the settle RPCs, and the channel poster's lease and failure bookkeeping (migration 017). */
+const RECONCILE_RPCS = { ...SETTLE_RPCS, ...POST_RPCS };
+/** The production shapes: unique columns, uq_reconciliations_final, and the RPCs. */
 function newDb(tables: Record<string, Array<Record<string, any>>>, rpc = RECONCILE_RPCS): FakeDb {
   return fakeDb({ markets: [], watches: [], bot_posts: [], reconciliations: [], loop_runs: [], ...tables }, { bot_posts: ["dedup_key"], reconciliations: ["resolution_id"] }, { partialUnique: RECONCILIATION_FINAL, rpc });
 }
@@ -214,8 +217,9 @@ describe("runReconcile", () => {
 
     const r1 = await runReconcile(env);
     expect(r1).toMatchObject({ checked: 1, resolved: 1, reconciliations: 2, reveals_recorded: 2, reveals_posted: 0, errors: [] });
-    // one write request (one transaction), then the read of the market's followers for shadow.revealed
-    expect(h.db.calls.filter((c) => c.action === "rpc").map((c) => c.table)).toEqual(["rpc:settle_market", "rpc:follow_entitlements"]);
+    // the channel poster's claim (nothing pending: no lease taken), one write request (one transaction), then the read
+    // of the market's followers for shadow.revealed
+    expect(h.db.calls.filter((c) => c.action === "rpc").map((c) => c.table)).toEqual(["rpc:claim_post_lease", "rpc:settle_market", "rpc:follow_entitlements"]);
     const rec = h.db.tables.reconciliations!;
     expect(rec.map((x) => [x.resolution_id, x.final, x.agreement, x.official_outcome, x.official_label, x.official_at_source])).toEqual([
       ["res-c1", false, "abstained", "OPTION_A", "Yes", "limitless_api_poll"],

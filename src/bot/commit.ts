@@ -3,9 +3,11 @@
  *
  * Commit: the bot_posts row is INSERTED FIRST (channel 'pending', unique dedup_key) with the commitment hash, the nonce
  * and the exact committed verdict (payload.committed), then posted, then only the delivery columns are filled
- * (migration 012's trigger lets exactly that transition through, once). A failed post leaves a pending row that
- * retryUnposted re-posts and the reconcile job alerts on after 15 minutes; a failed insert never becomes a public post.
- * Before 012 the post went first: a failed insert orphaned a public post and a failed post lost the commitment.
+ * (migration 012's trigger lets exactly that transition through, once). A failed post leaves a pending row that the
+ * channel poster (src/bot/post.ts) re-posts and the reconcile job alerts on after 15 minutes; a failed insert never
+ * becomes a public post. Before 012 the post went first: a failed insert orphaned a public post and a failed post lost
+ * the commitment. Since 017 a commit is deduped against the market's latest commit only, and the legs of one event
+ * (markets.event_key) are posted as one message by the channel poster.
  *
  * Reveal: a reply to the commit that prints the full preimage and the nonce, so sha256(preimage) = commitment can be
  * recomputed from the post text alone. Preimage v2's first field is platform:external_id (printed on every post);
@@ -15,26 +17,24 @@ import { z } from "zod";
 import type { Env } from "../env";
 import { db, type Db } from "../db/supabase";
 import { sha256Hex } from "../resolve/text";
-import { sendMessage, telegramConfigured } from "./telegram";
+import { telegramConfigured } from "./telegram";
+import { claimChannel, deliverMessage, releaseChannel, INLINE_LEASE_S } from "./channel";
 import { ResolutionStatus, WinningOutcome, DeterminationBasis, type Verdict } from "../resolve/schema";
 import type { MarketRow } from "../ingest/types";
 import { alert } from "../ops/alerts";
 import { redact } from "../ops/redact";
-import { Budget, COST } from "../ops/budget";
 
 export const DISCLAIMER = "Informational signal, not financial advice, not an oracle of record.";
 
 /**
- * Public confidence floor (plan §17.3 P2a, §19.2 item 3). During the first 100 public commits (kind='commit' rows on
- * non-test markets), a Jev-route RESOLVED verdict whose published confidence is below 0.90 is committed as
+ * Public confidence floor (plan §17.3 P2a, §19.2 item 3). During the first 100 public commits, counted by distinct event
+ * (commit_context().public_commit_events: events with a commit on a non-test shadow market, so the 24 legs of one ladder
+ * are one), a Jev-route RESOLVED verdict whose published confidence is below 0.90 is committed as
  * UNRESOLVED/NONE with this caveat: one wrong public RESOLVED before n=100 is the most damaging event on the record, and
  * abstaining is never wrong on it. The resolutions row keeps the original verdict; payload.committed carries the
  * floored one, and reveal and reconcile read only payload.committed.
  */
 export const PUBLIC_FLOOR = { confidence: 0.9, firstCommits: 100, caveat: "below_public_floor_0.90" } as const;
-
-/** A pending commit younger than this may still have its first post attempt in flight; retryUnposted leaves it alone. */
-export const RETRY_AFTER_S = 60;
 
 /**
  * SQLSTATE of migration 012's bot_posts_commit_market_open: the market stopped being open (the reconcile settled it)
@@ -100,7 +100,7 @@ export function floorCandidate(c: CommittedFields): boolean {
   return c.determination_basis === "jev" && c.resolution_status === "RESOLVED" && c.confidence_score < PUBLIC_FLOOR.confidence;
 }
 
-/** Pure. publicCommitsSoFar = kind='commit' rows on non-test markets before this one. */
+/** Pure. publicCommitsSoFar = distinct events with a commit on a non-test shadow market before this one. */
 export function applyPublicFloor(c: CommittedFields, publicCommitsSoFar: number): CommittedFields {
   if (!floorCandidate(c) || publicCommitsSoFar >= PUBLIC_FLOOR.firstCommits) return c;
   const caveats = c.caveats.includes(PUBLIC_FLOOR.caveat) ? c.caveats : [...c.caveats, PUBLIC_FLOOR.caveat];
@@ -123,103 +123,97 @@ function randomNonce(): string {
   return [...crypto.getRandomValues(new Uint8Array(12))].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-/** kind='commit' rows on non-test markets; null when the count could not be read. */
-async function countPublicCommits(client: Db): Promise<number | null> {
-  const { count, error } = await client.from("bot_posts").select("id, markets!inner(is_test)", { count: "exact", head: true }).eq("kind", "commit").eq("markets.is_test", false);
-  return error || count === null ? null : count;
+/**
+ * commit_context() (migration 017): the market's event_key, its latest commit (created_at desc, id desc: the order
+ * settle_market makes the final commit), the other open legs of its event, and the distinct events with a public commit.
+ */
+const CommitContext = z.object({
+  event_key: z.string().min(1),
+  latest: z.object({ id: z.string(), verdict_signature: z.string().nullable(), created_at: z.string() }).nullable(),
+  event_open_markets: z.number().int().nonnegative(),
+  public_commit_events: z.number().int().nonnegative(),
+});
+type CommitContext = z.infer<typeof CommitContext>;
+
+async function readCommitContext(client: Db, marketId: string): Promise<{ ok: true; ctx: CommitContext } | { ok: false; error: string }> {
+  const { data, error } = await client.rpc("commit_context", { p_market: marketId });
+  if (error) return { ok: false, error: redact(error.message).slice(0, 200) };
+  const p = CommitContext.safeParse(data);
+  return p.success ? { ok: true, ctx: p.data } : { ok: false, error: `unexpected commit_context answer ${JSON.stringify(data).slice(0, 200)}` };
 }
 
-/** A pending bot_posts row as the delivery path needs it. */
-export interface PendingPost { id: string; kind: "commit" | "reveal"; payload: Record<string, unknown> }
-
-/**
- * Post a pending row and record the receipt (or the failure) on it. A post whose receipt cannot be saved leaves the row
- * pending, so a retry would post it again: that is alerted, never silent (a duplicate of the same commitment is
- * harmless to the record; a lost commitment is not).
- */
-async function deliver(env: Env, client: Db, row: PendingPost, replyTo: number | null, budget: Budget | null): Promise<{ posted: boolean; error: string | null }> {
-  const r = await sendMessage(env, String(row.payload.text ?? ""), { replyTo });
-  if (r.ok) {
-    const receipt = { channel: "telegram", message_id: r.message_id, telegram_date: r.date, posted_at: r.date, ...(row.kind === "reveal" ? { reply_to_message_id: replyTo } : {}) };
-    const { error } = await client.from("bot_posts").update(receipt).eq("id", row.id).eq("channel", "pending");
-    if (!error) return { posted: true, error: null };
-    const text = `${row.kind} ${row.id} was posted (message ${r.message_id}) but its receipt was not saved: ${error.message}. The row is still pending; the next retry posts it again.`;
-    if (!budget || budget.take(COST.alert)) await alert(env, `post_receipt_${row.id}`, text, { dedupMinutes: 60 });
-    else console.error(JSON.stringify({ level: "error", job: "bot_post", error: redact(text) }));
-    return { posted: true, error: `receipt not saved: ${error.message}` };
-  }
-  const postError = redact(r.error ?? "unknown").slice(0, 300);
-  const payload = { ...row.payload, post_error: postError, post_attempts: Number(row.payload.post_attempts ?? 0) + 1 };
-  const { error } = await client.from("bot_posts").update({ payload }).eq("id", row.id).eq("channel", "pending");
-  if (error) console.error(JSON.stringify({ level: "error", job: "bot_post", id: row.id, error: redact(error.message) }));
-  return { posted: false, error: postError };
+/** The unique dedup_key of a commit: at most one commit follows a given latest commit (or none), so two invocations
+ * that read the same latest collide instead of both committing. */
+export function commitDedupKey(marketId: string, latestCommitId: string | null): string {
+  return `commit:${marketId}:after:${latestCommitId ?? "none"}`;
 }
 
 /** A commit row as recorded: what the private early reveal (src/shadow/events.ts) sends to followers. */
 export interface RecordedCommit { id: string; commitment_sha256: string; committed_at: string; committed: CommittedVerdict }
 
+export interface CommitResult { committed: boolean; posted: boolean; reason: string; commit?: RecordedCommit }
+
+/** Two commits of the market landed while this one was recorded; the third attempt is not made (alerted). */
+const COMMIT_ATTEMPTS = 2;
+
 /**
- * Record the commit (INSERT first), then post it. Deduped per market + committed verdict signature by the unique
- * dedup_key. Test markets are recorded with channel 'none' and never posted. `commit` is set whenever a row was recorded.
+ * Record the commit (INSERT first), then post it. Deduped against the market's LATEST commit only: a verdict equal to
+ * it is not committed again, any other is, so a verdict that returns to an earlier signature (A -> B -> A) is committed
+ * and the final commit reconcile settles is always the market's current verdict. A commit whose market shares its
+ * event with another open leg is left pending for the channel poster (src/bot/post.ts), which posts an event's legs as
+ * one message; a single-market commit is posted inline under the channel lease, or left pending when the channel is
+ * busy or at its pacing ceiling. Test markets are recorded with channel 'none' and never posted. `commit` is set
+ * whenever a row was recorded.
+ * Subrequests: commit_context 1 + insert 1 (both again after a dedup collision) + inline post 6 (lease claim, send 3,
+ * receipt, release), plus one alert on a failure.
  */
-export async function commitVerdict(env: Env, market: MarketRow, resolutionId: string, v: Verdict): Promise<{ committed: boolean; posted: boolean; reason: string; commit?: RecordedCommit }> {
+export async function commitVerdict(env: Env, market: MarketRow, resolutionId: string, v: Verdict): Promise<CommitResult> {
   const client = db(env);
   const isTest = market.is_test === true;
-  let fields = committedFields(v);
-  if (!isTest && floorCandidate(fields)) {
-    // An unreadable count fails closed: the floor applies.
-    fields = applyPublicFloor(fields, (await countPublicCommits(client)) ?? 0);
+  for (let attempt = 0; attempt < COMMIT_ATTEMPTS; attempt++) {
+    const read = await readCommitContext(client, market.id);
+    if (!read.ok) {
+      await alert(env, `commit_insert_${market.id}`, `commit for ${marketRef(market)} (resolution ${resolutionId}) was not recorded: its latest commit could not be read (${read.error}). Nothing was posted.`, { dedupMinutes: 60 });
+      return { committed: false, posted: false, reason: `commit_context: ${read.error}` };
+    }
+    const ctx = read.ctx;
+    let fields = committedFields(v);
+    // The floor counts distinct events (plan §17.3): the legs of one ladder are one public call.
+    if (!isTest && floorCandidate(fields)) fields = applyPublicFloor(fields, ctx.public_commit_events);
+    const signature = verdictSignature({ resolution_status: fields.resolution_status, winning_outcome: fields.winning_outcome, error_reason: fields.resolution_status === "ERROR" ? v.error_reason : null });
+    if (ctx.latest?.verdict_signature === signature) return { committed: false, posted: false, reason: "the market's latest commit already has this verdict signature" };
+    const batched = !isTest && ctx.event_open_markets > 0;
+    const nonce = randomNonce();
+    const preimage = buildPreimage(marketRef(market), fields, nonce);
+    const commitment = await sha256Hex(preimage);
+    const committed: CommittedVerdict = { preimage_version: "v2", preimage, ...fields };
+    const payload = { text: commitText(market, commitment, fields.raw_sha256, new Date().toISOString()), verdict_signature: signature, evidence_raw_sha256: fields.raw_sha256, canonical_sha256: fields.canonical_sha256, committed, post_attempts: 0, batched };
+    const { data: row, error } = await client.from("bot_posts").insert({
+      resolution_id: resolutionId, market_id: market.id, channel: isTest ? "none" : "pending", kind: "commit", message_id: null, telegram_date: null, posted_at: null,
+      commitment_sha256: commitment, nonce, payload, dedup_key: commitDedupKey(market.id, ctx.latest?.id ?? null),
+    }).select("id, created_at").single();
+    // Another commit of this market landed after the read: compare against it instead.
+    if (error?.code === "23505") continue;
+    if (error?.code === MARKET_NOT_OPEN_SQLSTATE) return { committed: false, posted: false, reason: `not committed: ${error.message}` };
+    if (error || !row) {
+      await alert(env, `commit_insert_${market.id}`, `commit for ${marketRef(market)} (resolution ${resolutionId}, ${signature}) was not recorded: ${error?.message ?? "no row"}. Nothing was posted.`, { dedupMinutes: 60 });
+      return { committed: false, posted: false, reason: `bot_posts insert: ${error?.message ?? "no row"}` };
+    }
+    const commit: RecordedCommit = { id: row.id as string, commitment_sha256: commitment, committed_at: String(row.created_at), committed };
+    if (isTest) return { committed: true, posted: false, reason: "test market: recorded, never posted", commit };
+    if (!telegramConfigured(env)) return { committed: true, posted: false, reason: "pending: telegram not configured", commit };
+    if (batched) return { committed: true, posted: false, reason: `pending: event ${ctx.event_key} has ${ctx.event_open_markets} other open market(s); the channel poster posts its legs as one message`, commit };
+    const claim = await claimChannel(client, INLINE_LEASE_S);
+    if (!claim.claimed) return { committed: true, posted: false, reason: `pending: ${claim.detail}; the channel poster posts it`, commit };
+    try {
+      const d = await deliverMessage(env, client, [commit.id], "commit", payload.text, null);
+      return { committed: true, posted: d.posted, reason: d.posted ? "posted" : `pending: ${d.error}`, commit };
+    } finally {
+      await releaseChannel(client, claim.session);
+    }
   }
-  const signature = verdictSignature({ resolution_status: fields.resolution_status, winning_outcome: fields.winning_outcome, error_reason: fields.resolution_status === "ERROR" ? v.error_reason : null });
-  const nonce = randomNonce();
-  const preimage = buildPreimage(marketRef(market), fields, nonce);
-  const commitment = await sha256Hex(preimage);
-  const committed: CommittedVerdict = { preimage_version: "v2", preimage, ...fields };
-  const payload = { text: commitText(market, commitment, fields.raw_sha256, new Date().toISOString()), verdict_signature: signature, evidence_raw_sha256: fields.raw_sha256, canonical_sha256: fields.canonical_sha256, committed, post_attempts: 0 };
-  const { data: row, error } = await client.from("bot_posts").insert({
-    resolution_id: resolutionId, market_id: market.id, channel: isTest ? "none" : "pending", kind: "commit", message_id: null, telegram_date: null, posted_at: null,
-    commitment_sha256: commitment, nonce, payload, dedup_key: `commit:${market.id}:${signature}`,
-  }).select("id, created_at").single();
-  if (error?.code === "23505") return { committed: false, posted: false, reason: "already committed for this verdict signature" };
-  if (error?.code === MARKET_NOT_OPEN_SQLSTATE) return { committed: false, posted: false, reason: `not committed: ${error.message}` };
-  if (error || !row) {
-    await alert(env, `commit_insert_${market.id}`, `commit for ${marketRef(market)} (resolution ${resolutionId}, ${signature}) was not recorded: ${error?.message ?? "no row"}. Nothing was posted.`, { dedupMinutes: 60 });
-    return { committed: false, posted: false, reason: `bot_posts insert: ${error?.message ?? "no row"}` };
-  }
-  const commit: RecordedCommit = { id: row.id as string, commitment_sha256: commitment, committed_at: String(row.created_at), committed };
-  if (isTest) return { committed: true, posted: false, reason: "test market: recorded, never posted", commit };
-  if (!telegramConfigured(env)) return { committed: true, posted: false, reason: "pending: telegram not configured", commit };
-  const d = await deliver(env, client, { id: commit.id, kind: "commit", payload }, null, null);
-  return { committed: true, posted: d.posted, reason: d.posted ? "posted" : `pending: ${d.error}`, commit };
-}
-
-export interface PendingRow { id: string; kind: string; channel: string; created_at: string; payload: Record<string, unknown> }
-
-/** Pure: commits still pending after RETRY_AFTER_S, oldest first, at most max. */
-export function retryCandidates<T extends PendingRow>(rows: T[], nowMs: number, max: number): T[] {
-  return rows
-    .filter((r) => r.kind === "commit" && r.channel === "pending" && nowMs - Date.parse(r.created_at) >= RETRY_AFTER_S * 1000)
-    .sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at) || a.id.localeCompare(b.id))
-    .slice(0, Math.max(0, max));
-}
-
-/** Re-post commits still pending after 60 s (bounded by max and the invocation's subrequest budget). */
-export async function retryUnposted(env: Env, max = 5, budget: Budget = new Budget(COST.db + max * (COST.telegram + COST.db))): Promise<{ attempted: number; posted: number; failed: number; stopped: boolean }> {
-  const out = { attempted: 0, posted: 0, failed: 0, stopped: false };
-  if (!telegramConfigured(env) || max <= 0) return out;
-  if (!budget.take(COST.db)) return { ...out, stopped: true };
-  const client = db(env);
-  const now = Date.now();
-  const { data, error } = await client.from("bot_posts").select("id, kind, channel, created_at, payload").eq("kind", "commit").eq("channel", "pending")
-    .lte("created_at", new Date(now - RETRY_AFTER_S * 1000).toISOString()).order("created_at", { ascending: true }).limit(max);
-  if (error) { console.error(JSON.stringify({ level: "error", job: "retry_unposted", error: redact(error.message) })); return { ...out, failed: 1 }; }
-  for (const row of retryCandidates((data ?? []) as PendingRow[], now, max)) {
-    if (!budget.take(COST.telegram + COST.db)) { out.stopped = true; break; }
-    out.attempted++;
-    const d = await deliver(env, client, { id: row.id, kind: "commit", payload: row.payload }, null, budget);
-    if (d.posted) out.posted++; else out.failed++;
-  }
-  return out;
+  await alert(env, `commit_insert_${market.id}`, `commit for ${marketRef(market)} (resolution ${resolutionId}) was not recorded: ${COMMIT_ATTEMPTS} other commits of the market landed while it was being recorded. The latest of them stands; nothing was posted for this one.`, { dedupMinutes: 60 });
+  return { committed: false, posted: false, reason: `not committed: ${COMMIT_ATTEMPTS} concurrent commits of this market` };
 }
 
 export interface CommitRow { id: string; market_id: string; nonce: string; commitment_sha256: string; payload: Record<string, unknown> }
@@ -270,32 +264,4 @@ export function buildReveal(m: Pick<MarketRow, "platform" | "external_id">, comm
     DISCLAIMER,
   ].join("\n");
   return { text, payload: { text, commit_id: commit.id, committed, official, agreement, post_attempts: 0 } };
-}
-
-/**
- * Post at most max pending reveals (oldest first) as replies to their commits. A reveal whose commit is itself still
- * pending waits: a reveal must never reach the channel before its commitment.
- */
-export async function postPendingReveals(env: Env, budget: Budget, max = 5): Promise<{ posted: number; waiting: number; failed: number; stopped: boolean }> {
-  const out = { posted: 0, waiting: 0, failed: 0, stopped: false };
-  if (!telegramConfigured(env) || max <= 0) return out;
-  if (!budget.take(COST.db)) return { ...out, stopped: true };
-  const client = db(env);
-  const { data, error } = await client.from("bot_posts").select("id, kind, channel, created_at, payload").eq("kind", "reveal").eq("channel", "pending").order("created_at", { ascending: true }).limit(max);
-  if (error) { console.error(JSON.stringify({ level: "error", job: "reveals", error: redact(error.message) })); return { ...out, failed: 1 }; }
-  const reveals = (data ?? []) as PendingRow[];
-  if (!reveals.length) return out;
-  if (!budget.take(COST.db)) return { ...out, stopped: true };
-  const commitIds = [...new Set(reveals.map((r) => String(r.payload.commit_id ?? "")))].filter(Boolean);
-  const { data: commits, error: ce } = await client.from("bot_posts").select("id, channel, message_id").in("id", commitIds);
-  if (ce) { console.error(JSON.stringify({ level: "error", job: "reveals", error: redact(ce.message) })); return { ...out, failed: 1 }; }
-  const byId = new Map((commits ?? []).map((c) => [c.id as string, c as { channel: string; message_id: number | null }]));
-  for (const r of reveals) {
-    const c = byId.get(String(r.payload.commit_id ?? ""));
-    if (!c || c.channel !== "telegram" || !c.message_id) { out.waiting++; continue; }
-    if (!budget.take(COST.telegram + COST.db)) { out.stopped = true; break; }
-    const d = await deliver(env, client, { id: r.id, kind: "reveal", payload: r.payload }, c.message_id, budget);
-    if (d.posted) out.posted++; else out.failed++;
-  }
-  return out;
 }

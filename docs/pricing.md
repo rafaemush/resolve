@@ -63,7 +63,7 @@ Early reveals are labeled "private early reveal — excluded from the public rec
 
 ## What we never claim
 
-- No accuracy percentage appears in any offer, message or invoice before 100 markets on that platform have been reconciled against the platform of record, counted by distinct event (the legs of one multi-outcome event count once). Before that, we quote only your own markets' reconciled rows and measured lead times. The public track record (`GET /v1/track-record`) shows percentages only after 100 reconciled markets per platform.
+- No accuracy percentage appears in any offer, message or invoice before 100 markets on that platform have been reconciled against the platform of record, counted by distinct event (the legs of one multi-outcome event count once). Before that, we quote only your own markets' reconciled rows and measured lead times. The public track record (`GET /v1/track-record`) shows percentages only after 100 reconciled events per platform, counted the same way.
 - No lead-time claim before lead time has been measured on at least 30 distinct events.
 - Resolve is an informational signal: not financial advice and not an oracle of record.
 

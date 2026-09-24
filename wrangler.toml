@@ -14,7 +14,8 @@ mode = "smart"
 
 # Three cron triggers (Free allows 5 per account); each is its own invocation with its own 50 subrequests.
 # Routing and per-invocation budgets: src/jobs/schedule.ts (tests/schedule.test.ts checks this list against it).
-#   every minute  -> worker_liveness row + dispatch (select_due_watches) check
+#   every minute  -> worker_liveness row + dispatch (select_due_watches) check, then the channel poster (pending
+#                    commits and reveals, the legs of an event as one message, at most 15 messages a minute)
 #   every 5 min   -> webhook delivery drain (cap 5), then the USDC deposit scan
 #   every 10 min  -> pg_net dispatch-failure count, then reconcile shadow verdicts against official outcomes
 [triggers]

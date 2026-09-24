@@ -8,8 +8,11 @@ import type { Env } from "../env";
 import { db } from "../db/supabase";
 import { alertMany, type AlertItem } from "../ops/alerts";
 import { redact } from "../ops/redact";
+import { COST } from "../ops/budget";
 
 export const LIVENESS_CRON = "* * * * *";
+/** The tick's worst case: the dispatch read, the liveness insert and one alertMany (the R2 diag write is a binding call). */
+export const TICK_SUBREQUESTS = 2 * COST.db + COST.alert;
 /** pg_cron dispatches every minute; three minutes without a row is a stopped scheduler, not jitter. */
 export const DISPATCH_LOOKBACK_MINUTES = 3;
 export const DISPATCH_ALERT_DEDUP_MINUTES = 60;

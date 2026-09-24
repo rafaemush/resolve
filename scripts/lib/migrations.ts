@@ -6,22 +6,26 @@
  * holds, so nothing is applied on top of it and the run exits 1 (plan §16.4 P0 step 5). A person resolves drift; the
  * runner never re-runs a file.
  * --dry-run reads and writes nothing: the ledger table is created only by --apply.
+ * --require-applied reads like --dry-run and exits 1 unless every file is applied and nothing drifts: the deploy gate
+ * (scripts/deploy.sh) runs it before wrangler, because the Worker it ships may read what a pending migration creates.
  */
 import { createHash } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
-export type Mode = "--dry-run" | "--apply" | "--verify-live";
+export type Mode = "--dry-run" | "--apply" | "--verify-live" | "--require-applied";
 
 export class UsageError extends Error {}
-export const USAGE = "usage: npx tsx scripts/migrate.ts [--dry-run (default) | --apply | --verify-live]";
+export const USAGE = "usage: npx tsx scripts/migrate.ts [--dry-run (default) | --apply | --verify-live | --require-applied]";
+/** --require-applied could not look (no Management API credentials): not "all applied", and not a failure to report as one. */
+export const EXIT_CANNOT_CHECK = 3;
 
 /** Exactly one mode (none = --dry-run). Anything else stops, so a typo never becomes a different run. */
 export function parseMigrateArgs(argv: readonly string[]): Mode {
   if (argv.length === 0) return "--dry-run";
   if (argv.length > 1) throw new UsageError(`one mode at a time, got: ${argv.join(" ")}`);
   const m = argv[0];
-  if (m === "--dry-run" || m === "--apply" || m === "--verify-live") return m;
+  if (m === "--dry-run" || m === "--apply" || m === "--verify-live" || m === "--require-applied") return m;
   throw new UsageError(`unknown argument "${m}"`);
 }
 
@@ -103,8 +107,11 @@ export async function readLedger(io: MigrateIo): Promise<Map<string, string>> {
   return ledger;
 }
 
-/** --dry-run or --apply; returns the exit code. Drift stops both before anything is applied. */
-export async function runMigrations(mode: "--dry-run" | "--apply", files: readonly MigrationFile[], io: MigrateIo): Promise<number> {
+/**
+ * --dry-run, --require-applied or --apply; returns the exit code. Drift stops all three before anything is applied;
+ * --require-applied also exits 1 while anything is pending. Only --apply writes.
+ */
+export async function runMigrations(mode: "--dry-run" | "--apply" | "--require-applied", files: readonly MigrationFile[], io: MigrateIo): Promise<number> {
   if (mode === "--apply") await io.sql(ENSURE_LEDGER);
   const ledger = await readLedger(io);
   if (!ledger.size) io.log("(ledger empty or absent: every file is pending)");
@@ -117,6 +124,11 @@ export async function runMigrations(mode: "--dry-run" | "--apply", files: readon
   }
   const pending = plan.flatMap((p) => (p.status === "pending" ? [p.file] : []));
   if (mode === "--dry-run") { io.log(`${pending.length} pending`); return 0; }
+  if (mode === "--require-applied") {
+    if (!pending.length) { io.log(`all ${files.length} migrations applied`); return 0; }
+    io.log(`${pending.length} pending: apply them (npx tsx scripts/migrate.ts --apply) before deploying a Worker that may read them`);
+    return 1;
+  }
   for (const f of pending) {
     const t0 = Date.now();
     try {
