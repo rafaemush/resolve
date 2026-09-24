@@ -21,7 +21,6 @@ import { alert } from "../ops/alerts";
 import { Budget, INVOCATION_SUBREQUESTS } from "../ops/budget";
 import { OfficialSeries } from "../resolve/schema";
 import { CorroborationStatus, hostAllowed, type OfficialCorroboration } from "../resolve/official";
-import { redact } from "../ops/redact";
 import { MatchBody, MatchRow, matchRefusal } from "../billing/match";
 import { paymentCreditedPayload } from "../billing/events";
 import { formatUsdc, parseUsdc } from "../billing/tiers";
