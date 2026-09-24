@@ -389,11 +389,13 @@ describe("publishing a verdict that looked (plan §18 (a): first delivery attemp
     resetWatch({ markets: { ...market(7 * 86_400_000), tenant_id: tenant } });
     h.rpc.mockImplementation(async (_c: unknown, fn: string) => {
       if (fn === "begin_resolution") return [{ request_id: "stub3", ok: true, charged: 5 }]; // bill-then-run
+      if (fn === "claim_low_credit_notice") return [{ crossed: false, balance: 995, threshold: 500 }]; // the charge stands
       throw new Error(`rpc ${fn} not expected`);
     });
     serve(200, JSON.stringify(pr(1)));
     const r = await runWatch(env(), cfg, WATCH_ID, { waitUntil });
     expect(r.outcome).toBe("success");
+    expect(h.rpc.mock.calls.map((c) => [c[1], c[2]])).toEqual([["begin_resolution", expect.objectContaining({ p_amount: 5 })], ["claim_low_credit_notice", { p_tenant: tenant }]]);
     expect(commitVerdict).not.toHaveBeenCalled();
     expect(publishShadowCommitted).not.toHaveBeenCalled();
     const [, to, type, payload, opts] = vi.mocked(publishEvent).mock.calls[0]!;

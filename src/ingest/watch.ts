@@ -16,6 +16,7 @@ import type { EvidenceInput, Verdict } from "../resolve/schema";
 import { commitVerdict } from "../bot/commit";
 import { publishEvent, type WaitUntil } from "../webhooks/deliver";
 import { publishShadowCommitted } from "../shadow/events";
+import { noteCharge } from "../billing/events";
 import { alert } from "../ops/alerts";
 
 export interface WatchRunSummary {
@@ -344,6 +345,9 @@ export async function runWatch(env: Env, cfg: Config, watchId: string, opts: Wat
       const type = v.resolution_status === "RESOLVED" ? "market.resolved" : v.resolution_status === "ERROR" ? "market.error" : "market.unresolved_update";
       await publishEvent(env, market.tenant_id, type, { market_id: market.id, external_id: market.external_id, request_id: rt.resolutionId, verdict: v }, { waitUntil: opts.waitUntil });
     }
+    // A charge that looked stands (only a could-not-look verdict is refunded): credits.low once per crossing. noteCharge
+    // never throws; 1 subrequest, 3 at the crossing, + 1 alert on a failure.
+    if (looked && charged > 0 && market.tenant_id && chargeRequestId) await noteCharge(env, market.tenant_id, chargeRequestId);
   } catch (e) {
     // The runtime threw ResolutionNotRecordedError (alerted there): no verdict row exists, so the charge bought nothing.
     if (!recorded && charged > 0 && chargeRequestId) await refund(chargeRequestId, null);

@@ -7,12 +7,16 @@
  * cron). Its loop_runs row and the one alertMany() that carries every alert of the run are reserved before any work,
  * and each RPC reserves before it is sent, so the scan's own trace survives a backlog. Running out stops the scan
  * before the block it could not finish, like a failed credit does, without calling it one.
+ * payment.credited (plan §16.4 P3 step 3): every deposit the run credited is announced to its tenant in one batch after
+ * the scan (PAYMENT_EVENTS_COST = 3, whatever the number of credits), reserved together with the run's first credit, so
+ * the budget never runs out between a credit and its event. The drain delivers them on the next 5-minute run.
  */
 import { formatUnits } from "viem";
 import type { Env, Config } from "../env";
 import { db, rpc } from "../db/supabase";
 import { baseLogsProviders, getBlock, hostOf, logsWindow, LogsUnavailableError, type LogsWindow, type RawLog } from "../ingest/base";
 import { alertMany, type AlertItem } from "../ops/alerts";
+import { PAYMENT_EVENTS_COST, queuePaymentsCredited, type CreditedDeposit } from "../billing/events";
 import { BudgetExhausted, COST, type Budget } from "../ops/budget";
 import { redact } from "../ops/redact";
 
@@ -91,6 +95,9 @@ export async function scanDeposits(env: Env, cfg: Config, budget: Budget): Promi
   const counts: Record<string, number> = {};
   const providerErrors: string[] = [];
   const items: AlertItem[] = [];
+  const credited: CreditedDeposit[] = [];
+  const eventProblems: string[] = [];
+  let eventsReserved = false;
   let result: Omit<ScanResult, "subrequests" | "alerts">;
   let provider = "";
   let startCursor: number | null = null;
@@ -131,13 +138,21 @@ export async function scanDeposits(env: Env, cfg: Config, budget: Budget): Promi
         const safeBlock = w.safe.number;
         const logs = w.logs.map(toDepositLog);
         const r = await processDeposits(logs, cursor, w.to, async (d) => {
-          budget.need(COST.db, `crediting ${d.tx}#${d.logIndex}`);
-          const out = await rpc<Array<{ status: string }> | { status: string }>(client, "credit_from_deposit", {
+          // The run's first credit also reserves the payment.credited batch (released after the scan if nothing credited).
+          budget.need(COST.db + (eventsReserved ? 0 : PAYMENT_EVENTS_COST), `crediting ${d.tx}#${d.logIndex}`);
+          eventsReserved = true;
+          type Credit = { status: string; tenant_id?: string | null; credits?: number };
+          const out = await rpc<Credit[] | Credit>(client, "credit_from_deposit", {
             p_tx_hash: d.tx, p_log_index: d.logIndex, p_from: d.from, p_to: receiver, p_amount_usdc: d.amountUsdc,
             p_block: d.block, p_safe_block: safeBlock, p_credits_per_usdc: cfg.creditsPerUsdc,
           });
           const row = Array.isArray(out) ? out[0] : out;
           if (!row?.status) throw new Error("credit_from_deposit returned no status");
+          if (row.status === "credited") {
+            // Never a throw: the credit is made, and a retry would only answer 'duplicate'.
+            if (typeof row.tenant_id === "string" && Number.isInteger(row.credits)) credited.push({ tenant: row.tenant_id, tx: d.tx, logIndex: d.logIndex, amountUsdc: d.amountUsdc, credits: row.credits! });
+            else eventProblems.push(`${d.tx}#${d.logIndex}: credit_from_deposit answered credited without its tenant and credits`);
+          }
           return row.status;
         });
         for (const [k, v] of Object.entries(r.counts)) counts[k] = (counts[k] ?? 0) + v;
@@ -172,8 +187,20 @@ export async function scanDeposits(env: Env, cfg: Config, budget: Budget): Promi
     const range = e instanceof LogsUnavailableError && e.rangeErrors;
     items.push({ key: range ? "deposit_scan_rpc_range" : "deposit_scan_failed", dedupMinutes: DEPOSIT_ALERT_DEDUP_MINUTES, text: `USDC deposit scan failed; deposits are not being credited until it recovers.\n${msg}` });
   }
+  // On every path, a failed scan included: the credits made before a failure stand, so their tenants hear of them.
+  let paymentEvents = 0;
+  if (credited.length) {
+    try {
+      const q = await queuePaymentsCredited(env, credited);
+      paymentEvents = q.queued;
+      if (q.error) eventProblems.push(q.error);
+    } catch (e) {
+      eventProblems.push(redact(String(e)).slice(0, 200));
+    }
+  } else if (eventsReserved) budget.release(PAYMENT_EVENTS_COST);
+  if (eventProblems.length) items.push({ key: "payment_event_failed", dedupMinutes: DEPOSIT_ALERT_DEDUP_MINUTES, meta: { deposits: credited.map((c) => `${c.tx}#${c.logIndex}`).slice(0, 20) }, text: `payment.credited was not queued for deposit(s) this scan credited (the credits stand; the tenants were not told): ${eventProblems.join("; ").slice(0, 600)}` });
   // On every path: an 'unmatched' credit from a window before a failure is behind the cursor and never seen again.
-  if (counts.unmatched) items.push({ key: "deposit_unmatched", dedupMinutes: 5, meta: { from: result.from ?? null, to: result.to ?? null }, text: `${counts.unmatched} USDC deposit(s) from an unregistered wallet landed as 'unmatched'; match them to a tenant before replying to the sender.` });
+  if (counts.unmatched) items.push({ key: "deposit_unmatched", dedupMinutes: 5, meta: { from: result.from ?? null, to: result.to ?? null }, text: `${counts.unmatched} USDC deposit(s) from an unregistered wallet landed as 'unmatched'; credit each to the tenant that sent it with POST /internal/deposits/match {tx_hash, log_index, tenant_id, reason} (usdc_deposits where status = 'unmatched') before replying to the sender.` });
   let unrecorded: string | null = null;
   try {
     const { error } = await client.from("loop_runs").insert({
@@ -182,7 +209,7 @@ export async function scanDeposits(env: Env, cfg: Config, budget: Budget): Promi
       rows_written: result.credited,
       duration_ms: Date.now() - started,
       error: result.scanned ? null : result.detail,
-      meta: { from: result.from ?? null, to: result.to ?? null, found: result.found, counts, provider, provider_errors: providerErrors.slice(0, 6), stopped_by_budget: result.stopped_by_budget, subrequests: budget.used },
+      meta: { from: result.from ?? null, to: result.to ?? null, found: result.found, counts, provider, provider_errors: providerErrors.slice(0, 6), stopped_by_budget: result.stopped_by_budget, subrequests: budget.used, payment_events_queued: paymentEvents },
     });
     if (error) unrecorded = redact(error.message).slice(0, 200);
   } catch (e) {
