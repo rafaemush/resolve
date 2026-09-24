@@ -116,11 +116,19 @@ export async function followerTenants(client: Db, marketId: string): Promise<{ t
   return { tenants: [...new Set(r.rows.filter((e) => followBlock(e) === null).map((e) => e.tenant_id))], error: null };
 }
 
+/**
+ * How a venue-facing surface names the route: "web_evidence" for the model route. Customer-facing surfaces never name
+ * the model (plan §2.1, MCA §2.3(a)); the venue report prints the same wording.
+ */
+export function venueBasis(basis: CommittedFields["determination_basis"]): "structured" | "web_evidence" | null {
+  return basis === "jev" ? "web_evidence" : basis;
+}
+
 /** The verdict fields a follower sees: the committed (public-floored) verdict, never the preimage or the nonce. */
 export function shadowVerdict(c: CommittedFields): Record<string, unknown> {
   return {
     resolution_status: c.resolution_status, winning_outcome: c.winning_outcome, confidence_score: c.confidence_score,
-    caveats: c.caveats, determination_basis: c.determination_basis, thresholds_version: c.thresholds_version,
+    caveats: c.caveats, determination_basis: venueBasis(c.determination_basis), thresholds_version: c.thresholds_version,
   };
 }
 

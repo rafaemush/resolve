@@ -28,7 +28,7 @@ vi.mock("../src/api/auth", () => ({
 vi.mock("../src/ops/alerts", () => ({ alert: vi.fn(async () => ({ sent: true, deduped: false })) }));
 
 import { v1 } from "../src/api/v1";
-import { followBlock, followCap, followEntitlements, followerTenants, followRefusal, shapeShadow, shapeShadowCommit, EARLY_REVEAL_LABEL, PLANS, type FollowEntitlement, type FollowTarget, type ShadowCommitRow } from "../src/shadow/follows";
+import { followBlock, followCap, followEntitlements, followerTenants, followRefusal, shadowVerdict, shapeShadow, shapeShadowCommit, venueBasis, EARLY_REVEAL_LABEL, PLANS, type FollowEntitlement, type FollowTarget, type ShadowCommitRow } from "../src/shadow/follows";
 import { shadowCommittedPayload, shadowRevealedPayload } from "../src/shadow/events";
 import { buildPreimage, committedFields, DISCLAIMER, type CommittedVerdict, type OfficialRecord } from "../src/bot/commit";
 import { sha256Hex } from "../src/resolve/text";
@@ -333,5 +333,19 @@ describe("POST/DELETE /v1/markets/:id/follow, GET /v1/follows, GET /v1/shadow/:m
     h.db.tables.api_keys![0]!.revoked_at = new Date(Date.now() - 1000).toISOString();
     const r = await call("GET", `/shadow/${M}`);
     expect([r.status, r.body.error.message]).toEqual([403, expect.stringContaining("the evaluation has ended")]);
+  });
+});
+
+describe("venue-facing route names (plan §2.1: customer surfaces never name the model)", () => {
+  it("the model route reads web_evidence; structured and null are unchanged", () => {
+    expect(venueBasis("jev")).toBe("web_evidence");
+    expect(venueBasis("structured")).toBe("structured");
+    expect(venueBasis(null)).toBeNull();
+  });
+  it("a follower's verdict never carries the model's name", () => {
+    const v = { resolution_status: "RESOLVED", winning_outcome: "OPTION_A", confidence_score: 0.95, caveats: [], evidence: null, thresholds_version: "v1", determination_basis: "jev" } as unknown as Verdict;
+    const shaped = shadowVerdict(committedFields(v));
+    expect(shaped.determination_basis).toBe("web_evidence");
+    expect(JSON.stringify(shaped)).not.toMatch(/jev/i);
   });
 });
