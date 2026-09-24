@@ -2,7 +2,8 @@ import type { Env } from "../env";
 import type { WatchRow, FetchOutcome } from "./types";
 import { ruleToRegex } from "./robots";
 import { railEnabled } from "../resolve/rails";
-import { discardBody, retryAfterSeconds, sameSite } from "./http";
+import { discardBody, retryAfterSeconds } from "./http";
+import { webUrlMatches } from "../resolve/precheck";
 
 const MAX_BYTES = 512 * 1024;
 const MAX_TEXT = 64 * 1024;
@@ -31,9 +32,11 @@ export async function htmlToText(res: Response): Promise<{ text: string; claimed
 
 /**
  * Fetch a page with a declared UA and hard caps. observed_at is always our fetch time for web sources.
- * Only a 200 is evidence. Redirects are followed; one that lands on a different site (precheck's host rule:
- * hostname without "www.") is a coverage gap, because its text would be judged against the registered source
- * it did not come from. Same-site redirects (http -> https, a trailing slash) are fine; final_url is recorded.
+ * Only a 200 is evidence. Redirects are followed; one whose final URL fails precheck's source rule (same host
+ * without "www.", path equal to or under the registered path: webUrlMatches) is a coverage gap: another site,
+ * or a moved or deleted article that lands on the homepage or a login page, would otherwise be judged against a
+ * source it did not come from and become a SOURCE_MISMATCH verdict. Redirects inside the rule (http -> https,
+ * www., a trailing slash) are evidence with final_url recorded.
  */
 export async function fetchWeb(env: Env, watch: WatchRow, botUa: string): Promise<FetchOutcome> {
   const url = String(watch.source_ref.url ?? watch.source_ref.ref ?? "");
@@ -50,7 +53,7 @@ export async function fetchWeb(env: Env, watch: WatchRow, botUa: string): Promis
   const deferSeconds = retryAfterSeconds(res.headers, Date.now());
   const answered = { httpStatus: res.status, ...(deferSeconds !== undefined ? { deferSeconds } : {}) };
   const gap = (error: string): FetchOutcome => ({ error, window: { from, to: now, status: "gap" }, cursor, ...answered });
-  if (railEnabled("non200_never_evidence") && res.redirected && res.url && !sameSite(url, res.url)) { await discardBody(res); return gap(`web ${url} redirected off-site to ${res.url}`); }
+  if (railEnabled("non200_never_evidence") && res.redirected && res.url && !webUrlMatches(url, res.url)) { await discardBody(res); return gap(`web ${url} redirected outside the registered source to ${res.url}`); }
   if (res.status === 304) return { notModified: true, etag: watch.etag, window: { from, to: now, status: "ok" }, cursor, ...answered };
   if (res.status !== 200) { await discardBody(res); return gap(`web ${res.status} for ${url}`); }
   const ct = (res.headers.get("content-type") ?? "").toLowerCase();

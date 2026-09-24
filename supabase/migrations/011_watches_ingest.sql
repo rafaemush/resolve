@@ -14,9 +14,9 @@ alter table watches add constraint watches_last_http_status_check
   check (last_http_status is null or last_http_status between 100 and 599);
 
 comment on column watches.last_canonical_hash is
-  'sha256 of the change projection (src/ingest/projection.ts: deciding fields of GitHub JSON, canonical text for web, the ordered matching logs/signatures for chains) of the last STORED observation. A poll whose projection hash equals this is a no_op (coverage/cursor advance, no evidence row, no resolution) unless it is the post-deadline observation. Not evidence.canonical_sha256, which stays the hash of the canonical evidence text.';
+  'sha256 of the change projection (src/ingest/projection.ts: deciding fields of GitHub JSON plus the value a numeric_threshold reads, canonical text for web, the carried and ordered matching logs/signatures for chains) of the last observation resolved by a verdict that looked. A verdict that could not look (error_code UPSTREAM_UNAVAILABLE) leaves it unchanged, so the next poll retries. A poll whose projection hash equals this is a no_op (coverage/cursor advance, no evidence row, no resolution) unless it is the post-deadline observation. Not evidence.canonical_sha256, which stays the hash of the canonical evidence text.';
 comment on column watches.last_http_status is
-  'HTTP status of the last answer from a github/web source (the final status after same-site redirects); null for chain sources and until the first poll after migration 011. A transition from 200/304 to a failing answer raises an operator alert.';
+  'HTTP status of the last answer from a github/web source (the final status after following redirects); null for chain sources and until the first poll after migration 011. A transition from 200/304 to a failing answer raises an operator alert.';
 comment on column watches.last_evidence_hash is
   'raw_sha256 of the last stored observation (the R2 key suffix). Change detection uses last_canonical_hash since migration 011.';
 

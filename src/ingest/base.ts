@@ -1,5 +1,7 @@
 import type { Env } from "../env";
 import type { WatchRow, FetchOutcome } from "./types";
+import type { Resolver } from "../resolve/schema";
+import { earlierMatches, nextEarlierMatches } from "./matches";
 
 interface RpcOk<T> { result: T }
 interface RpcErr { error: { code: number; message: string } }
@@ -123,8 +125,9 @@ export async function logsWindow(
 /**
  * Poll logs for the watched address over (cursor.block, min(safe, cursor.block + chunk)].
  * The cursor advances only to the window actually read; a window that does not reach `safe` marks backlog.
+ * structured.earlier_matches carries the resolver's matches from earlier windows (src/ingest/matches.ts).
  */
-export async function fetchBaseLogs(env: Env, watch: WatchRow, chunk = 2000): Promise<FetchOutcome> {
+export async function fetchBaseLogs(env: Env, watch: WatchRow, resolver: Resolver | undefined, chunk = 2000): Promise<FetchOutcome> {
   const callUrl = baseCallUrl(env);
   const address = String(watch.source_ref.address ?? "").toLowerCase();
   const topic0 = watch.source_ref.topic0 ? String(watch.source_ref.topic0).toLowerCase() : null;
@@ -151,14 +154,15 @@ export async function fetchBaseLogs(env: Env, watch: WatchRow, chunk = 2000): Pr
       decorated.push({ address: l.address.toLowerCase(), topics: l.topics.map((t) => t.toLowerCase()), data: l.data, block_number: bn, tx_hash: l.transactionHash, log_index: num(l.logIndex), timestamp: ts });
     }
     const backlog = w.to < w.safe.number;
-    const structured = { chain: "base", address, topic0, from_block: w.from, to_block: w.to, safe_block: w.safe.number, logs: decorated, has_code };
+    const carried = earlierMatches(watch.cursor);
+    const structured = { chain: "base", address, topic0, from_block: w.from, to_block: w.to, safe_block: w.safe.number, logs: decorated, earlier_matches: carried, has_code };
     const text = JSON.stringify(structured);
     const fromTs = String(watch.cursor.to_ts ?? watch.cursor.from_ts ?? toHeader.timestamp);
     return {
       evidence: { source_kind: "base_log", text, structured, observed_at: toHeader.timestamp, fetched_at: t0, coverage: { has_code, safe_block: w.safe.number, backlog }, provenance: { chain: "base", address, from_block: w.from, to_block: w.to, safe_block: w.safe.number, rpc_logs: hostOf(w.provider), rpc_calls: hostOf(callUrl), ...(w.errors.length ? { rpc_errors: w.errors } : {}) } },
       rawBytes: new TextEncoder().encode(text),
       window: { from: fromTs, to: toHeader.timestamp, status: "ok" },
-      cursor: { ...watch.cursor, block: w.to, to_ts: toHeader.timestamp, safe_block: w.safe.number, has_code },
+      cursor: { ...watch.cursor, block: w.to, to_ts: toHeader.timestamp, safe_block: w.safe.number, has_code, earlier_matches: nextEarlierMatches(resolver, carried, decorated) },
       backlog,
     };
   } catch (e) {

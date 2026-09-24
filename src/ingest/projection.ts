@@ -9,6 +9,7 @@
 import type { EvidenceInput } from "../resolve/schema";
 import { canonicalize } from "../resolve/text";
 import { railEnabled } from "../resolve/rails";
+import { getPath, parseNumber } from "../resolve/structured";
 
 type Obj = Record<string, unknown>;
 const isObj = (v: unknown): v is Obj => typeof v === "object" && v !== null && !Array.isArray(v);
@@ -96,13 +97,21 @@ function rawText(ev: EvidenceInput): string {
   return ev.text ?? (ev.structured !== undefined ? JSON.stringify(ev.structured) : "");
 }
 
+/** What change detection needs from a market's resolver: its kind, and the path a numeric_threshold reads. */
+export interface ChangeResolver { kind: string; path?: string }
+
 /**
- * The deterministic string whose sha256 decides whether a poll is a change.
- * Chain sources keep only the ordered matching logs / signatures: to_block, safe_block, backlog and the other
- * cursor fields move on every poll. Anything unrecognised falls back to canonical text.
+ * Chain sources: the matches carried from earlier windows (src/ingest/matches.ts) followed by this window's ordered
+ * logs / signatures. to_block, safe_block, backlog and the other cursor fields move on every poll; a match moving
+ * from the window into earlier_matches is not a change.
  */
-export function projectForChange(sourceKind: string, resolverKind: string | undefined, ev: EvidenceInput): string {
-  if (!railEnabled("stable_projection")) return rawText(ev);
+function projectChain(s: unknown, key: "logs" | "signatures"): string | null {
+  if (!isObj(s) || !Array.isArray(s[key])) return null;
+  const earlier = Array.isArray(s.earlier_matches) ? s.earlier_matches : [];
+  return stableStringify([...earlier, ...(s[key] as unknown[])]);
+}
+
+function projectSource(sourceKind: string, resolverKind: string | undefined, ev: EvidenceInput): string {
   const s = ev.structured;
   switch (sourceKind) {
     case "github_api":
@@ -112,10 +121,28 @@ export function projectForChange(sourceKind: string, resolverKind: string | unde
     case "web_render":
       return canonicalize(rawText(ev)).text;
     case "base_log":
-      return isObj(s) && Array.isArray(s.logs) ? stableStringify(s.logs) : canonicalize(rawText(ev)).text;
+      return projectChain(s, "logs") ?? canonicalize(rawText(ev)).text;
     case "solana_log":
-      return isObj(s) && Array.isArray(s.signatures) ? stableStringify(s.signatures) : canonicalize(rawText(ev)).text;
+      return projectChain(s, "signatures") ?? canonicalize(rawText(ev)).text;
     default:
       return canonicalize(rawText(ev)).text;
   }
+}
+
+/**
+ * The deterministic string whose sha256 decides whether a poll is a change. Anything unrecognised falls back to
+ * canonical text.
+ * numeric_threshold reads one number by path from the structured payload, else the numbers near the anchors in the
+ * full text (src/resolve/structured.ts). The source projections drop exactly such values (a repo's
+ * stargazers_count is a volatile key; a PR projection keeps no counters), so a threshold crossing would never be a
+ * change: the value read at the path joins the projection, and without one the projection is the canonical text
+ * the fallback reads.
+ */
+export function projectForChange(sourceKind: string, resolver: ChangeResolver | undefined, ev: EvidenceInput): string {
+  if (!railEnabled("stable_projection")) return rawText(ev);
+  const projected = projectSource(sourceKind, resolver?.kind, ev);
+  if (resolver?.kind !== "numeric_threshold") return projected;
+  const s = ev.structured;
+  const value = resolver.path && s !== undefined && s !== null ? parseNumber(getPath(s, resolver.path)) : undefined;
+  return value === undefined ? canonicalize(rawText(ev)).text : stableStringify({ projected, numeric: { path: resolver.path, value } });
 }

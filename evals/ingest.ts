@@ -14,7 +14,7 @@ import type { Env } from "../src/env";
 import { EvidenceInput } from "../src/resolve/schema";
 import { fetchGithub } from "../src/ingest/github";
 import { fetchWeb } from "../src/ingest/web";
-import { projectForChange } from "../src/ingest/projection";
+import { projectForChange, type ChangeResolver } from "../src/ingest/projection";
 import type { FetchOutcome, WatchRow } from "../src/ingest/types";
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
@@ -27,7 +27,7 @@ export type IngestGroup = "non200" | "projection";
 interface StubResponse { status: number; headers?: Record<string, string>; body?: string | null; redirected?: boolean; url?: string }
 interface AdapterExpect { evidence: boolean; raw_bytes: boolean; error: boolean; window_status: "ok" | "gap" | null; http_status: number | null }
 interface AdapterCase { id: string; group: "non200"; title: string; adapter: "github" | "web"; source_ref: Record<string, unknown>; resolver_kind?: string; response: StubResponse; expect: AdapterExpect }
-interface ProjectionCase { id: string; group: "projection"; title: string; source_kind: string; resolver_kind?: string; a: EvidenceInput; b: EvidenceInput; expect: "equal" | "different" }
+interface ProjectionCase { id: string; group: "projection"; title: string; source_kind: string; resolver?: ChangeResolver; a: EvidenceInput; b: EvidenceInput; expect: "equal" | "different" }
 export type IngestCase = AdapterCase | ProjectionCase;
 
 // ---- authored cases ---------------------------------------------------------------------------------------
@@ -69,8 +69,8 @@ function issue(labels: string[], comments: number) {
 const ghEv = (structured: unknown): EvidenceInput => ({ source_kind: "github_api", source_url: "https://api.github.com/repos/x/y", text: JSON.stringify(structured), structured, observed_at: "2026-09-23T06:05:00Z", fetched_at: "2026-09-23T06:05:00Z", http_status: 200, coverage: { snapshot_status: 200, deciding_field_present: true } });
 const webEv = (text: string): EvidenceInput => ({ source_kind: "web_fetch", source_url: "https://blog.aurora-protocol.example/", text, fetched_at: "2026-09-23T06:05:00Z", http_status: 200 });
 const LOG = { address: "0x1111111111111111111111111111111111111111", topics: ["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"], data: "0x", block_number: 22_000_100, tx_hash: "0xbeef", log_index: 3, timestamp: "2026-09-20T10:00:00.000Z" };
-const baseEv = (to: number, safe: number): EvidenceInput => {
-  const structured = { chain: "base", address: LOG.address, topic0: LOG.topics[0], from_block: to - 1999, to_block: to, safe_block: safe, logs: [LOG], has_code: true };
+const baseEv = (to: number, safe: number, logs: unknown[] = [LOG], earlier: unknown[] = []): EvidenceInput => {
+  const structured = { chain: "base", address: LOG.address, topic0: LOG.topics[0], from_block: to - 1999, to_block: to, safe_block: safe, logs, ...(earlier.length ? { earlier_matches: earlier } : {}), has_code: true };
   return { source_kind: "base_log", text: JSON.stringify(structured), structured, observed_at: "2026-09-23T06:05:00Z", fetched_at: "2026-09-23T06:05:00Z", provenance: { chain: "base", address: LOG.address, from_block: to - 1999, to_block: to, safe_block: safe } };
 };
 
@@ -93,20 +93,27 @@ export function authorCases(): IngestCase[] {
     { id: "ING-008", group: "non200", title: "control: same-site web redirect (http -> https, www.) is evidence", adapter: "web", source_ref: { url: "http://aurora-protocol.example/status" },
       response: { status: 200, headers: { "content-type": "text/plain" }, body: "Aurora status: v2 upgrade activated on mainnet at block 1,200,000.", redirected: true, url: "https://www.aurora-protocol.example/status/" }, expect: { evidence: true, raw_bytes: true, error: false, window_status: "ok", http_status: 200 } },
 
-    { id: "ING-101", group: "projection", title: "PR payloads differing only in head/base repo counters and updated_at project equal", source_kind: "github_api", resolver_kind: "github_pr_merged",
+    { id: "ING-009", group: "non200", title: "Web redirect on the same host off the registered path (moved article -> homepage) is a gap, never a SOURCE_MISMATCH verdict", adapter: "web", source_ref: { url: "https://blog.aurora-protocol.example/posts/v2-launch" },
+      response: { status: 200, headers: { "content-type": "text/plain" }, body: "Aurora blog. Latest posts: community call notes, validator operations guide.", redirected: true, url: "https://blog.aurora-protocol.example/" }, expect: NO_EVIDENCE_GAP(200) },
+
+    { id: "ING-101", group: "projection", title: "PR payloads differing only in head/base repo counters and updated_at project equal", source_kind: "github_api", resolver: { kind: "github_pr_merged" },
       a: ghEv(pr({ counters: C1, updated_at: "2026-09-23T06:01:40Z" })), b: ghEv(pr({ counters: C2, updated_at: "2026-09-23T06:05:02Z" })), expect: "equal" },
-    { id: "ING-102", group: "projection", title: "the same PR with merged_at set projects different", source_kind: "github_api", resolver_kind: "github_pr_merged",
+    { id: "ING-102", group: "projection", title: "the same PR with merged_at set projects different", source_kind: "github_api", resolver: { kind: "github_pr_merged" },
       a: ghEv(pr({ counters: C1, updated_at: "2026-09-23T06:01:40Z" })), b: ghEv(pr({ counters: C1, updated_at: "2026-09-23T06:01:40Z", merged_at: "2026-09-23T06:03:00Z" })), expect: "different" },
-    { id: "ING-103", group: "projection", title: "a reordered release list projects equal", source_kind: "github_api", resolver_kind: "github_release_published",
+    { id: "ING-103", group: "projection", title: "a reordered release list projects equal", source_kind: "github_api", resolver: { kind: "github_release_published" },
       a: ghEv([release(301, "v15.5.0"), release(299, "v15.4.9"), release(305, "v16.0.0-canary.1")]), b: ghEv([release(305, "v16.0.0-canary.1"), release(301, "v15.5.0"), release(299, "v15.4.9")]), expect: "equal" },
-    { id: "ING-104", group: "projection", title: "a draft release that gets published projects different", source_kind: "github_api", resolver_kind: "github_release_published",
+    { id: "ING-104", group: "projection", title: "a draft release that gets published projects different", source_kind: "github_api", resolver: { kind: "github_release_published" },
       a: ghEv([release(310, "v16.0.0", true), release(301, "v15.5.0")]), b: ghEv([release(310, "v16.0.0", false), release(301, "v15.5.0")]), expect: "different" },
-    { id: "ING-105", group: "projection", title: "an issue with labels reordered and a new comment count projects equal", source_kind: "github_api", resolver_kind: "github_issue_closed",
+    { id: "ING-105", group: "projection", title: "an issue with labels reordered and a new comment count projects equal", source_kind: "github_api", resolver: { kind: "github_issue_closed" },
       a: ghEv(issue(["bug", "sdk"], 4)), b: ghEv(issue(["sdk", "bug"], 7)), expect: "equal" },
     { id: "ING-106", group: "projection", title: "web text differing only in whitespace and zero-width characters projects equal", source_kind: "web_fetch",
       a: webEv("Aurora v2 upgrade\nactivated on mainnet."), b: webEv("Aurora  v2 upgrade\r\n​activated on   mainnet. "), expect: "equal" },
-    { id: "ING-107", group: "projection", title: "base logs with the same matching logs but a moved window/safe block project equal", source_kind: "base_log", resolver_kind: "evm_log_present",
+    { id: "ING-107", group: "projection", title: "base logs with the same matching logs but a moved window/safe block project equal", source_kind: "base_log", resolver: { kind: "evm_log_present" },
       a: baseEv(22_001_000, 22_001_000), b: baseEv(22_003_000, 22_003_010), expect: "equal" },
+    { id: "ING-108", group: "projection", title: "repo JSON under a numeric_threshold on stargazers_count: the counter named by the resolver path projects different", source_kind: "github_api", resolver: { kind: "numeric_threshold", path: "stargazers_count" },
+      a: ghEv(repo({ ...C1, stars: 9_990 })), b: ghEv(repo({ ...C1, stars: 10_050 })), expect: "different" },
+    { id: "ING-109", group: "projection", title: "base: a match carried into earlier_matches by the next (empty) window projects equal to the window that found it", source_kind: "base_log", resolver: { kind: "evm_log_present" },
+      a: baseEv(22_001_000, 22_001_000), b: baseEv(22_003_000, 22_003_000, [], [LOG]), expect: "equal" },
   ];
 }
 
@@ -172,7 +179,7 @@ async function runAdapterCase(k: AdapterCase): Promise<string[]> {
 }
 
 function runProjectionCase(k: ProjectionCase): string[] {
-  const equal = projectForChange(k.source_kind, k.resolver_kind, k.a) === projectForChange(k.source_kind, k.resolver_kind, k.b);
+  const equal = projectForChange(k.source_kind, k.resolver, k.a) === projectForChange(k.source_kind, k.resolver, k.b);
   const got = equal ? "equal" : "different";
   return got === k.expect ? [] : [`projection ${got} != ${k.expect}`];
 }

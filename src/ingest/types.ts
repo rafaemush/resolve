@@ -21,7 +21,10 @@ export interface WatchRow {
   cursor: Record<string, unknown>;
   coverage: CoverageWindow[];
   last_evidence_hash: string | null;
-  /** sha256 of the change projection (src/ingest/projection.ts) of the last STORED observation; null before the first. */
+  /**
+   * sha256 of the change projection (src/ingest/projection.ts) of the last observation resolved by a verdict that
+   * looked; null before the first. A could-not-look verdict leaves it unchanged so the next poll retries.
+   */
   last_canonical_hash?: string | null;
   /** HTTP status of the last HTTP answer (github/web); null for chain sources and before migration 011's first write. */
   last_http_status?: number | null;

@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
 import { fetchWeb } from "../src/ingest/web";
-import { retryAfterSeconds, sameSite, siteOf, clampDefer } from "../src/ingest/http";
+import { retryAfterSeconds, clampDefer } from "../src/ingest/http";
+import { sourceMatches, webUrlMatches } from "../src/resolve/precheck";
+import type { MarketRegistration } from "../src/resolve/schema";
 import type { WatchRow } from "../src/ingest/types";
 import { __setRailsForMutationTesting } from "../src/resolve/rails";
 
@@ -18,20 +20,23 @@ function respond(status: number, body: string | null, headers: Record<string, st
 
 afterEach(() => { vi.unstubAllGlobals(); __setRailsForMutationTesting([]); });
 
-describe("sameSite (precheck's host rule: hostname without www.)", () => {
+describe("webUrlMatches (precheck's web source rule, shared with the redirect guard)", () => {
   it.each([
     ["http://aurora.example/status", "https://aurora.example/status", true],
     ["https://aurora.example/blog", "https://aurora.example/blog/", true],
     ["https://aurora.example/", "https://www.aurora.example/", true],
     ["https://WWW.Aurora.example/", "https://aurora.example:8443/x", true],
+    ["https://aurora.example/posts", "https://aurora.example/posts/v2-launch", true],
+    ["https://blog.aurora.example/posts/v2-launch", "https://blog.aurora.example/", false],
+    ["https://blog.aurora.example/posts/v2-launch", "https://blog.aurora.example/login?next=/posts/v2-launch", false],
+    ["https://aurora.example/posts", "https://aurora.example/posts-archive", false],
     ["https://blog.aurora.example/", "https://aurora.example/", false],
     ["https://aurora.example/", "https://parked-domains.example/aurora", false],
     ["https://aurora.example/", "https://aurora.example.evil.test/", false],
     ["not a url", "https://aurora.example/", false],
   ])("%s -> %s = %s", (a, b, want) => {
-    expect(sameSite(a, b)).toBe(want);
+    expect(webUrlMatches(a, b)).toBe(want);
   });
-  it("siteOf returns null for an unparsable URL", () => { expect(siteOf("::")).toBeNull(); });
 });
 
 describe("retryAfterSeconds / clampDefer", () => {
@@ -55,7 +60,7 @@ describe("fetchWeb redirects and non-200", () => {
     const out = await fetchWeb({} as Env, watch("https://blog.aurora.example/"), "UA");
     expect(out.evidence).toBeUndefined();
     expect(out.rawBytes).toBeUndefined();
-    expect(out.error).toBe("web https://blog.aurora.example/ redirected off-site to https://parked-domains.example/aurora");
+    expect(out.error).toBe("web https://blog.aurora.example/ redirected outside the registered source to https://parked-domains.example/aurora");
     expect(out.window?.status).toBe("gap");
     expect(out.httpStatus).toBe(200);
   });
@@ -67,6 +72,24 @@ describe("fetchWeb redirects and non-200", () => {
     expect(out.evidence?.source_url).toBe("https://www.aurora.example/status/");
     expect(out.evidence?.provenance).toMatchObject({ url: "http://aurora.example/status", final_url: "https://www.aurora.example/status/", redirected: true });
     expect(out.httpStatus).toBe(200);
+  });
+
+  it("a same-host redirect off the registered path (moved article -> homepage) is a gap, never a SOURCE_MISMATCH verdict", async () => {
+    respond(200, "Aurora blog. Latest posts: community call notes, validator guide.", {}, "https://blog.aurora.example/");
+    const out = await fetchWeb({} as Env, watch("https://blog.aurora.example/posts/v2-launch"), "UA");
+    expect(out.evidence).toBeUndefined();
+    expect(out.rawBytes).toBeUndefined();
+    expect(out.error).toBe("web https://blog.aurora.example/posts/v2-launch redirected outside the registered source to https://blog.aurora.example/");
+    expect(out.window?.status).toBe("gap");
+  });
+
+  it("a trailing-slash redirect on the registered path is evidence", async () => {
+    respond(200, "Aurora v2 launch: the upgrade activated on mainnet.", {}, "https://blog.aurora.example/posts/v2-launch/");
+    const out = await fetchWeb({} as Env, watch("https://blog.aurora.example/posts/v2-launch"), "UA");
+    expect(out.error).toBeUndefined();
+    expect(out.evidence?.source_url).toBe("https://blog.aurora.example/posts/v2-launch/");
+    const market = { sources: [{ kind: "web_fetch", ref: "https://blog.aurora.example/posts/v2-launch" }] } as MarketRegistration;
+    expect(sourceMatches(market, out.evidence!).pass).toBe(true); // accepted by the guard => accepted by precheck
   });
 
   it("no redirect: final_url is the registered URL", async () => {

@@ -3,7 +3,7 @@
  * Positive findings resolve when they fall inside the market window. A negative
  * verdict is NEVER a non-observation: it requires the coverage proof.
  */
-import type { MarketRegistration, EvidenceInput, Coverage } from "./schema";
+import type { MarketRegistration, EvidenceInput, Coverage, Resolver } from "./schema";
 import type { PrecheckResult } from "./precheck";
 import { railEnabled } from "./rails";
 
@@ -28,6 +28,30 @@ export function getPath(obj: unknown, path: string): unknown {
     else return undefined;
   }
   return cur;
+}
+
+type Entry = Record<string, unknown>;
+const entries = (v: unknown): Entry[] => (Array.isArray(v) ? (v as Entry[]) : []);
+
+/** evm_log_present: a log from the registered address with topic0 and every non-null extra topic. */
+function evmLogMatches(r: Extract<Resolver, { kind: "evm_log_present" }>, l: Entry): boolean {
+  const topics = (Array.isArray(l.topics) ? l.topics : []).map((t) => String(t).toLowerCase());
+  if (String(l.address ?? "").toLowerCase() !== r.address.toLowerCase()) return false;
+  if (topics[0] !== r.topic0.toLowerCase()) return false;
+  return !(r.topics && r.topics.some((t, i) => t !== null && topics[i + 1] !== t.toLowerCase()));
+}
+
+/** solana_sig_present: a successful transaction, with the registered discriminator when one is set. */
+function solanaSigMatches(r: Extract<Resolver, { kind: "solana_sig_present" }>, sg: Entry): boolean {
+  if (sg.err !== null && sg.err !== undefined) return false;
+  return !r.discriminator || String(sg.discriminator ?? "") === r.discriminator;
+}
+
+/** Whether a decorated chain entry (log or signature) is one the market's chain resolver counts. Other kinds: never. */
+export function chainEntryMatches(r: Resolver | undefined, e: Entry): boolean {
+  if (r?.kind === "evm_log_present") return evmLogMatches(r, e);
+  if (r?.kind === "solana_sig_present") return solanaSigMatches(r, e);
+  return false;
 }
 
 interface Positive { found: boolean; at?: Date; disqualified?: string; wrongSubject?: string; detail: string }
@@ -94,14 +118,14 @@ function findPositive(market: MarketRegistration, s: unknown, text: string): Pos
       const at = obj.state === "closed" ? parseDate(obj.closed_at) : undefined;
       return at ? { found: true, at, detail: `closed_at=${at.toISOString()}` } : { found: false, detail: `state=${String(obj.state)}` };
     }
+    // Chain evidence covers one poll window; earlier_matches carries the matches the watch saw in earlier windows
+    // (src/ingest/matches.ts). They come first, so the earliest match decides and an empty post-deadline window
+    // can never read as absence after a match was observed.
     case "evm_log_present": {
-      const logs = (Array.isArray(obj.logs) ? obj.logs : []) as Record<string, unknown>[];
+      const logs = [...entries(obj.earlier_matches), ...entries(obj.logs)];
       const safe = typeof obj.safe_block === "number" ? obj.safe_block : undefined;
       for (const l of logs) {
-        const topics = (Array.isArray(l.topics) ? l.topics : []).map((t) => String(t).toLowerCase());
-        if (String(l.address ?? "").toLowerCase() !== r.address.toLowerCase()) continue;
-        if (topics[0] !== r.topic0.toLowerCase()) continue;
-        if (r.topics && r.topics.some((t, i) => t !== null && topics[i + 1] !== t.toLowerCase())) continue;
+        if (!evmLogMatches(r, l)) continue;
         const bn = Number(l.block_number ?? l.blockNumber);
         if (safe === undefined || !Number.isFinite(bn) || bn > safe) return { found: false, disqualified: "unsafe_block", detail: `log at block ${bn} above safe ${safe ?? "?"}` };
         const at = parseDate(l.timestamp ?? l.block_time ?? l.blockTime);
@@ -110,10 +134,9 @@ function findPositive(market: MarketRegistration, s: unknown, text: string): Pos
       return { found: false, detail: `no matching log in ${logs.length}` };
     }
     case "solana_sig_present": {
-      const sigs = (Array.isArray(obj.signatures) ? obj.signatures : []) as Record<string, unknown>[];
+      const sigs = [...entries(obj.earlier_matches), ...entries(obj.signatures)];
       for (const sg of sigs) {
-        if (sg.err !== null && sg.err !== undefined) continue;
-        if (r.discriminator && String(sg.discriminator ?? "") !== r.discriminator) continue;
+        if (!solanaSigMatches(r, sg)) continue;
         return { found: true, at: parseDate(sg.blockTime ?? sg.block_time), detail: `sig=${String(sg.signature)}` };
       }
       return { found: false, detail: `no matching signature in ${sigs.length}` };

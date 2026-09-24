@@ -65,6 +65,18 @@ function normalizeUrl(u: string): { host: string; path: string } | null {
   } catch { return null; }
 }
 
+/**
+ * The web source rule: same host (case-insensitive, without "www.") and the evidence path equal to or under the
+ * registered path (trailing slashes ignored; a registered site root covers every path). Scheme, port and query
+ * are not compared. The ingestion redirect guard (src/ingest/web.ts) applies this same function, so a redirect
+ * it accepts can never become a SOURCE_MISMATCH verdict.
+ */
+export function webUrlMatches(registered: string, evidenceUrl: string): boolean {
+  const a = normalizeUrl(evidenceUrl);
+  const b = normalizeUrl(registered);
+  return !!a && !!b && a.host === b.host && (a.path === b.path || a.path.startsWith(b.path + "/") || b.path === "");
+}
+
 export function sourceMatches(market: MarketRegistration, ev: EvidenceInput): { pass: boolean; detail: string } {
   const prov = (ev.provenance ?? {}) as Record<string, unknown>;
   for (const s of market.sources) {
@@ -81,10 +93,9 @@ export function sourceMatches(market: MarketRegistration, ev: EvidenceInput): { 
       continue;
     }
     // web sources: same host and path prefix
-    if (!ev.source_url) continue;
-    const a = normalizeUrl(ev.source_url);
-    const b = normalizeUrl(s.ref);
-    if (a && b && a.host === b.host && (a.path === b.path || a.path.startsWith(b.path + "/") || b.path === "")) return { pass: true, detail: `${b.host}${b.path}` };
+    if (!ev.source_url || !webUrlMatches(s.ref, ev.source_url)) continue;
+    const b = normalizeUrl(s.ref)!;
+    return { pass: true, detail: `${b.host}${b.path}` };
   }
   if (ev.source_kind === "tenant_supplied" && !ev.source_url) return { pass: true, detail: "tenant_supplied without url (labeled, excluded from track record)" };
   return { pass: false, detail: `evidence source ${ev.source_url ?? "(none)"} matches no registered source` };

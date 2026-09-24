@@ -24,19 +24,6 @@ export function maxDefer(...xs: Array<number | undefined>): number | undefined {
   return present.length ? Math.max(...present) : undefined;
 }
 
-/**
- * Same site for redirect purposes: the hostname with a leading "www." removed, case-insensitive.
- * This is the host rule precheck's source_match already applies (normalizeUrl), so a redirect this
- * accepts can never turn into a SOURCE_MISMATCH verdict; scheme and port changes (http -> https) are fine.
- */
-export function siteOf(url: string): string | null {
-  try { return new URL(url).hostname.toLowerCase().replace(/^www\./, ""); } catch { return null; }
-}
-export function sameSite(registered: string, final: string): boolean {
-  const a = siteOf(registered), b = siteOf(final);
-  return a !== null && a === b;
-}
-
 /** Release the connection of a response whose body we will not read. */
 export async function discardBody(res: Response): Promise<void> {
   try { await res.body?.cancel(); } catch { /* already consumed or not cancellable */ }

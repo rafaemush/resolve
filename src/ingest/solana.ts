@@ -1,6 +1,8 @@
 import type { Env } from "../env";
 import type { WatchRow, FetchOutcome } from "./types";
+import type { Resolver } from "../resolve/schema";
 import { rpc } from "./base";
+import { earlierMatches, nextEarlierMatches } from "./matches";
 
 export function solanaRpcUrl(env: Env): string {
   return env.HELIUS_API_KEY ? `https://mainnet.helius-rpc.com/?api-key=${env.HELIUS_API_KEY}` : env.SOLANA_FALLBACK_HTTP_URL || "https://api.mainnet-beta.solana.com";
@@ -8,8 +10,11 @@ export function solanaRpcUrl(env: Env): string {
 
 interface SigInfo { signature: string; slot: number; blockTime: number | null; err: unknown }
 
-/** Poll new signatures for a specific account (never a program id); at most 20 getTransaction calls per tick. */
-export async function fetchSolanaSignatures(env: Env, watch: WatchRow, maxTx = 20): Promise<FetchOutcome> {
+/**
+ * Poll new signatures for a specific account (never a program id); at most 20 getTransaction calls per tick.
+ * structured.earlier_matches carries the resolver's matches from earlier polls (src/ingest/matches.ts).
+ */
+export async function fetchSolanaSignatures(env: Env, watch: WatchRow, resolver: Resolver | undefined, maxTx = 20): Promise<FetchOutcome> {
   const url = solanaRpcUrl(env);
   const account = String(watch.source_ref.account ?? "");
   if (account.length < 32) return { error: "source_ref.account invalid" };
@@ -39,13 +44,14 @@ export async function fetchSolanaSignatures(env: Env, watch: WatchRow, maxTx = 2
     }
     const newest = sigs[0]!;
     const toTs = newest.blockTime ? new Date(newest.blockTime * 1000).toISOString() : now;
-    const structured = { chain: "solana", account, account_exists: accountExists, signatures: decorated, backlog };
+    const carried = earlierMatches(watch.cursor);
+    const structured = { chain: "solana", account, account_exists: accountExists, signatures: decorated, earlier_matches: carried, backlog };
     const text = JSON.stringify(structured);
     return {
       evidence: { source_kind: "solana_log", text, structured, observed_at: toTs, fetched_at: t0, coverage: { account_exists: accountExists, backlog }, provenance: { chain: "solana", account, until: watch.cursor.sig ?? null, newest: newest.signature, rpc: env.HELIUS_API_KEY ? "helius" : "public" } },
       rawBytes: new TextEncoder().encode(text),
       window: { from: String(watch.cursor.to_ts ?? toTs), to: toTs, status: "ok" },
-      cursor: { ...watch.cursor, sig: backlog ? take[take.length - 1]!.signature : newest.signature, to_ts: toTs, account_exists: accountExists },
+      cursor: { ...watch.cursor, sig: backlog ? take[take.length - 1]!.signature : newest.signature, to_ts: toTs, account_exists: accountExists, earlier_matches: nextEarlierMatches(resolver, carried, decorated) },
       backlog,
     };
   } catch (e) {
