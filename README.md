@@ -17,6 +17,10 @@ Stack: TypeScript on Cloudflare Workers, Supabase Postgres (pg_cron + pg_net sch
 
 Every published accuracy or latency number is rendered from database rows (`eval_runs`, `bench_runs`, `v_track_record`), never typed by hand. No number is published until it exists.
 
+## Track record
+
+Every shadow verdict is recorded first and then posted to the public Telegram channel as `sha256(preimage)`, where the preimage is `platform:external_id|status|outcome|confidence|caveats|canonical_sha256|thresholds_version|nonce`. When the platform resolves, the reveal is a reply that prints the preimage and the nonce, so the commitment can be recomputed from the post alone. `GET /v1/track-record/verify?hash=<sha256>` answers for any commitment: before the reveal only that it exists and when it was posted (never the nonce), after it everything needed to recompute it. `/v1/track-record` counts each market once, by its latest commit, excludes test markets, and shows percentages (with a 95 % Wilson interval) only after 100 reconciled markets per platform.
+
 ## Status
 
 Pre-launch. Nothing here is financial advice or an oracle of record.

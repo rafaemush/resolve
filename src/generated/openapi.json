@@ -1278,7 +1278,7 @@
     },
     "/v1/track-record": {
       "get": {
-        "summary": "Public track record rendered from v_track_record (60 s cache)",
+        "summary": "Public track record rendered from v_track_record (60 s cache; test markets excluded; one agreement per market; cumulative percentages with a 95 % Wilson interval only after 100 reconciled markets per platform)",
         "responses": {
           "200": {
             "description": "rows[] per platform and week",
@@ -1286,6 +1286,74 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "UPSTREAM_UNAVAILABLE",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/track-record/verify": {
+      "get": {
+        "summary": "Look up a commitment (public, no auth). Before the reveal: market, committed_at, posted, revealed=false (never the nonce). After the reveal: preimage, nonce, committed verdict, official outcome, agreement; sha256(preimage) = commitment_sha256",
+        "parameters": [
+          {
+            "name": "hash",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9a-fA-F]{64}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "commitment_sha256, market (platform:external_id), committed_at, posted, posted_at, message_id, revealed [+ preimage_version, preimage, nonce, committed, official, agreement, reveal_posted once revealed]",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "validation_error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not_found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "UPSTREAM_UNAVAILABLE",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
                 }
               }
             }

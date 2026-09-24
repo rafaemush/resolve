@@ -1,0 +1,110 @@
+{
+ "_source": "Structural fields of real Limitless API responses sampled 2026-09-23: a single CLOB market (GET /markets/active), the Senate group container with its first two legs (GET /markets/{slug}; legs also carry marketType group plus their own tokens and winningOutcomeIndex), one AMM market (267-market snapshot). Titles, descriptions and metadata are dropped (Platform Content). No resolved market was in the sample, so tests set winningOutcomeIndex / payoutNumerators themselves.",
+ "single_clob": {
+  "id": 406851,
+  "slug": "team-nemesis-vs-conventus-stellarum-1790108004599",
+  "marketType": "single",
+  "tradeType": "clob",
+  "automationType": "sports",
+  "groupId": null,
+  "status": "FUNDED",
+  "expired": false,
+  "expirationTimestamp": 1790244000000,
+  "updatedAt": "2026-09-22T20:19:15.146Z",
+  "winningOutcomeIndex": null,
+  "conditionId": "0x860ee36bdc05984927f390ebcb5ba48ab2991ad98425aec5b7f9357a8d9dd28e",
+  "tokens": {
+   "yes": "9214159780148437116924198997143987861421185870512133952288074933260266094257",
+   "no": "33893186384902202895002777265859658667926595697069251390613259436693628638960"
+  },
+  "prices": [
+   0.286,
+   0.714
+  ]
+ },
+ "group": {
+  "id": 10013328,
+  "slug": "which-party-will-win-the-senate-in-2026-1785850263367",
+  "marketType": "group",
+  "tradeType": "clob",
+  "automationType": "manual",
+  "status": "FUNDED",
+  "expired": false,
+  "expirationTimestamp": 1793664000000,
+  "updatedAt": "2026-08-04T13:37:57.309Z",
+  "outcomeTokens": [
+   "Yes",
+   "No"
+  ],
+  "markets": [
+   {
+    "id": 347098,
+    "slug": "democratic-party-1785850263376",
+    "marketType": "group",
+    "tradeType": "clob",
+    "automationType": "manual",
+    "groupId": 10013328,
+    "status": "FUNDED",
+    "expired": false,
+    "expirationTimestamp": 1793664000000,
+    "updatedAt": "2026-08-04T13:37:37.995Z",
+    "winningOutcomeIndex": null,
+    "conditionId": "0xa213029f8d7b16a5f2d0e2ec4a441fabeae4d0472264388862ae4562400100a6",
+    "tokens": {
+     "yes": "90597787792302424435942833425011046927278700258688759351747969048706794451118",
+     "no": "80876011830854119869362969249947492020450511638302832610086379394699501911243"
+    },
+    "prices": [
+     0.625,
+     0.375
+    ],
+    "payoutNumerators": null
+   },
+   {
+    "id": 347099,
+    "slug": "republican-party-1785850263389",
+    "marketType": "group",
+    "tradeType": "clob",
+    "automationType": "manual",
+    "groupId": 10013328,
+    "status": "FUNDED",
+    "expired": false,
+    "expirationTimestamp": 1793664000000,
+    "updatedAt": "2026-08-04T13:37:39.199Z",
+    "winningOutcomeIndex": null,
+    "conditionId": "0x08257fb57ee3865c6c74316b8b5c97e25360cc95587d90889aee95fac658ef12",
+    "tokens": {
+     "yes": "77139064565922968394106705385721440475178505266583696317340287931276635972796",
+     "no": "96924403243157296392536767507909575732248987692472765431393324546957928113799"
+    },
+    "prices": [
+     0.375,
+     0.625
+    ],
+    "payoutNumerators": null
+   }
+  ]
+ },
+ "amm": {
+  "id": 405603,
+  "slug": "ivory-coast-to-defeat-ghana-in-the-2027-afcon-qualifiers-on-sep-24-1790010175919",
+  "marketType": "single",
+  "tradeType": "amm",
+  "automationType": "manual",
+  "groupId": null,
+  "status": "FUNDED",
+  "expired": false,
+  "expirationTimestamp": 1790334000000,
+  "updatedAt": "2026-09-21T17:04:02.005Z",
+  "winningOutcomeIndex": null,
+  "conditionId": "0x86c483fcf3ab0492d6d32d56e486f82f33e3b472270779a95e3018242c24fb8f",
+  "prices": [
+   50,
+   50
+  ],
+  "positionIds": [
+   "54184452343733656869867370407393255102990006098988598318239015982220752561830",
+   "18086540801022467289628291778630189354423728877665673444253197385675883746690"
+  ]
+ }
+}

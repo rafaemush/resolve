@@ -3,10 +3,14 @@ import type { EvidenceInput, MarketRegistration } from "../resolve/schema";
 export interface MarketRow extends MarketRegistration {
   id: string;
   tenant_id: string | null;
-  status: "open" | "resolved" | "void" | "unsupported_source";
+  status: "open" | "resolved" | "void" | "unsupported_source" | "closed_unresolved";
   official_outcome: "OPTION_A" | "OPTION_B" | "VOID" | null;
   official_resolved_at: string | null;
   official_source_url: string | null;
+  /** Smoke/test market (migration 012): commits recorded with channel 'none', never posted or reconciled. Absent before 012. */
+  is_test?: boolean;
+  condition_id?: string | null;
+  meta?: Record<string, unknown>;
 }
 
 export interface CoverageWindow { from: string; to: string; status: "ok" | "gap" }

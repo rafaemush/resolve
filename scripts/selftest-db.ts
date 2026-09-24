@@ -1,14 +1,114 @@
 /**
- * Exercises the billing RPCs inside a DO block that always raises at the end,
- * so the whole thing rolls back and nothing persists. The raised message
- * carries the assertion results. Then a real concurrency probe: 10 parallel
- * begin_resolution calls with one Idempotency-Key against a __selftest__
- * tenant (soft-deleted afterwards; ledger rows are append-only by design).
+ * Exercises the billing RPCs, then the commit-reveal trigger and the public view (migration 012), each inside a DO
+ * block that always raises at the end, so the whole thing rolls back and nothing persists. The raised message
+ * carries the assertion results. Then a real concurrency probe: 10 parallel begin_resolution calls with one
+ * Idempotency-Key against a __selftest__ tenant (soft-deleted afterwards; ledger rows are append-only by design).
+ * Point it at staging: the concurrency probe persists rows.
  */
 import { loadEnv } from "./lib/env";
 import { sql } from "./lib/mgmt";
 
 loadEnv();
+
+/** Run a DO block that ends with raise exception '<tag> <json>' and return the parsed json (null when absent). */
+async function rollbackBlock(tag: string, block: string): Promise<Record<string, unknown> | null> {
+  let msg = "";
+  try { await sql(block); } catch (e) { msg = String(e); }
+  let inner = msg;
+  const j = msg.indexOf("{");
+  if (j >= 0) { try { inner = String(JSON.parse(msg.slice(j)).message ?? msg); } catch { /* keep raw */ } }
+  const m = inner.match(new RegExp(`${tag} (\\{.*\\})`, "s"));
+  if (!m) { console.error(`${tag} did not return results:`, msg.slice(0, 800)); return null; }
+  return JSON.parse(m[1]!) as Record<string, unknown>;
+}
+
+/** Print PASS/FAIL per expected key ("a.b" reads a nested key); returns the number of failures. */
+function check(r: Record<string, unknown>, expect: Record<string, unknown>): number {
+  let bad = 0;
+  for (const [k, v] of Object.entries(expect)) {
+    const got = k.includes(".") ? (r[k.split(".")[0]!] as Record<string, unknown> | undefined)?.[k.split(".")[1]!] : r[k];
+    const ok = JSON.stringify(got) === JSON.stringify(v);
+    if (!ok) bad++;
+    console.log(`${ok ? "PASS" : "FAIL"} ${k} = ${JSON.stringify(got)}${ok ? "" : ` (expected ${JSON.stringify(v)})`}`);
+  }
+  return bad;
+}
+
+/**
+ * Migration 012: a pending commit may take its delivery receipt once and nothing else; delete is refused; the view
+ * counts one agreement per market (the final reconciliation) and never a test market; anon cannot read the view.
+ */
+const P2A_BLOCK = `
+do $$
+declare m uuid; mt uuid; c1 uuid; c2 uuid; rv uuid; smoke boolean; b record; a record; out jsonb := '{}'::jsonb;
+begin
+  insert into markets (platform, external_id, condition, event_statement, option_a, option_b, positive_option, open_at, deadline_utc)
+    values ('polymarket', '__selftest_p2a__', 'selftest condition', 'selftest statement', 'Yes', 'No', 'OPTION_A', now() - interval '3 days', now() - interval '2 days') returning id into m;
+  insert into markets (platform, external_id, condition, event_statement, option_a, option_b, positive_option, open_at, deadline_utc)
+    values ('polymarket', '__selftest_p2a_test__', 'selftest condition', 'selftest statement', 'Yes', 'No', 'OPTION_A', now() - interval '3 days', now() - interval '2 days') returning id into mt;
+  update markets set is_test = true where id = mt;                       -- allowed: no commit yet
+  insert into markets (platform, external_id, condition, event_statement, option_a, option_b, positive_option, open_at, deadline_utc)
+    values ('custom', 'smoke-__selftest_p2a__', 'selftest condition', 'selftest statement', 'Yes', 'No', 'OPTION_A', now() - interval '3 days', now() - interval '2 days') returning is_test into smoke;
+  out := out || jsonb_build_object('smoke_insert_is_test', smoke);
+  select coalesce(sum(n_reconciled), 0)::int as n, coalesce(sum(abstained), 0)::int as ab, coalesce(sum(resolved_correct), 0)::int as ok,
+         coalesce(sum(n_committed), 0)::int as nc, coalesce(sum(n_markets_shadowed), 0)::int as ns into b from v_track_record where platform = 'polymarket';
+  insert into resolutions (id, market_id, mode, status_row, resolution_status, winning_outcome, confidence_score, determination_basis, caveats, thresholds_version) values
+    ('__selftest_p2a_r1__', m, 'shadow', 'complete', 'UNRESOLVED', 'NONE', 0.50, 'structured', '["selftest"]', 'v1'),
+    ('__selftest_p2a_r2__', m, 'shadow', 'complete', 'RESOLVED', 'OPTION_A', 0.95, 'structured', '[]', 'v1'),
+    ('__selftest_p2a_rt__', mt, 'shadow', 'complete', 'RESOLVED', 'OPTION_A', 0.95, 'structured', '[]', 'v1');
+  -- every row carries the transaction's now(), so the view sees one week whatever the wall clock
+  insert into bot_posts (resolution_id, market_id, channel, kind, commitment_sha256, nonce, payload, dedup_key, posted_at)
+    values ('__selftest_p2a_r1__', m, 'pending', 'commit', repeat('a', 64), 'n1', '{"committed":{"k":1},"post_attempts":0}', '__selftest_p2a_c1__', null) returning id into c1;
+  insert into bot_posts (resolution_id, market_id, channel, kind, commitment_sha256, nonce, payload, dedup_key, posted_at)
+    values ('__selftest_p2a_r2__', m, 'pending', 'commit', repeat('b', 64), 'n2', '{"committed":{"k":2},"post_attempts":0}', '__selftest_p2a_c2__', null) returning id into c2;
+  insert into bot_posts (resolution_id, market_id, channel, kind, commitment_sha256, nonce, payload, dedup_key, posted_at)
+    values ('__selftest_p2a_rt__', mt, 'none', 'commit', repeat('c', 64), 'n3', '{}', '__selftest_p2a_ct__', null);
+
+  begin update bot_posts set payload = payload || '{"post_error":"selftest","post_attempts":1}' where id = c2;
+    out := out || '{"pending_failed_attempt_allowed": true}'; exception when others then out := out || jsonb_build_object('pending_failed_attempt_allowed', sqlerrm); end;
+  begin update bot_posts set commitment_sha256 = repeat('d', 64) where id = c2;
+    out := out || '{"pending_sha_change_refused": false}'; exception when others then out := out || '{"pending_sha_change_refused": true}'; end;
+  begin update bot_posts set payload = jsonb_set(payload, '{committed,k}', '9') where id = c2;
+    out := out || '{"pending_committed_change_refused": false}'; exception when others then out := out || '{"pending_committed_change_refused": true}'; end;
+  begin update bot_posts set channel = 'none' where id = c2;
+    out := out || '{"pending_to_none_refused": false}'; exception when others then out := out || '{"pending_to_none_refused": true}'; end;
+  begin update bot_posts set channel = 'telegram' where id = c2;
+    out := out || '{"posted_without_receipt_refused": false}'; exception when others then out := out || '{"posted_without_receipt_refused": true}'; end;
+  begin update bot_posts set channel = 'telegram', message_id = 1, telegram_date = now(), posted_at = now(), payload = payload || '{"post_attempts":1}' where id = c1;
+    out := out || '{"pending_to_posted_allowed": true}'; exception when others then out := out || jsonb_build_object('pending_to_posted_allowed', sqlerrm); end;
+  begin update bot_posts set message_id = 2 where id = c1;
+    out := out || '{"second_update_after_posted_refused": false}'; exception when others then out := out || '{"second_update_after_posted_refused": true}'; end;
+  begin delete from bot_posts where id = c1;
+    out := out || '{"posted_delete_refused": false}'; exception when others then out := out || '{"posted_delete_refused": true}'; end;
+  begin delete from bot_posts where id = c2;
+    out := out || '{"pending_delete_refused": false}'; exception when others then out := out || '{"pending_delete_refused": true}'; end;
+  begin update markets set is_test = true where id = m;
+    out := out || '{"is_test_locked_after_commit": false}'; exception when others then out := out || '{"is_test_locked_after_commit": true}'; end;
+  insert into bot_posts (resolution_id, market_id, channel, kind, commitment_sha256, nonce, payload, dedup_key, posted_at)
+    values ('__selftest_p2a_r1__', m, 'pending', 'reveal', repeat('a', 64), 'n1', '{}', '__selftest_p2a_v1__', null) returning id into rv;
+  begin update bot_posts set channel = 'telegram', message_id = 3, telegram_date = now(), posted_at = now(), reply_to_message_id = 1 where id = rv;
+    out := out || '{"reveal_update_allowed": true}'; exception when others then out := out || jsonb_build_object('reveal_update_allowed', sqlerrm); end;
+
+  insert into reconciliations (resolution_id, market_id, platform, official_outcome, agreement, final) values
+    ('__selftest_p2a_r1__', m, 'polymarket', 'OPTION_A', 'abstained', false),
+    ('__selftest_p2a_r2__', m, 'polymarket', 'OPTION_A', 'agree', true),
+    ('__selftest_p2a_rt__', mt, 'polymarket', 'OPTION_A', 'agree', true);
+  select coalesce(sum(n_reconciled), 0)::int as n, coalesce(sum(abstained), 0)::int as ab, coalesce(sum(resolved_correct), 0)::int as ok,
+         coalesce(sum(n_committed), 0)::int as nc, coalesce(sum(n_markets_shadowed), 0)::int as ns into a from v_track_record where platform = 'polymarket';
+  out := out || jsonb_build_object('view_reconciled_delta', a.n - b.n, 'view_abstained_delta', a.ab - b.ab, 'view_correct_delta', a.ok - b.ok,
+                                   'view_committed_delta', a.nc - b.nc, 'view_shadowed_delta', a.ns - b.ns);
+  begin update reconciliations set final = true where resolution_id = '__selftest_p2a_r1__';
+    out := out || '{"second_final_refused": false}'; exception when unique_violation then out := out || '{"second_final_refused": true}'; end;
+  begin
+    set local role anon;
+    begin perform 1 from v_track_record limit 1; out := out || '{"anon_view_denied": false}';
+    exception when insufficient_privilege then out := out || '{"anon_view_denied": true}'; end;
+    reset role;
+  exception when others then out := out || jsonb_build_object('anon_view_denied', 'set role failed: ' || sqlerrm);
+  end;
+  raise exception 'SELFTEST_P2A %', out::text;
+end $$;`;
+
 async function main() {
   const block = `
 do $$
@@ -38,14 +138,8 @@ begin
     'final_balance', (select credits_balance from tenants where id = t));
   raise exception 'SELFTEST %', out::text;
 end $$;`;
-  let msg = "";
-  try { await sql(block); } catch (e) { msg = String(e); }
-  let inner = msg;
-  const j = msg.indexOf("{");
-  if (j >= 0) { try { inner = String(JSON.parse(msg.slice(j)).message ?? msg); } catch { /* keep raw */ } }
-  const m = inner.match(/SELFTEST (\{.*\})/s);
-  if (!m) { console.error("selftest did not return results:", msg.slice(0, 800)); process.exit(1); }
-  const r = JSON.parse(m[1]!);
+  const r = await rollbackBlock("SELFTEST", block);
+  if (!r) process.exit(1);
   const expect: Record<string, unknown> = {
     "r1.replayed": false, "r1.ok": true, "r1.balance": 2, "r1.charged": 5,
     "r2.replayed": true, "r2.ok": true, "r2.same_id": true, "r2.charged": 5,
@@ -55,14 +149,23 @@ end $$;`;
     "deposit1": "credited", "deposit1_credits": 250, "deposit2": "duplicate", "deposit3": "unmatched",
     "final_balance": 257,
   };
-  let bad = 0;
-  for (const [k, v] of Object.entries(expect)) {
-    const got = k.includes(".") ? r[k.split(".")[0]!]?.[k.split(".")[1]!] : r[k];
-    const ok = JSON.stringify(got) === JSON.stringify(v);
-    if (!ok) bad++;
-    console.log(`${ok ? "PASS" : "FAIL"} ${k} = ${JSON.stringify(got)}${ok ? "" : ` (expected ${JSON.stringify(v)})`}`);
-  }
+  let bad = check(r, expect);
   console.log("rolled back: nothing persisted from the DO block");
+
+  const p2a = await rollbackBlock("SELFTEST_P2A", P2A_BLOCK);
+  if (!p2a) process.exit(1);
+  bad += check(p2a, {
+    smoke_insert_is_test: true,
+    pending_failed_attempt_allowed: true, pending_sha_change_refused: true, pending_committed_change_refused: true,
+    pending_to_none_refused: true, posted_without_receipt_refused: true, pending_to_posted_allowed: true,
+    second_update_after_posted_refused: true, posted_delete_refused: true, pending_delete_refused: true,
+    is_test_locked_after_commit: true, reveal_update_allowed: true,
+    // snapshot before any row: one market with two commits counts once (its final agree, not the earlier abstention);
+    // the test market's resolution, commit and final agree never count
+    view_reconciled_delta: 1, view_abstained_delta: 0, view_correct_delta: 1, view_committed_delta: 1, view_shadowed_delta: 1,
+    second_final_refused: true, anon_view_denied: true,
+  });
+  console.log("rolled back: nothing persisted from the P2a block");
 
   // concurrency probe (persists rows on a __selftest__ tenant; tenant soft-deleted after)
   const [t] = await sql<{ id: string }>("insert into tenants (display_name, credits_balance) values ('__selftest_concurrency__', 100) returning id");

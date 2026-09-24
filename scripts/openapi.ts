@@ -33,7 +33,8 @@ const doc = {
     "/v1/webhooks/{id}": { delete: { summary: "Deactivate an endpoint", security: sec, responses: { 200: r("deleted") } } },
     "/v1/webhooks/deliveries": { get: { summary: "Delivery log (pending | delivering | delivered | dlq)", security: sec, responses: { 200: r("deliveries[]") } } },
     "/v1/webhooks/deliveries/{id}/replay": { post: { summary: "Replay a delivered or dead-lettered event", security: sec, responses: { 200: r("replayed") } } },
-    "/v1/track-record": { get: { summary: "Public track record rendered from v_track_record (60 s cache)", responses: { 200: r("rows[] per platform and week") } } },
+    "/v1/track-record": { get: { summary: "Public track record rendered from v_track_record (60 s cache; test markets excluded; one agreement per market; cumulative percentages with a 95 % Wilson interval only after 100 reconciled markets per platform)", responses: { 200: r("rows[] per platform and week"), 503: r("UPSTREAM_UNAVAILABLE", E) } } },
+    "/v1/track-record/verify": { get: { summary: "Look up a commitment (public, no auth). Before the reveal: market, committed_at, posted, revealed=false (never the nonce). After the reveal: preimage, nonce, committed verdict, official outcome, agreement; sha256(preimage) = commitment_sha256", parameters: [{ name: "hash", in: "query", required: true, schema: { type: "string", pattern: "^[0-9a-fA-F]{64}$" } }], responses: { 200: r("commitment_sha256, market (platform:external_id), committed_at, posted, posted_at, message_id, revealed [+ preimage_version, preimage, nonce, committed, official, agreement, reveal_posted once revealed]"), 400: r("validation_error", E), 404: r("not_found", E), 503: r("UPSTREAM_UNAVAILABLE", E) } } },
     "/health": { get: { summary: "Liveness + one database read", responses: { 200: r("service status") } } },
   },
 };

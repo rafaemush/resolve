@@ -1,23 +1,82 @@
 import { Hono } from "hono";
+import { z } from "zod";
 import type { Env } from "../env";
 import { ok, err } from "./envelope";
 import { db } from "../db/supabase";
+import { CommittedVerdict, type Agreement, type OfficialRecord } from "../bot/commit";
 
 type Vars = { requestId: string; schemaVersion: string };
 export const pub = new Hono<{ Bindings: Env; Variables: Vars }>();
 
-/** Public track record, rendered from v_track_record only, cached 60 s through the Cache API. */
+/**
+ * Public track record, rendered from v_track_record only, cached 60 s through the Cache API. Percentages (cumulative per
+ * platform) are shown only once the view marks the row reportable (>= 100 reconciled markets on that platform).
+ */
 pub.get("/v1/track-record", async (c) => {
   const cacheKey = new Request(new URL("/v1/track-record", c.req.url).toString());
   const cached = await caches.default.match(cacheKey);
   if (cached) return cached;
   const { data, error } = await db(c.env).from("v_track_record").select("*").order("week", { ascending: false }).limit(52);
-  if (error) return err(c, "UPSTREAM_UNAVAILABLE", error.message, 503);
-  const rows = (data ?? []).map((r) => ({ ...r, coverage_accuracy: r.reportable ? r.coverage_accuracy : `n=${r.n_reconciled}, not yet reportable`, precision: r.reportable ? r.precision : `n=${r.n_reconciled}, not yet reportable`, abstention_rate: r.reportable ? r.abstention_rate : `n=${r.n_reconciled}, not yet reportable` }));
-  const res = ok(c, { note: "Every number here is a database row. Percentages appear only once 100 markets on a platform have been reconciled against the platform of record. Informational signal, not financial advice, not an oracle of record.", rows });
+  if (error) return err(c, "UPSTREAM_UNAVAILABLE", "track record store unavailable", 503);
+  const rows = (data ?? []).map((r) => {
+    const gate = `n=${r.n_reconciled_cumulative ?? r.n_reconciled}, not yet reportable`;
+    return { ...r, coverage_accuracy: r.reportable ? r.coverage_accuracy : gate, precision: r.reportable ? r.precision : gate, abstention_rate: r.reportable ? r.abstention_rate : gate, wilson_low: r.reportable ? r.wilson_low : gate, wilson_high: r.reportable ? r.wilson_high : gate };
+  });
+  const res = ok(c, { note: "Every number here is a database row; test markets are excluded and each market counts once, by its latest commit. Percentages are cumulative per platform and appear only once 100 markets on that platform have been reconciled against the platform of record; precision carries a 95 % Wilson interval. Any commitment can be checked at /v1/track-record/verify?hash=<sha256>. Informational signal, not financial advice, not an oracle of record.", rows });
   res.headers.set("Cache-Control", "public, max-age=60, s-maxage=60");
   c.executionCtx.waitUntil(caches.default.put(cacheKey, res.clone()));
   return res;
+});
+
+const VerifyQuery = z.object({ hash: z.string().regex(/^[0-9a-fA-F]{64}$/, "64 hex characters") });
+
+export interface VerifyCommit { id: string; commitment_sha256: string; nonce: string; created_at: string; channel: string; message_id: number | null; telegram_date: string | null; markets: { platform: string; external_id: string } | null }
+export interface VerifyReveal { channel: string; message_id: number | null; telegram_date: string | null; payload: Record<string, unknown> }
+
+/**
+ * Pure. Before a reveal row exists the answer proves only that the commitment was recorded (and when it was posted):
+ * the nonce, the preimage and the committed verdict are never returned, because with them anyone could learn the
+ * verdict before the platform resolves. After the reveal, everything needed to recompute sha256(preimage).
+ */
+export function shapeVerify(commit: VerifyCommit, reveal: VerifyReveal | null): Record<string, unknown> {
+  const base = {
+    commitment_sha256: commit.commitment_sha256,
+    market: commit.markets ? `${commit.markets.platform}:${commit.markets.external_id}` : null,
+    committed_at: commit.created_at,
+    posted: commit.channel === "telegram",
+    posted_at: commit.telegram_date,
+    message_id: commit.message_id,
+    revealed: reveal !== null,
+  };
+  if (!reveal) return base;
+  const committed = CommittedVerdict.safeParse(reveal.payload.committed);
+  const official = (reveal.payload.official ?? null) as OfficialRecord | null;
+  return {
+    ...base,
+    reveal_posted: reveal.channel === "telegram",
+    reveal_message_id: reveal.message_id,
+    preimage_version: committed.success ? committed.data.preimage_version : null,
+    preimage: committed.success ? committed.data.preimage : null,
+    nonce: commit.nonce,
+    committed: committed.success ? { resolution_status: committed.data.resolution_status, winning_outcome: committed.data.winning_outcome, confidence_score: committed.data.confidence_score, caveats: committed.data.caveats, canonical_sha256: committed.data.canonical_sha256, raw_sha256: committed.data.raw_sha256, thresholds_version: committed.data.thresholds_version, determination_basis: committed.data.determination_basis } : null,
+    official,
+    agreement: (reveal.payload.agreement ?? null) as Agreement | null,
+    how_to_verify: "sha256(preimage) must equal commitment_sha256; the preimage's last field is the nonce.",
+  };
+}
+
+/** Public commitment lookup for third parties: GET /v1/track-record/verify?hash=<commitment sha256>. */
+pub.get("/v1/track-record/verify", async (c) => {
+  const q = VerifyQuery.safeParse({ hash: c.req.query("hash") ?? "" });
+  if (!q.success) return err(c, "validation_error", "hash must be a commitment sha256: 64 hex characters", 400);
+  const client = db(c.env);
+  const { data: commit, error } = await client.from("bot_posts").select("id, commitment_sha256, nonce, created_at, channel, message_id, telegram_date, markets(platform, external_id)")
+    .eq("kind", "commit").eq("commitment_sha256", q.data.hash.toLowerCase()).order("created_at", { ascending: true }).limit(1).maybeSingle();
+  if (error) return err(c, "UPSTREAM_UNAVAILABLE", "track record store unavailable", 503);
+  if (!commit) return err(c, "not_found", "no commit with this commitment hash", 404);
+  const { data: reveal, error: re } = await client.from("bot_posts").select("channel, message_id, telegram_date, payload").eq("kind", "reveal").eq("dedup_key", `reveal:${commit.id}`).maybeSingle();
+  if (re) return err(c, "UPSTREAM_UNAVAILABLE", "track record store unavailable", 503);
+  return ok(c, shapeVerify(commit as unknown as VerifyCommit, (reveal as VerifyReveal | null) ?? null));
 });
 
 /** Echo receivers for webhook self-tests (public, no state). */
