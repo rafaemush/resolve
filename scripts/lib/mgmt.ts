@@ -11,7 +11,9 @@ export async function sql<T = Record<string, unknown>>(query: string, opts: { ti
     signal: AbortSignal.timeout(opts.timeoutMs ?? 120_000),
   });
   const text = await res.text();
-  if (!res.ok) throw new Error(`mgmt sql ${res.status}: ${text.slice(0, 2000)}`);
+  // Rollback-only selftests return their results inside the error they raise (scripts/lib/selftest.ts), and the larger
+  // blocks raise tens of kilobytes of JSON: a short cut would truncate it into unparsable text.
+  if (!res.ok) throw new Error(`mgmt sql ${res.status}: ${text.slice(0, 65_536)}`);
   try {
     const parsed = JSON.parse(text);
     return Array.isArray(parsed) ? (parsed as T[]) : [];
