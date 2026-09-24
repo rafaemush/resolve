@@ -15,6 +15,8 @@ export interface MarketRow extends MarketRegistration {
   reconcile_attempts?: number;
   official_first_seen_at?: string | null;
   meta?: Record<string, unknown>;
+  /** The event this market is one leg of (migration 017, src/markets/event-key.ts). Absent before 017. */
+  event_key?: string;
 }
 
 export interface CoverageWindow { from: string; to: string; status: "ok" | "gap" }

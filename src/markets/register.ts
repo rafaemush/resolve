@@ -4,6 +4,7 @@ import { MarketRegistration, type MarketRegistration as Reg } from "../resolve/s
 import { robotsAllows } from "../ingest/web";
 import { baseRpcUrl, getBlock, blockAtOrAfter, hasCode } from "../ingest/base";
 import type { MarketMeta } from "./meta";
+import { eventKey } from "./event-key";
 import { officialRefusal, officialRegistrationIssues, parseOfficialRef } from "../resolve/official";
 
 export interface RegisterResult {
@@ -96,6 +97,8 @@ export async function registerMarket(env: Env, cfg: Config, input: unknown, tena
     resolver: reg.resolver ?? null, negative_rule: reg.negative_rule, allow_prerelease: reg.allow_prerelease, open_at: reg.open_at, deadline_utc: reg.deadline_utc,
     grace_seconds: reg.grace_seconds, status, meta: { ...meta, registration_reasons: reasons },
     condition_id: meta.condition_id ?? null, is_test: opts.isTest ?? false,
+    // the legs of one ladder share it: counted once on the public record, posted as one message (migration 017)
+    event_key: eventKey({ platform: reg.platform, external_id: reg.external_id, resolver: reg.resolver ?? null, meta }),
   }).select("id, is_test").single();
   if (error || !m) throw new Error(`markets insert: ${error?.message ?? "no row"}`);
   const nearDeadline = Date.parse(reg.deadline_utc) - Date.now() < 24 * 3600 * 1000;

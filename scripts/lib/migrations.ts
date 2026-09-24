@@ -6,23 +6,59 @@
  * holds, so nothing is applied on top of it and the run exits 1 (plan §16.4 P0 step 5). A person resolves drift; the
  * runner never re-runs a file.
  * --dry-run reads and writes nothing: the ledger table is created only by --apply.
+ * --require-applied reads like --dry-run and exits 1 unless every file is applied and nothing drifts: the deploy gate
+ * (scripts/deploy.sh) runs it before wrangler, because the Worker it ships may read what a pending migration creates.
+ * It is the production gate (wrangler.toml deploys one Worker), so it names the project it reads and refuses a ledger
+ * that may not be production's (ledgerTargetRefusal); staging's pending list is --dry-run's.
  */
 import { createHash } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
-export type Mode = "--dry-run" | "--apply" | "--verify-live";
+export type Mode = "--dry-run" | "--apply" | "--verify-live" | "--require-applied";
 
 export class UsageError extends Error {}
-export const USAGE = "usage: npx tsx scripts/migrate.ts [--dry-run (default) | --apply | --verify-live]";
+export const USAGE = "usage: npx tsx scripts/migrate.ts [--dry-run (default) | --apply | --verify-live | --require-applied]";
+/** --require-applied could not look (no Management API credentials): not "all applied", and not a failure to report as one. */
+export const EXIT_CANNOT_CHECK = 3;
 
 /** Exactly one mode (none = --dry-run). Anything else stops, so a typo never becomes a different run. */
 export function parseMigrateArgs(argv: readonly string[]): Mode {
   if (argv.length === 0) return "--dry-run";
   if (argv.length > 1) throw new UsageError(`one mode at a time, got: ${argv.join(" ")}`);
   const m = argv[0];
-  if (m === "--dry-run" || m === "--apply" || m === "--verify-live") return m;
+  if (m === "--dry-run" || m === "--apply" || m === "--verify-live" || m === "--require-applied") return m;
   throw new UsageError(`unknown argument "${m}"`);
+}
+
+/** Where --require-applied reads the ledger: the effective SUPABASE_PROJECT_REF and what it could have come from. */
+export interface LedgerTarget {
+  ref: string;
+  /** SUPABASE_PROJECT_REF as the shell had it before .env was read (scripts/lib/env.ts never overrides it). */
+  shellRef: string | undefined;
+  /** SUPABASE_PROJECT_REF in .env. */
+  dotenvRef: string | undefined;
+  stagingRef: string | undefined;
+  /** The SUPABASE_URL the scripts use (https://<ref>.supabase.co), shell first, then .env. */
+  supabaseUrl: string | undefined;
+}
+
+/**
+ * Why this ledger cannot approve a production deploy, or null. A shell that still exports staging's ref after a staging
+ * session would otherwise make the gate pass on staging's ledger while production has migrations pending: refused when
+ * the ref is STAGING_SUPABASE_PROJECT_REF, when the shell's ref differs from .env's (the gate does not guess which one
+ * the Worker reads), or when SUPABASE_URL names another Supabase project.
+ */
+export function ledgerTargetRefusal(t: LedgerTarget): string | null {
+  if (t.stagingRef && t.ref === t.stagingRef) return `SUPABASE_PROJECT_REF ${t.ref} is STAGING_SUPABASE_PROJECT_REF: staging's ledger cannot approve a production deploy (unset SUPABASE_PROJECT_REF in this shell)`;
+  if (t.shellRef && t.dotenvRef && t.shellRef !== t.dotenvRef) return `the shell's SUPABASE_PROJECT_REF ${t.shellRef} differs from .env's ${t.dotenvRef}: the gate does not guess which database the Worker reads (unset it in this shell, or fix .env)`;
+  if (t.supabaseUrl) {
+    let host: string;
+    try { host = new URL(t.supabaseUrl).hostname; } catch { return "SUPABASE_URL is not a URL: the gate cannot tell which project the Worker reads"; }
+    const m = /^([a-z0-9]+)\.supabase\.co$/.exec(host);
+    if (m && m[1] !== t.ref) return `SUPABASE_URL names project ${m[1]} but SUPABASE_PROJECT_REF is ${t.ref}: the gate would read another database's ledger`;
+  }
+  return null;
 }
 
 export interface MigrationFile { name: string; body: string; sha256: string }
@@ -103,8 +139,11 @@ export async function readLedger(io: MigrateIo): Promise<Map<string, string>> {
   return ledger;
 }
 
-/** --dry-run or --apply; returns the exit code. Drift stops both before anything is applied. */
-export async function runMigrations(mode: "--dry-run" | "--apply", files: readonly MigrationFile[], io: MigrateIo): Promise<number> {
+/**
+ * --dry-run, --require-applied or --apply; returns the exit code. Drift stops all three before anything is applied;
+ * --require-applied also exits 1 while anything is pending. Only --apply writes.
+ */
+export async function runMigrations(mode: "--dry-run" | "--apply" | "--require-applied", files: readonly MigrationFile[], io: MigrateIo): Promise<number> {
   if (mode === "--apply") await io.sql(ENSURE_LEDGER);
   const ledger = await readLedger(io);
   if (!ledger.size) io.log("(ledger empty or absent: every file is pending)");
@@ -117,6 +156,11 @@ export async function runMigrations(mode: "--dry-run" | "--apply", files: readon
   }
   const pending = plan.flatMap((p) => (p.status === "pending" ? [p.file] : []));
   if (mode === "--dry-run") { io.log(`${pending.length} pending`); return 0; }
+  if (mode === "--require-applied") {
+    if (!pending.length) { io.log(`all ${files.length} migrations applied`); return 0; }
+    io.log(`${pending.length} pending: apply them (npx tsx scripts/migrate.ts --apply) before deploying a Worker that may read them`);
+    return 1;
+  }
   for (const f of pending) {
     const t0 = Date.now();
     try {

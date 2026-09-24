@@ -11,7 +11,8 @@ const h = vi.hoisted(() => ({ db: null as unknown as FakeDb, dm: { ok: true } as
 vi.mock("../src/db/supabase", () => ({ db: () => h.db.client }));
 vi.mock("../src/bot/telegram", () => ({ alertOperator: vi.fn(async () => h.dm) }));
 
-import { alert, alertMany } from "../src/ops/alerts";
+import { alert, alertMany, redactMeta } from "../src/ops/alerts";
+import { redact } from "../src/ops/redact";
 import { alertOperator } from "../src/bot/telegram";
 
 const env = {} as Env;
@@ -60,6 +61,36 @@ describe("alertMany", () => {
     await alert(env, "k", "failed with apikey_ABCDEFGH12345678 and https://base-mainnet.g.alchemy.com/v2/secretkey123");
     expect(h.db.tables.alerts![0]!.text).not.toMatch(/ABCDEFGH12345678|secretkey123/);
     expect(dms()[0]).not.toMatch(/ABCDEFGH12345678|secretkey123/);
+  });
+
+  it("meta is redacted before it is stored: an Alchemy URL and an rsl_live_ key inside it, at any depth", async () => {
+    h.db = fakeDb({ alerts: [] });
+    await alert(env, "k", "rpc failed", { meta: {
+      rpc: "https://base-mainnet.g.alchemy.com/v2/AbCdEf123456789secret",
+      nested: { keys: ["rsl_live_ABCDEFGH12345678xyz", "fine"], depth: { note: "Bearer abcdefghijklmnop" } },
+      authorization: "opaque-value-without-a-pattern",
+      block: 123, ok: true, none: null,
+    } });
+    const meta = h.db.tables.alerts![0]!.meta;
+    expect(JSON.stringify(meta)).not.toMatch(/AbCdEf123456789secret|ABCDEFGH12345678xyz|abcdefghijklmnop|opaque-value/);
+    expect(meta).toEqual({
+      rpc: "https://base-mainnet.g.alchemy.com/v2/[redacted]",
+      nested: { keys: ["rsl_live_[redacted]", "fine"], depth: { note: "Bearer [redacted]" } },
+      authorization: "[redacted]",
+      block: 123, ok: true, none: null,
+    });
+  });
+
+  it("redactMeta keeps the JSON valid where redacting the serialized text would not, and never throws", () => {
+    // Serialized, the value ends in an escaped backslash and an escaped quote; the key= pattern swallows the escapes and
+    // the text no longer parses. Walking the structure redacts the string itself.
+    const tricky = { url: 'https://x.example/?key=abc\\"', n: 1 };
+    expect(() => JSON.parse(redact(JSON.stringify(tricky)))).toThrow();
+    expect(redactMeta(tricky)).toEqual({ url: 'https://x.example/?key=[redacted]"', n: 1 });
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    expect(Object.keys(redactMeta(cyclic))).toEqual(["meta_unserializable"]);
+    expect(redactMeta(undefined)).toEqual({});
   });
 
   it("an unreadable alerts table (the outage itself) still dedups per isolate: one DM, not one per tick", async () => {

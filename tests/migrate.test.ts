@@ -6,7 +6,7 @@
 import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
-import { ENSURE_LEDGER, parseMigrateArgs, planMigrations, readMigrationFiles, runMigrations, UsageError, type MigrateIo, type MigrationFile } from "../scripts/lib/migrations";
+import { ENSURE_LEDGER, ledgerTargetRefusal, parseMigrateArgs, planMigrations, readMigrationFiles, runMigrations, UsageError, type MigrateIo, type MigrationFile } from "../scripts/lib/migrations";
 
 const file = (name: string, body: string): MigrationFile => ({ name, body, sha256: createHash("sha256").update(body).digest("hex") });
 const F1 = file("001_a.sql", "create table a ();"), F2 = file("002_b.sql", "create table b ();"), F3 = file("003_c.sql", "create table c ();");
@@ -94,10 +94,45 @@ describe("runMigrations", () => {
   });
 });
 
+describe("--require-applied (the deploy gate)", () => {
+  it("exit 0 only when every file is applied; pending exits 1; nothing is ever written", async () => {
+    const all = fakeDb(new Map([[F1.name, F1.sha256], [F2.name, F2.sha256]]));
+    expect(await runMigrations("--require-applied", [F1, F2], all.io)).toBe(0);
+    expect(all.lines.at(-1)).toBe("all 2 migrations applied");
+    const pending = fakeDb(new Map([[F1.name, F1.sha256]]));
+    expect(await runMigrations("--require-applied", [F1, F2, F3], pending.io)).toBe(1);
+    expect(pending.lines.at(-1)).toContain("2 pending");
+    const none = fakeDb(null);
+    expect(await runMigrations("--require-applied", [F1], none.io)).toBe(1);
+    for (const db of [all, pending, none]) expect(db.writes()).toEqual([]);
+  });
+  it("drift and a ledger row without its file exit 1", async () => {
+    expect(await runMigrations("--require-applied", [F1], fakeDb(new Map([[F1.name, "0".repeat(64)]])).io)).toBe(1);
+    expect(await runMigrations("--require-applied", [F1], fakeDb(new Map([[F1.name, F1.sha256], ["000_gone.sql", "f".repeat(64)]])).io)).toBe(1);
+  });
+});
+
+describe("ledgerTargetRefusal (--require-applied reads production's ledger or refuses)", () => {
+  const prod = { ref: "prodref", shellRef: undefined, dotenvRef: "prodref", stagingRef: "stagref", supabaseUrl: "https://prodref.supabase.co" };
+  it("production's ref from .env, SUPABASE_URL agreeing: allowed", () => {
+    expect(ledgerTargetRefusal(prod)).toBeNull();
+    expect(ledgerTargetRefusal({ ...prod, shellRef: "prodref", dotenvRef: undefined, supabaseUrl: undefined })).toBeNull(); // CI: no .env
+    expect(ledgerTargetRefusal({ ...prod, supabaseUrl: "https://db.resolve.example" })).toBeNull(); // not a supabase.co host: nothing to compare
+  });
+  it("a staging session left exported can never approve a production deploy", () => {
+    expect(ledgerTargetRefusal({ ...prod, ref: "stagref", shellRef: "stagref" })).toContain("STAGING_SUPABASE_PROJECT_REF");
+    // without STAGING_SUPABASE_PROJECT_REF set: the shell overriding .env is refused, not guessed
+    expect(ledgerTargetRefusal({ ...prod, ref: "stagref", shellRef: "stagref", stagingRef: undefined })).toContain("differs from .env's prodref");
+    // SUPABASE_URL (the database the scripts, and by convention the Worker, use) naming another project
+    expect(ledgerTargetRefusal({ ...prod, ref: "otherref", shellRef: undefined, dotenvRef: "otherref", stagingRef: undefined, supabaseUrl: "https://prodref.supabase.co" })).toContain("SUPABASE_URL names project prodref");
+    expect(ledgerTargetRefusal({ ...prod, supabaseUrl: "not a url" })).toContain("not a URL");
+  });
+});
+
 describe("parseMigrateArgs", () => {
   it("one mode, dry run by default; anything else stops", () => {
     expect(parseMigrateArgs([])).toBe("--dry-run");
-    for (const m of ["--dry-run", "--apply", "--verify-live"] as const) expect(parseMigrateArgs([m])).toBe(m);
+    for (const m of ["--dry-run", "--apply", "--verify-live", "--require-applied"] as const) expect(parseMigrateArgs([m])).toBe(m);
     for (const argv of [["--aply"], ["--apply", "--dry-run"], ["apply"], ["--apply=1"]]) expect(() => parseMigrateArgs(argv), argv.join(" ")).toThrow(UsageError);
   });
 });

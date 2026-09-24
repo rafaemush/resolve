@@ -16,6 +16,30 @@ const TEXT_MAX = 3500;
 /** Telegram caps a message at 4096 characters; alerts that share one DM split this between them. */
 const DM_MAX = 4000;
 
+/** A meta key whose value is a credential whatever it looks like. */
+const SECRET_KEY = /^(authorization|api[-_]?key|access[-_]?token|refresh[-_]?token|token|secret|client[-_]?secret|password|private[-_]?key|service[-_]?role[-_]?key)$/i;
+
+/**
+ * Alert meta as stored: JSON-normalized (what the insert would serialize), every string, keys included, through
+ * redact(), and the value of a key that names a credential replaced whole. It walks the structure instead of redacting
+ * the serialized text: a pattern that swallows an escape character there leaves JSON that no longer parses, and an
+ * alert must never throw. Unserializable meta (a cycle, a BigInt) is stored as the reason it could not be.
+ */
+export function redactMeta(meta: Record<string, unknown> | undefined): Record<string, unknown> {
+  let plain: unknown;
+  try { plain = JSON.parse(JSON.stringify(meta ?? {})); } catch (e) { return { meta_unserializable: redact(String(e)).slice(0, 200) }; }
+  const walk = (v: unknown): unknown => {
+    if (typeof v === "string") return redact(v);
+    if (Array.isArray(v)) return v.map(walk);
+    if (v && typeof v === "object") {
+      return Object.fromEntries(Object.entries(v).map(([k, x]) => [redact(k), SECRET_KEY.test(k) && x !== null && x !== "" ? "[redacted]" : walk(x)]));
+    }
+    return v;
+  };
+  const out = walk(plain);
+  return out && typeof out === "object" && !Array.isArray(out) ? (out as Record<string, unknown>) : {};
+}
+
 const log = (job: string, key: string, e: unknown) => console.error(JSON.stringify({ level: "error", job, key, error: redact(String(e)).slice(0, 300) }));
 
 /**
@@ -68,7 +92,7 @@ export async function alertMany(env: Env, items: AlertItem[]): Promise<AlertMany
   }
   if (fresh.length && client) {
     try {
-      const { error } = await client.from("alerts").insert(fresh.map((i) => ({ key: i.key, text: body(i), meta: i.meta ?? {} })));
+      const { error } = await client.from("alerts").insert(fresh.map((i) => ({ key: i.key, text: body(i), meta: redactMeta(i.meta) })));
       if (error) log("alert", fresh[0]!.key, error.message);
     } catch (e) {
       log("alert", fresh[0]!.key, e);

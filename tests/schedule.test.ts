@@ -18,7 +18,8 @@ const h = vi.hoisted(() => {
   });
   return { state, job };
 });
-vi.mock("../src/jobs/tick", () => ({ LIVENESS_CRON: "* * * * *", runTick: h.job("liveness", { inserted: true, alerts: [] }) }));
+vi.mock("../src/jobs/tick", () => ({ LIVENESS_CRON: "* * * * *", TICK_SUBREQUESTS: 7, runTick: h.job("liveness", { inserted: true, alerts: [] }) }));
+vi.mock("../src/bot/post", () => ({ postPending: h.job("channel_post", { errors: [], send_errors: [], messages: 0 }) }));
 vi.mock("../src/jobs/dispatch", () => ({ checkDispatchFailures: h.job("dispatch_check", { ok: true }) }));
 vi.mock("../src/jobs/reconcile", () => ({ runReconcile: h.job("reconcile", { errors: [], unreachable: 0 }) }));
 vi.mock("../src/jobs/deposits", async (actual) => ({ ...(await actual<typeof import("../src/jobs/deposits")>()), scanDeposits: h.job("deposit_scan", { scanned: true }) }));
@@ -27,7 +28,8 @@ vi.mock("../src/webhooks/deliver", async (actual) => ({ ...(await actual<typeof 
 vi.mock("../src/env", () => ({ parseConfig: () => ({}) }));
 vi.mock("../src/ops/alerts", () => ({ alert: vi.fn(async () => ({ sent: true, deduped: false })), alertMany: vi.fn(async () => ({ sent: [], deduped: [] })) }));
 
-import { CRONS, DEPOSIT_SCAN_SUBREQUESTS, jobsForCron, jobExceptionKey, runScheduled, type JobName } from "../src/jobs/schedule";
+import { CHANNEL_POST_LIMITS, CHANNEL_POST_SUBREQUESTS, CRONS, DEPOSIT_SCAN_SUBREQUESTS, jobsForCron, jobExceptionKey, runScheduled, type JobName } from "../src/jobs/schedule";
+import { postPending } from "../src/bot/post";
 import { alert } from "../src/ops/alerts";
 import { drainWebhooks, drainSubrequests, DRAIN_MAX } from "../src/webhooks/deliver";
 import { scanDeposits, SCAN_RESERVE } from "../src/jobs/deposits";
@@ -37,8 +39,8 @@ const env = {} as Env;
 const alerts = () => vi.mocked(alert).mock.calls.map((c) => [c[1], c[3]?.dedupMinutes]);
 
 describe("jobsForCron", () => {
-  it("the every-minute tick only writes liveness; drain + deposits every 5 min; dispatch check + reconcile every 10", () => {
-    expect(jobsForCron("* * * * *")).toEqual(["liveness"]);
+  it("every minute: liveness, then the channel poster; drain + deposits every 5 min; dispatch check + reconcile every 10", () => {
+    expect(jobsForCron("* * * * *")).toEqual(["liveness", "channel_post"]);
     expect(jobsForCron("*/5 * * * *")).toEqual(["webhook_drain", "deposit_scan"]);
     expect(jobsForCron("*/10 * * * *")).toEqual(["dispatch_check", "reconcile"]);
   });
@@ -49,7 +51,7 @@ describe("jobsForCron", () => {
   it("every job runs on exactly one cron", () => {
     const all = Object.values(CRONS).flatMap((c) => jobsForCron(c));
     expect(new Set(all).size).toBe(all.length);
-    expect(new Set(all)).toEqual(new Set<JobName>(["liveness", "webhook_drain", "deposit_scan", "dispatch_check", "reconcile"]));
+    expect(new Set(all)).toEqual(new Set<JobName>(["liveness", "channel_post", "webhook_drain", "deposit_scan", "dispatch_check", "reconcile"]));
   });
   it("wrangler.toml [triggers] lists exactly the routed crons", () => {
     const toml = readFileSync(resolve(import.meta.dirname, "../wrangler.toml"), "utf8");
@@ -81,6 +83,13 @@ describe("per-invocation subrequest budgets (Workers Free: 50)", async () => {
     // The scan's reserve, its cursor read and one window's minimum (safe header, eth_getLogs, cursor write) fit.
     expect(DEPOSIT_SCAN_SUBREQUESTS).toBeGreaterThanOrEqual(SCAN_RESERVE + COST.db + 2 * COST.http + COST.db);
   });
+  it("every-minute invocation: the tick (read, insert, one alertMany) + the channel poster's budget + one exception alert = 50", async () => {
+    const { TICK_SUBREQUESTS } = await vi.importActual<typeof import("../src/jobs/tick")>("../src/jobs/tick");
+    expect(TICK_SUBREQUESTS).toBe(2 * COST.db + COST.alert);
+    expect(TICK_SUBREQUESTS + CHANNEL_POST_SUBREQUESTS + EXCEPTION_RESERVE).toBe(INVOCATION_SUBREQUESTS);
+    // the poster's claim + release, the three reads and one message with its alert fit
+    expect(CHANNEL_POST_SUBREQUESTS).toBeGreaterThanOrEqual(2 * COST.db + 3 * COST.db + COST.telegram + COST.db + COST.alert);
+  });
   it("the manual drain (POST /internal/webhooks/drain, max 10) fits one invocation", () => {
     expect(drainSubrequests(10)).toBeLessThanOrEqual(INVOCATION_SUBREQUESTS);
   });
@@ -99,6 +108,15 @@ describe("runScheduled", () => {
     expect(scanBudget).toBeInstanceOf(Budget);
     expect(scanBudget.limit).toBe(DEPOSIT_SCAN_SUBREQUESTS);
     expect(alerts()).toEqual([]);
+  });
+
+  it("the every-minute invocation runs the tick, then the channel poster on its own budget (at most 4 events)", async () => {
+    const r = await runScheduled(env, "* * * * *");
+    expect(h.state.ran).toEqual(["liveness", "channel_post"]);
+    expect(r.jobs.map((j) => [j.job, j.ok])).toEqual([["liveness", true], ["channel_post", true]]);
+    const [, budget, limits] = vi.mocked(postPending).mock.calls.at(-1)! as unknown as [unknown, Budget, typeof CHANNEL_POST_LIMITS];
+    expect(budget.limit).toBe(CHANNEL_POST_SUBREQUESTS);
+    expect(limits).toEqual({ commitEvents: 4, revealGroups: 4 });
   });
 
   it("a job that throws becomes a redacted alert and the next job still runs", async () => {

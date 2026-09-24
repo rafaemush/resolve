@@ -22,8 +22,9 @@ type Row = Record<string, unknown>;
  * of them fails (the first failure stops it). Reconcile reserves this with each settle; the inline half
  * (inlineSubrequests(INLINE_MAX) = 1 + 2 x 4 + 5 = 14) runs on its own budget, or on what a reconcile run has left.
  * On the watch path the two halves add at most 3 + 14 = 17 to a run that, by count of src/ingest/watch.ts,
- * src/resolve/runtime.ts and src/bot/commit.ts, makes at most 24 subrequests on a web + Jev path before its alerts
- * (each alert 5 more); a run that still hits Workers Free's 50 leaves its claimed rows 'delivering', and the drain's
+ * src/resolve/runtime.ts and src/bot/commit.ts, makes at most 26 subrequests on a web + Jev path before its alerts
+ * (each alert 5 more; since migration 017 the commit takes 8: commit_context, insert, lease claim, send 3, receipt,
+ * release, and 2 more after a dedup collision); a run that still hits Workers Free's 50 leaves its claimed rows 'delivering', and the drain's
  * stale sweep requeues them.
  */
 export const QUEUE_SUBREQUESTS = 3 * COST.db + COST.alert;

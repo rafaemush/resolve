@@ -3,7 +3,7 @@
   "info": {
     "title": "Resolve API",
     "version": "1.0.0-beta",
-    "description": "Automated resolution infrastructure for long-tail prediction markets. Verdicts are contract-validated; UNRESOLVED always carries a caveat; a non-observation is never a negative verdict. Percentages in the track record appear only after 100 reconciled markets per platform."
+    "description": "Automated resolution infrastructure for long-tail prediction markets. Verdicts are contract-validated; UNRESOLVED always carries a caveat; a non-observation is never a negative verdict. Percentages in the track record appear only after 100 reconciled events per platform (the legs of one multi-outcome event count once)."
   },
   "servers": [
     {
@@ -1664,10 +1664,10 @@
     },
     "/v1/track-record": {
       "get": {
-        "summary": "Public track record rendered from v_track_record (60 s cache; test markets excluded; one agreement per market; cumulative percentages with a 95 % Wilson interval only after 100 reconciled markets per platform)",
+        "summary": "Public track record rendered from v_track_record (60 s cache; test markets excluded; one agreement per market; the legs of one multi-outcome event are one event: n_events_* columns, event_precision; cumulative percentages with 95 % Wilson intervals only after 100 reconciled events per platform)",
         "responses": {
           "200": {
-            "description": "rows[] per platform and week",
+            "description": "rows[] per platform and week; before 100 reconciled events each percentage column holds the gate text",
             "content": {
               "application/json": {
                 "schema": {
@@ -1705,7 +1705,7 @@
         ],
         "responses": {
           "200": {
-            "description": "commitment_sha256, market (platform:external_id), committed_at, posted, posted_at, message_id, revealed [+ preimage_version, preimage, nonce, committed, official, agreement, reveal_posted once revealed]",
+            "description": "commitment_sha256, market (platform:external_id), committed_at, posted, posted_at, message_id (the legs of one event share their commit message), revealed [+ preimage_version, preimage, nonce, committed, official, agreement, reveal_posted once revealed]",
             "content": {
               "application/json": {
                 "schema": {
