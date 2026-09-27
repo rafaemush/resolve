@@ -57,9 +57,17 @@ export interface Budget {
 }
 /**
  * One HTTP exchange of officialGet as the admin probe reports it (POST /internal/official/probe): status null when
- * fetch threw; bytes only for a body that was read (a 200), null for a discarded one.
+ * fetch threw; bytes only for a body that was read (a 200), null for a discarded one. content_length: the
+ * Content-Length header of a discarded body (a 3xx or non-200), when it sent one, so a several-KB challenge page can be
+ * told from a short "Access Denied" without reading it.
  */
-export interface FetchTrace { url: string; status: number | null; content_type: string | null; server: string | null; bytes: number | null; ms: number; location?: string; error?: string }
+export interface FetchTrace { url: string; status: number | null; content_type: string | null; server: string | null; bytes: number | null; ms: number; content_length?: number; location?: string; error?: string }
+/** The Content-Length header as a whole number of bytes, else undefined (absent or unreadable). */
+export function contentLength(h: Headers): number | undefined {
+  const v = h.get("content-length")?.trim();
+  if (!v || !/^\d{1,15}$/.test(v)) return undefined;
+  return Number(v);
+}
 export function budget(now: () => number, ms: number, requests: number, deadlineMs?: number): Budget {
   return { deadlineMs: deadlineMs ?? now() + ms, requests, used: 0, now, timeouts: [] };
 }
@@ -76,10 +84,16 @@ export async function officialGet(series: OfficialSeriesId, url: string, b: Budg
   let current = url;
   let res: Response;
   let t0 = 0;
-  const trace = (r: Response | null, extra: { bytes?: number; location?: string; error?: string } = {}) => b.trace?.({
-    url: current, status: r?.status ?? null, content_type: r?.headers.get("content-type") ?? null, server: r?.headers.get("server") ?? null,
-    bytes: extra.bytes ?? null, ms: Date.now() - t0, ...(extra.location !== undefined ? { location: extra.location } : {}), ...(extra.error !== undefined ? { error: extra.error } : {}),
-  });
+  // discarded: the body was dropped unread (a 3xx or non-200), so its Content-Length is the only size there is
+  const trace = (r: Response | null, extra: { bytes?: number; discarded?: boolean; location?: string; error?: string } = {}) => {
+    if (!b.trace) return;
+    const cl = r && extra.discarded ? contentLength(r.headers) : undefined;
+    b.trace({
+      url: current, status: r?.status ?? null, content_type: r?.headers.get("content-type") ?? null, server: r?.headers.get("server") ?? null,
+      bytes: extra.bytes ?? null, ms: Date.now() - t0, ...(cl !== undefined ? { content_length: cl } : {}),
+      ...(extra.location !== undefined ? { location: extra.location } : {}), ...(extra.error !== undefined ? { error: extra.error } : {}),
+    });
+  };
   for (let hop = 0; ; hop++) {
     if (!hostAllowed(series, current)) return { ok: false, error: `refused: ${current} is not an https URL on the ${series} host allowlist`, retryable: false };
     if (b.requests <= 0) return { ok: false, error: "request budget exhausted", retryable: false };
@@ -94,7 +108,7 @@ export async function officialGet(series: OfficialSeriesId, url: string, b: Budg
     if (res.status < 300 || res.status > 399) break;
     const location = res.headers.get("location");
     await discardBody(res);
-    trace(res, location ? { location } : {});
+    trace(res, location ? { discarded: true, location } : { discarded: true });
     const moved = { httpStatus: res.status };
     if (!location) return { ok: false, error: `HTTP ${res.status} from ${current} without a Location`, retryable: false, ...moved };
     let next: string;
@@ -107,7 +121,7 @@ export async function officialGet(series: OfficialSeriesId, url: string, b: Budg
   const answered = { httpStatus: res.status, ...(deferSeconds !== undefined ? { deferSeconds } : {}) };
   if (res.status !== 200) {
     await discardBody(res);
-    trace(res);
+    trace(res, { discarded: true });
     // 404 and 5xx right at a release are "not there yet" (a CDN edge behind the feed); 403/429 mean back off.
     return { ok: false, error: `HTTP ${res.status} from ${current}`, retryable: res.status === 404 || res.status >= 500, ...answered };
   }

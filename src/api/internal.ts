@@ -21,7 +21,7 @@ import { alert } from "../ops/alerts";
 import { Budget, INVOCATION_SUBREQUESTS } from "../ops/budget";
 import { OfficialSeries } from "../resolve/schema";
 import { CorroborationStatus, OFFICIAL_SERIES, hostAllowed, type OfficialCorroboration } from "../resolve/official";
-import { PROBE_GROUPS, PROBE_MAX_SUBREQUESTS, plannedRequests, probePlan, runOfficialProbe } from "../ingest/official-probe";
+import { PROBE_GROUPS, probePlan, probeRefusal, runOfficialProbe } from "../ingest/official-probe";
 import { MatchBody, MatchRow, matchRefusal } from "../billing/match";
 import { paymentCreditedPayload } from "../billing/events";
 import { formatUsdc, parseUsdc } from "../billing/tiers";
@@ -218,18 +218,20 @@ const ProbeBody = z.strictObject({
   group: z.enum(PROBE_GROUPS).optional(),
   series: z.array(OfficialSeries).min(1).max(Object.keys(OFFICIAL_SERIES).length).optional(),
   corroboration: z.boolean().optional(),
-}).refine((b) => !(b.group && b.series), "give group or series, not both");
+}).refine((b) => !(b.group && b.series), "give group or series, not both")
+  .refine((b) => b.group !== undefined || b.series !== undefined, `give group (${PROBE_GROUPS.join(" | ")}) or series: one group per call stays under the 10 ms CPU limit`);
 
 /**
  * Which official sources (and election hosts) answer THIS Worker (src/ingest/official-probe.ts; runbook
  * docs/runbooks/official-probe.md). For each series the rail's own requests for the latest published period, through
  * officialGet (allowlist, ResolveBot UA, timeouts), the rail's parser on the answer, and the corroboration fetch; per
- * request: host, path (no query), status, bytes, content-type, server, ms, redirects, and what the parser read.
- * No database, no alert, no R2: the answer is the only output. Body (all optional, JSON): group "bls" |
- * "central_banks" | "elections", or series [ids] (not both), and corroboration false to skip the corroborating
- * requests (BLS API v1 allows 25 key-less queries a day: the bls group spends 7). An empty body probes everything
- * (26 requests before redirects); every call is capped at PROBE_MAX_SUBREQUESTS (40) subrequests, redirect hops
- * included, and a plan above the cap is refused (pass group or series). Per group is lighter on the 10 ms CPU limit.
+ * request: host, path (no query), status, bytes (or the Content-Length of a dropped body), content-type, server, ms,
+ * redirects, and what the parser read. Error and detail texts show a URL as host + path, never its query.
+ * No database, no alert, no R2: the answer is the only output. Body (JSON): group "bls" | "central_banks" |
+ * "elections", or series [ids]; exactly one of the two is required (an empty body is refused: all groups in one call
+ * are over the 10 ms CPU limit). corroboration false skips the corroborating requests (BLS API v1 allows 25 key-less
+ * queries a day: the bls group spends 7, and none on the ET day of a scheduled BLS release). Every call is capped at
+ * PROBE_MAX_SUBREQUESTS (40) subrequests, redirect hops included; a plan that could need more is refused.
  */
 internal.post("/official/probe", async (c) => {
   if (!isAdmin(c)) return err(c, "forbidden", "admin key required", 403);
@@ -239,8 +241,8 @@ internal.post("/official/probe", async (c) => {
   const parsed = ProbeBody.safeParse(json);
   if (!parsed.success) return err(c, "validation_error", parsed.error.issues.map((i) => `${i.path.join(".") || "body"}: ${i.message}`).join("; ").slice(0, 400), 400, { extra: { groups: PROBE_GROUPS } });
   const plan = probePlan(parsed.data);
-  const planned = plannedRequests(plan);
-  if (planned > PROBE_MAX_SUBREQUESTS) return err(c, "validation_error", `this probe needs ${planned} requests before redirects (cap ${PROBE_MAX_SUBREQUESTS}): pass group (${PROBE_GROUPS.join(" | ")}) or series`, 400, { extra: { groups: PROBE_GROUPS } });
+  const refused = probeRefusal(plan);
+  if (refused) return err(c, "validation_error", refused, 400, { extra: { groups: PROBE_GROUPS } });
   const report = await runOfficialProbe(plan);
   const colo = (c.req.raw as Request & { cf?: { colo?: string } }).cf?.colo ?? null;
   console.log(JSON.stringify({ job: "official_probe", colo, groups: plan.groups, used: report.subrequests.used, hosts: Object.fromEntries(Object.entries(report.hosts).map(([h, s]) => [h, s.statuses])) }));

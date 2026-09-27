@@ -14,11 +14,14 @@
  *
  * No database, no R2, no alert, no Telegram: the report is the only output. One failure never stops the others.
  * Subrequests: at most PROBE_MAX_SUBREQUESTS per call (redirect hops count), shared by every request of the call.
+ * Every error and detail string in the report goes through clean(): a URL in it (the rail's own, or a redirect target
+ * the upstream chose) is shown as host + path with its query as "?…", then redact() strips anything credential-shaped.
+ * On the ET day of a scheduled BLS release (KNOWN_RELEASES) the BLS API v1 is not requested at all (blsApiHoldOn).
  */
-import { OFFICIAL_SERIES, type CorroborationStatus, type OfficialSeriesId } from "../resolve/official";
+import { KNOWN_RELEASES, OFFICIAL_SERIES, type CorroborationStatus, type OfficialSeriesId } from "../resolve/official";
 import type { z } from "zod";
 import {
-  officialGet, fetchCorroboration, parseBlsSeries, budget, blsApiUrl, BLS_API, URLS, OFFICIAL_UA, MAX_REDIRECTS,
+  officialGet, fetchCorroboration, parseBlsSeries, budget, blsApiUrl, contentLength, BLS_API, URLS, OFFICIAL_UA, MAX_REDIRECTS,
   type Budget, type FetchTrace, type FetchedObservation,
 } from "./official";
 import {
@@ -26,6 +29,7 @@ import {
   parseBcbHistory, latestOrdinaryCopomMeeting, parseBlsApi, parseEcbDfrCsv, parseEcosRows, monthNumber, type DocObservation, type DocParse,
 } from "./official-parse";
 import { discardBody } from "./http";
+import { redact } from "../ops/redact";
 
 export const PROBE_GROUPS = ["bls", "central_banks", "elections"] as const;
 export type ProbeGroup = (typeof PROBE_GROUPS)[number];
@@ -61,7 +65,8 @@ export function seriesOfGroup(g: ProbeGroup): OfficialSeriesId[] {
 
 // ---- report shape -------------------------------------------------------------------------------------------------
 
-export interface ProbeHop { host: string; path: string; status: number | null; content_type: string | null; server: string | null; bytes: number | null; ms: number; location?: string; error?: string }
+/** bytes: a body that was read; content_length: the header of one that was dropped unread (a 3xx or non-200), when sent. */
+export interface ProbeHop { host: string; path: string; status: number | null; content_type: string | null; server: string | null; bytes: number | null; content_length?: number; ms: number; location?: string; error?: string }
 /** What the rail's parser read from one response: ok = it extracted a value (or, for a feed, found the document). */
 export interface Readout { series: OfficialSeriesId; ok: boolean; period: string | null; value_text: string | null; detail: string | null }
 export interface ProbeRequest {
@@ -74,6 +79,8 @@ export interface ProbeRequest {
   /** From the last exchange (after redirects); ms is the sum over all of them. */
   status: number | null;
   bytes: number | null;
+  /** The last exchange's Content-Length header when its body was dropped unread (a challenge page is several KB). */
+  content_length: number | null;
   content_type: string | null;
   server: string | null;
   ms: number | null;
@@ -95,6 +102,8 @@ export interface ProbeReport {
   groups: ProbeGroup[];
   series: OfficialSeriesId[];
   corroboration: boolean;
+  /** Why the BLS API v1 was not requested (a BLS release day, ET), or null. */
+  bls_api_hold: string | null;
   user_agent: string;
   subrequests: { cap: number; planned: number; used: number };
   duration_ms: number;
@@ -103,18 +112,53 @@ export interface ProbeReport {
   requests: ProbeRequest[];
 }
 
-export interface ProbePlan { groups: ProbeGroup[]; series: OfficialSeriesId[]; elections: boolean; corroboration: boolean }
+/** blsApiHold: why the BLS API v1 is not requested by this plan (blsApiHoldOn), or null. */
+export interface ProbePlan { groups: ProbeGroup[]; series: OfficialSeriesId[]; elections: boolean; corroboration: boolean; blsApiHold: string | null }
 
-/** body.series, else body.group, else everything. The series keep the registry's order. */
-export function probePlan(body: { group?: ProbeGroup; series?: OfficialSeriesId[]; corroboration?: boolean }): ProbePlan {
+/**
+ * body.series, else body.group, else everything. The series keep the registry's order. The route refuses a body with
+ * neither (one group per call stays under the Workers Free CPU limit); the full plan is what the subrequest cap is
+ * sized for. nowMs decides the BLS release-day hold.
+ */
+export function probePlan(body: { group?: ProbeGroup; series?: OfficialSeriesId[]; corroboration?: boolean }, nowMs: number = Date.now()): ProbePlan {
   const corroboration = body.corroboration ?? true;
+  const blsApiHold = blsApiHoldOn(nowMs);
   if (body.series?.length) {
     const want = new Set(body.series);
     const series = ALL_SERIES.filter((s) => want.has(s));
-    return { groups: [...new Set(series.map((s) => (isBls(s) ? "bls" : "central_banks") as ProbeGroup))], series, elections: false, corroboration };
+    return { groups: [...new Set(series.map((s) => (isBls(s) ? "bls" : "central_banks") as ProbeGroup))], series, elections: false, corroboration, blsApiHold };
   }
   const groups: ProbeGroup[] = body.group ? [body.group] : [...PROBE_GROUPS];
-  return { groups, series: groups.flatMap(seriesOfGroup), elections: groups.includes("elections"), corroboration };
+  return { groups, series: groups.flatMap(seriesOfGroup), elections: groups.includes("elections"), corroboration, blsApiHold };
+}
+
+/** The America/New_York calendar day (YYYY-MM-DD) of an instant: BLS schedules its releases at 08:30 ET. */
+export function etDay(ms: number): string {
+  const parts = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(ms);
+  const get = (t: string) => parts.find((p) => p.type === t)?.value ?? "";
+  return `${get("year")}-${get("month")}-${get("day")}`;
+}
+
+/**
+ * Why the probe must not request the BLS API v1 at nowMs, or null. Without a key it allows 25 queries a day, possibly
+ * per shared Cloudflare egress IP, and on the ET day of a scheduled BLS release (any BLS series in KNOWN_RELEASES:
+ * the quota is shared by all of them) those queries are the rail's corroboration: the probe leaves them alone.
+ */
+export function blsApiHoldOn(nowMs: number): string | null {
+  const today = etDay(nowMs);
+  const due = Object.entries(KNOWN_RELEASES).filter(([key, r]) => {
+    const s = key.split(":")[0] as OfficialSeriesId;
+    return s in OFFICIAL_SERIES && isBls(s) && etDay(Date.parse(r.release_at)) === today;
+  });
+  if (!due.length) return null;
+  const at = [...new Set(due.map(([, r]) => r.release_at))].join(", ");
+  return `BLS release day ${today} (ET): ${due.map(([k]) => k).join(", ")} scheduled ${at}; the BLS API v1's 25 key-less queries a day are left to the rail, so it was not requested`;
+}
+
+/** Why the route refuses the plan (more requests than the cap before redirects), or null. cap exists for tests. */
+export function probeRefusal(plan: ProbePlan, cap: number = PROBE_MAX_SUBREQUESTS): string | null {
+  const planned = plannedRequests(plan);
+  return planned > cap ? `this probe needs up to ${planned} requests before redirects (cap ${cap}): narrow it with group (${PROBE_GROUPS.join(" | ")}) or fewer series` : null;
 }
 
 // ---- units ----------------------------------------------------------------------------------------------------------
@@ -123,10 +167,17 @@ interface UnitOut { requests: ProbeRequest[]; results: SeriesProbe[] }
 interface Unit { cost: number; series: OfficialSeriesId[]; run: (b: Budget) => Promise<UnitOut> }
 type Got = Awaited<ReturnType<typeof officialGet>>;
 
-const TWO_REQUEST_PRIMARIES: ReadonlySet<OfficialSeriesId> = new Set(["fomc_upper_bound", "ecb_dfr"]);
+/**
+ * Primary requests of the central banks that need more than one: the FOMC feed then the statement; the ECB index, the
+ * previous year's index when the current one names no decision yet (1 January to the first meeting), then the release.
+ */
+const PRIMARY_REQUESTS: Partial<Record<OfficialSeriesId, number>> = { fomc_upper_bound: 2, ecb_dfr: 3 };
 const corroborates = (s: OfficialSeriesId) => OFFICIAL_SERIES[s].corroboration === "when_available";
 
-/** The probe units of a plan with their request cost before redirects: one per BLS document, per other series, per election URL. */
+/**
+ * The probe units of a plan with the most requests each can make before redirects: one per BLS document, per other
+ * series, per election URL, plus the corroborations (none from the BLS API on a BLS release day).
+ */
 export function probeUnits(plan: ProbePlan): Unit[] {
   const units: Unit[] = [];
   const docs = new Map<string, OfficialSeriesId[]>();
@@ -135,10 +186,10 @@ export function probeUnits(plan: ProbePlan): Unit[] {
     docs.set(url, [...(docs.get(url) ?? []), s]);
   }
   for (const [url, list] of docs) {
-    units.push({ cost: 1 + (plan.corroboration ? list.filter(corroborates).length : 0), series: list, run: (b) => blsDocUnit(b, url, list, plan.corroboration) });
+    units.push({ cost: 1 + (plan.corroboration && !plan.blsApiHold ? list.filter(corroborates).length : 0), series: list, run: (b) => blsDocUnit(b, url, list, plan) });
   }
   for (const s of plan.series.filter((x) => !isBls(x))) {
-    units.push({ cost: (TWO_REQUEST_PRIMARIES.has(s) ? 2 : 1) + (plan.corroboration && corroborates(s) ? 1 : 0), series: [s], run: (b) => centralBankUnit(b, s, plan.corroboration) });
+    units.push({ cost: (PRIMARY_REQUESTS[s] ?? 1) + (plan.corroboration && corroborates(s) ? 1 : 0), series: [s], run: (b) => centralBankUnit(b, s, plan) });
   }
   if (plan.elections) for (const p of ELECTION_PROBES) units.push({ cost: 1, series: [], run: async (b) => ({ requests: [await electionGet(b, p)], results: [] }) });
   return units;
@@ -159,14 +210,14 @@ export async function runOfficialProbe(plan: ProbePlan, opts: { maxSubrequests?:
   const outs = await pool(units.map((u) => async (): Promise<UnitOut> => {
     try { return await u.run(b); }
     catch (e) {
-      const detail = `probe threw: ${String(e).slice(0, 200)}`;
+      const detail = clean(`probe threw: ${String(e).slice(0, 200)}`);
       return { requests: [], results: u.series.map((s) => ({ series: s, group: isBls(s) ? "bls" : "central_banks", period: null, primary: { ok: false, value_text: null, detail }, corroboration: { status: "error", value_text: null, detail } })) };
     }
   }), CONCURRENCY);
   const requests = outs.flatMap((o) => o.requests);
   const byName = new Map(outs.flatMap((o) => o.results).map((r) => [r.series, r]));
   return {
-    groups: plan.groups, series: plan.series, corroboration: plan.corroboration, user_agent: OFFICIAL_UA,
+    groups: plan.groups, series: plan.series, corroboration: plan.corroboration, bls_api_hold: plan.blsApiHold, user_agent: OFFICIAL_UA,
     subrequests: { cap, planned: units.reduce((n, u) => n + u.cost, 0), used: b.used },
     duration_ms: Date.now() - t0,
     hosts: hostSummary(requests),
@@ -204,24 +255,47 @@ function where(url: string): { host: string; path: string } {
   catch { return { host: "(unparseable)", path: "" }; }
 }
 
-const hopOf = (t: FetchTrace): ProbeHop => {
-  const w = where(t.url);
-  return {
-    ...w, status: t.status, content_type: t.content_type, server: t.server, bytes: t.bytes, ms: t.ms,
-    ...(t.location !== undefined ? { location: (() => { const l = where(new URL(t.location, t.url).href); return l.host + l.path; })() } : {}),
-    ...(t.error !== undefined ? { error: t.error } : {}),
-  };
-};
+/** A URL inside a text (any scheme). Trailing punctuation the message put after it is peeled off in clean(). */
+const URL_IN_TEXT = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>]+/gi;
+
+/**
+ * Every error and detail string the report carries: officialGet and fetchCorroboration name the URL they requested
+ * ("HTTP 403 from <url>", "<url> redirected off the allowlist to <Location>"), and a redirect target is the upstream's
+ * choice (a login page with ?token=…). Each URL becomes host + path with its query as "?…", then redact() runs.
+ */
+export function clean(text: string): string {
+  const shown = text.replace(URL_IN_TEXT, (m) => {
+    const tail = /[.,;:)\]]+$/.exec(m)?.[0] ?? "";
+    const w = where(m.slice(0, m.length - tail.length));
+    return (w.host === "(unparseable)" ? "(url)" : `${w.host}${w.path}`) + tail;
+  });
+  return redact(shown);
+}
+
+/** A Location header as host + path (resolved against the URL that sent it); never throws. */
+function locationOf(location: string, base: string): string {
+  let href: string;
+  try { href = new URL(location, base).href; } catch { return "(unreadable)"; }
+  const l = where(href);
+  return l.host + l.path;
+}
+
+const hopOf = (t: FetchTrace): ProbeHop => ({
+  ...where(t.url), status: t.status, content_type: t.content_type, server: t.server, bytes: t.bytes,
+  ...(t.content_length !== undefined ? { content_length: t.content_length } : {}), ms: t.ms,
+  ...(t.location !== undefined ? { location: locationOf(t.location, t.url) } : {}),
+  ...(t.error !== undefined ? { error: clean(t.error) } : {}),
+});
 
 function request(role: ProbeRequest["role"], label: string, series: OfficialSeriesId[], url: string, traces: FetchTrace[], error: string | null): ProbeRequest {
-  const hops = traces.map((t) => { try { return hopOf(t); } catch { return { ...where(t.url), status: t.status, content_type: t.content_type, server: t.server, bytes: t.bytes, ms: t.ms }; } });
+  const hops = traces.map(hopOf);
   const last = hops.at(-1);
   return {
     role, label, series, ...where(url),
-    status: last?.status ?? null, bytes: last?.bytes ?? null, content_type: last?.content_type ?? null, server: last?.server ?? null,
+    status: last?.status ?? null, bytes: last?.bytes ?? null, content_length: last?.content_length ?? null, content_type: last?.content_type ?? null, server: last?.server ?? null,
     ms: hops.length ? hops.reduce((n, h) => n + h.ms, 0) : null,
     redirects: hops.filter((h) => h.status !== null && h.status >= 300 && h.status <= 399).length,
-    hops, error, parsed: null,
+    hops, error: error === null ? null : clean(error), parsed: null,
   };
 }
 
@@ -245,10 +319,16 @@ async function probeGet(b: Budget, series: OfficialSeriesId, url: string, accept
   return { got, req: request(role, label, list, url, sink, error) };
 }
 
-const readout = (series: OfficialSeriesId, p: DocParse): Readout => p.ok
-  ? { series, ok: true, period: p.obs.period, value_text: p.obs.value_text, detail: p.obs.deciding_text.slice(0, 300) }
-  : { series, ok: false, period: null, value_text: null, detail: `${p.reason}: ${p.detail}`.slice(0, 300) };
-const failedRead = (series: OfficialSeriesId, detail: string): Readout => ({ series, ok: false, period: null, value_text: null, detail: detail.slice(0, 300) });
+/**
+ * What the parser read. A feed item's pubDate leads the detail (BoE, BoK): for the BoE it is the period itself, and the
+ * operator compares it with the scheduled decision day (the rail answers pending unless the two are equal).
+ */
+const readout = (series: OfficialSeriesId, p: DocParse): Readout => {
+  if (!p.ok) return { series, ok: false, period: null, value_text: null, detail: clean(`${p.reason}: ${p.detail}`).slice(0, 300) };
+  const pub = typeof p.obs.meta?.pub_date === "string" && p.obs.meta.pub_date ? `pubDate ${p.obs.meta.pub_date}; ` : "";
+  return { series, ok: true, period: p.obs.period, value_text: p.obs.value_text, detail: clean(`${pub}${p.obs.deciding_text}`).slice(0, 300) };
+};
+const failedRead = (series: OfficialSeriesId, detail: string): Readout => ({ series, ok: false, period: null, value_text: null, detail: clean(detail).slice(0, 300) });
 
 const asObs = (series: OfficialSeriesId, o: DocObservation, g: Extract<Got, { ok: true }>, b: Budget): FetchedObservation =>
   ({ ...o, series, source_url: g.url, raw: g.bytes, raw_sha256: "(probe: not stored)", fetched_at: new Date(b.now()).toISOString() });
@@ -273,19 +353,20 @@ const newestFirst = (xs: string[]) => [...new Set(xs)].sort().reverse();
  * With an observation: the rail's fetchCorroboration for (series, period). Without one: the corroboration URL the rail
  * would request, fetched once for reachability, with the latest row its parser reads.
  */
-async function corroborate(b: Budget, s: OfficialSeriesId, obs: FetchedObservation | null, on: boolean): Promise<{ req: ProbeRequest | null; summary: SeriesProbe["corroboration"] }> {
-  if (!on) return { req: null, summary: { status: "skipped", value_text: null, detail: "corroboration: false" } };
+async function corroborate(b: Budget, s: OfficialSeriesId, obs: FetchedObservation | null, plan: ProbePlan): Promise<{ req: ProbeRequest | null; summary: SeriesProbe["corroboration"] }> {
+  if (!plan.corroboration) return { req: null, summary: { status: "skipped", value_text: null, detail: "corroboration: false" } };
   if (!corroborates(s)) return { req: null, summary: { status: "single_source", value_text: null, detail: "no corroborating source for this series (by design); nothing requested" } };
+  if (plan.blsApiHold && s in BLS_API) return { req: null, summary: { status: "skipped", value_text: null, detail: plan.blsApiHold } };
   if (obs) {
     const sink: FetchTrace[] = [];
     try {
       const c = await fetchCorroboration(obs, obs.period, traced(b, sink));
       const url = sink[0]?.url ?? c.source_url;
       const req = url ? request("corroboration", `${s} corroboration`, [s], url, sink, sink.at(-1)?.status === 200 ? null : c.detail) : null;
-      if (req) req.parsed = [{ series: s, ok: c.value_text !== null, period: obs.period, value_text: c.value_text, detail: `${c.status}: ${c.detail}`.slice(0, 300) }];
-      return { req, summary: { status: c.status, value_text: c.value_text, detail: c.detail } };
+      if (req) req.parsed = [{ series: s, ok: c.value_text !== null, period: obs.period, value_text: c.value_text, detail: clean(`${c.status}: ${c.detail}`).slice(0, 300) }];
+      return { req, summary: { status: c.status, value_text: c.value_text, detail: clean(c.detail) } };
     } catch (e) {
-      const detail = `threw: ${String(e).slice(0, 200)}`;
+      const detail = clean(`threw: ${String(e).slice(0, 200)}`);
       return { req: sink.length ? request("corroboration", `${s} corroboration`, [s], sink[0]!.url, sink, detail) : null, summary: { status: "error", value_text: null, detail } };
     }
   }
@@ -341,7 +422,7 @@ function reachability(s: OfficialSeriesId, nowMs: number): { url: string; accept
 
 // ---- BLS: one document per fetch group ----------------------------------------------------------------------------
 
-async function blsDocUnit(b: Budget, url: string, list: OfficialSeriesId[], corroboration: boolean): Promise<UnitOut> {
+async function blsDocUnit(b: Budget, url: string, list: OfficialSeriesId[], plan: ProbePlan): Promise<UnitOut> {
   const label = `${OFFICIAL_SERIES[list[0]!].fetchGroup ?? list[0]}: BLS release page`;
   const { got, req } = await probeGet(b, list[0]!, url, "text/html", "primary", label, list);
   const requests = [req];
@@ -362,7 +443,7 @@ async function blsDocUnit(b: Budget, url: string, list: OfficialSeriesId[], corr
   const results: SeriesProbe[] = [];
   for (const s of list) {
     const read = reads.get(s);
-    const c = await corroborate(b, s, read?.obs ?? null, corroboration);
+    const c = await corroborate(b, s, read?.obs ?? null, plan);
     if (c.req) requests.push(c.req);
     results.push({
       series: s, group: "bls", period: read?.r.period ?? null,
@@ -388,7 +469,7 @@ function firstMatches(text: string, re: RegExp, max: number, map: (m: RegExpExec
   return out;
 }
 
-async function centralBankUnit(b: Budget, s: OfficialSeriesId, corroboration: boolean): Promise<UnitOut> {
+async function centralBankUnit(b: Budget, s: OfficialSeriesId, plan: ProbePlan): Promise<UnitOut> {
   const requests: ProbeRequest[] = [];
   let primary: Readout = failedRead(s, "not fetched");
   let obs: FetchedObservation | null = null;
@@ -423,16 +504,28 @@ async function centralBankUnit(b: Budget, s: OfficialSeriesId, corroboration: bo
       break;
     }
     case "ecb_dfr": {
-      const year = String(new Date(b.now()).getUTCFullYear());
-      const idx = await get(URLS.ecbIndex(year), "text/html", `ECB monetary policy decisions index ${year}`);
-      if (!idx.got?.ok) { primary = failedRead(s, idx.req.error ?? "not fetched"); break; }
-      const text = idx.got.text;
-      const days = newestFirst(firstMatches(text, /isoDate="(\d{4}-\d{2}-\d{2})"/g, 60, (m) => m[1]!));
-      const f = firstDecisive(days, (d) => findEcbDecision(text, d));
-      indexRead(idx.req, f, "Monetary policy decisions release");
-      if (!f?.r.ok) break;
-      const rel = await get(f.r.url, "text/html", "ECB monetary policy decisions release");
-      if (rel.got?.ok) settle(f.target, parseEcbRelease(rel.got.text), rel.got, rel.req); else primary = failedRead(s, rel.req.error ?? "not fetched");
+      // The rail reads the index of the target's year. From 1 January to the year's first meeting the current year's
+      // index is missing (404) or names no decision yet, so the previous year's is read once (PRIMARY_REQUESTS counts it).
+      const thisYear = new Date(b.now()).getUTCFullYear();
+      for (const year of [thisYear, thisYear - 1]) {
+        const idx = await get(URLS.ecbIndex(String(year)), "text/html", `ECB monetary policy decisions index ${year}`);
+        const current = year === thisYear;
+        if (!idx.got?.ok) {
+          primary = failedRead(s, idx.req.error ?? "not fetched");
+          if (current && idx.got && !idx.got.ok && idx.got.httpStatus === 404) continue;
+          break;
+        }
+        const text = idx.got.text;
+        const days = newestFirst(firstMatches(text, /isoDate="(\d{4}-\d{2}-\d{2})"/g, 60, (m) => m[1]!));
+        const f = firstDecisive(days, (d) => findEcbDecision(text, d));
+        indexRead(idx.req, f, "Monetary policy decisions release");
+        // no decision this year yet: the previous year's index; drift is reported, never skipped past
+        if (!f) { if (current) continue; break; }
+        if (!f.r.ok) { if (current && f.r.reason === "not_published") continue; break; }
+        const rel = await get(f.r.url, "text/html", "ECB monetary policy decisions release");
+        if (rel.got?.ok) settle(f.target, parseEcbRelease(rel.got.text), rel.got, rel.req); else primary = failedRead(s, rel.req.error ?? "not fetched");
+        break;
+      }
       break;
     }
     case "boe_bank_rate": {
@@ -443,7 +536,9 @@ async function centralBankUnit(b: Budget, s: OfficialSeriesId, corroboration: bo
       const months = [...new Set(firstMatches(text, new RegExp(String.raw`\b(${MONTHS_RE}) (\d{4}) Monetary Policy Summary`, "gi"), 20, (m) => `${m[2]}-${String(monthNumber(m[1]!)).padStart(2, "0")}`))].sort().reverse();
       const f = firstDecisive(months, (ym) => parseBoeRss(text, `${MONTH_NAMES[Number(ym.slice(5)) - 1]} ${ym.slice(0, 4)}`));
       if (!f) { primary = failedRead(s, "no Monetary Policy Summary item in the feed"); g.req.parsed = [primary]; break; }
-      // the item is matched by month; its pubDate is the decision day, the period the rail's target names
+      // The item is matched by month and its pubDate becomes the period. The probe cannot know the scheduled decision
+      // day, so this period gate passes by construction; the rail's (settle(target) with the market's day) does not.
+      // The readout leads with the pubDate: the operator checks it against the MPC date (runbook, "Reading the answer").
       settle(f.r.ok ? f.r.obs.period : f.target, f.r, g.got, g.req);
       break;
     }
@@ -478,7 +573,7 @@ async function centralBankUnit(b: Budget, s: OfficialSeriesId, corroboration: bo
     default: primary = failedRead(s, "not a central-bank series");
   }
 
-  const c = await corroborate(b, s, obs, corroboration);
+  const c = await corroborate(b, s, obs, plan);
   if (c.req) requests.push(c.req);
   const p: Readout = primary;
   return { requests, results: [{ series: s, group: "central_banks", period: p.period, primary: { ok: p.ok, value_text: p.value_text, detail: p.detail }, corroboration: c.summary }] };
@@ -530,7 +625,8 @@ async function electionGet(b: Budget, p: { label: string; url: string }): Promis
     if (res.status >= 300 && res.status <= 399) {
       const location = res.headers.get("location");
       await discardBody(res);
-      sink.push({ ...head, bytes: null, ms: Date.now() - t0, ...(location ? { location } : {}) });
+      const cl = contentLength(res.headers);
+      sink.push({ ...head, bytes: null, ...(cl !== undefined ? { content_length: cl } : {}), ms: Date.now() - t0, ...(location ? { location } : {}) });
       if (!location) { error = `HTTP ${res.status} without a Location`; break; }
       try { current = new URL(location, current).href; } catch { error = `HTTP ${res.status} with an unreadable Location`; break; }
       if (hop >= MAX_REDIRECTS) { error = `more than ${MAX_REDIRECTS} redirects`; break; }
