@@ -4,8 +4,9 @@
  *   alchemy_transfers  alchemy_getAssetTransfers on ALCHEMY_BASE_HTTP_URL, when it is set: the primary source. The public
  *                      Base RPCs refuse Cloudflare Worker egress (OBSERVED 2026-09-27 on every scan: mainnet.base.org
  *                      HTTP 429, base-rpc.publicnode.com HTTP 403) and Alchemy Free caps eth_getLogs at 10 blocks, but its
- *                      transfers API has no range cap. uniqueId "<tx>:log:<N>" carries the block-level logIndex
- *                      (VERIFIED 2026-09-27), so a transfer keys (tx_hash, log_index) exactly as its Transfer log does.
+ *                      transfers API has no range cap. uniqueId "<tx>:log:<N>" carries the block-level logIndex in decimal
+ *                      (VERIFIED 2026-09-27: 115 of 115 transfers of a block, e.g. log:41 = logIndex 0x29; src/ingest/base.ts),
+ *                      so a transfer keys (tx_hash, log_index) exactly as its Transfer log does.
  *   eth_getLogs        the public providers (baseLogsProviders): without Alchemy, or when a transfers call fails (HTTP or
  *                      JSON-RPC error, timeout, a result that is not a page); the scan then continues from wherever the
  *                      transfers path left the cursor.
@@ -15,13 +16,23 @@
  * A transfer the transfers API returns malformed (uniqueId not "<tx hash>:log:<N>", no raw amount, ...) is refused: the
  * cursor holds before its block and an alert names it. One that is positively not a deposit (another contract, another
  * recipient, not erc20) is skipped with an alert and never credited.
+ * The transfers index can lag the node's safe head, and a numeric toBlock past it is answered silently with what it has
+ * (PROBED 2026-09-27), so the query never runs past what the index probe (latestIndexedTransferBlock) shows indexed: its
+ * range ends at the newest block holding an indexed USDC transfer, at most the safe block, and the cursor never passes it.
+ * An index more than TRANSFERS_INDEX_WINDOW blocks behind safe is a transfers failure (the logs fallback reads on); one
+ * not yet past the cursor, with the gap inside that window, holds the cursor quietly for the next scan.
+ * Pages after the first must go on in block order (order "asc"): a page holding a block below one an earlier page held
+ * could hold a transfer the cursor was about to pass, so it is a transfers failure and the cursor stays before that block.
  * The scan runs on a subrequest budget (Workers Free: 50 per invocation, shared with the webhook drain on the 5-minute
  * cron). Its loop_runs row and the one alertMany() that carries every alert of the run are reserved before any work,
  * and each RPC reserves before it is sent, so the scan's own trace survives a backlog. Running out stops the scan
  * before the block it could not finish, like a failed credit does, without calling it one.
- * Transfers path cost: the safe header (1), one subrequest per page of up to 1,000 transfers (TRANSFER_PAGE_COST, over
- * any block range), one per deposit credited, and one cursor write for the whole path. Pagination stops when the budget
- * cannot carry another page, with the cursor at the last block fully handled.
+ * Transfers path cost: the safe header (1), the index probe (1, INDEX_PROBE_COST), one subrequest per page of up to 100
+ * transfers (TRANSFER_PAGE_COST, over any block range), one per deposit credited, and one cursor write for the whole path.
+ * Pagination stops when the budget cannot carry another page, or after MAX_TRANSFER_PAGES_PER_SCAN pages, with the
+ * cursor at the last block fully handled. The cursor is written once, after the last page: an invocation killed before
+ * that write (the Workers Free CPU limit) redoes the same pages next scan, which is why pages are small and zero-value
+ * transfers are excluded at the source (each page is at most 100 non-zero transfers to parse).
  * payment.credited (plan §16.4 P3 step 3): every deposit the run credited is announced to its tenant in one batch after
  * the scan (PAYMENT_EVENTS_COST = 3, whatever the number of credits), reserved together with the run's first credit, so
  * the budget never runs out between a credit and its event. The drain delivers them on the next 5-minute run.
@@ -30,7 +41,7 @@ import { formatUnits } from "viem";
 import type { Env, Config } from "../env";
 import { db, rpc } from "../db/supabase";
 import {
-  assetTransfersPage, baseCallUrl, baseLogsProviders, getBlock, hostOf, logsWindow, LogsUnavailableError,
+  assetTransfersPage, baseCallUrl, baseLogsProviders, getBlock, hostOf, latestIndexedTransferBlock, logsWindow, LogsUnavailableError,
   type AssetTransfer, type AssetTransfersPage, type BlockHeader, type LogsWindow, type RawLog,
 } from "../ingest/base";
 import { alertMany, type AlertItem } from "../ops/alerts";
@@ -48,12 +59,22 @@ const WINDOW_MIN = 2 * COST.http + COST.db;
 export const DEPOSIT_ALERT_DEDUP_MINUTES = 60;
 /** The transfers source's name in the result's detail and source, and in loop_runs meta.provider. */
 export const TRANSFERS_SOURCE = "alchemy_transfers";
-/** One page of alchemy_getAssetTransfers (up to 1,000 transfers, over any block range) is one subrequest. */
+/** One page of alchemy_getAssetTransfers (up to 100 transfers, over any block range) is one subrequest. */
 export const TRANSFER_PAGE_COST = COST.http;
-/** The least the transfers path needs to move the cursor: the safe header, one page and the cursor write. */
-export const TRANSFERS_MIN = COST.http + TRANSFER_PAGE_COST + COST.db;
-/** Pages one scan follows at most (8,000 transfers); on the 5-minute share the budget stops it sooner. */
+/** The index probe (latestIndexedTransferBlock): one alchemy_getAssetTransfers call. */
+export const INDEX_PROBE_COST = COST.http;
+/** The least the transfers path needs to move the cursor: the safe header, the index probe, one page and the cursor write. */
+export const TRANSFERS_MIN = COST.http + INDEX_PROBE_COST + TRANSFER_PAGE_COST + COST.db;
+/**
+ * Pages one scan follows at most (800 transfers). On the 5-minute share the budget stops it sooner; on the manual scan's
+ * whole invocation this cap does, bounding the CPU one invocation spends parsing pages before its single cursor write.
+ */
 export const MAX_TRANSFER_PAGES_PER_SCAN = 8;
+/**
+ * Blocks (about 30 minutes on Base) the transfers index may lag the safe head before the scan stops trusting it: the index
+ * probe looks this far below safe, and finding no indexed USDC transfer there is a transfers failure (the logs fallback).
+ */
+export const TRANSFERS_INDEX_WINDOW = 900;
 
 export interface DepositLog { tx: string; logIndex: number; block: number; from: string; amountUsdc: string }
 export type CreditFn = (d: DepositLog) => Promise<string>;
@@ -180,6 +201,8 @@ export async function scanDeposits(env: Env, cfg: Config, budget: Budget): Promi
   let source = "";
   let transfersError: string | null = null;
   let pages = 0;
+  /** The index probe's answer: the transfers range's end (null before it answers, or when it found none). */
+  let indexedTo: number | null = null;
   let startCursor: number | null = null;
   let cursor = NaN;
   let found = 0;
@@ -261,11 +284,23 @@ export async function scanDeposits(env: Env, cfg: Config, budget: Budget): Promi
         try { safe = await getBlock(transfersUrl, "safe"); } catch (e) { transfersError = `safe header: ${clip(e)}`; }
         if (safe && safe.number <= cursor) detail = "no new safe blocks";
         else if (safe) {
-          // One query over (cursor, safe], oldest first, continued by pageKey. toBlock must be a number ("safe" is refused).
-          const range = { from: cursor + 1, to: safe.number };
+          // The index probe, before any page (the index only grows, so every page then sees at least this much indexed).
+          const probeFrom = Math.max(cursor + 1, safe.number - TRANSFERS_INDEX_WINDOW + 1);
+          budget.need(INDEX_PROBE_COST, `the ${TRANSFERS_SOURCE} index probe`);
+          try {
+            indexedTo = await latestIndexedTransferBlock(transfersUrl, { fromBlock: probeFrom, toBlock: safe.number, contract: cfg.usdcContract });
+            if (indexedTo === null && probeFrom > cursor + 1) transfersError = `index behind: no USDC transfer indexed in the ${TRANSFERS_INDEX_WINDOW} blocks up to safe block ${safe.number}`;
+            else if (indexedTo === null) detail = `transfers index not yet past block ${cursor}`; // the next scan retries
+          } catch (e) { transfersError = `index probe: ${clip(e)}`; }
+        }
+        if (safe && indexedTo !== null) {
+          // One query over (cursor, indexedTo], oldest first, continued by pageKey. toBlock must be a number ("safe" is refused).
+          const range = { from: cursor + 1, to: indexedTo };
+          const caughtUp = indexedTo < safe.number ? `caught up to the transfers index at block ${indexedTo} (safe ${safe.number})` : "caught up";
           const credit = creditAt(safe.number);
           detail = "backlog remains"; // unless the last page is reached
           let pageKey: string | undefined;
+          let highest = -Infinity; // the highest block the pages before this one held
           while (pages < MAX_TRANSFER_PAGES_PER_SCAN) {
             // The first page always runs: a scan that cannot read one is a failure, not a budget stop.
             if (pages > 0 && budget.left < TRANSFER_PAGE_COST) { budgetStop(""); break; }
@@ -277,12 +312,23 @@ export async function scanDeposits(env: Env, cfg: Config, budget: Budget): Promi
             pages++;
             found += page.transfers.length;
             const checks = page.transfers.map((t) => checkTransfer(t, cfg.usdcContract, receiver, range));
+            const blocks = checks.flatMap((c) => (c.kind === "deposit" ? [c.deposit.block] : c.block === null ? [] : [c.block]));
+            // A page going back below a block an earlier page held is out of order: the cursor may already sit past that
+            // block (a pageKey page ends before its last block), so nothing on it is handled and the cursor goes back
+            // before it. This runs before the single cursor write below, and the block is in the range, so never below start.
+            const back = blocks.filter((n) => n < highest);
+            if (back.length) {
+              const low = Math.min(...back);
+              handled = Math.min(handled, low - 1);
+              transfersError = `page ${pages}: transfers out of block order (block ${low} after block ${highest})`;
+              break;
+            }
+            if (blocks.length) highest = Math.max(highest, ...blocks);
             // A refused transfer holds the cursor before its block (before the whole page when it names none): nothing at
             // or after that block is handled this scan.
             const refused = checks.flatMap((c) => (c.kind === "refuse" ? [c] : []));
             const holdAt = !refused.length ? Infinity : refused.some((c) => c.block === null) ? handled + 1 : Math.min(...refused.map((c) => c.block!));
             // The page's last block may go on in the next page: with a pageKey, the cursor stops just before that block.
-            const blocks = checks.flatMap((c) => (c.kind === "deposit" ? [c.deposit.block] : c.block === null ? [] : [c.block]));
             const pageEnd = page.pageKey ? (blocks.length ? Math.max(...blocks) - 1 : handled) : range.to;
             const through = Math.max(handled, Math.min(pageEnd, holdAt - 1));
             for (const c of checks) if (c.kind === "skip" && c.block < holdAt) { counts.skipped = (counts.skipped ?? 0) + 1; skipped.push(`${c.ref}: ${c.reason}`); }
@@ -299,7 +345,7 @@ export async function scanDeposits(env: Env, cfg: Config, budget: Budget): Promi
             handled = r.cursor;
             if (stopsAt(r, deposits)) break;
             if (refused.length) { held = true; detail = `held before block ${holdAt}: ${refused.length} malformed transfer(s) refused`; break; }
-            if (!page.pageKey) { detail = "caught up"; break; }
+            if (!page.pageKey) { detail = caughtUp; break; }
             if (page.pageKey === pageKey) { transfersError = `page ${pages}: the same pageKey again`; break; }
             pageKey = page.pageKey;
           }
@@ -377,7 +423,7 @@ export async function scanDeposits(env: Env, cfg: Config, budget: Budget): Promi
       rows_written: result.credited,
       duration_ms: Date.now() - started,
       error: result.scanned ? null : result.detail,
-      meta: { from: result.from ?? null, to: result.to ?? null, found: result.found, counts, provider: source, provider_errors: providerErrors.slice(0, 6), stopped_by_budget: result.stopped_by_budget, subrequests: budget.used, payment_events_queued: paymentEvents, ...(transfersUrl ? { transfer_pages: pages } : {}) },
+      meta: { from: result.from ?? null, to: result.to ?? null, found: result.found, counts, provider: source, provider_errors: providerErrors.slice(0, 6), stopped_by_budget: result.stopped_by_budget, subrequests: budget.used, payment_events_queued: paymentEvents, ...(transfersUrl ? { transfer_pages: pages, transfers_indexed_to: indexedTo } : {}) },
     });
     if (error) unrecorded = redact(error.message).slice(0, 200);
   } catch (e) {

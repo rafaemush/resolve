@@ -22,7 +22,7 @@ vi.mock("../src/db/supabase", () => ({
 }));
 vi.mock("../src/ops/alerts", () => ({ alertMany: vi.fn(async () => ({ sent: [], deduped: [] })) }));
 
-import { checkTransfer, scanDeposits, toDepositLog, MAX_TRANSFER_PAGES_PER_SCAN } from "../src/jobs/deposits";
+import { checkTransfer, scanDeposits, toDepositLog, MAX_TRANSFER_PAGES_PER_SCAN, TRANSFERS_INDEX_WINDOW } from "../src/jobs/deposits";
 import { DEPOSIT_SCAN_SUBREQUESTS } from "../src/jobs/schedule";
 import { alertMany } from "../src/ops/alerts";
 import { Budget, COST, INVOCATION_SUBREQUESTS } from "../src/ops/budget";
@@ -59,8 +59,15 @@ function log(block: number, logIndex: number, raw = 2_500_000n): RawLog {
 
 interface Api {
   safe: number; transfers: Wire[]; pageSize?: number;
-  /** A failure injected on the Alchemy URL: an HTTP response, a thrown error (a timeout), or null for a normal answer. */
-  fail?: (method: string) => Response | Error | null;
+  /** The transfers index's height (default: everything): nothing above it is returned, and no error says so. */
+  indexed?: number;
+  /** Answer every pageKey'd page with the pageKey it was asked with (a provider stuck on one page). */
+  repeatPageKey?: boolean;
+  /**
+   * A failure injected on the Alchemy URL: an HTTP response, a thrown error (a timeout), or null for a normal answer.
+   * `q` is an alchemy_getAssetTransfers call's query: with toAddress a deposit page, without it the index probe.
+   */
+  fail?: (method: string, q: Record<string, unknown> | undefined) => Response | Error | null;
   logs?: RawLog[]; logsDown?: boolean;
 }
 interface Call { host: string; method: string; params: any[] }
@@ -79,18 +86,24 @@ beforeEach(() => {
     const reply = (result: unknown) => new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result }));
     const header = () => reply({ number: hex(api.safe), timestamp: hex(1_700_000_000) });
     if (url === ALCHEMY) {
-      const f = api.fail?.(body.method) ?? null;
+      const f = api.fail?.(body.method, body.params?.[0]) ?? null;
       if (f instanceof Error) throw f;
       if (f) return f;
       if (body.method === "eth_getBlockByNumber") return header();
       if (body.method !== "alchemy_getAssetTransfers") return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: -32601, message: "unexpected" } }));
-      const q = body.params[0] as { fromBlock: string; toBlock: string; pageKey?: string };
+      const q = body.params[0] as { fromBlock: string; toBlock: string; pageKey?: string; toAddress?: string };
       const from = parseInt(q.fromBlock, 16), to = parseInt(q.toBlock, 16);
+      const indexed = api.indexed ?? Infinity;
+      if (!q.toAddress) {
+        // The index probe (order desc, maxCount 1): USDC moves in every block, so the newest indexed one in the range.
+        const head = Math.min(to, indexed);
+        return reply({ transfers: head < from ? [] : [transfer(head, 0, { to: OTHER, hash: txHash(head, 999) })], pageKey: "probe:1" });
+      }
       // A transfer whose blockNum does not parse is always returned (the API misbehaving); the rest by range, oldest first.
-      const all = api.transfers.filter((t) => { const b = parseInt(String(t.blockNum), 16); return Number.isNaN(b) || (b >= from && b <= to); });
-      const size = api.pageSize ?? 1000;
+      const all = api.transfers.filter((t) => { const b = parseInt(String(t.blockNum), 16); return Number.isNaN(b) || (b >= from && b <= to && b <= indexed); });
+      const size = api.pageSize ?? 100;
       const offset = q.pageKey ? Number(q.pageKey.split(":")[1]) : 0;
-      const next = offset + size < all.length ? `page:${offset + size}` : undefined;
+      const next = api.repeatPageKey && q.pageKey ? q.pageKey : offset + size < all.length ? `page:${offset + size}` : undefined;
       return reply({ transfers: all.slice(offset, offset + size), ...(next ? { pageKey: next } : {}) });
     }
     // The public providers: down as the Worker sees them, or answering eth_getLogs over the same chain.
@@ -122,7 +135,13 @@ function newDb(cursor: number, endpoints = false) {
 const cursorNow = () => Number(h.db.tables.app_config!.find((r) => r.key === "usdc_cursor_block")!.value);
 const setCursor = (n: number) => { h.db.tables.app_config!.find((r) => r.key === "usdc_cursor_block")!.value = String(n); };
 const alertItems = () => vi.mocked(alertMany).mock.calls.flatMap((c) => c[1]!);
-const transferQueries = () => calls.filter((c) => c.method === "alchemy_getAssetTransfers").map((c) => c.params[0] as Record<string, unknown>);
+const assetTransferCalls = () => calls.filter((c) => c.method === "alchemy_getAssetTransfers").map((c) => c.params[0] as Record<string, unknown>);
+/** The deposit pages (toAddress = the receiving address). */
+const transferQueries = () => assetTransferCalls().filter((q) => "toAddress" in q);
+/** The index probes (contract only, newest first). */
+const probeQueries = () => assetTransferCalls().filter((q) => !("toAddress" in q));
+/** A failure on the deposit pages only (the index probe answers). */
+const onPage = (f: () => Response | Error) => (m: string, q: Record<string, unknown> | undefined) => (m === "alchemy_getAssetTransfers" && q && "toAddress" in q ? f() : null);
 
 /** One scan; returns what it really sent: RPCs + database calls (an rpc counts once) + COST.alert per alertMany(). */
 async function scan(budget = new Budget(DEPOSIT_SCAN_SUBREQUESTS), e: Env = env) {
@@ -152,6 +171,22 @@ describe("checkTransfer (a transfer read as the deposit its log would give)", ()
     }
     expect(checkTransfer(transfer(1_100, 0, { uniqueId: `${hash}:log:99999999999999999999` }) as AssetTransfer, USDC, RECEIVER, range)).toMatchObject({ kind: "refuse", reason: "uniqueId's log index is out of range" });
     expect(checkTransfer(transfer(1_100, 0, { hash: txHash(1_100, 9), uniqueId: `${hash}:log:0` }) as AssetTransfer, USDC, RECEIVER, range)).toMatchObject({ kind: "refuse", reason: "hash differs from uniqueId's transaction hash" });
+  });
+
+  it("reads N in decimal: a real transfer (PROBED 2026-09-27, block 51,870,696) keys exactly as its Transfer log, logIndex 0x29", () => {
+    // As alchemy_getAssetTransfers returned it (withMetadata false). Its USDC Transfer log in that block has logIndex 0x29
+    // (41): all 115 USDC transfers of the block matched their log's logIndex with N read in decimal, none in hex. Read in
+    // hex, "41" would be 65: another primary key than the logs path's, so a block read by both sources would credit twice.
+    const hash = "0xc028e360977d9b15171ba9520604ebf3cd8da89661abcc29f58c6bba7ce194e0";
+    const from = "0xb2cc224c1c9fee385f8ad6a55b4d94e92359dc59", to = "0xb093da272a66d47b7445ca389cebdc6d3ac7753d";
+    const real: Wire = {
+      blockNum: "0x3177be8", uniqueId: `${hash}:log:41`, hash, from, to, value: 92794.069938, erc721TokenId: null, erc1155Metadata: null,
+      tokenId: null, asset: "USDC", category: "erc20", rawContract: { value: "0x159af523b2", address: USDC, decimal: "0x6" }, metadata: null,
+    };
+    const itsLog: RawLog = { address: USDC, topics: [TRANSFER, topic(from), topic(to)], data: "0x159af523b2", blockNumber: "0x3177be8", transactionHash: hash, logIndex: "0x29" };
+    const c = checkTransfer(real as AssetTransfer, USDC, to, { from: 51_870_001, to: 51_871_000 });
+    expect(c).toEqual({ kind: "deposit", deposit: toDepositLog(itsLog) });
+    expect(c).toMatchObject({ deposit: { tx: hash, logIndex: 41, block: 51_870_696, amountUsdc: "92794.069938" } });
   });
 
   it("refuses what it cannot read for certain: the raw amount, its decimals, the sender, a block outside the range", () => {
@@ -188,11 +223,13 @@ describe("scanDeposits on alchemy_getAssetTransfers", () => {
     expect(creditArgs).toEqual([expect.objectContaining({ p_tx_hash: txHash(1_100, 4), p_log_index: 4, p_from: TENANT_WALLET, p_to: RECEIVER, p_amount_usdc: "123.456789", p_block: 1_100, p_safe_block: 1_500 })]);
     expect(h.db.tables.tenants![0]!.credits_balance).toBe(12_345); // floor(123.456789 x 100): the raw integer, not 999.99
     expect(cursorNow()).toBe(1_500);
-    // Every RPC went to Alchemy: the safe header, then one page whose toBlock is that header's number ("safe" is refused).
-    expect(calls.map((c) => `${c.host} ${c.method}`)).toEqual([`${ALCHEMY_HOST} eth_getBlockByNumber`, `${ALCHEMY_HOST} alchemy_getAssetTransfers`]);
+    // Every RPC went to Alchemy: the safe header, the index probe up to it, then one page whose toBlock is the newest indexed
+    // block, here the header's number ("safe" is refused as a toBlock).
+    expect(calls.map((c) => `${c.host} ${c.method}`)).toEqual([`${ALCHEMY_HOST} eth_getBlockByNumber`, `${ALCHEMY_HOST} alchemy_getAssetTransfers`, `${ALCHEMY_HOST} alchemy_getAssetTransfers`]);
     expect(calls[0]!.params).toEqual(["safe", false]);
-    expect(transferQueries()).toEqual([{ fromBlock: hex(1_001), toBlock: hex(1_500), toAddress: RECEIVER, contractAddresses: [USDC], category: ["erc20"], withMetadata: true, excludeZeroValue: false, maxCount: "0x3e8", order: "asc" }]);
-    expect(h.db.tables.loop_runs![0]).toMatchObject({ outcome: "success", rows_written: 1, meta: { provider: "alchemy_transfers", transfer_pages: 1, provider_errors: [] } });
+    expect(probeQueries()).toEqual([{ fromBlock: hex(1_001), toBlock: hex(1_500), contractAddresses: [USDC], category: ["erc20"], withMetadata: false, excludeZeroValue: false, maxCount: "0x1", order: "desc" }]);
+    expect(transferQueries()).toEqual([{ fromBlock: hex(1_001), toBlock: hex(1_500), toAddress: RECEIVER, contractAddresses: [USDC], category: ["erc20"], withMetadata: false, excludeZeroValue: true, maxCount: "0x64", order: "asc" }]);
+    expect(h.db.tables.loop_runs![0]).toMatchObject({ outcome: "success", rows_written: 1, meta: { provider: "alchemy_transfers", transfer_pages: 1, transfers_indexed_to: 1_500, provider_errors: [] } });
     expect(used).toBeLessThanOrEqual(r.subrequests);
     expect(r.subrequests).toBeLessThanOrEqual(DEPOSIT_SCAN_SUBREQUESTS);
   });
@@ -204,8 +241,10 @@ describe("scanDeposits on alchemy_getAssetTransfers", () => {
     expect(r).toMatchObject({ scanned: true, detail: "caught up via alchemy_transfers", from: 51_667_929, to: 51_870_000, found: 0, alerts: [] });
     expect(cursorNow()).toBe(51_870_000);
     expect(transferQueries()).toEqual([expect.objectContaining({ fromBlock: hex(51_667_929), toBlock: hex(51_870_000) })]);
-    expect(used).toBe(5); // cursor read, safe header, one page, cursor write, loop_runs row
-    expect(r.subrequests).toBe(5);
+    // The probe looks back TRANSFERS_INDEX_WINDOW blocks from safe, not over the whole gap.
+    expect(probeQueries()).toEqual([expect.objectContaining({ fromBlock: hex(51_870_000 - TRANSFERS_INDEX_WINDOW + 1), toBlock: hex(51_870_000) })]);
+    expect(used).toBe(6); // cursor read, safe header, index probe, one page, cursor write, loop_runs row
+    expect(r.subrequests).toBe(6);
     expect(h.db.tables.loop_runs![0]).toMatchObject({ outcome: "no_op" });
   });
 
@@ -215,6 +254,8 @@ describe("scanDeposits on alchemy_getAssetTransfers", () => {
     const { r, used } = await scan();
     expect(r).toMatchObject({ scanned: true, detail: "no new safe blocks via alchemy_transfers", alerts: [] });
     expect(used).toBe(3); // cursor read, safe header, loop_runs row
+    expect(r.subrequests).toBe(3); // the cursor write reserved for the path is given back when the cursor does not move
+    expect(assetTransferCalls()).toHaveLength(0);
     expect(cursorNow()).toBe(1_000);
   });
 
@@ -281,14 +322,16 @@ describe("scanDeposits on alchemy_getAssetTransfers", () => {
   });
 
   it("follows pageKey over the same range across two pages, crediting each deposit once", async () => {
-    api = { safe: 1_500, pageSize: 2, transfers: [transfer(1_100, 0), transfer(1_200, 0), transfer(1_200, 1), transfer(1_400, 0)] };
+    // Block 1200 goes on from page 1 into page 2. Two pages and three credits are the whole 5-minute share: 11 + 1 + 3 + 3.
+    api = { safe: 1_500, pageSize: 2, transfers: [transfer(1_100, 0), transfer(1_200, 0), transfer(1_200, 1)] };
     newDb(1_000);
     const { r, used } = await scan();
     expect(used).toBeLessThanOrEqual(DEPOSIT_SCAN_SUBREQUESTS);
-    expect(r).toMatchObject({ scanned: true, found: 4, credited: 4, detail: "caught up via alchemy_transfers", to: 1_500 });
+    expect(r.subrequests).toBe(DEPOSIT_SCAN_SUBREQUESTS - COST.alert); // the alert reserve is given back
+    expect(r).toMatchObject({ scanned: true, found: 3, credited: 3, detail: "caught up via alchemy_transfers", to: 1_500 });
     const [first, second] = transferQueries();
     expect(second).toEqual({ ...first, pageKey: "page:2" });
-    expect([...credits.values()]).toEqual([1, 1, 1, 1]);
+    expect([...credits.values()]).toEqual([1, 1, 1]);
     expect(h.db.tables.loop_runs![0]!.meta).toMatchObject({ transfer_pages: 2 });
     expect(cursorNow()).toBe(1_500);
   });
@@ -296,9 +339,10 @@ describe("scanDeposits on alchemy_getAssetTransfers", () => {
   it("the budget ending between pages leaves the cursor at the last block fully handled; the next scan finishes", async () => {
     api = { safe: 1_500, pageSize: 2, transfers: [transfer(1_100, 0), transfer(1_200, 0), transfer(1_200, 1), transfer(1_400, 0)] };
     newDb(1_000);
-    // reserve 6, cursor read, cursor write, safe header, page 1 (10), two credits and the payment batch (15): no page 2.
-    const { r, used } = await scan(new Budget(15));
-    expect(used).toBeLessThanOrEqual(15);
+    // reserve 6, cursor read, cursor write, safe header, index probe, page 1 (11), two credits and the payment batch (16):
+    // no page 2.
+    const { r, used } = await scan(new Budget(16));
+    expect(used).toBeLessThanOrEqual(16);
     expect(r).toMatchObject({ scanned: true, stopped_by_budget: true, credited: 2, to: 1_199, detail: "subrequest budget reached; backlog remains via alchemy_transfers" });
     // Block 1200 may go on in page 2, so the cursor stops before it even though 1200#0 was credited.
     expect(cursorNow()).toBe(1_199);
@@ -333,18 +377,142 @@ describe("scanDeposits on alchemy_getAssetTransfers", () => {
   });
 });
 
+describe("the transfers index lagging the safe head (a numeric toBlock past it is answered silently, PROBED 2026-09-27)", () => {
+  it("the range ends at the newest indexed block: a deposit in the unindexed tail is credited once the index reaches it", async () => {
+    // The index holds blocks up to 1300 while safe is 1500; the deposit at 1400 is not in it yet and nothing says so.
+    api = { safe: 1_500, indexed: 1_300, transfers: [transfer(1_100, 0), transfer(1_400, 0)] };
+    newDb(1_000);
+    const { r, used } = await scan();
+    expect(used).toBeLessThanOrEqual(DEPOSIT_SCAN_SUBREQUESTS);
+    expect(transferQueries()).toEqual([expect.objectContaining({ fromBlock: hex(1_001), toBlock: hex(1_300) })]);
+    expect(r).toMatchObject({ scanned: true, credited: 1, to: 1_300, alerts: [], detail: "caught up to the transfers index at block 1300 (safe 1500) via alchemy_transfers" });
+    expect(cursorNow()).toBe(1_300); // not 1500: the block range (1300, 1500] is read again next scan
+    expect(h.db.tables.loop_runs![0]!.meta).toMatchObject({ transfers_indexed_to: 1_300 });
+
+    api.indexed = 1_600; api.safe = 1_600;
+    const next = await scan();
+    expect(transferQueries()[0]).toMatchObject({ fromBlock: hex(1_301), toBlock: hex(1_600) });
+    expect(next.r).toMatchObject({ scanned: true, credited: 1, detail: "caught up via alchemy_transfers", to: 1_600 });
+    expect([...credits.keys()]).toEqual([`${txHash(1_100, 0)}#0`, `${txHash(1_400, 0)}#0`]);
+    expect(cursorNow()).toBe(1_600);
+  });
+
+  it("an index not yet past the cursor, with the gap inside the window, holds the cursor quietly for the next scan", async () => {
+    api = { safe: 1_500, indexed: 1_440, transfers: [transfer(1_460, 0)] };
+    newDb(1_450);
+    const { r } = await scan();
+    expect(r).toMatchObject({ scanned: true, credited: 0, to: 1_450, alerts: [], detail: "transfers index not yet past block 1450 via alchemy_transfers" });
+    expect(probeQueries()).toEqual([expect.objectContaining({ fromBlock: hex(1_451), toBlock: hex(1_500) })]);
+    expect(transferQueries()).toHaveLength(0);
+    expect(r.subrequests).toBe(4); // cursor read, header, probe, loop_runs row
+    expect(cursorNow()).toBe(1_450);
+
+    api.indexed = 1_500;
+    const next = await scan();
+    expect(next.r).toMatchObject({ scanned: true, credited: 1, detail: "caught up via alchemy_transfers", to: 1_500 });
+    expect(cursorNow()).toBe(1_500);
+  });
+
+  it("an index more than TRANSFERS_INDEX_WINDOW blocks behind safe is a transfers failure: the logs fallback reads the range", async () => {
+    const safe = 5_000;
+    api = { safe, indexed: safe - TRANSFERS_INDEX_WINDOW, transfers: [transfer(4_000, 0)], logs: [log(4_000, 0)] };
+    newDb(3_500);
+    const { r, used } = await scan();
+    expect(used).toBeLessThanOrEqual(DEPOSIT_SCAN_SUBREQUESTS);
+    expect(probeQueries()).toEqual([expect.objectContaining({ fromBlock: hex(safe - TRANSFERS_INDEX_WINDOW + 1), toBlock: hex(safe) })]);
+    expect(transferQueries()).toHaveLength(0);
+    const behind = `index behind: no USDC transfer indexed in the ${TRANSFERS_INDEX_WINDOW} blocks up to safe block ${safe}`;
+    expect(r).toMatchObject({ scanned: true, source: "mainnet.base.org", credited: 1, to: safe, detail: `caught up via mainnet.base.org (alchemy_transfers failed: ${behind})` });
+    expect(cursorNow()).toBe(safe);
+
+    // Both behind: the failure alert, naming the lag, with the cursor held.
+    api = { ...api, logsDown: true };
+    newDb(3_500);
+    const down = await scan();
+    expect(down.r).toMatchObject({ scanned: false, credited: 0, alerts: ["deposit_scan_failed"] });
+    expect(down.r.detail).toContain(`alchemy_transfers failed (${behind}), then`);
+    expect(cursorNow()).toBe(3_500);
+  });
+});
+
+describe("pages that do not go on in block order", () => {
+  it("a page going back below a block an earlier page held is a transfers failure; the cursor goes back before that block", async () => {
+    // Page 1 = [1100, 1300] (pageKey), page 2 = [1200 malformed, 1400]: 1200 is below 1300, which page 1 already handled.
+    api = { safe: 1_500, pageSize: 2, transfers: [transfer(1_100, 0), transfer(1_300, 0), transfer(1_200, 1, { uniqueId: "0xdead:log:1" }), transfer(1_400, 0)], logsDown: true };
+    newDb(1_000);
+    const { r, used } = await scan(new Budget(INVOCATION_SUBREQUESTS));
+    expect(used).toBeLessThanOrEqual(INVOCATION_SUBREQUESTS);
+    expect(transferQueries()).toHaveLength(2);
+    // Nothing on page 2 was handled, the refusal included: the scan does not claim to hold before 1200, it goes back there.
+    expect(r.counts).not.toHaveProperty("refused");
+    expect([...credits.keys()]).toEqual([`${txHash(1_100, 0)}#0`, `${txHash(1_300, 0)}#0`]);
+    expect(r).toMatchObject({ scanned: false, to: 1_199, alerts: ["deposit_scan_failed"] });
+    expect(r.detail).toContain("alchemy_transfers failed (page 2: transfers out of block order (block 1200 after block 1300)), then");
+    expect(cursorNow()).toBe(1_199); // not 1299: the next scan reads 1200 again
+
+    // In order and well-formed again: 1200#1 is credited, 1300#0 answers 'duplicate', nothing is lost.
+    api = { safe: 1_500, pageSize: 2, transfers: [transfer(1_100, 0), transfer(1_200, 1), transfer(1_300, 0), transfer(1_400, 0)] };
+    const next = await scan();
+    expect(transferQueries()[0]).toMatchObject({ fromBlock: hex(1_200) });
+    expect(next.r).toMatchObject({ scanned: true, credited: 2, counts: { credited: 2, duplicate: 1 }, detail: "caught up via alchemy_transfers", to: 1_500 });
+    expect(credits.size).toBe(4);
+    expect(h.db.tables.tenants![0]!.credits_balance).toBe(4 * 250);
+  });
+
+  it("a provider answering the same pageKey again: one repeated page, then the logs fallback from the unfinished block", async () => {
+    api = { safe: 1_500, pageSize: 1, repeatPageKey: true, transfers: [transfer(1_100, 0), transfer(1_200, 0), transfer(1_300, 0)], logs: [log(1_100, 0), log(1_200, 0), log(1_300, 0)] };
+    newDb(1_000);
+    const { r, used } = await scan(new Budget(INVOCATION_SUBREQUESTS));
+    expect(used).toBeLessThanOrEqual(INVOCATION_SUBREQUESTS);
+    expect(transferQueries().map((q) => q.pageKey)).toEqual([undefined, "page:1"]); // page 2 answered pageKey page:1 again
+    expect(r).toMatchObject({ scanned: true, source: "mainnet.base.org", credited: 3, to: 1_500 });
+    expect(r.detail).toBe("caught up via mainnet.base.org (alchemy_transfers failed: page 2: the same pageKey again)");
+    // Page 2 ended in block 1200 with a pageKey, so the cursor stopped before it and the logs window starts there.
+    expect(calls.find((c) => c.method === "eth_getLogs")!.params[0]).toMatchObject({ fromBlock: hex(1_200) });
+    expect(credits.get(`${txHash(1_200, 0)}#0`)).toBe(2); // replayed from its log as 'duplicate'
+    expect(credits.size).toBe(3);
+    expect(cursorNow()).toBe(1_500);
+  });
+
+  it("the manual scan stops after MAX_TRANSFER_PAGES_PER_SCAN pages, before its budget does; the next scan goes on", async () => {
+    // 40 deposits, one per page: on the whole invocation (50) the budget alone would carry about 17 pages.
+    api = { safe: 2_000, pageSize: 1, transfers: Array.from({ length: 40 }, (_, i) => transfer(1_010 + i * 10, 0)) };
+    newDb(1_000);
+    const { r, used } = await scan(new Budget(INVOCATION_SUBREQUESTS));
+    expect(MAX_TRANSFER_PAGES_PER_SCAN).toBe(8);
+    expect(transferQueries()).toHaveLength(8);
+    expect(r).toMatchObject({ scanned: true, stopped_by_budget: false, credited: 8, detail: "backlog remains via alchemy_transfers", to: 1_079 });
+    // loop_runs row, cursor read, header, probe, cursor write, 8 pages, 8 credits, the payment batch: 24 of 50.
+    expect(r.subrequests).toBe(24);
+    expect(used).toBeLessThanOrEqual(r.subrequests);
+    expect(cursorNow()).toBe(1_079); // 1080 was page 8's last block and might have gone on in page 9
+
+    const next = await scan(new Budget(INVOCATION_SUBREQUESTS));
+    expect(transferQueries()[0]).toMatchObject({ fromBlock: hex(1_080) });
+    expect(next.r).toMatchObject({ credited: 7, counts: { duplicate: 1, credited: 7 } });
+  });
+});
+
 describe("the eth_getLogs fallback when a transfers call fails", () => {
-  const failures: Array<[string, (method: string) => Response | Error | null, string]> = [
-    ["an HTTP error on the page", (m) => (m === "alchemy_getAssetTransfers" ? new Response("", { status: 503 }) : null), "page 1: Error: rpc alchemy_getAssetTransfers HTTP 503"],
-    ["a JSON-RPC error on the safe header", (m) => (m === "eth_getBlockByNumber" ? new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: 429, message: "Your app has exceeded its compute units per second capacity" } })) : null), "safe header: Error: rpc eth_getBlockByNumber: 429 Your app has exceeded its compute units per second capacity"],
-    ["a timeout", (m) => (m === "alchemy_getAssetTransfers" ? new DOMException("The operation was aborted due to timeout", "TimeoutError") : null), "page 1: TimeoutError: The operation was aborted due to timeout"],
-    ["a result that is not a page", (m) => (m === "alchemy_getAssetTransfers" ? new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { transfers: [null] } })) : null), "page 1: Error: alchemy_getAssetTransfers returned a transfer that is not an object"],
+  const probeAnswers = (t: Wire) => (m: string, q: Record<string, unknown> | undefined) => (m === "alchemy_getAssetTransfers" && q && !("toAddress" in q) ? new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { transfers: [t] } })) : null);
+  // [name, failure, error named, subrequests reserved]: the loop_runs row, the cursor read, what Alchemy was sent (header,
+  // probe, page: up to 3), one logs window (header, eth_getLogs, cursor write), one credit and the payment batch (3). The
+  // alert and the transfers path's cursor write are reserved and given back: a leak of either shows here.
+  const failures: Array<[string, NonNullable<Api["fail"]>, string, number]> = [
+    ["an HTTP error on the page", onPage(() => new Response("", { status: 503 })), "page 1: Error: rpc alchemy_getAssetTransfers HTTP 503", 12],
+    ["a JSON-RPC error on the safe header", (m) => (m === "eth_getBlockByNumber" ? new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: 429, message: "Your app has exceeded its compute units per second capacity" } })) : null), "safe header: Error: rpc eth_getBlockByNumber: 429 Your app has exceeded its compute units per second capacity", 10],
+    ["a timeout", onPage(() => new DOMException("The operation was aborted due to timeout", "TimeoutError")), "page 1: TimeoutError: The operation was aborted due to timeout", 12],
+    ["a result that is not a page", onPage(() => new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { transfers: [null] } }))), "page 1: Error: alchemy_getAssetTransfers returned a transfer that is not an object", 12],
+    ["an HTTP error on the index probe", (m, q) => (m === "alchemy_getAssetTransfers" && q && !("toAddress" in q) ? new Response("", { status: 502 }) : null), "index probe: Error: rpc alchemy_getAssetTransfers HTTP 502", 11],
+    ["an index probe answering another contract's transfer", probeAnswers(transfer(1_200, 0, { contract: OTHER })), `index probe: Error: alchemy_getAssetTransfers returned a transfer of ${OTHER}, not ${USDC}`, 11],
+    ["an index probe answering a block outside its range", probeAnswers(transfer(1_600, 0)), "index probe: Error: alchemy_getAssetTransfers returned blockNum 0x640, not a block of [1001, 1500]", 11],
   ];
-  it.each(failures)("%s: the scan reads the same range from the logs providers and names both", async (_name, fail, error) => {
+  it.each(failures)("%s: the scan reads the same range from the logs providers and names both", async (_name, fail, error, subrequests) => {
     api = { safe: 1_500, transfers: [transfer(1_100, 0)], fail, logs: [log(1_100, 0)] };
     newDb(1_000);
     const { r, used } = await scan();
     expect(used).toBeLessThanOrEqual(DEPOSIT_SCAN_SUBREQUESTS);
+    expect(r.subrequests).toBe(subrequests);
     expect(r).toMatchObject({ scanned: true, source: "mainnet.base.org", credited: 1, to: 1_500, alerts: [] });
     expect(r.detail).toBe(`caught up via mainnet.base.org (alchemy_transfers failed: ${error})`);
     expect(calls.filter((c) => c.host === "mainnet.base.org").map((c) => c.method)).toEqual(["eth_getBlockByNumber", "eth_getLogs"]);
@@ -356,7 +524,7 @@ describe("the eth_getLogs fallback when a transfers call fails", () => {
     let pagesServed = 0;
     api = {
       safe: 1_500, pageSize: 2, transfers: [transfer(1_100, 0), transfer(1_200, 0), transfer(1_200, 1), transfer(1_400, 0)],
-      fail: (m) => (m === "alchemy_getAssetTransfers" && ++pagesServed > 1 ? new Response("", { status: 500 }) : null),
+      fail: onPage(() => (++pagesServed > 1 ? new Response("", { status: 500 }) : (null as unknown as Response))),
       logs: [log(1_100, 0), log(1_200, 0), log(1_200, 1), log(1_400, 0)],
     };
     newDb(1_000);
@@ -364,7 +532,8 @@ describe("the eth_getLogs fallback when a transfers call fails", () => {
 
   it("a page failing after progress on the 5-minute share: the progress is written and the rest is a budget stop, not a failure", async () => {
     pageTwoFails();
-    // reserve 6, cursor read, cursor write, header, page 1, two credits + the batch (15), page 2 (16): no logs window fits.
+    // reserve 6, cursor read, cursor write, header, probe, page 1, two credits + the batch (16), page 2 (17): no logs window
+    // fits.
     const { r, used } = await scan();
     expect(used).toBeLessThanOrEqual(DEPOSIT_SCAN_SUBREQUESTS);
     expect(r).toMatchObject({ scanned: true, stopped_by_budget: true, source: "alchemy_transfers", to: 1_199, credited: 2, alerts: [] });
@@ -388,7 +557,7 @@ describe("the eth_getLogs fallback when a transfers call fails", () => {
   });
 
   it("both sources failing: the failure result and deposit_scan_failed, naming each, with the cursor held", async () => {
-    api = { safe: 1_500, transfers: [transfer(1_100, 0)], fail: (m) => (m === "alchemy_getAssetTransfers" ? new Response("", { status: 503 }) : null), logsDown: true };
+    api = { safe: 1_500, transfers: [transfer(1_100, 0)], fail: onPage(() => new Response("", { status: 503 })), logsDown: true };
     newDb(1_000);
     const { r, used } = await scan();
     expect(used).toBeLessThanOrEqual(DEPOSIT_SCAN_SUBREQUESTS);

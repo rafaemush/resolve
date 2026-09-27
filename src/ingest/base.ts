@@ -187,34 +187,69 @@ export async function fetchBaseLogs(env: Env, watch: WatchRow, resolver: Resolve
 // ---- alchemy_getAssetTransfers (the USDC deposit scan's primary source) --------
 // Alchemy's transfers API has no block-range cap on Free (the eth_getLogs cap above does not apply). PROBED 2026-09-27
 // with the configured key: toBlock must be a block number ("safe" is refused: "expected latest, indexed, or a hex/decimal
-// block number"), so callers resolve the safe header first; uniqueId is "<tx hash>:log:<N>" with N the BLOCK-level
-// logIndex (the same number eth_getLogs reports); `value` is a float and never money: rawContract.value is the raw integer.
+// block number"), so callers resolve the safe header first; `value` is a float and never money: rawContract.value is the
+// raw integer. uniqueId is "<tx hash>:log:<N>" with N the BLOCK-level logIndex written in DECIMAL (the number eth_getLogs
+// reports in hex): VERIFIED 2026-09-27 on block 51,870,696, where all 115 USDC transfers' N matched their Transfer log's
+// logIndex read as decimal and none read as hex (e.g. log:41 is logIndex 0x29, log:98 is 0x62).
+// The index can lag the chain, and a numeric toBlock past what it has indexed is NOT refused (PROBED 2026-09-27: toBlock
+// head + 100,000 answered with the newest indexed transfer, a range wholly past the head with an empty page), so a
+// lagging index answers silently: latestIndexedTransferBlock below is how a caller bounds its range to what is indexed.
+// Also PROBED 2026-09-27: withMetadata false, excludeZeroValue true, maxCount 0x64 and a query with no from/to address
+// (contract only, order desc) are accepted.
 
 /** One transfer as alchemy_getAssetTransfers returns it (category erc20). Fields are checked by the caller, never trusted. */
 export interface AssetTransfer {
   blockNum?: unknown; uniqueId?: unknown; hash?: unknown; from?: unknown; to?: unknown; category?: unknown;
   rawContract?: { value?: unknown; address?: unknown; decimal?: unknown } | null;
-  metadata?: { blockTimestamp?: unknown } | null;
 }
 export interface AssetTransfersPage { transfers: AssetTransfer[]; pageKey?: string }
-/** Transfers per page (the API's maximum, 0x3e8). */
-export const ASSET_TRANSFERS_PAGE_SIZE = 1000;
+/**
+ * Transfers per page (0x64). Every returned transfer is a non-zero USDC transfer to the receiving address, and each costs
+ * the scan a credit subrequest, so a scan never handles more than a few dozen: bigger pages would only add JSON to parse
+ * on the Workers Free CPU limit.
+ */
+export const ASSET_TRANSFERS_PAGE_SIZE = 100;
+
+/** One alchemy_getAssetTransfers call (one subrequest) whose result must be a page of objects. */
+async function transfersCall(url: string, params: Record<string, unknown>): Promise<AssetTransfersPage> {
+  const r = await rpc<{ transfers?: unknown; pageKey?: unknown } | null>(url, "alchemy_getAssetTransfers", [{ category: ["erc20"], withMetadata: false, ...params }]);
+  if (!r || typeof r !== "object" || !Array.isArray(r.transfers)) throw new Error("alchemy_getAssetTransfers returned no transfers array");
+  if (r.transfers.some((t) => !t || typeof t !== "object")) throw new Error("alchemy_getAssetTransfers returned a transfer that is not an object");
+  if (r.pageKey !== undefined && r.pageKey !== null && (typeof r.pageKey !== "string" || !r.pageKey)) throw new Error("alchemy_getAssetTransfers returned an unusable pageKey");
+  return { transfers: r.transfers as AssetTransfer[], ...(typeof r.pageKey === "string" ? { pageKey: r.pageKey } : {}) };
+}
 
 /**
- * One page (one subrequest) of ERC-20 transfers of `contract` to `toAddress` over [fromBlock, toBlock], oldest first.
- * Pass the previous page's pageKey, with the same range, for the next page. Throws on an HTTP or JSON-RPC error, a
+ * One page (one subrequest) of non-zero ERC-20 transfers of `contract` to `toAddress` over [fromBlock, toBlock], oldest
+ * first. Pass the previous page's pageKey, with the same range, for the next page. Throws on an HTTP or JSON-RPC error, a
  * timeout, or a result that is not a page (no transfers array, a pageKey that is not a non-empty string).
  */
 export async function assetTransfersPage(
   url: string, q: { fromBlock: number; toBlock: number; toAddress: string; contract: string; pageKey?: string },
 ): Promise<AssetTransfersPage> {
-  const r = await rpc<{ transfers?: unknown; pageKey?: unknown } | null>(url, "alchemy_getAssetTransfers", [{
+  return transfersCall(url, {
     fromBlock: hex(q.fromBlock), toBlock: hex(q.toBlock), toAddress: q.toAddress, contractAddresses: [q.contract],
-    category: ["erc20"], withMetadata: true, excludeZeroValue: false, maxCount: hex(ASSET_TRANSFERS_PAGE_SIZE), order: "asc",
-    ...(q.pageKey ? { pageKey: q.pageKey } : {}),
-  }]);
-  if (!r || typeof r !== "object" || !Array.isArray(r.transfers)) throw new Error("alchemy_getAssetTransfers returned no transfers array");
-  if (r.transfers.some((t) => !t || typeof t !== "object")) throw new Error("alchemy_getAssetTransfers returned a transfer that is not an object");
-  if (r.pageKey !== undefined && r.pageKey !== null && (typeof r.pageKey !== "string" || !r.pageKey)) throw new Error("alchemy_getAssetTransfers returned an unusable pageKey");
-  return { transfers: r.transfers as AssetTransfer[], ...(typeof r.pageKey === "string" ? { pageKey: r.pageKey } : {}) };
+    excludeZeroValue: true, maxCount: hex(ASSET_TRANSFERS_PAGE_SIZE), order: "asc", ...(q.pageKey ? { pageKey: q.pageKey } : {}),
+  });
+}
+
+/**
+ * The index probe (one subrequest): the newest block in [fromBlock, toBlock] where the transfers index holds a transfer of
+ * `contract` (any sender, any recipient), or null when it holds none there. The index is read up to one height (the API
+ * names it: toBlock "indexed"), so a transfer indexed at block B means every block up to B is indexed and a query ending
+ * at B misses nothing. USDC on Base moves in nearly every block (115 transfers in the one probed), so B is the indexed
+ * height itself unless the index is behind. Throws like assetTransfersPage, and on a transfer that is not of `contract` or
+ * whose blockNum is not a block of the range.
+ */
+export async function latestIndexedTransferBlock(url: string, q: { fromBlock: number; toBlock: number; contract: string }): Promise<number | null> {
+  const page = await transfersCall(url, {
+    fromBlock: hex(q.fromBlock), toBlock: hex(q.toBlock), contractAddresses: [q.contract], excludeZeroValue: false, maxCount: "0x1", order: "desc",
+  });
+  const t = page.transfers[0];
+  if (!t) return null;
+  const contract = t.rawContract?.address;
+  if (typeof contract !== "string" || contract.toLowerCase() !== q.contract.toLowerCase()) throw new Error(`alchemy_getAssetTransfers returned a transfer of ${String(contract).slice(0, 42)}, not ${q.contract}`);
+  const block = typeof t.blockNum === "string" && /^0x[0-9a-f]+$/i.test(t.blockNum) ? parseInt(t.blockNum, 16) : NaN;
+  if (!Number.isSafeInteger(block) || block < q.fromBlock || block > q.toBlock) throw new Error(`alchemy_getAssetTransfers returned blockNum ${String(t.blockNum).slice(0, 24)}, not a block of [${q.fromBlock}, ${q.toBlock}]`);
+  return block;
 }

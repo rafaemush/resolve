@@ -33,7 +33,7 @@ import { postPending } from "../src/bot/post";
 import { recorderCheckDue, runTick } from "../src/jobs/tick";
 import { alert } from "../src/ops/alerts";
 import { drainWebhooks, drainSubrequests, DRAIN_MAX } from "../src/webhooks/deliver";
-import { scanDeposits, SCAN_RESERVE, TRANSFER_PAGE_COST, TRANSFERS_MIN } from "../src/jobs/deposits";
+import { scanDeposits, INDEX_PROBE_COST, SCAN_RESERVE, TRANSFER_PAGE_COST, TRANSFERS_MIN } from "../src/jobs/deposits";
 import { Budget, COST, DISPATCH_CHECK_SUBREQUESTS, EXCEPTION_RESERVE, INVOCATION_SUBREQUESTS } from "../src/ops/budget";
 
 const env = {} as Env;
@@ -83,11 +83,17 @@ describe("per-invocation subrequest budgets (Workers Free: 50)", async () => {
     expect(drainSubrequests(DRAIN_MAX) + DEPOSIT_SCAN_SUBREQUESTS + EXCEPTION_RESERVE).toBe(INVOCATION_SUBREQUESTS);
     // The scan's reserve, its cursor read and one window's minimum (safe header, eth_getLogs, cursor write) fit.
     expect(DEPOSIT_SCAN_SUBREQUESTS).toBeGreaterThanOrEqual(SCAN_RESERVE + COST.db + 2 * COST.http + COST.db);
-    // The Alchemy transfers path: one subrequest per page of up to 1,000 transfers over any block range. Its reserve, the
-    // cursor read, the safe header, one page and the one cursor write fit, leaving 8 for more pages and credits.
+    // The Alchemy transfers path: one subrequest per page of up to 100 transfers over any block range. Its reserve, the
+    // cursor read, the safe header, the index probe, one page and the one cursor write fit, leaving 7 for more pages and
+    // credits: the payment batch and 4 credits.
     expect(TRANSFER_PAGE_COST).toBe(COST.http);
-    expect(TRANSFERS_MIN).toBe(COST.http + TRANSFER_PAGE_COST + COST.db);
-    expect(DEPOSIT_SCAN_SUBREQUESTS - (SCAN_RESERVE + COST.db + TRANSFERS_MIN)).toBe(8);
+    expect(INDEX_PROBE_COST).toBe(COST.http);
+    expect(TRANSFERS_MIN).toBe(COST.http + INDEX_PROBE_COST + TRANSFER_PAGE_COST + COST.db);
+    expect(DEPOSIT_SCAN_SUBREQUESTS - (SCAN_RESERVE + COST.db + TRANSFERS_MIN)).toBe(7);
+    // After a failed transfers attempt (header, probe and page 1 spent), the logs fallback's first window still fits.
+    const fallbackLeft = DEPOSIT_SCAN_SUBREQUESTS - (SCAN_RESERVE + COST.db + COST.http + INDEX_PROBE_COST + TRANSFER_PAGE_COST);
+    expect(fallbackLeft).toBe(8);
+    expect(fallbackLeft).toBeGreaterThanOrEqual(2 * COST.http + COST.db);
   });
   it("every-minute invocation: the tick (dispatch read, recorder read, insert, one alertMany) + the channel poster's budget + one exception alert = 50", async () => {
     const { TICK_SUBREQUESTS } = await vi.importActual<typeof import("../src/jobs/tick")>("../src/jobs/tick");

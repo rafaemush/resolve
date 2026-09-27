@@ -10,11 +10,16 @@
  *                  would sit in 'delivering' until the stale sweep), then the USDC deposit scan on what is left
  *                  (DEPOSIT_SCAN_SUBREQUESTS = 18; safe to cut off: credits are INSERT-first and the cursor moves only
  *                  past handled logs, so a cut is a retry, never a lost deposit). Its Alchemy transfers path spends
- *                  SCAN_RESERVE 6 + cursor read 1 + safe header 1 + cursor write 1, then 1 per page of up to 1,000
- *                  transfers (TRANSFER_PAGE_COST, any block range) and 1 per credit (+ PAYMENT_EVENTS_COST 3 once): a
- *                  one-page catch-up over any gap reserves 10 (SCAN_RESERVE + cursor read + TRANSFERS_MIN), leaving 8
- *                  for more pages and credits, and a scan with no alert sends 5 of the 10. The eth_getLogs fallback
- *                  keeps its per-window cost (safe header, eth_getLogs, cursor write: 3 per 2,000 blocks)
+ *                  SCAN_RESERVE 6 + cursor read 1 + safe header 1 + index probe 1 + cursor write 1, then 1 per page of
+ *                  up to 100 transfers (TRANSFER_PAGE_COST, any block range) and 1 per credit (+ PAYMENT_EVENTS_COST 3
+ *                  once): a one-page catch-up over any gap reserves 11 (SCAN_RESERVE + cursor read + TRANSFERS_MIN),
+ *                  leaving 7 for more pages and credits (4 credits with the payment batch), and a scan with no alert
+ *                  sends 6 of the 11. The eth_getLogs fallback keeps its per-window cost (safe header, eth_getLogs,
+ *                  cursor write: 3 per 2,000 blocks), but after a failed transfers attempt it starts with less: 18 - 6
+ *                  - 1 - (header, probe, page 1: up to 3) = 8 at worst, not the 11 it has without Alchemy. Its worst case
+ *                  (both providers answering range errors through every halving, 2 x 5 + the write) needs 11, so there
+ *                  the second provider gets its header and one eth_getLogs and the scan reports a budget run-out
+ *                  instead of "no provider answered": still a failure with the cursor held and an alert
  *   every 10 min   pg_net dispatch check (6), then reconcile on its own budget (RECONCILE_SUBREQUESTS = 39)
  * Every invocation keeps EXCEPTION_RESERVE back: a job that throws becomes an operator alert, not a log line.
  * wrangler.toml [triggers] must list exactly the CRONS below (tests/schedule.test.ts reads it).
