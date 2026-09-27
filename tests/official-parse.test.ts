@@ -8,6 +8,7 @@ import { officialFixture as fx, officialFixtureBytes } from "../evals/lib/offici
 import {
   parseBlsRelease, parseBlsApi, blsApiYoy, findFomcStatement, parseFomcStatement, parseFraction, fredValueOn, findEcbDecision,
   parseEcbRelease, parseEcbDfrCsv, parseBoeRss, iadbValueOn, parseBokDecisionRss, parseBokGdpRss, parseEcosRows, parseBcbHistory, decodeEntities, bytesInclude, usDayLabel,
+  parseBlsCpiTableA, parseEmpsitRelease,
 } from "../src/ingest/official-parse";
 
 const obs = (p: ReturnType<typeof parseBlsRelease>) => { if (!p.ok) throw new Error(`${p.reason}: ${p.detail}`); return p.obs; };
@@ -161,7 +162,12 @@ describe("CPU budget (Workers Free: 10 ms per invocation)", () => {
   const ppi = fx("bls_ppi_nr0.html");
   const ecb = fx("ecb_mp260910.html");
   const bcb = fx("bcb_historicotaxasjuros.json");
+  const cpi = fx("bls_cpi_nr0.html");
+  // the saved summary is an excerpt (its <PRE>); padded to the live page's 62 KB so the <PRE> search costs what it does there
+  const empsit = `<html>${"<div>navigation</div>".repeat(2600)}${fx("bls_empsit_nr0_excerpt.html")}</html>`;
   const cases: Array<[string, () => unknown]> = [
+    ["bls cpi 90 KB, the four series of one fetch (the text and three Table A cells)", () => [parseBlsRelease(cpi, "cpi"), parseBlsCpiTableA(cpi, "all_items", "sa_1m"), parseBlsCpiTableA(cpi, "core", "sa_1m"), parseBlsCpiTableA(cpi, "core", "nsa_12m")]],
+    ["bls employment situation ~62 KB, both numbers", () => [parseEmpsitRelease(empsit, "payrolls_change"), parseEmpsitRelease(empsit, "unemployment_rate")]],
     ["bok decision feed 886 KB, target absent (walks all 100 items)", () => parseBokDecisionRss(bokFeed, "2026-10-22")],
     ["bok decision feed 886 KB, target present", () => parseBokDecisionRss(bokFeed, "2026-08-27")],
     ["bok decision feed 886 KB, bytes -> text -> parse (what the Worker does after arrayBuffer)", () => parseBokDecisionRss(new TextDecoder().decode(bokBytes), "2026-08-27")],

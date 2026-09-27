@@ -317,7 +317,12 @@
                       "boe_bank_rate",
                       "bok_base_rate",
                       "kr_gdp_advance_yoy",
-                      "bcb_selic_target"
+                      "bcb_selic_target",
+                      "us_cpi_u_sa_mom",
+                      "us_core_cpi_nsa_yoy",
+                      "us_core_cpi_sa_mom",
+                      "us_unemployment_rate",
+                      "us_nonfarm_payrolls_change"
                     ]
                   },
                   "period": {
@@ -365,7 +370,8 @@
                     "enum": [
                       "pct_1dp",
                       "bps_away_from_zero_25",
-                      "bps_nearest_25_min_25"
+                      "bps_nearest_25_min_25",
+                      "thousands_as_printed"
                     ]
                   }
                 },

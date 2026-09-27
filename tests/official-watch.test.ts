@@ -13,7 +13,7 @@ type Row = Record<string, unknown>;
 const h = vi.hoisted(() => {
   const state = {
     watch: {} as Row, evidence: [] as Row[], resolutions: [] as Row[], loopRuns: [] as Row[],
-    obs: new Map<string, Row>(), slots: new Map<string, number>(), extends: [] as number[], hideObsFromSelect: false, nowMs: undefined as number | undefined, rpcCalls: [] as string[], seq: 0,
+    obs: new Map<string, Row>(), slots: new Map<string, number>(), extends: [] as number[], hideObsFromSelect: false, nowMs: undefined as number | undefined, rpcCalls: [] as string[], seq: 0, obsReads: [] as string[],
   };
   const now = () => state.nowMs ?? Date.now();
   class Q implements PromiseLike<{ data: unknown; error: unknown; count?: number }> {
@@ -25,6 +25,7 @@ const h = vi.hoisted(() => {
     insert(p: Row) { this.action = "insert"; this.payload = p; return this; }
     update(p: Row) { this.action = "update"; this.payload = p; return this; }
     eq(c: string, v: unknown) { this.filters.push([c, v]); return this; }
+    in(c: string, v: unknown[]) { this.filters.push([c, v]); return this; }
     gte() { return this; }
     or() { return this; }
     order() { return this; }
@@ -38,7 +39,9 @@ const h = vi.hoisted(() => {
       if (t === "watches" && this.action === "update") { Object.assign(state.watch, structuredClone(this.payload)); return { data: null, error: null }; }
       if (t === "loop_runs") { state.loopRuns.push(this.payload!); return { data: null, error: null }; }
       if (t === "official_observations") {
-        const f = Object.fromEntries(this.filters) as { series: string; period: string };
+        const f = Object.fromEntries(this.filters) as { series: string | string[]; period: string };
+        state.obsReads.push(Array.isArray(f.series) ? f.series.join(",") : f.series);
+        if (Array.isArray(f.series)) return { data: state.hideObsFromSelect ? [] : f.series.filter((s) => state.obs.has(`${s}|${f.period}`)).map((s) => ({ series: s })), error: null };
         return { data: state.hideObsFromSelect ? null : (state.obs.get(`${f.series}|${f.period}`) ?? null), error: null };
       }
       if (t === "evidence" && this.action === "insert") {
@@ -103,6 +106,7 @@ import { fetchPrimary, officialGet, budget, OFFICIAL_UA } from "../src/ingest/of
 import { alert } from "../src/ops/alerts";
 import type { MarketRow, WatchRow } from "../src/ingest/types";
 import { buildLegRegistration } from "../src/markets/official-legs";
+import { decideOfficial } from "../src/resolve/official";
 
 const WATCH_ID = "33333333-3333-4333-8333-333333333333";
 const MARKET_ID = "44444444-4444-4444-8444-444444444444";
@@ -158,7 +162,7 @@ function clock(startIso: string) {
 }
 
 beforeEach(() => {
-  Object.assign(h.state, { evidence: [], resolutions: [], loopRuns: [], obs: new Map(), slots: new Map(), extends: [], hideObsFromSelect: false, nowMs: undefined, rpcCalls: [], seq: 0 });
+  Object.assign(h.state, { evidence: [], resolutions: [], loopRuns: [], obs: new Map(), slots: new Map(), extends: [], hideObsFromSelect: false, nowMs: undefined, rpcCalls: [], seq: 0, obsReads: [] });
   put = vi.fn(async () => ({}));
   vi.mocked(alert).mockClear();
 });
@@ -229,7 +233,7 @@ describe("fetchOfficial", () => {
     const m = market(cpiGroup("2026-10-14T12:30:00Z"), "3.3%");
     setWatch(m);
     const c = clock("2026-10-14T12:30:01Z");
-    h.state.slots.set("us_cpi_u_nsa_yoy|2026-09", c.now() + 30_000);
+    h.state.slots.set("bls_cpi_release|2026-09", c.now() + 30_000); // the CPI release's one slot, shared by its four series
     serve(cpiRouter(1));
     const out = await fetchOfficial(env(), watchRow(), m, c.deps);
     expect(out).toMatchObject({ notModified: true, note: "awaiting_observation: another leg of this event holds the fetch lease", nextPollAt: "2026-10-14T12:31:00.000Z" });
@@ -545,3 +549,227 @@ describe("runWatch with an official_release source", () => {
     expect(h.state.resolutions[0]!.verdict).toMatchObject({ resolution_status: "RESOLVED", winning_outcome: "OPTION_A" });
   });
 });
+
+// ---- the BLS fetch groups: one page, several series (2026-09-27) --------------------------------------------------------
+
+// SYNTHETIC September pages: the saved August releases with their month edited (header, Table A's last column, the
+// summary sentences), standing for releases not yet made.
+const CPI_SEP_FULL = CPI_AUG
+  .replace("CONSUMER PRICE INDEX - AUGUST 2026", "CONSUMER PRICE INDEX - SEPTEMBER 2026")
+  .replace('id="cpi_pressa.h.2.8">Aug.<br />2026', 'id="cpi_pressa.h.2.8">Sep.<br />2026')
+  .replace("ended<br />Aug. 2026", "ended<br />Sep. 2026")
+  .replace("seasonally adjusted basis in August", "seasonally adjusted basis in September");
+const EMPSIT_AUG = fx("bls_empsit_nr0_excerpt.html");
+const EMPSIT_SEP = EMPSIT_AUG.replace("THE EMPLOYMENT SITUATION - AUGUST 2026", "THE EMPLOYMENT SITUATION - SEPTEMBER 2026").split("in August").join("in September");
+const API_BODY: Record<string, string> = {
+  CUUR0000SA0: "bls_v1_cpi.json", CUSR0000SA0: "bls_v1_cpi_sa.json", CUSR0000SA0L1E: "bls_v1_core_sa.json", CUUR0000SA0L1E: "bls_v1_core_nsa.json",
+  LNS14000000: "bls_v1_unrate.json", CES0000000001: "bls_v1_payrolls.json",
+};
+const blsRouter = (pages: Record<string, string>) => (url: string) => {
+  for (const [part, body] of Object.entries(pages)) if (url === `https://www.bls.gov/news.release/${part}`) return ok(body);
+  const id = /\/timeseries\/data\/([A-Z0-9]+)$/.exec(url)?.[1];
+  if (id && API_BODY[id]) return ok(fx(API_BODY[id]), "application/json");
+  return new Response("not found", { status: 404 });
+};
+const sepGroup = (series: Group["series"], title: string, release_at: string): Group => ({ series, period: "2026-09", release_at, title });
+const CPI_REL = "2026-10-14T12:30:00Z", EMPSIT_REL = "2026-10-02T12:30:00Z";
+const legOf = (series: Group["series"], label: string, release_at: string) => market(sepGroup(series, "t", release_at), label, "2026-10-15T03:59:00Z", "2026-09-04T00:00:00Z");
+const payLeg = (label: string) => {
+  const r = buildLegRegistration({ platform: "polymarket", external_id: `leg-${label}`, group: sepGroup("us_nonfarm_payrolls_change", "How many jobs added in September?", EMPSIT_REL), label, open_at: "2026-09-04T16:37:33Z", deadline_utc: "2026-10-03T03:59:00Z", criteria: "Ties go to the higher range bracket." });
+  if (!r.ok) throw new Error(r.reason);
+  return { ...r.market, id: MARKET_ID, tenant_id: null, status: "open", official_outcome: null, official_resolved_at: null, official_source_url: null } as MarketRow;
+};
+
+describe("BLS fetch groups: one fetch slot and one page fetch per release", () => {
+  it("the CPI release minute: the holder fetches cpi.nr0.htm once and records all four series from it, each with its own corroboration", async () => {
+    const m = legOf("us_cpi_u_nsa_yoy", "3.4%", CPI_REL);
+    setWatch(m);
+    const c = clock("2026-10-14T12:30:02Z");
+    serve(blsRouter({ "cpi.nr0.htm": CPI_SEP_FULL }));
+    const pending: Array<Promise<unknown>> = [];
+    const out = await fetchOfficial(env(), watchRow(), m, { ...c.deps, waitUntil: (p) => pending.push(p) });
+    expect(out.note).toMatch(/release minute: the capture burst continues in waitUntil/);
+    await Promise.all(pending);
+    expect(calls.filter((x) => x.url.endsWith("cpi.nr0.htm"))).toHaveLength(1);
+    expect(calls.filter((x) => x.url.includes("api.bls.gov")).map((x) => x.url.split("/").pop()).sort()).toEqual(["CUSR0000SA0", "CUSR0000SA0L1E", "CUUR0000SA0", "CUUR0000SA0L1E"]);
+    expect(h.state.slots.has("bls_cpi_release|2026-09")).toBe(true);
+    expect([...h.state.slots.keys()]).toEqual(["bls_cpi_release|2026-09"]);
+    const rows = Object.fromEntries([...h.state.obs.entries()].map(([k, r]) => [k, r.value_text]));
+    expect(rows).toEqual({ "us_cpi_u_nsa_yoy|2026-09": "3.4", "us_cpi_u_sa_mom|2026-09": "0.4", "us_core_cpi_nsa_yoy|2026-09": "2.4", "us_core_cpi_sa_mom|2026-09": "0.3" });
+    const mom = h.state.obs.get("us_cpi_u_sa_mom|2026-09")!;
+    expect(mom.deciding_text).toBe("CONSUMER PRICE INDEX - SEPTEMBER 2026: Table A, All items, Seasonally adjusted changes from preceding month, Sep. 2026: 0.4");
+    expect(mom.meta).toMatchObject({ captured_by_market: MARKET_ID, sibling_of: "us_cpi_u_nsa_yoy", doc_period: "2026-09" });
+    expect((mom.corroboration as Row).status).toBe("unavailable"); // the saved API bodies end in August: not a disagreement
+    expect(put).toHaveBeenCalledTimes(1); // one upstream body, one R2 object
+    // a leg of a sibling ladder resolves from its stored row on its next poll, with no upstream request
+    calls = [];
+    const momLeg = legOf("us_cpi_u_sa_mom", "0.4%", CPI_REL);
+    setWatch(momLeg);
+    vi.useFakeTimers({ toFake: ["Date"], now: new Date("2026-10-14T12:31:00Z") });
+    try {
+      const s = await runWatch(env(), cfg, WATCH_ID);
+      expect(s.outcome).toBe("success");
+    } finally { vi.useRealTimers(); }
+    expect(calls).toHaveLength(0);
+    expect(h.state.resolutions.at(-1)!.verdict).toMatchObject({ resolution_status: "RESOLVED", winning_outcome: "OPTION_A" });
+  });
+
+  it("a release without a 1-month change (Table A '-', as after the 2025 lapse): the 1-month legs stay pending, the 12-month numbers of the same page are recorded", async () => {
+    const lapse = CPI_SEP_FULL
+      .replace('headers="cpi_pressa.r.1 cpi_pressa.h.1.2 cpi_pressa.h.2.8"><span class="datavalue">0.4</span>', 'headers="cpi_pressa.r.1 cpi_pressa.h.1.2 cpi_pressa.h.2.8"><span class="datavalue">-</span>')
+      .replace('headers="cpi_pressa.r.1.3 cpi_pressa.h.1.2 cpi_pressa.h.2.8"><span class="datavalue">0.3</span>', 'headers="cpi_pressa.r.1.3 cpi_pressa.h.1.2 cpi_pressa.h.2.8"><span class="datavalue">-</span>'); // SYNTHETIC
+    const m = legOf("us_cpi_u_sa_mom", "0.4%", CPI_REL);
+    setWatch(m);
+    const c = clock("2026-10-14T12:40:00Z");
+    serve(blsRouter({ "cpi.nr0.htm": lapse }));
+    const pending: Array<Promise<unknown>> = [];
+    await fetchOfficial(env(), watchRow(), m, { ...c.deps, waitUntil: (p) => pending.push(p) });
+    await Promise.all(pending);
+    expect(Object.fromEntries([...h.state.obs.entries()].map(([k, r]) => [k, r.value_text]))).toEqual({ "us_cpi_u_nsa_yoy|2026-09": "3.4", "us_core_cpi_nsa_yoy|2026-09": "2.4" });
+    expect(calls.filter((x) => x.url.endsWith("cpi.nr0.htm"))).toHaveLength(1);
+    expect(put).toHaveBeenCalledTimes(1);
+    // six hours on, the 1-month legs are release_not_observed: never 0.0, never another month
+    h.state.slots.clear();
+    const late = await fetchOfficial(env(), watchRow(), m, clock("2026-10-14T18:31:00Z").deps);
+    expect(late.evidence!.structured).toMatchObject({ kind: "official_missing", series: "us_cpi_u_sa_mom", period: "2026-09" });
+  });
+
+  it("a leg of one CPI series cannot fetch while a leg of another holds the release's slot", async () => {
+    const m = legOf("us_core_cpi_sa_mom", "0.3%", CPI_REL);
+    setWatch(m);
+    const c = clock("2026-10-14T12:30:01Z");
+    h.state.slots.set("bls_cpi_release|2026-09", c.now() + 30_000);
+    serve(blsRouter({ "cpi.nr0.htm": CPI_SEP_FULL }));
+    const out = await fetchOfficial(env(), watchRow(), m, c.deps);
+    expect(out.note).toBe("awaiting_observation: another leg of this event holds the fetch lease");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("the Employment Situation: a sibling already stored is skipped (no second record, no corroboration request for it)", async () => {
+    const m = payLeg("150k to 200k");
+    setWatch(m);
+    h.state.obs.set("us_unemployment_rate|2026-09", { series: "us_unemployment_rate", period: "2026-09", value: 4.1, value_text: "4.1", deciding_text: "THE EMPLOYMENT SITUATION - SEPTEMBER 2026: ...", source_url: "https://www.bls.gov/news.release/empsit.nr0.htm", raw_sha256: "d".repeat(64), observed_at: "2026-10-02T12:30:01.000Z", corroboration: null, meta: {} });
+    const c = clock("2026-10-02T12:30:03Z");
+    serve(blsRouter({ "empsit.nr0.htm": EMPSIT_SEP }));
+    const pending: Array<Promise<unknown>> = [];
+    await fetchOfficial(env(), watchRow(), m, { ...c.deps, waitUntil: (p) => pending.push(p) });
+    await Promise.all(pending);
+    expect(h.state.obs.get("us_nonfarm_payrolls_change|2026-09")).toMatchObject({ value: 162, value_text: "162" });
+    expect(calls.map((x) => x.url.split("/").pop())).toEqual(["empsit.nr0.htm", "CES0000000001"]); // no LNS14000000: the rate was stored
+    expect(h.state.obsReads).toContain("us_unemployment_rate");
+    expect([...h.state.slots.keys()]).toEqual(["bls_empsit_release|2026-09"]);
+  });
+
+  it("the Employment Situation: both numbers from one fetch; the payroll corroboration is unavailable until the API's latest month is September", async () => {
+    const m = legOf("us_unemployment_rate", "4.1%", EMPSIT_REL);
+    setWatch(m);
+    const c = clock("2026-10-02T12:30:00.300Z");
+    serve(blsRouter({ "empsit.nr0.htm": EMPSIT_SEP }));
+    const pending: Array<Promise<unknown>> = [];
+    await fetchOfficial(env(), watchRow(), m, { ...c.deps, waitUntil: (p) => pending.push(p) });
+    await Promise.all(pending);
+    expect(calls.filter((x) => x.url.endsWith("empsit.nr0.htm"))).toHaveLength(1);
+    expect(h.state.obs.get("us_unemployment_rate|2026-09")).toMatchObject({ value_text: "4.1" });
+    const pay = h.state.obs.get("us_nonfarm_payrolls_change|2026-09")!;
+    expect(pay).toMatchObject({ value: 162, value_text: "162" });
+    expect(pay.deciding_text).toBe("THE EMPLOYMENT SITUATION - SEPTEMBER 2026: Total nonfarm payroll employment increased by 162,000 in September, and the unemployment rate was unchanged at 4.1 percent, the U.S. Bureau of Labor Statistics reported today.");
+    expect((pay.corroboration as Row).status).toBe("unavailable");
+  });
+
+  it("without an ExecutionContext only the holder's own series is recorded (the others fetch on their own turn at the slot)", async () => {
+    const m = legOf("us_unemployment_rate", "4.1%", EMPSIT_REL);
+    setWatch(m);
+    serve(blsRouter({ "empsit.nr0.htm": EMPSIT_SEP }));
+    const out = await fetchOfficial(env(), watchRow(), m, clock("2026-10-02T12:40:00Z").deps);
+    expect(out.evidence!.structured).toMatchObject({ series: "us_unemployment_rate", value_text: "4.1" });
+    expect([...h.state.obs.keys()]).toEqual(["us_unemployment_rate|2026-09"]);
+  });
+
+  it("a delayed Employment Situation (the August summary still up after 12:30Z on Oct 2) is pending, then release_not_observed, never August's numbers", async () => {
+    const m = payLeg("150k to 200k");
+    setWatch(m);
+    serve(blsRouter({ "empsit.nr0.htm": EMPSIT_AUG }));
+    const early = await fetchOfficial(env(), watchRow(), m, clock("2026-10-02T12:45:00Z").deps);
+    expect(early).toMatchObject({ notModified: true });
+    expect(early.note).toContain("document is about 2026-08");
+    h.state.slots.clear();
+    const late = await fetchOfficial(env(), watchRow(), m, clock("2026-10-02T18:31:00Z").deps);
+    expect(late.evidence!.structured).toMatchObject({ kind: "official_missing", series: "us_nonfarm_payrolls_change", period: "2026-09" });
+    expect(h.state.obs.size).toBe(0);
+  });
+
+  it("first print: a payroll revision read later is alerted and ignored; the stored -23 still decides", async () => {
+    const jul: Group = { series: "us_nonfarm_payrolls_change", period: "2026-07", release_at: "2026-08-07T12:30:00Z", title: "How many jobs added in July?" };
+    const r = buildLegRegistration({ platform: "polymarket", external_id: "leg-jul", group: jul, label: "-50k to 0", open_at: "2026-06-01T00:00:00Z", deadline_utc: "2026-08-08T03:59:00Z", criteria: "higher range bracket" });
+    if (!r.ok) throw new Error(r.reason);
+    const m = { ...r.market, id: MARKET_ID, tenant_id: null, status: "open", official_outcome: null, official_resolved_at: null, official_source_url: null } as MarketRow;
+    setWatch(m);
+    h.state.obs.set("us_nonfarm_payrolls_change|2026-07", { series: "us_nonfarm_payrolls_change", period: "2026-07", value: -23, value_text: "-23", deciding_text: "THE EMPLOYMENT SITUATION - JULY 2026: Both nonfarm payroll employment (-23,000) and the unemployment rate (4.1 percent) changed little in July, the U.S. Bureau of Labor Statistics reported today.", source_url: "https://www.bls.gov/news.release/empsit.nr0.htm", raw_sha256: "e".repeat(64), observed_at: "2026-08-07T12:30:03.000Z", corroboration: null, meta: {} });
+    h.state.hideObsFromSelect = true; // this leg's read raced the first print, so it fetched a later (SYNTHETIC reissued) page offering +21
+    const reissued = fx("bls_empsit_202607_excerpt.html").split("-23,000").join("+21,000");
+    serve(blsRouter({ "empsit.nr0.htm": reissued }));
+    const out = await fetchOfficial(env(), watchRow(), m, clock("2026-08-07T13:00:00Z").deps);
+    expect(out.evidence!.structured).toMatchObject({ value_text: "-23" });
+    expect(alertKeys()).toContainEqual(["official_revision_us_nonfarm_payrolls_change_2026-07", 1440]);
+  });
+});
+
+describe("BLS fetch groups: what the holder's page may and may not record for its siblings", () => {
+  it("a page about another month records nothing for the target, not even a sibling it states (the 2025 lapse: October never published, November's 1-month cells '-')", async () => {
+    const nov25 = fx("bls_cpi_202511_excerpt.html");
+    serve(blsRouter({ "cpi.nr0.htm": nov25 }));
+    // pure: the target October 2025 gets no sibling from the November page; the November target gets the two 12-month numbers
+    const oct = await fetchPrimary("us_cpi_u_sa_mom", "2025-10", budget(() => Date.now(), 8000, 4));
+    expect(oct).toMatchObject({ kind: "pending" });
+    expect("siblings" in oct ? oct.siblings : undefined).toBeUndefined();
+    const nov = await fetchPrimary("us_cpi_u_sa_mom", "2025-11", budget(() => Date.now(), 8000, 4));
+    expect(nov.kind === "pending" ? nov.siblings?.map((x) => [x.series, x.period, x.value_text]) : null).toEqual([["us_cpi_u_nsa_yoy", "2025-11", "2.7"], ["us_core_cpi_nsa_yoy", "2025-11", "2.6"]]);
+    // through the watch, in waitUntil: an October 2025 leg's capture stores no row at all
+    const m = market({ series: "us_cpi_u_sa_mom", period: "2025-10", release_at: "2025-11-13T13:30:00Z", title: "October 2025 Inflation US - Monthly" }, "0.3%", "2025-11-14T04:59:00Z", "2025-10-01T00:00:00Z");
+    setWatch(m);
+    const pending: Array<Promise<unknown>> = [];
+    await fetchOfficial(env(), watchRow(), m, { ...clock("2025-12-18T13:31:00Z").deps, waitUntil: (p) => pending.push(p) });
+    await Promise.all(pending);
+    expect(h.state.obs.size).toBe(0);
+    expect(put).not.toHaveBeenCalled();
+    expect(calls.filter((x) => x.url.includes("api.bls.gov"))).toHaveLength(0);
+  });
+
+  it("the holder's own part of the page drifts: the siblings the page states are still recorded, and the drift is alerted", async () => {
+    // SYNTHETIC: Table A's core row relabelled, so both core series drift while the headline text and row still parse
+    const drifted = CPI_SEP_FULL.replace('id="cpi_pressa.r.1.3"><p class="sub1">All items less food and energy</p>', 'id="cpi_pressa.r.1.3"><p class="sub1">All items less food and energy (new basket)</p>');
+    expect(drifted).not.toBe(CPI_SEP_FULL);
+    const m = legOf("us_core_cpi_sa_mom", "0.3%", CPI_REL);
+    setWatch(m);
+    serve(blsRouter({ "cpi.nr0.htm": drifted }));
+    const pending: Array<Promise<unknown>> = [];
+    await fetchOfficial(env(), watchRow(), m, { ...clock("2026-10-14T12:30:02Z").deps, waitUntil: (p) => pending.push(p) });
+    await Promise.all(pending);
+    expect(calls.filter((x) => x.url.endsWith("cpi.nr0.htm"))).toHaveLength(1); // drift is not retried in the burst
+    expect(Object.fromEntries([...h.state.obs.entries()].map(([k, r]) => [k, r.value_text]))).toEqual({ "us_cpi_u_nsa_yoy|2026-09": "3.4", "us_cpi_u_sa_mom|2026-09": "0.4" });
+    expect(h.state.obs.get("us_cpi_u_sa_mom|2026-09")!.meta).toMatchObject({ sibling_of: "us_core_cpi_sa_mom", captured_by_market: MARKET_ID });
+    expect(put).toHaveBeenCalledTimes(1);
+    expect(alertKeys()).toContainEqual(["official_schema_us_core_cpi_sa_mom", 360]);
+    // without an ExecutionContext nothing is recorded from a drifted holder (only the holder's own series ever is)
+    h.state.obs.clear(); h.state.slots.clear();
+    await fetchOfficial(env(), watchRow(), m, clock("2026-10-14T12:40:00Z").deps);
+    expect(h.state.obs.size).toBe(0);
+  });
+});
+
+describe("a first print first seen after the market's fallback", () => {
+  it("payrolls: a September summary that first appears on Nov 9 (after 00:00 ET Nov 6, the October data's date) is recorded but decides nothing", async () => {
+    const m = payLeg("150k to 200k");
+    setWatch(m);
+    serve(blsRouter({ "empsit.nr0.htm": EMPSIT_SEP }));
+    const out = await fetchOfficial(env(), watchRow(), m, clock("2026-11-09T14:00:00Z").deps);
+    expect(out.evidence!.structured).toMatchObject({ kind: "official_observation", series: "us_nonfarm_payrolls_change", period: "2026-09", value_text: "162", observed_at: "2026-11-09T14:00:00.000Z" });
+    expect(out.stop).toMatch(/fallback window has passed/);
+    expect(decideOfficial(m, out.evidence!)).toMatchObject({ status: "UNRESOLVED", outcome: "NONE", caveats: ["released_after_fallback"] });
+    // the same page seen before the fallback resolves the leg
+    h.state.obs.clear(); h.state.slots.clear();
+    const inTime = await fetchOfficial(env(), watchRow(), m, clock("2026-11-05T20:00:00Z").deps);
+    expect(decideOfficial(m, inTime.evidence!)).toMatchObject({ status: "RESOLVED", outcome: "OPTION_A" });
+  });
+});
+

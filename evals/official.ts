@@ -1,7 +1,10 @@
 /**
- * Frozen official_release cases: real response bodies saved on 2026-09-24 (evals/fixtures/official/, provenance.json)
- * are parsed at run time by the production parsers, turned into the rail's document, and resolved by the production
- * resolver with a Jev caller that fails the case if it is ever called. Grader = equality only.
+ * Frozen official_release cases: real response bodies saved on 2026-09-24 and 2026-09-27 (evals/fixtures/official/,
+ * provenance.json; archived BLS releases as byte-exact excerpts) are parsed at run time by the production parsers,
+ * turned into the rail's document, and resolved by the production resolver with a Jev caller that fails the case if
+ * it is ever called. Grader = equality only. A case marked SYNTHETIC edits a saved body before parsing (Read.edits,
+ * every edit must apply). A body the production parser calls not published becomes the rail's release_not_observed
+ * document, as the watch records it 6 h after the release.
  *   npx tsx evals/official.ts            run the frozen cases (exit 1 on any failure)
  *   npx tsx evals/official.ts --build    freeze the authored cases to evals/official-cases/cases.jsonl + manifest.sha256
  *   npx tsx evals/official.ts --check    fail if the frozen files differ from the authored cases (CI guard)
@@ -16,12 +19,14 @@ import { MarketRegistration, type MarketRegistration as Reg } from "../src/resol
 import { resolveMarket } from "../src/resolve";
 import { DEFAULT_THRESHOLDS } from "../src/resolve/thresholds";
 import {
-  firstPrintFor, officialEvidence, sameAtPrecision, reading, type OfficialCorroboration, type OfficialObservationDoc, type OfficialSeriesId,
+  OFFICIAL_SERIES, firstPrintFor, officialEvidence, sameAtPrecision, reading, releaseAtOf, type OfficialCorroboration, type OfficialDoc, type OfficialResolver, type OfficialSeriesId,
 } from "../src/resolve/official";
 import {
-  parseBlsRelease, parseBlsApi, blsApiYoy, parseFomcStatement, fredValueOn, parseEcbRelease, parseEcbDfrCsv, parseBoeRss, iadbValueOn,
-  parseBokDecisionRss, parseBokGdpRss, parseEcosRows, parseBcbHistory, type DocObservation,
+  parseBlsRelease, parseBlsCpiTableA, parseEmpsitRelease, parseBlsApi, blsApiYoy, blsApiMom, blsApiLevelChange, previousMonth, parseFomcStatement,
+  fredValueOn, parseEcbRelease, parseEcbDfrCsv, parseBoeRss, iadbValueOn, parseBokDecisionRss, parseBokGdpRss, parseEcosRows, parseBcbHistory,
+  type CpiTableColumn, type CpiTableRow, type DocObservation, type DocParse, type EmpsitNumber,
 } from "../src/ingest/official-parse";
+import { BLS_API, blsCorroboration } from "../src/ingest/official";
 import { buildLegRegistration, type LegGroup } from "../src/markets/official-legs";
 import { officialFixture, officialFixtureBytes, OFFICIAL_FIXTURE_DIR } from "./lib/official-fixtures";
 
@@ -31,13 +36,17 @@ const CASES_FILE = resolve(DIR, "cases.jsonl");
 const MANIFEST = resolve(DIR, "manifest.sha256");
 
 export type OfficialGroup = "release_gate" | "first_print";
-type Parser = "bls_cpi_text" | "bls_ppi_text" | "bls_api_yoy" | "fed_statement" | "ecb_release" | "boe_rss" | "bok_decision_rss" | "bok_gdp_rss" | "ecos_quarter" | "bcb_latest_row" | "bcb_history" | "sgs432_row";
-type CorrParser = "bls_api_yoy" | "fred" | "ecb_dfr" | "iadb" | "ecos_daily" | "ecos_quarter" | "single_source";
+type Parser = "bls_cpi_text" | "bls_ppi_text" | "bls_api_yoy" | "fed_statement" | "ecb_release" | "boe_rss" | "bok_decision_rss" | "bok_gdp_rss" | "ecos_quarter" | "bcb_latest_row" | "bcb_history" | "sgs432_row"
+  | "bls_cpi_table" | "bls_empsit_text" | "bls_api_mom" | "bls_api_level" | "bls_api_change";
+/** bls_api_yoy and bls_api run the production corroboration (src/ingest/official.ts blsCorroboration) on the saved body. */
+type CorrParser = "bls_api_yoy" | "bls_api" | "fred" | "ecb_dfr" | "iadb" | "ecos_daily" | "ecos_quarter" | "single_source";
+/** SYNTHETIC [from, to] replacements applied to a saved body before it is parsed; every "from" must occur. */
+type Edits = Array<[string, string]>;
 /**
  * own_capture: this market's own watch made the observation (default). For events outside KNOWN_RELEASES the
  * release-time part of gate 1 applies only to such observations (src/resolve/official.ts).
  */
-interface Read { fixture: string; parser: Parser; select?: string; observed_at: string; own_capture?: boolean; corroboration?: { fixture?: string; parser: CorrParser; select?: string } }
+interface Read { fixture: string; parser: Parser; select?: string; observed_at: string; own_capture?: boolean; edits?: Edits; corroboration?: { fixture?: string; parser: CorrParser; select?: string; edits?: Edits } }
 interface Expect { status: "RESOLVED" | "UNRESOLVED" | "ERROR"; outcome: "OPTION_A" | "OPTION_B" | "NONE"; caveats_include?: readonly string[]; error_reason?: string }
 export interface OfficialCase { id: string; group: OfficialGroup; control: boolean; title: string; market: Reg; stored?: Read; fetched: Read; expect: Expect }
 
@@ -48,7 +57,9 @@ const NO = { status: "RESOLVED", outcome: "OPTION_B", caveats_include: ["first_p
 const AWAIT = { status: "UNRESOLVED", outcome: "NONE", caveats_include: ["awaiting_release"] } as const;
 
 function leg(group: LegGroup, label: string, open_at: string, deadline_utc: string, platform: "limitless" | "polymarket" = "limitless"): Reg {
-  const r = buildLegRegistration({ platform, external_id: `eval-${group.series}-${group.period}-${label}`, group, label, open_at, deadline_utc, criteria: `Frozen eval leg for ${group.title}.` });
+  // a thousands ladder is read half-open only when its text settles a boundary value in the higher bracket (paraphrased here)
+  const tie = OFFICIAL_SERIES[group.series].decides === "change_thousands" ? " A value exactly on the boundary between two brackets settles in the higher bracket." : "";
+  const r = buildLegRegistration({ platform, external_id: `eval-${group.series}-${group.period}-${label}`, group, label, open_at, deadline_utc, criteria: `Frozen eval leg for ${group.title}.${tie}` });
   if (!r.ok) throw new Error(r.reason);
   return r.market;
 }
@@ -87,6 +98,118 @@ const bokAug = (observed_at: string): Read => ({ fixture: "bok_rss_mpd.xml", par
 const gdpQ2 = (observed_at: string): Read => ({ fixture: "bok_rss_press.xml", parser: "bok_gdp_rss", select: "2026-Q2", observed_at, corroboration: { fixture: "ecos_200Y102_10211.json", parser: "ecos_quarter", select: "2026Q2" } });
 const gdpQ1First: Read = { fixture: "bok_rss_press.xml", parser: "bok_gdp_rss", select: "2026-Q1", observed_at: "2026-04-22T23:00:40Z" };
 const gdpQ1Revised: Read = { fixture: "ecos_200Y102_10211.json", parser: "ecos_quarter", select: "2026Q1", observed_at: AT.ecosGdp };
+
+// BLS CPI siblings (Table A of the CPI release) and the Employment Situation (research and fixtures of 2026-09-27).
+// Release times are the embargo lines of the saved releases and the BLS schedules (observed); Polymarket-only ladders.
+const bls = (series: LegGroup["series"], period: string, release_at: string, title: string): LegGroup => ({ series, period, release_at, title });
+const MOM_SEP = bls("us_cpi_u_sa_mom", "2026-09", "2026-10-14T12:30:00Z", "September Inflation US - Monthly");
+const MOM_AUG = bls("us_cpi_u_sa_mom", "2026-08", "2026-09-11T12:30:00Z", "August Inflation US - Monthly (past event)");
+const MOM_JUL = bls("us_cpi_u_sa_mom", "2026-07", "2026-08-12T12:30:00Z", "July Inflation US - Monthly (past event)");
+const MOM_JUN = bls("us_cpi_u_sa_mom", "2026-06", "2026-07-14T12:30:00Z", "June Inflation US - Monthly (past event)");
+const MOM_NOV25 = bls("us_cpi_u_sa_mom", "2025-11", "2025-12-18T13:30:00Z", "November 2025 Inflation US - Monthly (past event, after the 2025 lapse)");
+// release_at: the pre-lapse schedule (UNVERIFIED); BLS published the September 2025 release on Oct 24, 2025 (observed)
+const MOM_SEP25 = bls("us_cpi_u_sa_mom", "2025-09", "2025-10-15T12:30:00Z", "September 2025 Inflation US - Monthly (past event, published late)");
+const MOM_MAY24 = bls("us_cpi_u_sa_mom", "2024-05", "2024-06-12T12:30:00Z", "May 2024 Inflation US - Monthly (past event)");
+const CYOY_SEP = bls("us_core_cpi_nsa_yoy", "2026-09", "2026-10-14T12:30:00Z", "Core CPI YoY - September 2026");
+const CYOY_AUG = bls("us_core_cpi_nsa_yoy", "2026-08", "2026-09-11T12:30:00Z", "Core CPI YoY - August 2026 (past event)");
+const CYOY_NOV25 = bls("us_core_cpi_nsa_yoy", "2025-11", "2025-12-18T13:30:00Z", "Core CPI YoY - November 2025 (past event, after the 2025 lapse)");
+const CMOM_SEP = bls("us_core_cpi_sa_mom", "2026-09", "2026-10-14T12:30:00Z", "Core CPI MoM - September 2026");
+const CMOM_AUG = bls("us_core_cpi_sa_mom", "2026-08", "2026-09-11T12:30:00Z", "Core CPI MoM - August 2026 (past event)");
+const CMOM_JUN = bls("us_core_cpi_sa_mom", "2026-06", "2026-07-14T12:30:00Z", "Core CPI MoM - June 2026 (past event)");
+const UNR_SEP = bls("us_unemployment_rate", "2026-09", "2026-10-02T12:30:00Z", "September Unemployment Rate");
+const UNR_AUG = bls("us_unemployment_rate", "2026-08", "2026-09-04T12:30:00Z", "August Unemployment Rate (past event)");
+const UNR_JUL = bls("us_unemployment_rate", "2026-07", "2026-08-07T12:30:00Z", "July Unemployment Rate (past event)");
+const UNR_FEB = bls("us_unemployment_rate", "2026-02", "2026-03-06T13:30:00Z", "February Unemployment Rate (past event)");
+const PAY_SEP = bls("us_nonfarm_payrolls_change", "2026-09", "2026-10-02T12:30:00Z", "How many jobs added in September?");
+const PAY_AUG = bls("us_nonfarm_payrolls_change", "2026-08", "2026-09-04T12:30:00Z", "How many jobs added in August? (past event)");
+const PAY_JUL = bls("us_nonfarm_payrolls_change", "2026-07", "2026-08-07T12:30:00Z", "How many jobs added in July? (past event)");
+const PAY_FEB = bls("us_nonfarm_payrolls_change", "2026-02", "2026-03-06T13:30:00Z", "How many jobs added in February? (past event)");
+
+const AT27 = {
+  cpi202606: "2026-09-27T18:47:43Z", cpi202511: "2026-09-27T18:47:55Z", cpi202509: "2026-09-27T18:48:08Z", cpi202405: "2026-09-27T18:51:15Z",
+  empsit: "2026-09-27T18:45:52Z", empsit202607: "2026-09-27T18:46:28Z", empsit202602: "2026-09-27T18:48:59Z",
+  apiCpiSa: "2026-09-27T18:48:16Z", apiCoreSa: "2026-09-27T18:48:21Z", apiCoreNsa: "2026-09-27T18:48:26Z", apiUnrate: "2026-09-27T18:47:12Z", apiPayrolls: "2026-09-27T18:47:12Z",
+};
+type Corr = NonNullable<Read["corroboration"]>;
+const api = (fixture: string, select: string, edits?: Edits): Corr => ({ fixture, parser: "bls_api", select, ...(edits ? { edits } : {}) });
+const table = (fixture: string, select: string, observed_at: string, corroboration?: Corr, edits?: Edits): Read => ({ fixture, parser: "bls_cpi_table", select, observed_at, ...(edits ? { edits } : {}), ...(corroboration ? { corroboration } : {}) });
+const empsit = (fixture: string, select: "unemployment_rate" | "payrolls_change", observed_at: string, corroboration?: Corr, edits?: Edits): Read => ({ fixture, parser: "bls_empsit_text", select, observed_at, ...(edits ? { edits } : {}), ...(corroboration ? { corroboration } : {}) });
+const CPI_AUG_PAGE = "bls_cpi_nr0.html";
+const EMPSIT_AUG = "bls_empsit_nr0_excerpt.html";
+const PM_OPEN = { cpi: "2026-09-11T15:28:51Z", empsit: "2026-09-04T16:35:35Z" };
+const WITH_CORR = ["first_print", "corroboration_unavailable"] as const;
+const LATE = { status: "UNRESOLVED", outcome: "NONE", caveats_include: ["released_after_fallback"] } as const;
+// SYNTHETIC September releases: the saved August pages with their month edited (header, Table A's last month and
+// 12-month columns, the headline 1-month sentence; the summary's "in August"), standing for releases not yet made.
+const SEP_CPI: Edits = [
+  ["CONSUMER PRICE INDEX - AUGUST 2026", "CONSUMER PRICE INDEX - SEPTEMBER 2026"], ['id="cpi_pressa.h.2.8">Aug.<br />2026', 'id="cpi_pressa.h.2.8">Sep.<br />2026'],
+  ["ended<br />Aug. 2026", "ended<br />Sep. 2026"], ["seasonally adjusted basis in August", "seasonally adjusted basis in September"],
+];
+const SEP_EMPSIT: Edits = [["THE EMPLOYMENT SITUATION - AUGUST 2026", "THE EMPLOYMENT SITUATION - SEPTEMBER 2026"], ["in August", "in September"]];
+
+/** The five BLS series of 2026-09-27: correct buckets, wrong period refused, prior months never read, delays pending, ties. */
+function blsCases(): OfficialCase[] {
+  const pm = "polymarket" as const;
+  const past = { open: "2026-06-01T00:00:00Z", cpiDeadline: "2026-09-12T03:59:00Z", empDeadline: "2026-09-05T03:59:00Z" };
+  return [
+    // --- release_gate: a September leg never reads the August release, whenever and however it is read -----------------
+    { id: "OFF-G11", group: "release_gate", control: false, title: "CPI 1-month: after 12:30Z on Oct 14 the page still names AUGUST 2026 (a delayed release): Table A's August 0.4 never resolves the September 0.4% leg", market: leg(MOM_SEP, "0.4%", PM_OPEN.cpi, "2026-10-15T03:59:00Z", pm), fetched: table(CPI_AUG_PAGE, "all_items:sa_1m", "2026-10-14T12:35:00Z", api("bls_v1_cpi_sa.json", "2026-09")), expect: AWAIT },
+    { id: "OFF-G12", group: "release_gate", control: false, title: "Core CPI 12-month: the August release read at 12:29Z on Oct 14, a minute before the September release, never resolves the 2.4% leg", market: leg(CYOY_SEP, "2.4%", PM_OPEN.cpi, "2026-10-15T03:59:00Z", pm), fetched: table(CPI_AUG_PAGE, "core:nsa_12m", "2026-10-14T12:29:00Z"), expect: AWAIT },
+    { id: "OFF-G13", group: "release_gate", control: false, title: "Core CPI 1-month: the August column (0.3) is not September's, even read after the release time", market: leg(CMOM_SEP, "0.3%", PM_OPEN.cpi, "2026-10-15T03:59:00Z", pm), fetched: table(CPI_AUG_PAGE, "core:sa_1m", "2026-10-14T12:31:00Z"), expect: AWAIT },
+    { id: "OFF-G14", group: "release_gate", control: false, title: "Unemployment: a lapse in appropriations leaves the AUGUST 2026 summary up after 12:30Z on Oct 2: its 4.1 percent never resolves the September legs", market: leg(UNR_SEP, "4.1%", PM_OPEN.empsit, "2026-10-02T08:30:00Z", pm), fetched: empsit(EMPSIT_AUG, "unemployment_rate", "2026-10-02T12:31:00Z", api("bls_v1_unrate.json", "2026-09")), expect: AWAIT },
+    { id: "OFF-G15", group: "release_gate", control: false, title: "Payrolls: the August summary (+162,000) read at 12:30:05Z on Oct 2 is not the September print", market: leg(PAY_SEP, "150k to 200k", "2026-09-04T16:37:33Z", "2026-10-03T03:59:00Z", pm), fetched: empsit(EMPSIT_AUG, "payrolls_change", "2026-10-02T12:30:05Z"), expect: AWAIT },
+    { id: "OFF-G16", group: "release_gate", control: false, title: "Payrolls August 2026 (not a registered event): the right summary, captured by this market's own watch at 12:29Z, a minute before its scheduled release, never resolves", market: leg(PAY_AUG, "150k to 200k", past.open, past.empDeadline, pm), fetched: { ...empsit(EMPSIT_AUG, "payrolls_change", "2026-09-04T12:29:00Z"), own_capture: true }, expect: AWAIT },
+    { id: "OFF-G17", group: "release_gate", control: false, title: "CPI 1-month July 2026: the August release's Table A still prints July (0.1) in an earlier column; the rail reads only the header month, so the July legs wait", market: leg(MOM_JUL, "0.1%", past.open, "2026-08-13T03:59:00Z", pm), fetched: table(CPI_AUG_PAGE, "all_items:sa_1m", AT.cpi), expect: AWAIT },
+    { id: "OFF-G18", group: "release_gate", control: false, title: "Payrolls July 2026: the August summary revises July from -23,000 to +21,000; a July leg never reads that revision (nor August's +162,000)", market: leg(PAY_JUL, "0 to 50k", past.open, "2026-08-08T03:59:00Z", pm), fetched: empsit(EMPSIT_AUG, "payrolls_change", AT27.empsit), expect: AWAIT },
+    // --- release_gate controls: the same parsers on their own releases, identical with the rail on or off ----------------
+    { id: "OFF-C16", group: "release_gate", control: true, title: "CPI 1-month August 2026: Table A 0.4 (the API's 334.131/332.813 agrees): the 0.4% leg is Yes", market: leg(MOM_AUG, "0.4%", past.open, past.cpiDeadline, pm), fetched: table(CPI_AUG_PAGE, "all_items:sa_1m", AT.cpi, api("bls_v1_cpi_sa.json", "2026-08")), expect: YES },
+    { id: "OFF-C17", group: "release_gate", control: true, title: "CPI 1-month August 2026: the 0.3% leg is a positive No", market: leg(MOM_AUG, "0.3%", past.open, past.cpiDeadline, pm), fetched: table(CPI_AUG_PAGE, "all_items:sa_1m", AT.cpi, api("bls_v1_cpi_sa.json", "2026-08")), expect: NO },
+    { id: "OFF-C18", group: "release_gate", control: true, title: "CPI 1-month near-tie, SYNTHETIC API index 333.978: the recomputed change 0.35004 could print 0.3 or 0.4 and the release printed 0.4: inconclusive, the published 0.4 decides", market: leg(MOM_AUG, "0.4%", past.open, past.cpiDeadline, pm), fetched: table(CPI_AUG_PAGE, "all_items:sa_1m", AT.cpi, api("bls_v1_cpi_sa.json", "2026-08", [['"334.131"', '"333.978"']])), expect: { ...YES, caveats_include: WITH_CORR } },
+    { id: "OFF-C19", group: "release_gate", control: true, title: "CPI 1-month near-tie, SYNTHETIC API index 333.645: the change 0.24999 could print 0.2 or 0.3, never the release's 0.4: sources disagree, no RESOLVED", market: leg(MOM_AUG, "0.4%", past.open, past.cpiDeadline, pm), fetched: table(CPI_AUG_PAGE, "all_items:sa_1m", AT.cpi, api("bls_v1_cpi_sa.json", "2026-08", [['"334.131"', '"333.645"']])), expect: { status: "UNRESOLVED", outcome: "NONE", caveats_include: ["sources_disagree"] } },
+    { id: "OFF-C20", group: "release_gate", control: true, title: "CPI 1-month June 2026: 'decreased 0.4 percent' / Table A -0.4 (API agrees): the ≤0.0% leg is Yes", market: leg(MOM_JUN, "≤0.0%", past.open, "2026-07-15T03:59:00Z", pm), fetched: table("bls_cpi_202606_excerpt.html", "all_items:sa_1m", AT27.cpi202606, api("bls_v1_cpi_sa.json", "2026-06")), expect: YES },
+    { id: "OFF-C21", group: "release_gate", control: true, title: "CPI 1-month May 2024: 'was unchanged in May on a seasonally adjusted basis' (the other word order) and Table A 0.0: the ≤0.0% leg is Yes", market: leg(MOM_MAY24, "≤0.0%", "2024-05-01T00:00:00Z", "2024-06-13T03:59:00Z", pm), fetched: table("bls_cpi_202405_excerpt.html", "all_items:sa_1m", AT27.cpi202405), expect: { ...YES, caveats_include: WITH_CORR } },
+    { id: "OFF-C22", group: "release_gate", control: true, title: "CPI 1-month November 2025 (after the 2025 lapse): Table A prints '-' and the text gives a 2-month 0.2; the legs stay pending (release_not_observed), never 0.0 or 0.2", market: leg(MOM_NOV25, "0.2%", "2025-11-01T00:00:00Z", "2025-12-19T04:59:00Z", pm), fetched: table("bls_cpi_202511_excerpt.html", "all_items:sa_1m", AT27.cpi202511), expect: { status: "UNRESOLVED", outcome: "NONE", caveats_include: ["release_not_observed"] } },
+    { id: "OFF-C23", group: "release_gate", control: true, title: "CPI 1-month September 2025, published late (Oct 24, 2025): the late release names its own month and resolves (0.3)", market: leg(MOM_SEP25, "0.3%", "2025-09-01T00:00:00Z", "2025-10-25T03:59:00Z", pm), fetched: table("bls_cpi_202509_excerpt.html", "all_items:sa_1m", "2025-10-24T12:30:04Z"), expect: { ...YES, caveats_include: WITH_CORR } },
+    { id: "OFF-C24", group: "release_gate", control: true, title: "Core CPI 12-month August 2026: Table A 2.4 before seasonal adjustment (API 338.041/329.970 agrees): the 2.4% leg is Yes", market: leg(CYOY_AUG, "2.4%", past.open, past.cpiDeadline, pm), fetched: table(CPI_AUG_PAGE, "core:nsa_12m", AT.cpi, api("bls_v1_core_nsa.json", "2026-08")), expect: YES },
+    { id: "OFF-C25", group: "release_gate", control: true, title: "Core CPI 12-month August 2026: the ≥2.9% leg is a positive No", market: leg(CYOY_AUG, "≥2.9%", past.open, past.cpiDeadline, pm), fetched: table(CPI_AUG_PAGE, "core:nsa_12m", AT.cpi, api("bls_v1_core_nsa.json", "2026-08")), expect: NO },
+    { id: "OFF-C26", group: "release_gate", control: true, title: "Core CPI 12-month November 2025: printed (2.6) although the 1-month cells are '-' (API agrees): the 2.6% leg is Yes", market: leg(CYOY_NOV25, "2.6%", "2025-11-01T00:00:00Z", "2025-12-19T04:59:00Z", pm), fetched: table("bls_cpi_202511_excerpt.html", "core:nsa_12m", AT27.cpi202511, api("bls_v1_core_nsa.json", "2025-11")), expect: YES },
+    { id: "OFF-C27", group: "release_gate", control: true, title: "Core CPI 12-month near-tie, SYNTHETIC API index 338.054: 2.44992 could print 2.4 or 2.5 and the release printed 2.4: inconclusive, the published 2.4 decides", market: leg(CYOY_AUG, "2.4%", past.open, past.cpiDeadline, pm), fetched: table(CPI_AUG_PAGE, "core:nsa_12m", AT.cpi, api("bls_v1_core_nsa.json", "2026-08", [['"338.041"', '"338.054"']])), expect: { ...YES, caveats_include: WITH_CORR } },
+    { id: "OFF-C28", group: "release_gate", control: true, title: "Core CPI 1-month August 2026: Table A 0.3 (API 337.765/336.789 agrees): the 0.3% leg is Yes", market: leg(CMOM_AUG, "0.3%", past.open, past.cpiDeadline, pm), fetched: table(CPI_AUG_PAGE, "core:sa_1m", AT.cpi, api("bls_v1_core_sa.json", "2026-08")), expect: YES },
+    { id: "OFF-C29", group: "release_gate", control: true, title: "Core CPI 1-month August 2026: the 0.6%+ leg is a positive No", market: leg(CMOM_AUG, "0.6%+", past.open, past.cpiDeadline, pm), fetched: table(CPI_AUG_PAGE, "core:sa_1m", AT.cpi, api("bls_v1_core_sa.json", "2026-08")), expect: NO },
+    { id: "OFF-C30", group: "release_gate", control: true, title: "Core CPI 1-month June 2026: 'was unchanged in June' and Table A 0.0 (API agrees): the ≤0.0% leg is Yes", market: leg(CMOM_JUN, "≤0.0%", past.open, "2026-07-15T03:59:00Z", pm), fetched: table("bls_cpi_202606_excerpt.html", "core:sa_1m", AT27.cpi202606, api("bls_v1_core_sa.json", "2026-06")), expect: YES },
+    { id: "OFF-C31", group: "release_gate", control: true, title: "Unemployment August 2026: 'was unchanged at 4.1 percent' in the lead and the household section (LNS14000000 agrees): the 4.1% leg is Yes", market: leg(UNR_AUG, "4.1%", past.open, past.empDeadline, pm), fetched: empsit(EMPSIT_AUG, "unemployment_rate", AT27.empsit, api("bls_v1_unrate.json", "2026-08")), expect: YES },
+    { id: "OFF-C32", group: "release_gate", control: true, title: "Unemployment August 2026: the ≤3.8% leg is a positive No", market: leg(UNR_AUG, "≤3.8%", past.open, past.empDeadline, pm), fetched: empsit(EMPSIT_AUG, "unemployment_rate", AT27.empsit, api("bls_v1_unrate.json", "2026-08")), expect: NO },
+    { id: "OFF-C33", group: "release_gate", control: true, title: "Unemployment August 2026 on a leg whose platform deadline (08:30Z) is 4 h before the 12:30Z release: the release still decides, Yes", market: leg(UNR_AUG, "4.1%", past.open, "2026-09-04T08:30:00Z", pm), fetched: empsit(EMPSIT_AUG, "unemployment_rate", "2026-09-04T12:30:03Z", api("bls_v1_unrate.json", "2026-08")), expect: YES },
+    { id: "OFF-C34", group: "release_gate", control: true, title: "Unemployment July 2026: '(4.1 percent)' and ', at 4.1 percent,' (API agrees): the 4.1% leg is Yes", market: leg(UNR_JUL, "4.1%", past.open, "2026-08-07T08:30:00Z", pm), fetched: empsit("bls_empsit_202607_excerpt.html", "unemployment_rate", AT27.empsit202607, api("bls_v1_unrate.json", "2026-07")), expect: YES },
+    { id: "OFF-C35", group: "release_gate", control: true, title: "Unemployment February 2026: the 'SITUATION -- FEBRUARY 2026' header and a boxed note (API 4.4 agrees): the 4.4% leg is Yes", market: leg(UNR_FEB, "4.4%", "2026-01-01T00:00:00Z", "2026-03-06T09:30:00Z", pm), fetched: empsit("bls_empsit_202602_excerpt.html", "unemployment_rate", AT27.empsit202602, api("bls_v1_unrate.json", "2026-02")), expect: YES },
+    { id: "OFF-C36", group: "release_gate", control: true, title: "Payrolls August 2026: +162,000 ('increased by' and 'rose by'; the June and July revisions in the same text are not read; CES levels 159075-158913 agree): 150k to 200k is Yes", market: leg(PAY_AUG, "150k to 200k", past.open, past.empDeadline, pm), fetched: empsit(EMPSIT_AUG, "payrolls_change", AT27.empsit, api("bls_v1_payrolls.json", "2026-08")), expect: YES },
+    { id: "OFF-C37", group: "release_gate", control: true, title: "Payrolls August 2026: the 200k+ leg is a positive No", market: leg(PAY_AUG, "200k+", past.open, past.empDeadline, pm), fetched: empsit(EMPSIT_AUG, "payrolls_change", AT27.empsit, api("bls_v1_payrolls.json", "2026-08")), expect: NO },
+    { id: "OFF-C38", group: "release_gate", control: true, title: "Payrolls July 2026: 'changed little in July (-23,000)'; the API's latest month is August, so its levels are a later vintage: single source; -50k to 0 is Yes", market: leg(PAY_JUL, "-50k to 0", past.open, "2026-08-08T03:59:00Z", pm), fetched: empsit("bls_empsit_202607_excerpt.html", "payrolls_change", AT27.empsit202607, api("bls_v1_payrolls.json", "2026-07")), expect: { ...YES, caveats_include: ["first_print", "single_source"] } },
+    { id: "OFF-C39", group: "release_gate", control: true, title: "Payrolls February 2026: 'edged down by 92,000' is -92: the <-50k leg is Yes", market: leg(PAY_FEB, "<-50k", "2026-01-01T00:00:00Z", "2026-03-07T04:59:00Z", pm), fetched: empsit("bls_empsit_202602_excerpt.html", "payrolls_change", AT27.empsit202602, api("bls_v1_payrolls.json", "2026-02")), expect: { ...YES, caveats_include: ["first_print", "single_source"] } },
+    { id: "OFF-C40", group: "release_gate", control: true, title: "Payrolls exactly on a boundary, SYNTHETIC +150,000 (CES level edited to match): the higher bracket, 150k to 200k, is Yes", market: leg(PAY_AUG, "150k to 200k", past.open, past.empDeadline, pm), fetched: empsit(EMPSIT_AUG, "payrolls_change", AT27.empsit, api("bls_v1_payrolls.json", "2026-08", [['"159075"', '"159063"']]), [["162,000", "150,000"]]), expect: YES },
+    { id: "OFF-C41", group: "release_gate", control: true, title: "Payrolls exactly on a boundary, SYNTHETIC +150,000: the lower bracket, 100k to 150k, is a positive No", market: leg(PAY_AUG, "100k to 150k", past.open, past.empDeadline, pm), fetched: empsit(EMPSIT_AUG, "payrolls_change", AT27.empsit, api("bls_v1_payrolls.json", "2026-08", [['"159075"', '"159063"']]), [["162,000", "150,000"]]), expect: NO },
+    { id: "OFF-C42", group: "release_gate", control: true, title: "Payrolls, SYNTHETIC CES level 159076: the levels differ by 163, one thousand from the printed 162 (level rounding): inconclusive, the release decides", market: leg(PAY_AUG, "150k to 200k", past.open, past.empDeadline, pm), fetched: empsit(EMPSIT_AUG, "payrolls_change", AT27.empsit, api("bls_v1_payrolls.json", "2026-08", [['"159075"', '"159076"']])), expect: { ...YES, caveats_include: WITH_CORR } },
+    { id: "OFF-C43", group: "release_gate", control: true, title: "Payrolls, SYNTHETIC CES level 159100: the levels differ by 187 against the printed 162: sources disagree, no RESOLVED", market: leg(PAY_AUG, "150k to 200k", past.open, past.empDeadline, pm), fetched: empsit(EMPSIT_AUG, "payrolls_change", AT27.empsit, api("bls_v1_payrolls.json", "2026-08", [['"159075"', '"159100"']])), expect: { status: "UNRESOLVED", outcome: "NONE", caveats_include: ["sources_disagree"] } },
+    // --- release_gate: a first print first seen at or after the market's fallback decides nothing (the texts then settle
+    // on an earlier period, which the rail never decides from) --------------------------------------------------------------
+    { id: "OFF-G19", group: "release_gate", control: false, title: "Payrolls: a SYNTHETIC September summary (+162,000) first seen Nov 9, after the fallback (no September data by the date of the October release, Nov 6): no verdict", market: leg(PAY_SEP, "150k to 200k", "2026-09-04T16:37:33Z", "2026-10-03T03:59:00Z", pm), fetched: empsit(EMPSIT_AUG, "payrolls_change", "2026-11-09T14:00:00Z", undefined, SEP_EMPSIT), expect: LATE },
+    { id: "OFF-G20", group: "release_gate", control: false, title: "Unemployment: the SYNTHETIC September summary first seen at 12:00Z on Nov 6, the October release's date ('by the date' is read from 00:00 ET): no verdict", market: leg(UNR_SEP, "4.1%", PM_OPEN.empsit, "2026-10-02T08:30:00Z", pm), fetched: empsit(EMPSIT_AUG, "unemployment_rate", "2026-11-06T12:00:00Z", undefined, SEP_EMPSIT), expect: LATE },
+    { id: "OFF-G21", group: "release_gate", control: false, title: "Core CPI 1-month: a SYNTHETIC September release first seen at 13:30Z on Nov 10, the next CPI release time: no verdict", market: leg(CMOM_SEP, "0.3%", PM_OPEN.cpi, "2026-10-15T03:59:00Z", pm), fetched: table(CPI_AUG_PAGE, "core:sa_1m", "2026-11-10T13:30:00Z", undefined, SEP_CPI), expect: LATE },
+    { id: "OFF-G22", group: "release_gate", control: false, title: "CPI 12-month (the headline series): a SYNTHETIC September release first seen Nov 11, after the next CPI release: no verdict", market: leg(CPI_SEP, "3.4%", "2026-09-15T08:56:56.799Z", "2026-10-15T03:59:00Z"), fetched: { fixture: CPI_AUG_PAGE, parser: "bls_cpi_text", observed_at: "2026-11-11T14:00:00Z", edits: SEP_CPI.slice(0, 1) }, expect: LATE },
+    { id: "OFF-C44", group: "release_gate", control: true, title: "Payrolls: the SYNTHETIC September summary first seen at 23:00Z on Nov 5 (18:00 ET, the eve of the October release date): a delayed print inside the window resolves, 150k to 200k is Yes", market: leg(PAY_SEP, "150k to 200k", "2026-09-04T16:37:33Z", "2026-10-03T03:59:00Z", pm), fetched: empsit(EMPSIT_AUG, "payrolls_change", "2026-11-05T23:00:00Z", undefined, SEP_EMPSIT), expect: { ...YES, caveats_include: WITH_CORR } },
+    { id: "OFF-C45", group: "release_gate", control: true, title: "Unemployment August 2026, SYNTHETIC LNS14000000 August value 4.2 against the printed 4.1: sources disagree, no RESOLVED", market: leg(UNR_AUG, "4.1%", past.open, past.empDeadline, pm), fetched: empsit(EMPSIT_AUG, "unemployment_rate", AT27.empsit, api("bls_v1_unrate.json", "2026-08", [['"periodName":"August","latest":"true","value":"4.1"', '"periodName":"August","latest":"true","value":"4.2"']])), expect: { status: "UNRESOLVED", outcome: "NONE", caveats_include: ["sources_disagree"] } },
+
+    // --- first_print: a later vintage never replaces the first print of payrolls or the unemployment rate --------------
+    { id: "OFF-F04", group: "first_print", control: false, title: "Payrolls February 2026: first print -92 (Mar 6); today's CES levels differ by -156: the finer -100k to -50k leg stays Yes", market: leg(PAY_FEB, "-100k to -50k", "2026-01-01T00:00:00Z", "2026-03-07T04:59:00Z", pm), stored: empsit("bls_empsit_202602_excerpt.html", "payrolls_change", "2026-03-06T13:30:04Z"), fetched: { fixture: "bls_v1_payrolls.json", parser: "bls_api_change", select: "2026-02", observed_at: AT27.apiPayrolls }, expect: YES },
+    { id: "OFF-F05", group: "first_print", control: false, title: "Payrolls July 2026: first print -23 (Aug 7); revised to +21 a month later: the -50k to 0 leg stays Yes", market: leg(PAY_JUL, "-50k to 0", past.open, "2026-08-08T03:59:00Z", pm), stored: empsit("bls_empsit_202607_excerpt.html", "payrolls_change", "2026-08-07T12:30:03Z"), fetched: { fixture: "bls_v1_payrolls.json", parser: "bls_api_change", select: "2026-07", observed_at: AT27.apiPayrolls }, expect: YES },
+    { id: "OFF-F06", group: "first_print", control: false, title: "Payrolls July 2026: the 0 to 50k leg stays a positive No although the revised levels differ by +21", market: leg(PAY_JUL, "0 to 50k", past.open, "2026-08-08T03:59:00Z", pm), stored: empsit("bls_empsit_202607_excerpt.html", "payrolls_change", "2026-08-07T12:30:03Z"), fetched: { fixture: "bls_v1_payrolls.json", parser: "bls_api_change", select: "2026-07", observed_at: AT27.apiPayrolls }, expect: NO },
+    { id: "OFF-F07", group: "first_print", control: false, title: "Unemployment August 2026: first print 4.1; a SYNTHETIC later vintage of LNS14000000 says 4.2: the 4.1% leg stays Yes", market: leg(UNR_AUG, "4.1%", past.open, past.empDeadline, pm), stored: empsit(EMPSIT_AUG, "unemployment_rate", "2026-09-04T12:30:02Z", api("bls_v1_unrate.json", "2026-08")), fetched: { fixture: "bls_v1_unrate.json", parser: "bls_api_level", select: "2026-08", observed_at: AT27.apiUnrate, edits: [['"periodName":"August","latest":"true","value":"4.1"', '"periodName":"August","latest":"true","value":"4.2"']] }, expect: YES },
+    // --- first_print controls ---------------------------------------------------------------------------------------------
+    { id: "OFF-FC5", group: "first_print", control: true, title: "Payrolls February 2026 on the real <-50k leg: Yes with -92 or -156", market: leg(PAY_FEB, "<-50k", "2026-01-01T00:00:00Z", "2026-03-07T04:59:00Z", pm), stored: empsit("bls_empsit_202602_excerpt.html", "payrolls_change", "2026-03-06T13:30:04Z"), fetched: { fixture: "bls_v1_payrolls.json", parser: "bls_api_change", select: "2026-02", observed_at: AT27.apiPayrolls }, expect: { ...YES, caveats_include: WITH_CORR } },
+    { id: "OFF-FC6", group: "first_print", control: true, title: "Core CPI 12-month August 2026: the API's 2.4 (not seasonally adjusted, never revised) agrees with the stored 2.4", market: leg(CYOY_AUG, "2.4%", past.open, past.cpiDeadline, pm), stored: table(CPI_AUG_PAGE, "core:nsa_12m", AT.cpi, api("bls_v1_core_nsa.json", "2026-08")), fetched: { fixture: "bls_v1_core_nsa.json", parser: "bls_api_yoy", select: "2026-08", observed_at: AT27.apiCoreNsa }, expect: YES },
+    { id: "OFF-FC7", group: "first_print", control: true, title: "Unemployment August 2026: the API's 4.1 agrees with the stored 4.1", market: leg(UNR_AUG, "4.1%", past.open, past.empDeadline, pm), stored: empsit(EMPSIT_AUG, "unemployment_rate", "2026-09-04T12:30:02Z", api("bls_v1_unrate.json", "2026-08")), fetched: { fixture: "bls_v1_unrate.json", parser: "bls_api_level", select: "2026-08", observed_at: AT27.apiUnrate }, expect: YES },
+  ];
+}
 
 export function authorCases(): OfficialCase[] {
   const target = { open: "2026-09-15T08:56:56.799Z" };
@@ -128,6 +251,7 @@ export function authorCases(): OfficialCase[] {
     { id: "OFF-FC2", group: "first_print", control: true, title: "CPI August 2026: the API's 3.4 agrees with the stored 3.4", market: leg(CPI_AUG, "3.4%", "2026-08-01T00:00:00Z", "2026-09-12T03:59:00Z"), stored: cpiText(AT.cpi), fetched: { fixture: "bls_v1_cpi.json", parser: "bls_api_yoy", select: "2026-08", observed_at: AT.blsApiCpi }, expect: YES },
     { id: "OFF-FC3", group: "first_print", control: true, title: "PPI August 2026: the API's 5.4 agrees with the stored 5.4", market: leg(PPI_AUG, "5.4%", "2026-08-01T00:00:00Z", "2026-09-11T03:59:00Z"), stored: ppiText(AT.ppi), fetched: { fixture: "bls_v1_ppi.json", parser: "bls_api_yoy", select: "2026-08", observed_at: AT.blsApiPpi }, expect: YES },
     { id: "OFF-FC4", group: "first_print", control: true, title: "Korea GDP Q2: no stored first print yet, the first read decides", market: leg(GDP_Q2, "3.5–3.9%", "2026-04-24T00:00:00Z", "2026-07-23T00:00:00Z"), fetched: gdpQ2(AT.press), expect: YES },
+    ...blsCases(),
   ];
 }
 
@@ -136,12 +260,55 @@ export function authorCases(): OfficialCase[] {
 const PROVENANCE = JSON.parse(readFileSync(resolve(OFFICIAL_FIXTURE_DIR, "provenance.json"), "utf8")) as { files: Record<string, { url: string }> };
 const urlOf = (fixture: string) => { const u = PROVENANCE.files[fixture]?.url; if (!u) throw new Error(`no url for ${fixture}`); return u; };
 const MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+/** The BLS API v1 series each saved API body holds. */
+const API_IDS: Record<string, string> = {
+  "bls_v1_cpi.json": "CUUR0000SA0", "bls_v1_ppi.json": "WPUFD4", "bls_v1_cpi_sa.json": "CUSR0000SA0", "bls_v1_core_sa.json": "CUSR0000SA0L1E",
+  "bls_v1_core_nsa.json": "CUUR0000SA0L1E", "bls_v1_unrate.json": "LNS14000000", "bls_v1_payrolls.json": "CES0000000001",
+};
+const apiId = (fixture: string) => { const id = API_IDS[fixture]; if (!id) throw new Error(`no BLS API series id for ${fixture}`); return id; };
+const monthLabel = (period: string) => `${MONTHS[Number(period.slice(5, 7)) - 1]} ${period.slice(0, 4)}`;
 
-function parse(read: Read): DocObservation {
-  const body = officialFixture(read.fixture);
+/** A saved body with its SYNTHETIC edits applied (an edit that does not apply is a harness error, never a silent no-op). */
+function bodyOf(fixture: string, edits: Edits = []): string {
+  let body = officialFixture(fixture);
+  for (const [from, to] of edits) {
+    if (!body.includes(from)) throw new Error(`${fixture}: edit "${from.slice(0, 60)}" does not apply`);
+    body = body.split(from).join(to);
+  }
+  return body;
+}
+const bytesOf = (read: Read) => (read.edits?.length ? new TextEncoder().encode(bodyOf(read.fixture, read.edits)) : officialFixtureBytes(read.fixture));
+
+/** The parsed document, or { missing } when the production parser says the number is not published (never a value). */
+function parse(read: Read): DocObservation | { missing: string } {
+  const body = bodyOf(read.fixture, read.edits);
   const need = (p: { ok: true; obs: DocObservation } | { ok: false; reason: string; detail: string }) => { if (!p.ok) throw new Error(`${read.fixture} ${read.parser}: ${p.reason} ${p.detail}`); return p.obs; };
+  const orMissing = (p: DocParse) => (!p.ok && p.reason === "not_published" ? { missing: p.detail } : need(p));
   switch (read.parser) {
     case "bls_cpi_text": return need(parseBlsRelease(body, "cpi"));
+    case "bls_cpi_table": { const [row, col] = read.select!.split(":") as [CpiTableRow, CpiTableColumn]; return orMissing(parseBlsCpiTableA(body, row, col)); }
+    case "bls_empsit_text": return orMissing(parseEmpsitRelease(body, read.select as EmpsitNumber));
+    case "bls_api_mom": case "bls_api_level": case "bls_api_change": {
+      // what a reader of the API's current vintage sees (the rail records only the release; these stand for a later read)
+      const id = apiId(read.fixture);
+      const p = parseBlsApi(body, id);
+      if (!p.ok) throw new Error(`${read.fixture}: ${p.detail}`);
+      const per = read.select!, prev = previousMonth(per);
+      if (read.parser === "bls_api_level") {
+        const v = p.index.get(per);
+        if (!v) throw new Error(`${read.fixture}: no ${per}`);
+        return { period: per, value: Number(v), value_text: v, deciding_text: `BLS API v1 ${id}: ${monthLabel(per)} = ${v} percent`, direction: null, meta: {} };
+      }
+      if (read.parser === "bls_api_change") {
+        const c = blsApiLevelChange(p.index, per);
+        if (!c) throw new Error(`${read.fixture}: no ${per} change`);
+        return { period: per, value: c.change, value_text: String(c.change), deciding_text: `BLS API v1 ${id}: ${monthLabel(per)} level ${c.current} minus ${monthLabel(prev)} level ${c.base} = ${c.change} thousand`, direction: null, meta: {} };
+      }
+      const m = blsApiMom(p.index, per);
+      if (!m) throw new Error(`${read.fixture}: no ${per}`);
+      const v = (m.tenths / 10).toFixed(1);
+      return { period: per, value: Number(v), value_text: v, deciding_text: `BLS API v1 ${id}: ${monthLabel(per)} index ${m.current} over ${monthLabel(prev)} index ${m.base} = ${v} percent`, direction: null, meta: {} };
+    }
     case "bls_ppi_text": return need(parseBlsRelease(body, "ppi"));
     case "fed_statement": return need(parseFomcStatement(body));
     case "ecb_release": return need(parseEcbRelease(body));
@@ -150,7 +317,7 @@ function parse(read: Read): DocObservation {
     case "bok_gdp_rss": return need(parseBokGdpRss(body, read.select!));
     case "bcb_history": return need(parseBcbHistory(body, read.select!));
     case "bls_api_yoy": {
-      const id = read.fixture.includes("cpi") ? "CUUR0000SA0" : "WPUFD4";
+      const id = apiId(read.fixture);
       const p = parseBlsApi(body, id);
       const y = p.ok ? blsApiYoy(p.index, read.select!) : undefined;
       if (!y) throw new Error(`${read.fixture}: no ${read.select}`);
@@ -169,7 +336,7 @@ function parse(read: Read): DocObservation {
       // what a reader that takes the newest row instead of the meeting's row sees
       const rows = (JSON.parse(body) as { conteudo: Array<{ DataReuniaoCopom: string }> }).conteudo;
       const latest = rows.map((r) => new Date(Date.parse(r.DataReuniaoCopom) - 3 * 3600_000).toISOString().slice(0, 10)).sort().pop()!;
-      return parse({ ...read, parser: "bcb_history", select: latest });
+      return parse({ ...read, parser: "bcb_history", select: latest }) as DocObservation;
     }
     case "sgs432_row": {
       // SGS 432 forward-fills future dates with the current target: the row exists before the meeting happens
@@ -185,10 +352,14 @@ function parse(read: Read): DocObservation {
 function corroborate(series: OfficialSeriesId, obs: DocObservation, spec: Read["corroboration"], at: string): OfficialCorroboration | null {
   if (!spec) return null;
   if (spec.parser === "single_source") return { status: "single_source", source_url: null, value: null, value_text: null, detail: "SGS 432 forward-fills; the Copom history row is the only source", checked_at: at };
-  const body = officialFixture(spec.fixture!);
+  const body = bodyOf(spec.fixture!, spec.edits);
   let v: string | undefined;
   switch (spec.parser) {
-    case "bls_api_yoy": { const p = parseBlsApi(body, spec.fixture!.includes("cpi") ? "CUUR0000SA0" : "WPUFD4"); const y = p.ok ? blsApiYoy(p.index, spec.select!) : undefined; v = y ? (y.tenths / 10).toFixed(1) : undefined; break; }
+    case "bls_api_yoy": case "bls_api": {
+      if (!(series in BLS_API)) throw new Error(`${series} has no BLS API corroboration`);
+      if (apiId(spec.fixture!) !== BLS_API[series as keyof typeof BLS_API].id) throw new Error(`${spec.fixture} is not ${BLS_API[series as keyof typeof BLS_API].id}`);
+      return blsCorroboration({ series: series as keyof typeof BLS_API, value: obs.value, value_text: obs.value_text }, spec.select!, body, urlOf(spec.fixture!), at);
+    }
     case "fred": v = fredValueOn(body, spec.select!); break;
     case "ecb_dfr": v = parseEcbDfrCsv(body).find((r) => r.date === spec.select)?.value; break;
     case "iadb": v = iadbValueOn(body, spec.select!); break;
@@ -199,11 +370,15 @@ function corroborate(series: OfficialSeriesId, obs: DocObservation, spec: Read["
   return { status: sameAtPrecision(series, reading(obs), v) ? "agree" : "disagree", source_url: urlOf(spec.fixture!), value: Number(v), value_text: v, detail: `${spec.parser} ${spec.select} = ${v}`, checked_at: at };
 }
 
-function docOf(series: OfficialSeriesId, read: Read): OfficialObservationDoc {
+function docOf(r: OfficialResolver, read: Read): OfficialDoc {
+  const series = r.series;
   const obs = parse(read);
+  if ("missing" in obs) {
+    return { kind: "official_missing", series, period: r.period, release_at: new Date(releaseAtOf(r)).toISOString(), source_url: urlOf(read.fixture), detail: `not observed by release_at + 6 h: ${obs.missing}`.slice(0, 500) };
+  }
   return {
     kind: "official_observation", series, period: obs.period, value: obs.value, value_text: obs.value_text, deciding_text: obs.deciding_text,
-    source_url: urlOf(read.fixture), raw_sha256: sha(officialFixtureBytes(read.fixture)), observed_at: new Date(read.observed_at).toISOString(),
+    source_url: urlOf(read.fixture), raw_sha256: sha(bytesOf(read)), observed_at: new Date(read.observed_at).toISOString(),
     direction: obs.direction, corroboration: corroborate(series, obs, read.corroboration, new Date(read.observed_at).toISOString()),
     stated_prior: typeof obs.meta.stated_prior === "string" ? obs.meta.stated_prior : null,
     stated_step_bps: typeof obs.meta.stated_step_bps === "number" ? obs.meta.stated_step_bps : null,
@@ -240,8 +415,13 @@ export interface OfficialSummary { suite_sha256: string; cases: number; passed: 
 async function runCase(k: OfficialCase): Promise<{ failures: string[]; falseResolved: boolean }> {
   const r = k.market.resolver;
   if (r?.kind !== "official_release") throw new Error("case market has no official_release resolver");
-  const fetched = docOf(r.series, k.fetched);
-  const doc = k.stored ? firstPrintFor(docOf(r.series, k.stored), fetched) : fetched;
+  const fetched = docOf(r, k.fetched);
+  let doc: OfficialDoc = fetched;
+  if (k.stored) {
+    const stored = docOf(r, k.stored);
+    if (stored.kind !== "official_observation" || fetched.kind !== "official_observation") throw new Error("a first_print case needs two observations");
+    doc = firstPrintFor(stored, fetched);
+  }
   const { evidence } = officialEvidence(doc, new Date(k.fetched.observed_at).toISOString(), { ownCapture: k.fetched.own_capture ?? true });
   let jevCalls = 0;
   const res = await resolveMarket({ marketId: k.id, market: k.market, evidence, thresholds: DEFAULT_THRESHOLDS, spotlightSecret: "eval-spotlight-v1", model: "jev-1.13.0", now: new Date(k.fetched.observed_at) }, { jev: async () => { jevCalls++; throw new Error("official_release reached Jev"); } });

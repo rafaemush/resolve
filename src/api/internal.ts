@@ -61,7 +61,8 @@ const DISPATCH_REFUSAL: Record<Exclude<z.infer<typeof DispatchClaim>, "claimed">
  * dispatch_failures() (migration 013) counts them and the 10-minute job alerts. An admin bearer runs the poll by hand,
  * bypassing both checks; that run is marked dispatch=admin in its loop_runs row.
  * Subrequests: the claim is one on top of runWatch's worst case (36 for an official_release slot holder without
- * waitUntil, src/ingest/official-watch.ts): 37 of Workers Free's 50.
+ * waitUntil; 44 with it, when the holder's capture also records the other series of a BLS fetch group,
+ * src/ingest/official-watch.ts): at most 45 of Workers Free's 50.
  */
 internal.post("/watch/:id", async (c) => {
   const id = c.req.param("id");

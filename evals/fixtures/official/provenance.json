@@ -171,6 +171,162 @@
    "bytes": 115,
    "sha256": "f1e6d1e970dfcd466a586997748a1e315c2e0d52b9e469048e80b704b41e7c3b",
    "file": "bcb_sgs432_ultimos3.json"
+  },
+  "bls_cpi_202606_excerpt.html": {
+   "fetched_at": "2026-09-27T18:47:43Z",
+   "url": "https://www.bls.gov/news.release/archives/cpi_07142026.htm",
+   "http_status": 200,
+   "content_type": "text/html",
+   "bytes": 24930,
+   "sha256": "0e172ecafddc66341374b5468d4e83a6264779292068802a0e3499f6839cc6e5",
+   "file": "bls_cpi_202606_excerpt.html.gz",
+   "excerpt_of": {
+    "bytes": 1379586,
+    "sha256": "382f20db3bdeba1f45a7783dacdaebb87e4ca8461ae2e701db803538afdfc790",
+    "kept": "the first <PRE> block (release header and summary) through the end of Table A (id cpi_pressa), byte-exact"
+   },
+   "what": "CPI June 2026 release (Jul 14, 2026): headline 1-month -0.4 ('decreased'), core 1-month 0.0 ('was unchanged')"
+  },
+  "bls_cpi_202511_excerpt.html": {
+   "fetched_at": "2026-09-27T18:47:55Z",
+   "url": "https://www.bls.gov/news.release/archives/cpi_12182025.htm",
+   "http_status": 200,
+   "content_type": "text/html",
+   "bytes": 25376,
+   "sha256": "db243ab68b15a058812c159a5494b868bd12ac8dc2c3899b5025caf6fc55a9a7",
+   "file": "bls_cpi_202511_excerpt.html.gz",
+   "excerpt_of": {
+    "bytes": 1363461,
+    "sha256": "85627e2f11db4d58fbdebc5877b27e71022c0ef17db77ddfb04497c4e33105b5",
+    "kept": "the first <PRE> block (release header and summary) through the end of Table A (id cpi_pressa), byte-exact"
+   },
+   "what": "CPI November 2025 release (Dec 18, 2025, after the 2025 lapse): Table A prints '-' for the Oct. and Nov. 2025 1-month cells; 2-month change sentence"
+  },
+  "bls_cpi_202509_excerpt.html": {
+   "fetched_at": "2026-09-27T18:48:08Z",
+   "url": "https://www.bls.gov/news.release/archives/cpi_10242025.htm",
+   "http_status": 200,
+   "content_type": "text/html",
+   "bytes": 24747,
+   "sha256": "0fc878a666a31c5380c9f6d47a96527797a79eb30bfdd706290f28508ad0c49e",
+   "file": "bls_cpi_202509_excerpt.html.gz",
+   "excerpt_of": {
+    "bytes": 1365560,
+    "sha256": "ab7e0e431246f6f983575529cf4eae509706963fa893b6156576a2c320556397",
+    "kept": "the first <PRE> block (release header and summary) through the end of Table A (id cpi_pressa), byte-exact"
+   },
+   "what": "CPI September 2025 release, published late (Oct 24, 2025) during the 2025 lapse"
+  },
+  "bls_cpi_202405_excerpt.html": {
+   "fetched_at": "2026-09-27T18:51:15Z",
+   "url": "https://www.bls.gov/news.release/archives/cpi_06122024.htm",
+   "http_status": 200,
+   "content_type": "text/html",
+   "bytes": 25088,
+   "sha256": "9a034e2da94adfe2c5739d1923fdfb19a8496e68129494425c5b5b67b845f5ad",
+   "file": "bls_cpi_202405_excerpt.html.gz",
+   "excerpt_of": {
+    "bytes": 1365393,
+    "sha256": "76eff97eff76a812263bd21d8e55c29c42ea2b883c7dea4ff98f326112cf8437",
+    "kept": "the first <PRE> block (release header and summary) through the end of Table A (id cpi_pressa), byte-exact"
+   },
+   "what": "CPI May 2024 release (Jun 12, 2024): headline 'was unchanged in May on a seasonally adjusted basis' word order"
+  },
+  "bls_empsit_nr0_excerpt.html": {
+   "fetched_at": "2026-09-27T18:45:52Z",
+   "url": "https://www.bls.gov/news.release/empsit.nr0.htm",
+   "http_status": 200,
+   "content_type": "text/html",
+   "bytes": 6856,
+   "sha256": "a4f9fae2b9f321f847ecce7efda343a9d812853f362a149e433a2f8cc767493b",
+   "file": "bls_empsit_nr0_excerpt.html",
+   "excerpt_of": {
+    "bytes": 62353,
+    "sha256": "20e122273575e268b2325ced449aff2868fe3fad75b0d1d854688749bf5dca99",
+    "kept": "the first <PRE> block (the whole summary text), byte-exact"
+   },
+   "what": "Employment Situation Summary, August 2026 data (Sep 4, 2026): +162,000 and 4.1 percent; revises June and July"
+  },
+  "bls_empsit_202607_excerpt.html": {
+   "fetched_at": "2026-09-27T18:46:28Z",
+   "url": "https://www.bls.gov/news.release/archives/empsit_08072026.htm",
+   "http_status": 200,
+   "content_type": "text/html",
+   "bytes": 8503,
+   "sha256": "2bcb08e42d1e46d68eb43c4cee1760b833fc09e4d7973b0f87efc42a4fd8ce62",
+   "file": "bls_empsit_202607_excerpt.html",
+   "excerpt_of": {
+    "bytes": 1066217,
+    "sha256": "4602e50c53ccfc789d52ef73191171d9918141516b7734524e70f2b8326024a5",
+    "kept": "the first <PRE> block (the whole summary text), byte-exact"
+   },
+   "what": "Employment Situation, July 2026 data (Aug 7, 2026): 'changed little (-23,000)', '(4.1 percent)'"
+  },
+  "bls_empsit_202602_excerpt.html": {
+   "fetched_at": "2026-09-27T18:48:59Z",
+   "url": "https://www.bls.gov/news.release/archives/empsit_03062026.htm",
+   "http_status": 200,
+   "content_type": "text/html",
+   "bytes": 21902,
+   "sha256": "98e19b1808e62f4f389139293125501de81b2747406f1083cd2ffe2b05522313",
+   "file": "bls_empsit_202602_excerpt.html.gz",
+   "excerpt_of": {
+    "bytes": 1080980,
+    "sha256": "596a68af690cac8805340128de322b5b4ff3f3b7773cc77151c061340b7d1435",
+    "kept": "the first <PRE> block (the whole summary text), byte-exact"
+   },
+   "what": "Employment Situation, February 2026 data (Mar 6, 2026): 'edged down by 92,000', '--' header, boxed note"
+  },
+  "bls_v1_cpi_sa.json": {
+   "fetched_at": "2026-09-27T18:48:16Z",
+   "url": "https://api.bls.gov/publicAPI/v1/timeseries/data/CUSR0000SA0",
+   "http_status": 200,
+   "content_type": "application/json",
+   "bytes": 3023,
+   "sha256": "b6f1174929a61d5130ed02f347fd1082db1488b8260f11943baace34c23695d7",
+   "file": "bls_v1_cpi_sa.json",
+   "what": "CPI-U all items, seasonally adjusted index (1-month changes)"
+  },
+  "bls_v1_core_sa.json": {
+   "fetched_at": "2026-09-27T18:48:21Z",
+   "url": "https://api.bls.gov/publicAPI/v1/timeseries/data/CUSR0000SA0L1E",
+   "http_status": 200,
+   "content_type": "application/json",
+   "bytes": 3027,
+   "sha256": "509818981a0a934a8b7a7afacd0f435dcc2e57b1c19cd1ffa174d84fe134946a",
+   "file": "bls_v1_core_sa.json",
+   "what": "CPI-U all items less food and energy, seasonally adjusted index"
+  },
+  "bls_v1_core_nsa.json": {
+   "fetched_at": "2026-09-27T18:48:26Z",
+   "url": "https://api.bls.gov/publicAPI/v1/timeseries/data/CUUR0000SA0L1E",
+   "http_status": 200,
+   "content_type": "application/json",
+   "bytes": 3202,
+   "sha256": "a6fedd0a84570bfd33721ba4fb59519e8ffb7ee59e5232ff853515160598cbda",
+   "file": "bls_v1_core_nsa.json",
+   "what": "CPI-U all items less food and energy, not seasonally adjusted index (12-month changes)"
+  },
+  "bls_v1_unrate.json": {
+   "fetched_at": "2026-09-27T18:47:12Z",
+   "url": "https://api.bls.gov/publicAPI/v1/timeseries/data/LNS14000000",
+   "http_status": 200,
+   "content_type": "application/json",
+   "bytes": 3066,
+   "sha256": "af584b377c27b065e3ec97fbe8d583f02c57981478041a5dbb0569df3afbbbac",
+   "file": "bls_v1_unrate.json",
+   "what": "Unemployment rate, seasonally adjusted (2025-10 is '-', the 2025 lapse)"
+  },
+  "bls_v1_payrolls.json": {
+   "fetched_at": "2026-09-27T18:47:12Z",
+   "url": "https://api.bls.gov/publicAPI/v1/timeseries/data/CES0000000001",
+   "http_status": 200,
+   "content_type": "application/json",
+   "bytes": 2986,
+   "sha256": "5fc342fda696ebd2b6fe0c91abfdb5c543c71cc7f355fd16af20eb8b331648e7",
+   "file": "bls_v1_payrolls.json",
+   "what": "Total nonfarm employment level, seasonally adjusted, thousands (2026-08 latest, preliminary)"
   }
- }
+ },
+ "_note_2026_09_27": "Entries fetched 2026-09-27 (BLS CPI Table A siblings, Employment Situation, BLS API v1 CUSR0000SA0 / CUSR0000SA0L1E / CUUR0000SA0L1E / LNS14000000 / CES0000000001) by curl with the same UA; every request answered 200 with Accept text/html or application/json (no browser-like header needed). Archived release pages (1.1-1.4 MB) are kept as byte-exact excerpts (excerpt_of names the full body's size and sha256, kept says which bytes); US government public-domain text. sha256 is of the stored excerpt."
 }

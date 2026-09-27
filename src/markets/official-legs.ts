@@ -1,8 +1,8 @@
 /**
  * Building official_release leg registrations from platform ladders (scripts/official-legs.ts). Pure: the bucket
- * label parser turns an option title ("≤2.9%", "2.0–2.4%", "25 bps cut", "50+ bps increase", "No change") into the
- * bucket the leg represents, in the series' decided unit. Anything it does not recognise is null, never a guess:
- * the leg is then left out of the suggestions with its label listed for the founder.
+ * label parser turns an option title ("≤2.9%", "2.0–2.4%", "25 bps cut", "50+ bps increase", "No change", "50k to
+ * 100k", "<-50k", "200k+") into the bucket the leg represents, in the series' decided unit. Anything it does not
+ * recognise is null, never a guess: the leg is then left out of the suggestions with its label listed for the founder.
  */
 import type { MarketRegistration, OfficialBucket } from "../resolve/schema";
 import { OFFICIAL_SERIES, type OfficialSeriesId, type SeriesDef } from "../resolve/official";
@@ -52,9 +52,45 @@ function bpsBucket(label: string): OfficialBucket | null {
   return { label, lo: sign * size, hi: sign * size, lo_inclusive: true, hi_inclusive: true };
 }
 
-/** The bucket an option title names, in the series' decided unit (percent at 1 dp, or bps of change), else null. */
+/** "50k" -> 50, "-50k" -> -50, "0" -> 0 (a bound without "k" must be zero). */
+function kValue(n: string, k: string): number | null {
+  const x = num(n);
+  return k || x === 0 ? x : null;
+}
+
+/**
+ * Payroll-change ladders in thousands: "<-50k", "-50k to 0", "0 to 50k", "200k+". "X to Y" is half-open [X, Y): the
+ * ladders put each boundary in two adjacent labels and settle a value exactly on it in the higher bracket, which
+ * buildLegRegistration requires the market text to say (TIE_TO_HIGHER), so "<-50k" is below -50 and "200k+" from 200.
+ */
+function thousandsBucket(label: string): OfficialBucket | null {
+  const t = norm(label).replace(/(\d)\s+k\b/gi, "$1k");
+  let m: RegExpExecArray | null;
+  const K = String.raw`(${NUM})(k?)`;
+  if ((m = new RegExp(String.raw`^(?:<|less than |below |under )\s*${K}$`, "i").exec(t))) { const x = kValue(m[1]!, m[2]!); return x === null ? null : one(x, "hi", false, label); }
+  if ((m = new RegExp(String.raw`^(?:≤|<=)\s*${K}$`).exec(t))) { const x = kValue(m[1]!, m[2]!); return x === null ? null : one(x, "hi", true, label); }
+  if ((m = new RegExp(String.raw`^(?:>|more than |above |over )\s*${K}$`, "i").exec(t))) { const x = kValue(m[1]!, m[2]!); return x === null ? null : one(x, "lo", false, label); }
+  if ((m = new RegExp(String.raw`^(?:≥|>=)\s*${K}$`).exec(t))) { const x = kValue(m[1]!, m[2]!); return x === null ? null : one(x, "lo", true, label); }
+  if ((m = new RegExp(String.raw`^${K}\s*\+$`).exec(t)) || (m = new RegExp(String.raw`^${K} or (?:more|higher|above)$`, "i").exec(t))) { const x = kValue(m[1]!, m[2]!); return x === null ? null : one(x, "lo", true, label); }
+  if ((m = new RegExp(String.raw`^${K}\s*(?:to|–)\s*${K}$`, "i").exec(t))) {
+    if (!m[2] && !m[4]) return null; // "0 to 50" names no unit
+    const lo = kValue(m[1]!, m[2]!), hi = kValue(m[3]!, m[4]!);
+    return lo === null || hi === null || lo >= hi ? null : { label, lo, hi, lo_inclusive: true, hi_inclusive: false };
+  }
+  return null;
+}
+
+/** A thousands ladder is read half-open only when its text settles a boundary value in the higher bracket. */
+export const TIE_TO_HIGHER = /\bhigher (?:range )?bracket\b/i;
+
+/** The bucket an option title names, in the series' decided unit (percent at 1 dp, bps of change, thousands), else null. */
 export function parseBucketLabel(label: string, decides: SeriesDef["decides"]): OfficialBucket | null {
-  return decides === "percent" ? percentBucket(label) : bpsBucket(label);
+  switch (decides) {
+    case "percent": return percentBucket(label);
+    case "rate_change_bps": return bpsBucket(label);
+    case "change_thousands": return thousandsBucket(label);
+    default: { const never: never = decides; throw new Error(`unhandled decided unit ${String(never)}`); }
+  }
 }
 
 export interface LegGroup {
@@ -84,6 +120,9 @@ export function buildLegRegistration(i: LegInput): { ok: true; market: MarketReg
   const def = OFFICIAL_SERIES[i.group.series];
   const bucket = parseBucketLabel(i.label, def.decides);
   if (!bucket) return { ok: false, reason: `unrecognised option label "${i.label}"` };
+  if (def.decides === "change_thousands" && !TIE_TO_HIGHER.test(strip(i.criteria))) {
+    return { ok: false, reason: `"${i.label}": the market text does not say which bracket a value exactly on a boundary settles in, so "X to Y" cannot be read as [X, Y)` };
+  }
   const head = `Leg "${i.label}" of "${i.group.title}": resolves Yes iff the first print of ${def.label} for ${i.group.period}, decided under the market's rounding, falls in this bucket; otherwise No (another bucket was printed). `;
   const market: MarketRegistration = {
     platform: i.platform, external_id: i.external_id,

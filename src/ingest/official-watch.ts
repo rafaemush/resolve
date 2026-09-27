@@ -5,8 +5,12 @@
  *     next_poll_at = the start of the release minute (pg_cron dispatches once a minute, migration 007).
  * (b) At/after it every leg first reads the shared first print (official_observations, migration 016). Dozens of
  *     legs of one ladder share one (series, period): only the holder of claim_official_fetch requests the source,
- *     so the upstream sees one fetcher per minute however many legs exist. A Retry-After extends that lease, so the
- *     whole ladder backs off, not one leg.
+ *     so the upstream sees one fetcher per minute however many legs exist. Series read from one page (the CPI
+ *     release: headline and core, 1- and 12-month; the Employment Situation: unemployment rate and payrolls) share
+ *     one slot named by their fetch group (fetchSlotOf), and the holder's capture in waitUntil records every series
+ *     of the group the page states for the period from the same bytes (also when the page is out without the
+ *     holder's own number, a "-" cell, or when the holder's part of the page drifted), so the page is fetched once
+ *     per release. A Retry-After extends that lease, so every ladder on the page backs off, not one leg.
  * (c) The holder's capture runs in waitUntil whenever the route has an ExecutionContext, and the poll returns at
  *     once (legs resolve from the stored row on their next poll): pg_net waits 30 s at most. Inside the release
  *     minute it is the scheduled burst (plan §18.1): every 3 s for at most 25 s and at most 10 upstream requests,
@@ -15,7 +19,9 @@
  * (d) Not observed by release + 6 h: one UNRESOLVED observation (release_not_observed) per leg plus an alert, then a
  *     poll every 15 minutes until the market text's fallback window ends (the next scheduled release or meeting,
  *     45 days at most), daily for 7 more days, then the watch stops with one alert. Never an older period: the
- *     adapters only record a document about the target period.
+ *     adapters only record a document about the target period. A first print first seen at or after the named
+ *     fallback is still recorded (the audit trail of when it appeared) but decides nothing: gate 1 answers
+ *     released_after_fallback, because the market texts then settle on an earlier period.
  * (e) Change detection projects series|period|first print|corroboration status (src/ingest/projection.ts): later
  *     polls are no_op, and an audited re-check of the corroboration (recheck_official_corroboration) re-resolves.
  *
@@ -25,8 +31,10 @@
  * corroboration 1 + R2 put of the upstream body 1 + record_official_observation 1 + revision/disagreement/prior-level
  * alerts <= 3 x 3 (dedup read, insert, Telegram) = 26, then runWatch stores and resolves: R2 put 1 + evidence insert
  * 1 + check_gates 1 + resolutions insert 1 + evidence update 1 + commit 3 (bot_posts read, Telegram, insert) +
- * watches update 1 + loop_runs insert 1 = 10. Total 36. With waitUntil: the request makes 5 (load, read, claim,
- * watches update, loop_runs) and the capture task <= 23.
+ * watches update 1 + loop_runs insert 1 = 10. Total 36 (no siblings are recorded inline). With waitUntil: the request
+ * makes 5 (load, read, claim, watches update, loop_runs) and the capture task <= 23 for its own series plus, for a
+ * fetch group, 1 read of the siblings' rows and per missing sibling (3 at most, the CPI group) corroboration 1 +
+ * record 1 + one alert 3 (a sibling is either inserted, and alerted on a disagreement, or a revision) = 16: 44.
  */
 import type { Env } from "../env";
 import { db, rpc } from "../db/supabase";
@@ -34,7 +42,7 @@ import type { FetchOutcome, MarketRow, WatchRow } from "./types";
 import { MAX_DEFER_S } from "./http";
 import { fetchPrimary, fetchCorroboration, budget, type FetchedObservation, type PrimaryResult } from "./official";
 import {
-  OFFICIAL_SERIES, OfficialCorroboration, firstPrintFor, officialEvidence, priorLevelProblem, releaseAtOf, fallbackEndMs,
+  OFFICIAL_SERIES, OfficialCorroboration, firstPrintFor, officialEvidence, priorLevelProblem, releaseAtOf, fallbackEndMs, fetchSlotOf,
   type OfficialObservationDoc, type OfficialMissingDoc, type OfficialResolver, type OfficialSeriesId,
 } from "../resolve/official";
 import { alert } from "../ops/alerts";
@@ -133,17 +141,74 @@ async function safeAlert(env: Env, key: string, text: string, dedupMinutes: numb
 }
 
 export type Capture =
-  | { kind: "recorded"; stored: OfficialObservationDoc; fetched: OfficialObservationDoc; inserted: boolean; revision: boolean; ownCapture: boolean; requests: number }
-  | { kind: "pending"; detail: string; requests: number }
-  | { kind: "error"; error: string; retryable: boolean; drift: boolean; httpStatus?: number; deferSeconds?: number; requests: number };
+  | { kind: "recorded"; stored: OfficialObservationDoc; fetched: OfficialObservationDoc; inserted: boolean; revision: boolean; ownCapture: boolean; requests: number; siblings: string[] }
+  | { kind: "pending"; detail: string; requests: number; siblings?: string[] }
+  | { kind: "error"; error: string; retryable: boolean; drift: boolean; httpStatus?: number; deferSeconds?: number; requests: number; siblings?: string[] };
+
+/** record_official_observation for one fetched observation of `period`, with the revision and disagreement alerts. */
+async function recordObservation(env: Env, obs: FetchedObservation, period: string, corroboration: OfficialCorroboration, meta: Record<string, unknown>): Promise<StoredRow> {
+  const alertMeta = { series: obs.series, period };
+  const row = await rpc<StoredRow>(db(env), "record_official_observation", {
+    p_series: obs.series, p_period: period, p_value: obs.value, p_value_text: obs.value_text, p_deciding_text: obs.deciding_text,
+    p_source_url: obs.source_url, p_raw_sha256: obs.raw_sha256, p_corroboration: corroboration,
+    p_meta: { ...obs.meta, direction: obs.direction, doc_period: obs.period, fetched_at: obs.fetched_at, ...meta },
+  });
+  if (row.revision_differs) {
+    await safeAlert(env, `official_revision_${obs.series}_${period}`, `${obs.series} ${period}: stored first print ${row.value_text} (${new Date(row.observed_at).toISOString()}); a later read offered ${obs.value_text} from ${obs.source_url}. The first print stands.`, 1440, alertMeta);
+  }
+  if (row.inserted && corroboration.status === "disagree") {
+    await safeAlert(env, `official_disagree_${obs.series}_${period}`, `${obs.series} ${period}: primary ${obs.value_text} (${obs.source_url}) vs ${corroboration.value_text} (${corroboration.source_url}). Every leg stays UNRESOLVED (sources_disagree) until an operator re-checks it (POST /internal/official/recheck).`, 1440, alertMeta);
+  }
+  return row;
+}
+
+const corroborate = async (obs: FetchedObservation, period: string, deps: Pick<OfficialDeps, "now">, hardStop: number): Promise<OfficialCorroboration> => {
+  try { return await fetchCorroboration(obs, period, budget(deps.now, 0, 1, Math.min(deps.now() + 8000, hardStop))); }
+  catch (e) { return { status: "unavailable", source_url: null, value: null, value_text: null, detail: `corroboration threw: ${String(e).slice(0, 200)}`, checked_at: iso(deps.now()) }; }
+};
+
+/**
+ * The other series of the fetch group that the holder's page states for the period: each one not yet stored gets its
+ * own corroboration and first print from the same bytes (already in R2). Never throws; returns one note per sibling.
+ */
+async function recordSiblings(env: Env, r: OfficialResolver, marketId: string, siblings: FetchedObservation[], upstream: number, deps: Pick<OfficialDeps, "now">, hardStop: number): Promise<string[]> {
+  if (!siblings.length) return [];
+  const { data, error } = await db(env).from("official_observations").select("series").eq("period", r.period).in("series", siblings.map((s) => s.series));
+  if (error) return siblings.map((s) => `${s.series}: not recorded (official_observations read: ${error.message.slice(0, 120)})`);
+  const stored = new Set(((data ?? []) as Array<{ series: string }>).map((x) => x.series));
+  const todo = siblings.filter((s) => !stored.has(s.series));
+  const notes = siblings.filter((s) => stored.has(s.series)).map((s) => `${s.series}: already stored`);
+  const corr = await Promise.all(todo.map((s) => corroborate(s, r.period, deps, hardStop)));
+  for (const [i, s] of todo.entries()) {
+    try {
+      const row = await recordObservation(env, s, r.period, corr[i]!, { upstream_requests: upstream + 1, captured_by_market: marketId, sibling_of: r.series });
+      notes.push(`${s.series}: ${row.inserted ? "recorded" : "already stored"} ${row.value_text}`);
+    } catch (e) { notes.push(`${s.series}: record_official_observation: ${String(e).slice(0, 160)}`); }
+  }
+  return notes;
+}
+
+/**
+ * The holder's page states other series of the group although it gave the holder's own series no first print (a "-"
+ * cell, or its part of the page drifted): the body to R2 once, then each sibling's first print (recordSiblings).
+ */
+async function recordPageSiblings(env: Env, r: OfficialResolver, marketId: string, res: { siblings?: FetchedObservation[]; siblingNotes?: string[] }, upstream: number, deps: Pick<OfficialDeps, "now">, hardStop: number): Promise<string[]> {
+  const siblings = res.siblings ?? [];
+  if (!siblings.length) return res.siblingNotes ?? [];
+  const body = siblings[0]!;
+  try { await env.RAW.put(`raw/${body.raw_sha256}`, body.raw, { httpMetadata: { contentType: "application/octet-stream" } }); }
+  catch (e) { await safeAlert(env, "r2_put_failed", `R2 put raw/${body.raw_sha256} (${r.series} ${r.period} upstream body) failed: ${String(e).slice(0, 200)}`, 60, { series: r.series, period: r.period }); }
+  return [...await recordSiblings(env, r, marketId, siblings, upstream, deps, hardStop), ...(res.siblingNotes ?? [])];
+}
 
 /**
  * The slot holder's fetch: primary (one attempt, or the burst), then corroboration (one request), the upstream body
  * to R2, and record_official_observation (first print wins; a different later value comes back as revision_differs).
  * marketId is recorded as the capturer: for events outside KNOWN_RELEASES only a market's own capture is held to
- * its own release_at (src/resolve/official.ts gate 1).
+ * its own release_at (src/resolve/official.ts gate 1). With mode.siblings (a capture in waitUntil) the other series
+ * of the fetch group that the same page states are recorded too (recordSiblings).
  */
-export async function captureOfficial(env: Env, r: OfficialResolver, marketId: string, mode: { burst: boolean }, deps: Pick<OfficialDeps, "now" | "sleep">): Promise<Capture> {
+export async function captureOfficial(env: Env, r: OfficialResolver, marketId: string, mode: { burst: boolean; siblings?: boolean }, deps: Pick<OfficialDeps, "now" | "sleep">): Promise<Capture> {
   const start = deps.now();
   const hardStop = start + (mode.burst ? BURST_HARD_STOP_MS : SINGLE_HARD_STOP_MS);
   const b = mode.burst ? budget(deps.now, BURST_WINDOW_MS, BURST_MAX_REQUESTS) : budget(deps.now, 0, SINGLE_MAX_REQUESTS, hardStop);
@@ -158,43 +223,38 @@ export async function captureOfficial(env: Env, r: OfficialResolver, marketId: s
     if (b.requests <= 0 || next >= b.deadlineMs) break;
     await deps.sleep(Math.max(0, next - deps.now()));
   }
-  if (res.kind === "pending") return { ...res, requests: b.used };
+  if (res.kind === "pending") {
+    // the page is out without this series' number: the other series it states are still recorded (waitUntil only)
+    if (!mode.siblings || !res.siblings?.length) return { kind: "pending", detail: res.detail, requests: b.used };
+    return { kind: "pending", detail: res.detail, requests: b.used, siblings: await recordPageSiblings(env, r, marketId, res, b.used, deps, hardStop) };
+  }
   if (res.kind === "error") {
     // The source asked to wait: the whole ladder backs off (every leg's claim fails while the lease lives).
     if (res.deferSeconds !== undefined) {
-      try { await rpc(db(env), "extend_official_fetch", { p_series: r.series, p_period: r.period, p_seconds: Math.min(MAX_DEFER_S, Math.max(FETCH_LEASE_S, res.deferSeconds)) }); }
+      try { await rpc(db(env), "extend_official_fetch", { p_series: fetchSlotOf(r.series), p_period: r.period, p_seconds: Math.min(MAX_DEFER_S, Math.max(FETCH_LEASE_S, res.deferSeconds)) }); }
       catch (e) { await safeAlert(env, `official_upstream_${r.series}_${r.period}`, `${r.series} ${r.period}: could not extend the fetch lease for Retry-After ${res.deferSeconds} s: ${String(e).slice(0, 200)}`, 60, meta); }
     }
     // The fetch lease rotates across the legs of a ladder, so no single watch accumulates an error streak: the
     // alert is per series. Only a retryable answer inside the release-minute burst (the burst itself retries) waits.
-    if (res.drift) await safeAlert(env, `official_schema_${r.series}`, `${r.series} ${r.period}: the source no longer parses (${res.error}). Nothing was recorded; the parser needs a look before the release window closes.`, 360, meta);
+    // A drift in this series' part of a shared page does not hold back the other series the page states (waitUntil only).
+    const siblings = mode.siblings && res.siblings?.length ? await recordPageSiblings(env, r, marketId, res, b.used, deps, hardStop) : undefined;
+    if (res.drift) await safeAlert(env, `official_schema_${r.series}`, `${r.series} ${r.period}: the source no longer parses (${res.error}). Nothing was recorded for ${r.series}${siblings ? ` (from the same page: ${siblings.join("; ").slice(0, 300)})` : ""}; the parser needs a look before the release window closes.`, 360, meta);
     else if (!res.retryable || !mode.burst) await safeAlert(env, `official_upstream_${r.series}_${r.period}`, `${r.series} ${r.period}: ${res.error}. Nothing was recorded; the next poll retries.`, 60, meta);
-    return { kind: "error", error: `${res.error} (${b.used} upstream requests)`, retryable: res.retryable, drift: res.drift, httpStatus: res.httpStatus, deferSeconds: res.deferSeconds, requests: b.used };
+    return { kind: "error", error: `${res.error} (${b.used} upstream requests)`, retryable: res.retryable, drift: res.drift, httpStatus: res.httpStatus, deferSeconds: res.deferSeconds, requests: b.used, ...(siblings ? { siblings } : {}) };
   }
   const obs = res.obs;
-  let corroboration: OfficialCorroboration;
-  try { corroboration = await fetchCorroboration(obs, r.period, budget(deps.now, 0, 1, Math.min(deps.now() + 8000, hardStop))); }
-  catch (e) { corroboration = { status: "unavailable", source_url: null, value: null, value_text: null, detail: `corroboration threw: ${String(e).slice(0, 200)}`, checked_at: iso(deps.now()) }; }
+  const corroboration = await corroborate(obs, r.period, deps, hardStop);
   // The upstream body first: a first print names bytes that exist (the evidence rows follow the same rule).
   try { await env.RAW.put(`raw/${obs.raw_sha256}`, obs.raw, { httpMetadata: { contentType: "application/octet-stream" } }); }
   catch (e) { await safeAlert(env, "r2_put_failed", `R2 put raw/${obs.raw_sha256} (${r.series} ${r.period} upstream body) failed: ${String(e).slice(0, 200)}`, 60, meta); }
   let row: StoredRow;
-  try {
-    row = await rpc<StoredRow>(db(env), "record_official_observation", {
-      p_series: r.series, p_period: r.period, p_value: obs.value, p_value_text: obs.value_text, p_deciding_text: obs.deciding_text,
-      p_source_url: obs.source_url, p_raw_sha256: obs.raw_sha256, p_corroboration: corroboration,
-      p_meta: { ...obs.meta, direction: obs.direction, doc_period: obs.period, fetched_at: obs.fetched_at, upstream_requests: b.used + 1, captured_by_market: marketId },
-    });
-  } catch (e) { return { kind: "error", error: `record_official_observation: ${String(e).slice(0, 200)}`, retryable: true, drift: false, requests: b.used }; }
+  try { row = await recordObservation(env, obs, r.period, corroboration, { upstream_requests: b.used + 1, captured_by_market: marketId }); }
+  catch (e) { return { kind: "error", error: `record_official_observation: ${String(e).slice(0, 200)}`, retryable: true, drift: false, requests: b.used }; }
   const stored = docFromRow(row);
   const fetched = docFromFetch(obs, corroboration);
-  if (row.revision_differs) {
-    await safeAlert(env, `official_revision_${r.series}_${r.period}`, `${r.series} ${r.period}: stored first print ${stored.value_text} (${stored.observed_at}); a later read offered ${obs.value_text} from ${obs.source_url}. The first print stands.`, 1440, meta);
-  }
-  if (row.inserted && corroboration.status === "disagree") {
-    await safeAlert(env, `official_disagree_${r.series}_${r.period}`, `${r.series} ${r.period}: primary ${obs.value_text} (${obs.source_url}) vs ${corroboration.value_text} (${corroboration.source_url}). Every leg stays UNRESOLVED (sources_disagree) until an operator re-checks it (POST /internal/official/recheck).`, 1440, meta);
-  }
-  return { kind: "recorded", stored, fetched, inserted: row.inserted === true, revision: row.revision_differs === true, ownCapture: row.meta?.captured_by_market === marketId, requests: b.used };
+  const siblings = mode.siblings ? await recordSiblings(env, r, marketId, res.siblings ?? [], b.used, deps, hardStop) : [];
+  if (mode.siblings) siblings.push(...(res.siblingNotes ?? []));
+  return { kind: "recorded", stored, fetched, inserted: row.inserted === true, revision: row.revision_differs === true, ownCapture: row.meta?.captured_by_market === marketId, requests: b.used, siblings };
 }
 
 async function observedOutcome(env: Env, r: OfficialResolver, stored: OfficialObservationDoc, fetched: OfficialObservationDoc | null, ownCapture: boolean, nowMs: number, s: OfficialSchedule, note: string): Promise<FetchOutcome> {
@@ -246,7 +306,7 @@ async function pollOfficial(env: Env, watch: WatchRow, market: MarketRow, deps: 
 
   const missing = now - s.releaseAtMs >= MISSING_AFTER_MS;
   let holder: boolean;
-  try { holder = (await rpc<boolean>(client, "claim_official_fetch", { p_series: r.series, p_period: r.period, p_seconds: FETCH_LEASE_S })) === true; }
+  try { holder = (await rpc<boolean>(client, "claim_official_fetch", { p_series: fetchSlotOf(r.series), p_period: r.period, p_seconds: FETCH_LEASE_S })) === true; }
   catch (e) { return { error: `claim_official_fetch: ${String(e).slice(0, 200)}` }; }
   if (!holder) {
     if (missing) return missingOutcome(env, r, now, s, "another leg holds the fetch lease");
@@ -256,8 +316,8 @@ async function pollOfficial(env: Env, watch: WatchRow, market: MarketRow, deps: 
   const burst = !missing && inReleaseMinute(now, s.releaseAtMs);
   if (deps.waitUntil) {
     // pg_net stops waiting after 30 s: the capture never runs inside the request when it can run after it.
-    const task = captureOfficial(env, r, market.id, { burst }, deps)
-      .then((c) => console.log(JSON.stringify({ job: "official_capture", series: r.series, period: r.period, burst, outcome: c.kind, requests: c.requests, detail: c.kind === "recorded" ? c.stored.value_text : c.kind === "pending" ? c.detail : c.error })))
+    const task = captureOfficial(env, r, market.id, { burst, siblings: true }, deps)
+      .then((c) => console.log(JSON.stringify({ job: "official_capture", series: r.series, period: r.period, burst, outcome: c.kind, requests: c.requests, detail: c.kind === "recorded" ? c.stored.value_text : c.kind === "pending" ? c.detail : c.error, ...(c.siblings?.length ? { siblings: c.siblings } : {}) })))
       .catch((e) => safeAlert(env, `official_upstream_${r.series}_${r.period}`, `${r.series} ${r.period}: the capture threw: ${String(e).slice(0, 200)}`, 60, { series: r.series, period: r.period }));
     deps.waitUntil(task);
     if (missing) return missingOutcome(env, r, now, s, "the capture continues in waitUntil");

@@ -1,6 +1,7 @@
 /**
  * official_release: binary legs of ladders that settle on one scheduled official number (US CPI/PPI 12-month change,
- * FOMC upper bound, ECB deposit facility rate, BoE Bank Rate, BoK Base Rate, Korea GDP advance YoY, BCB Selic).
+ * US CPI 1-month and core CPI 1- and 12-month changes, the US unemployment rate and nonfarm payroll change, FOMC upper
+ * bound, ECB deposit facility rate, BoE Bank Rate, BoK Base Rate, Korea GDP advance YoY, BCB Selic).
  * The rail fetches the named source itself (src/ingest/official.ts), stores the FIRST PRINT once per (series, period)
  * in official_observations (migration 016), and every leg decides from that stored row in code. Jev is never called.
  * A leg resolves Yes iff the decided value falls in its bucket, else No: a "No" is a positive determination that the
@@ -24,8 +25,12 @@ const ORDINALS = ["First", "Second", "Third", "Fourth"] as const;
 export interface SeriesDef {
   id: OfficialSeriesId;
   label: string;
-  /** percent: the 12-month change as published (1 dp). rate_change_bps: the new level minus prior_level, in bps. */
-  decides: "percent" | "rate_change_bps";
+  /**
+   * percent: the percent as published (1 dp: a 1- or 12-month change, or a rate such as unemployment).
+   * rate_change_bps: the new level minus prior_level, in bps. change_thousands: a signed change in whole thousands
+   * as published (payroll employment), never rounded further.
+   */
+  decides: "percent" | "rate_change_bps" | "change_thousands";
   /** The rounding the market texts for this series prescribe (research 2026-09-24). */
   rounding: OfficialRoundingRule;
   period: "month" | "quarter" | "day";
@@ -35,10 +40,23 @@ export interface SeriesDef {
   primaryUrl: string;
   /** when_available: a second official source is compared once it has the number; none: single-source by design. */
   corroboration: "when_available" | "none";
+  /**
+   * Series read from the same primary document share one fetch slot, named by this (fetchSlotOf). The slot holder
+   * fetches the page once and records every series of the group the page names, so the upstream sees one fetcher
+   * per release however many ladders depend on it.
+   */
+  fetchGroup?: string;
 }
 
 export const OFFICIAL_SERIES: Record<OfficialSeriesId, SeriesDef> = {
-  us_cpi_u_nsa_yoy: { id: "us_cpi_u_nsa_yoy", label: "US CPI-U all items, 12-month change before seasonal adjustment (BLS)", decides: "percent", rounding: "pct_1dp", period: "month", hosts: ["www.bls.gov", "api.bls.gov"], primaryUrl: "https://www.bls.gov/news.release/cpi.nr0.htm", corroboration: "when_available" },
+  us_cpi_u_nsa_yoy: { id: "us_cpi_u_nsa_yoy", label: "US CPI-U all items, 12-month change before seasonal adjustment (BLS)", decides: "percent", rounding: "pct_1dp", period: "month", hosts: ["www.bls.gov", "api.bls.gov"], primaryUrl: "https://www.bls.gov/news.release/cpi.nr0.htm", corroboration: "when_available", fetchGroup: "bls_cpi_release" },
+  // The three CPI siblings are read from Table A of the same release (row and column matched by label and month).
+  us_cpi_u_sa_mom: { id: "us_cpi_u_sa_mom", label: "US CPI-U all items, 1-month change, seasonally adjusted (BLS)", decides: "percent", rounding: "pct_1dp", period: "month", hosts: ["www.bls.gov", "api.bls.gov"], primaryUrl: "https://www.bls.gov/news.release/cpi.nr0.htm", corroboration: "when_available", fetchGroup: "bls_cpi_release" },
+  us_core_cpi_nsa_yoy: { id: "us_core_cpi_nsa_yoy", label: "US CPI-U all items less food and energy, 12-month change before seasonal adjustment (BLS)", decides: "percent", rounding: "pct_1dp", period: "month", hosts: ["www.bls.gov", "api.bls.gov"], primaryUrl: "https://www.bls.gov/news.release/cpi.nr0.htm", corroboration: "when_available", fetchGroup: "bls_cpi_release" },
+  us_core_cpi_sa_mom: { id: "us_core_cpi_sa_mom", label: "US CPI-U all items less food and energy, 1-month change, seasonally adjusted (BLS)", decides: "percent", rounding: "pct_1dp", period: "month", hosts: ["www.bls.gov", "api.bls.gov"], primaryUrl: "https://www.bls.gov/news.release/cpi.nr0.htm", corroboration: "when_available", fetchGroup: "bls_cpi_release" },
+  // The Employment Situation summary text states both numbers of the reference month; the first print decides.
+  us_unemployment_rate: { id: "us_unemployment_rate", label: "US unemployment rate (U-3), seasonally adjusted (BLS Employment Situation)", decides: "percent", rounding: "pct_1dp", period: "month", hosts: ["www.bls.gov", "api.bls.gov"], primaryUrl: "https://www.bls.gov/news.release/empsit.nr0.htm", corroboration: "when_available", fetchGroup: "bls_empsit_release" },
+  us_nonfarm_payrolls_change: { id: "us_nonfarm_payrolls_change", label: "US total nonfarm payroll employment, over-the-month change in thousands, seasonally adjusted (BLS Employment Situation)", decides: "change_thousands", rounding: "thousands_as_printed", period: "month", hosts: ["www.bls.gov", "api.bls.gov"], primaryUrl: "https://www.bls.gov/news.release/empsit.nr0.htm", corroboration: "when_available", fetchGroup: "bls_empsit_release" },
   us_ppi_fd_nsa_yoy: { id: "us_ppi_fd_nsa_yoy", label: "US PPI final demand, 12-month change before seasonal adjustment (BLS)", decides: "percent", rounding: "pct_1dp", period: "month", hosts: ["www.bls.gov", "api.bls.gov"], primaryUrl: "https://www.bls.gov/news.release/ppi.nr0.htm", corroboration: "when_available" },
   fomc_upper_bound: { id: "fomc_upper_bound", label: "FOMC target range upper bound (Federal Reserve statement)", decides: "rate_change_bps", rounding: "bps_away_from_zero_25", period: "day", hosts: ["www.federalreserve.gov", "fred.stlouisfed.org"], primaryUrl: "https://www.federalreserve.gov/feeds/press_monetary.xml", corroboration: "when_available" },
   ecb_dfr: { id: "ecb_dfr", label: "ECB deposit facility rate (Monetary policy decisions release)", decides: "rate_change_bps", rounding: "bps_nearest_25_min_25", period: "day", hosts: ["www.ecb.europa.eu", "data-api.ecb.europa.eu"], primaryUrl: "https://www.ecb.europa.eu/press/govcdec/mopo/html/index.en.html", corroboration: "when_available" },
@@ -57,16 +75,45 @@ export const UNSUPPORTED_OFFICIAL_SERIES: Record<string, string> = {
 
 export function seriesDef(id: OfficialSeriesId): SeriesDef { return OFFICIAL_SERIES[id]; }
 
+/** The official_fetch_slots key of a series: its fetch group, else the series itself (group names are never series ids). */
+export function fetchSlotOf(series: OfficialSeriesId): string { return OFFICIAL_SERIES[series].fetchGroup ?? series; }
+
+/** Every series recorded from one fetch of this series' primary document (itself first). */
+export function fetchGroupOf(series: OfficialSeriesId): OfficialSeriesId[] {
+  const g = OFFICIAL_SERIES[series].fetchGroup;
+  if (!g) return [series];
+  return [series, ...(Object.keys(OFFICIAL_SERIES) as OfficialSeriesId[]).filter((s) => s !== series && OFFICIAL_SERIES[s].fetchGroup === g)];
+}
+
 /**
  * The scheduled publication of each event the rail is registered for (research 2026-09-24). release_at belongs to the
  * (series, period), never to a registration: every leg of every market reads the same first print, so a market
  * registered with an earlier release_at could otherwise record a first print that a market with a later one would
  * refuse forever. Registration refuses a differing release_at for these events. fallback_until: the market texts'
- * fallback when the source does not publish (the next scheduled release or meeting), when the text names one.
+ * fallback when the source does not publish (the next scheduled release or meeting), when the text names one. From
+ * that moment the texts settle on an earlier period, which the rail never decides from, so gate 1 refuses a first
+ * print first observed at or after it (released_after_fallback): a late print never resolves these legs.
  */
 export interface KnownRelease { release_at: string; fallback_until: string | null; basis: string }
+/** The September 2026 CPI release: one document, four series (headline YoY in the text, the rest in Table A). */
+const CPI_2026_09: KnownRelease = { release_at: "2026-10-14T12:30:00Z", fallback_until: "2026-11-10T13:30:00Z", basis: "BLS CPI schedule: September 2026 -> Oct. 14, 2026 08:30 ET; the market then waits for the next CPI release, Nov. 10, 2026 08:30 ET" };
+const CPI_2026_09_SIBLING: KnownRelease = { ...CPI_2026_09, basis: `${CPI_2026_09.basis} (www.bls.gov/schedule/news_release/cpi.htm observed 2026-09-27T18:53Z; the same release as us_cpi_u_nsa_yoy)` };
+/**
+ * The September 2026 Employment Situation (observed on www.bls.gov/schedule/news_release/empsit.htm 2026-09-27T18:46Z
+ * and in the August release text). Oct 2 is EDT (UTC-4), Nov 6 is EST (UTC-5). The market texts fall back when no
+ * September data is released "by the date" the October data is scheduled (Nov 6). Whether a September print made on
+ * Nov 6 itself is on time is ambiguous, so fallback_until is the START of that date, 00:00 ET = 05:00Z: a print first
+ * seen on Nov 6 or later never resolves (both readings of the text agree before it). A lapse in appropriations moves
+ * BLS dates, which is a registry update here, never a new reading of the market text.
+ */
+const EMPSIT_2026_09: KnownRelease = { release_at: "2026-10-02T12:30:00Z", fallback_until: "2026-11-06T05:00:00Z", basis: "BLS Employment Situation schedule: September 2026 -> Oct. 02, 2026 08:30 ET; next release (October 2026 data) Nov. 06, 2026 08:30 ET (observed 2026-09-27T18:46Z); the texts fall back 'by the date' of that release, read conservatively as 00:00 ET Nov. 06" };
 export const KNOWN_RELEASES: Record<string, KnownRelease> = {
-  "us_cpi_u_nsa_yoy:2026-09": { release_at: "2026-10-14T12:30:00Z", fallback_until: "2026-11-10T13:30:00Z", basis: "BLS CPI schedule: September 2026 -> Oct. 14, 2026 08:30 ET; the market then waits for the next CPI release, Nov. 10, 2026 08:30 ET" },
+  "us_cpi_u_nsa_yoy:2026-09": CPI_2026_09,
+  "us_cpi_u_sa_mom:2026-09": CPI_2026_09_SIBLING,
+  "us_core_cpi_nsa_yoy:2026-09": CPI_2026_09_SIBLING,
+  "us_core_cpi_sa_mom:2026-09": CPI_2026_09_SIBLING,
+  "us_unemployment_rate:2026-09": EMPSIT_2026_09,
+  "us_nonfarm_payrolls_change:2026-09": EMPSIT_2026_09,
   "us_ppi_fd_nsa_yoy:2026-09": { release_at: "2026-10-15T12:30:00Z", fallback_until: "2026-11-13T13:30:00Z", basis: "BLS PPI schedule: September 2026 -> Oct. 15, 2026 08:30 ET; next PPI release Nov. 13, 2026 08:30 ET" },
   "bok_base_rate:2026-10-22": { release_at: "2026-10-22T01:00:00Z", fallback_until: "2026-11-26T01:00:00Z", basis: "BoK 2026 MPB dates: October Thursday 22 (10:00 KST UNVERIFIED); next meeting November Thursday 26" },
   "kr_gdp_advance_yoy:2026-Q3": { release_at: "2026-10-26T23:00:00Z", fallback_until: null, basis: "BoK statistical calendar: 2026-10-27 08:00 KST Real GDP Q3 advance" },
@@ -175,11 +222,12 @@ export function divRoundHalfAway(num: bigint, den: bigint): bigint {
 }
 
 /**
- * The 12-month percent change (I[t] / I[t-12] - 1) * 100 from the published index strings, rounded half away from
- * zero to one decimal (returned in tenths of a percent). nearTie: the unrounded change lies within 0.0005 of an
- * x.x5 boundary, where the published index's own rounding can flip the printed decimal.
+ * The percent change (I[t] / I[base] - 1) * 100 from the published index strings, rounded half away from zero to one
+ * decimal (returned in tenths of a percent): base = t-12 for a 12-month change, t-1 for a 1-month change. nearTie: the
+ * unrounded change lies within 0.0005 of an x.x5 boundary, where the published index's own rounding can flip the
+ * printed decimal; alt is then the other side of that boundary (the only other value the release may print).
  */
-export function yoyTenths(current: string, base: string): { tenths: number; nearTie: boolean } | undefined {
+export function yoyTenths(current: string, base: string): { tenths: number; nearTie: boolean; alt?: number } | undefined {
   const a = parseDecimal(current), b = parseDecimal(base);
   if (!a || !b) return undefined;
   const scale = Math.max(a.scale, b.scale);
@@ -192,7 +240,12 @@ export function yoyTenths(current: string, base: string): { tenths: number; near
   const k = absN / den;
   const boundary = (2n * k + 1n) * 500n * B;
   const dist = absN > boundary ? absN - boundary : boundary - absN;
-  return { tenths: Number(tenths), nearTie: dist <= 5n * B };
+  const nearTie = dist <= 5n * B;
+  if (!nearTie) return { tenths: Number(tenths), nearTie };
+  // the boundary sits between k and k + 1 tenths (in magnitude); the rounded value is one of them, alt the other
+  const sign = N < 0n ? -1 : 1;
+  const mag = Math.abs(Number(tenths));
+  return { tenths: Number(tenths), nearTie, alt: sign * (mag === Number(k) ? Number(k) + 1 : Number(k)) };
 }
 
 /** A published percent ("3.4", "-0.2", 3.4) in tenths, rounded half away from zero. */
@@ -200,6 +253,13 @@ export function percentTenths(v: string | number): number | undefined {
   const d = typeof v === "string" ? parseDecimal(v) : Number.isFinite(v) ? parseDecimal(v.toFixed(6)) : undefined;
   if (!d) return undefined;
   return d.scale <= 1 ? Number(d.n * pow10(1 - d.scale)) : Number(divRoundHalfAway(d.n, pow10(d.scale - 1)));
+}
+
+/** A change published in whole thousands ("162", "-23", 162); anything with a fraction is undefined. */
+export function thousandsOf(v: string | number): number | undefined {
+  if (typeof v === "number") return Number.isSafeInteger(v) ? v : undefined;
+  const d = parseDecimal(v);
+  return d && d.scale === 0 && d.n <= BigInt(Number.MAX_SAFE_INTEGER) && d.n >= -BigInt(Number.MAX_SAFE_INTEGER) ? Number(d.n) : undefined;
 }
 
 /** A rate level in hundredths of a percent (= basis points of level), rounded half away from zero. */
@@ -226,21 +286,33 @@ export function roundedChangeBps(hundredths: number, rule: OfficialRoundingRule)
   switch (rule) {
     case "bps_away_from_zero_25": return sign * Math.ceil(a / 2500) * 25;
     case "bps_nearest_25_min_25": return sign * (a < 2500 ? 25 : Math.floor((a + 1250) / 2500) * 25);
-    case "pct_1dp": throw new Error("pct_1dp is not a basis-point rule");
+    case "pct_1dp": case "thousands_as_printed": throw new Error(`${rule} is not a basis-point rule`);
     default: { const never: never = rule; throw new Error(`unhandled rounding ${String(never)}`); }
   }
 }
 
 /** Two readings of the same number agree at the precision the series is published and decided in. */
 export function sameAtPrecision(series: OfficialSeriesId, a: string | number, b: string | number): boolean {
-  if (OFFICIAL_SERIES[series].decides === "percent") { const x = percentTenths(a), y = percentTenths(b); return x !== undefined && x === y; }
+  const d = OFFICIAL_SERIES[series].decides;
+  if (d === "percent") { const x = percentTenths(a), y = percentTenths(b); return x !== undefined && x === y; }
+  if (d === "change_thousands") { const x = thousandsOf(a), y = thousandsOf(b); return x !== undefined && x === y; }
   const x = levelBps(a), y = levelBps(b);
   return x !== undefined && x === y;
 }
 
+/** Which rounding rules a series' decided unit admits. */
+export function roundingFits(decides: SeriesDef["decides"], rule: OfficialRoundingRule): boolean {
+  switch (decides) {
+    case "percent": return rule === "pct_1dp";
+    case "change_thousands": return rule === "thousands_as_printed";
+    case "rate_change_bps": return rule === "bps_away_from_zero_25" || rule === "bps_nearest_25_min_25";
+    default: { const never: never = decides; throw new Error(`unhandled decided unit ${String(never)}`); }
+  }
+}
+
 // ---- buckets --------------------------------------------------------------------------------------------------
 
-/** Bucket bounds on the decided grid: tenths of a percent, or whole bps. Off-grid bounds are undefined. */
+/** Bucket bounds on the decided grid: tenths of a percent, whole bps, or whole thousands. Off-grid bounds are undefined. */
 function gridUnits(x: number, decides: SeriesDef["decides"]): number | undefined {
   const u = decides === "percent" ? x * 10 : x;
   const r = Math.round(u);
@@ -258,7 +330,7 @@ export function bucketProblem(b: OfficialBucket, decides: SeriesDef["decides"]):
   if (b.lo === undefined && b.hi === undefined) return "bucket has neither lo nor hi";
   const lo = b.lo === undefined ? undefined : gridUnits(b.lo, decides);
   const hi = b.hi === undefined ? undefined : gridUnits(b.hi, decides);
-  const grid = decides === "percent" ? "a multiple of 0.1" : "a whole number of bps";
+  const grid = decides === "percent" ? "a multiple of 0.1" : decides === "change_thousands" ? "a whole number of thousands" : "a whole number of bps";
   if (b.lo !== undefined && lo === undefined) return `bucket lo ${b.lo} is not ${grid}`;
   if (b.hi !== undefined && hi === undefined) return `bucket hi ${b.hi} is not ${grid}`;
   if (lo === undefined || hi === undefined) return null; // open-ended on one side: always reachable
@@ -373,12 +445,16 @@ export function reading(doc: Pick<OfficialObservationDoc, "value" | "value_text"
   return parseDecimal(doc.value_text) ? doc.value_text : doc.value;
 }
 
-/** The decided value in grid units (tenths of a percent, or bps of change after the market's rounding). */
+/** The decided value in grid units (tenths of a percent, thousands, or bps of change after the market's rounding). */
 export function decidedUnits(r: OfficialResolver, doc: Pick<OfficialObservationDoc, "value" | "value_text">): { units: number; shown: string } | { error: string } {
   const def = OFFICIAL_SERIES[r.series];
   if (def.decides === "percent") {
     const t = percentTenths(reading(doc));
     return t === undefined ? { error: `unreadable value ${doc.value_text}` } : { units: t, shown: `${(t / 10).toFixed(1)}%` };
+  }
+  if (def.decides === "change_thousands") {
+    const k = thousandsOf(reading(doc));
+    return k === undefined ? { error: `unreadable change ${doc.value_text} (whole thousands expected)` } : { units: k, shown: `${k > 0 ? "+" : ""}${k}k` };
   }
   if (r.prior_level === undefined) return { error: "prior_level missing for a rate-change series" };
   const h = changeHundredthsBp(reading(doc), r.prior_level);
@@ -409,8 +485,8 @@ export function priorLevelProblem(r: OfficialResolver, doc: Pick<OfficialObserva
 }
 
 /**
- * Decide one leg from the rail's document. Gate 1 (release time + period named), gate 2 (corroboration), gate 3
- * (bucket). Every path returns a decision, so an official_release market never reaches Jev.
+ * Decide one leg from the rail's document. Gate 1 (release time + period named + not after the market's fallback),
+ * gate 2 (corroboration), gate 3 (bucket). Every path returns a decision, so an official_release market never reaches Jev.
  */
 export function decideOfficial(market: MarketRegistration, ev: EvidenceInput): StructuredDecision {
   const r = market.resolver as OfficialResolver;
@@ -437,6 +513,12 @@ export function decideOfficial(market: MarketRegistration, ev: EvidenceInput): S
     if (doc.period !== r.period) problems.push(`document is about ${doc.period}, market is ${r.period}`);
     if (!namesPeriod(r.series, r.period, doc.deciding_text)) problems.push(`deciding text does not name ${periodMentions(r.series, r.period).join(" | ")}`);
     if (problems.length) return unresolved("awaiting_release", problems.join("; "));
+    // From the fallback the market texts settle on an earlier period, which the rail never decides from, so a first
+    // print first seen at or after it (a lapse in appropriations can push a release that far) decides nothing.
+    // observed_at is the rail's own first sight, never before the publication: this only ever withholds a verdict.
+    if (known?.fallback_until && Date.parse(doc.observed_at) >= Date.parse(known.fallback_until)) {
+      return unresolved("released_after_fallback", `${r.series} ${r.period} first observed ${doc.observed_at}, at or after the market's fallback ${known.fallback_until} (${known.basis}); the market texts then settle on an earlier period, which the rail never decides from`);
+    }
   }
 
   const decided = decidedUnits(r, doc);
@@ -501,7 +583,8 @@ export function officialRegistrationIssues(reg: MarketRegistration): string[] {
   if (!periodValid(r.series, r.period)) issues.push(`period ${r.period} is not a ${def.period} period for ${r.series}`);
   if (def.decides === "rate_change_bps" && r.prior_level === undefined) issues.push(`${r.series} decides a change in bps: prior_level is required`);
   if (def.decides === "percent" && r.prior_level !== undefined) issues.push(`${r.series} decides a published percent: prior_level must be absent`);
-  if (def.decides === "percent" ? r.rounding !== "pct_1dp" : r.rounding === "pct_1dp") issues.push(`rounding ${r.rounding} does not fit ${r.series} (${def.decides})`);
+  if (def.decides === "change_thousands" && r.prior_level !== undefined) issues.push(`${r.series} decides a published change: prior_level must be absent`);
+  if (!roundingFits(def.decides, r.rounding)) issues.push(`rounding ${r.rounding} does not fit ${r.series} (${def.decides})`);
   const bp = bucketProblem(r.bucket, def.decides);
   if (bp) issues.push(bp);
   if (Date.parse(r.release_at) < Date.parse(reg.open_at)) issues.push(`release_at ${r.release_at} is before open_at ${reg.open_at}`);

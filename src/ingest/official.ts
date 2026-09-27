@@ -5,14 +5,14 @@
  * URL as a typed error with httpStatus + deferSeconds: a non-200 body is never parsed, so it can never be evidence.
  * A document that is readable but still about an earlier period is "pending", never an observation.
  */
-import { hostAllowed, sameAtPrecision, reading, type OfficialCorroboration, type OfficialSeriesId } from "../resolve/official";
+import { OFFICIAL_SERIES, fetchGroupOf, hostAllowed, sameAtPrecision, reading, thousandsOf, percentTenths, type OfficialCorroboration, type OfficialSeriesId } from "../resolve/official";
 import { sha256Hex } from "../resolve/text";
 import { discardBody, retryAfterSeconds } from "./http";
 import { RESOLVE_BOT_UA } from "../ops/ua";
 import {
-  parseBlsRelease, parseBlsApi, blsApiYoy, findFomcStatement, parseFomcStatement, fredValueOn, findEcbDecision, parseEcbRelease,
-  parseEcbDfrCsv, parseBoeRss, iadbValueOn, parseBokDecisionRss, parseBokGdpRss, parseEcosRows, parseBcbHistory, bytesInclude, usDayLabel,
-  type DocObservation, type DocParse,
+  parseBlsRelease, parseBlsCpiTableA, parseEmpsitRelease, parseBlsApi, blsApiYoy, blsApiMom, blsApiLevelChange, findFomcStatement,
+  parseFomcStatement, fredValueOn, findEcbDecision, parseEcbRelease, parseEcbDfrCsv, parseBoeRss, iadbValueOn, parseBokDecisionRss,
+  parseBokGdpRss, parseEcosRows, parseBcbHistory, bytesInclude, usDayLabel, type DocObservation, type DocParse,
 } from "./official-parse";
 
 /** The official-release fetcher sends ResolveBot's one UA (src/ops/ua.ts). */
@@ -24,11 +24,14 @@ export const MAX_REDIRECTS = 3;
 
 const MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
 
+/** BLS public API v1, one series per request (no key: 25 queries a day). */
+export const blsApiUrl = (seriesId: string) => `https://api.bls.gov/publicAPI/v1/timeseries/data/${seriesId}`;
+
 export const URLS = {
   cpiText: "https://www.bls.gov/news.release/cpi.nr0.htm",
   ppiText: "https://www.bls.gov/news.release/ppi.nr0.htm",
-  cpiApi: "https://api.bls.gov/publicAPI/v1/timeseries/data/CUUR0000SA0",
-  ppiApi: "https://api.bls.gov/publicAPI/v1/timeseries/data/WPUFD4",
+  cpiApi: blsApiUrl("CUUR0000SA0"),
+  ppiApi: blsApiUrl("WPUFD4"),
   fedRss: "https://www.federalreserve.gov/feeds/press_monetary.xml",
   fred: "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DFEDTARU",
   ecbIndex: (year: string) => `https://www.ecb.europa.eu/press/govcdec/mopo/${year}/html/index_include.en.html`,
@@ -106,9 +109,15 @@ export interface FetchedObservation extends DocObservation {
 }
 
 export type PrimaryResult =
-  | { kind: "observed"; obs: FetchedObservation }
-  | { kind: "pending"; detail: string }
-  | { kind: "error"; error: string; httpStatus?: number; deferSeconds?: number; retryable: boolean; drift: boolean };
+  /**
+   * siblings: the other series of the fetch group that the same document states for the same period (recorded by the
+   * slot holder from these bytes, so the page is fetched once per release); siblingNotes: why a sibling was not read.
+   */
+  | { kind: "observed"; obs: FetchedObservation; siblings?: FetchedObservation[]; siblingNotes?: string[] }
+  /** siblings: as above, when the page is out but does not state this series' number (a "-" cell after a lapse). */
+  | { kind: "pending"; detail: string; siblings?: FetchedObservation[]; siblingNotes?: string[] }
+  /** siblings: as above, when this series' part of the page no longer parses (drift) but the others' parts do. */
+  | { kind: "error"; error: string; httpStatus?: number; deferSeconds?: number; retryable: boolean; drift: boolean; siblings?: FetchedObservation[]; siblingNotes?: string[] };
 
 const failed = (g: Extract<Got, { ok: false }>): PrimaryResult => ({ kind: "error", error: g.error, httpStatus: g.httpStatus, deferSeconds: g.deferSeconds, retryable: g.retryable, drift: false });
 const notFound = (p: { reason: "not_published" | "schema_drift"; detail: string }): PrimaryResult =>
@@ -125,14 +134,61 @@ async function settle(series: OfficialSeriesId, target: string, p: DocParse, g: 
 /** "2026-11-05" -> "November 2026" */
 const monthYear = (day: string) => `${MONTHS[Number(day.slice(5, 7)) - 1]} ${day.slice(0, 4)}`;
 
+/** How each series read from a BLS release page is parsed (null: not a BLS release series). */
+export function parseBlsSeries(series: OfficialSeriesId, html: string): DocParse | null {
+  switch (series) {
+    case "us_cpi_u_nsa_yoy": return parseBlsRelease(html, "cpi");
+    case "us_ppi_fd_nsa_yoy": return parseBlsRelease(html, "ppi");
+    case "us_cpi_u_sa_mom": return parseBlsCpiTableA(html, "all_items", "sa_1m");
+    case "us_core_cpi_nsa_yoy": return parseBlsCpiTableA(html, "core", "nsa_12m");
+    case "us_core_cpi_sa_mom": return parseBlsCpiTableA(html, "core", "sa_1m");
+    case "us_unemployment_rate": return parseEmpsitRelease(html, "unemployment_rate");
+    case "us_nonfarm_payrolls_change": return parseEmpsitRelease(html, "payrolls_change");
+    default: return null;
+  }
+}
+
+/** The other series of the fetch group read from the same bytes: only those the document states for the target period. */
+function siblingsOf(series: OfficialSeriesId, target: string, g: Extract<Got, { ok: true }>, raw_sha256: string, fetched_at: string): { siblings: FetchedObservation[]; siblingNotes: string[] } {
+  const siblings: FetchedObservation[] = [];
+  const siblingNotes: string[] = [];
+  for (const s of fetchGroupOf(series).slice(1)) {
+    const p = parseBlsSeries(s, g.text);
+    if (!p) { siblingNotes.push(`${s}: no parser for this document`); continue; }
+    if (!p.ok) { siblingNotes.push(`${s}: ${p.reason} ${p.detail}`.slice(0, 300)); continue; }
+    if (p.obs.period !== target) { siblingNotes.push(`${s}: the document is about ${p.obs.period}, not ${target}`); continue; }
+    siblings.push({ ...p.obs, series: s, source_url: g.url, raw: g.bytes, raw_sha256, fetched_at });
+  }
+  return { siblings, siblingNotes };
+}
+
 /** One attempt at the primary source of `series` for the target period. Requests are counted in `b`. */
 export async function fetchPrimary(series: OfficialSeriesId, target: string, b: Budget): Promise<PrimaryResult> {
   switch (series) {
-    case "us_cpi_u_nsa_yoy":
     case "us_ppi_fd_nsa_yoy": {
-      const cpi = series === "us_cpi_u_nsa_yoy";
-      const g = await officialGet(series, cpi ? URLS.cpiText : URLS.ppiText, b, "text/html");
-      return g.ok ? settle(series, target, parseBlsRelease(g.text, cpi ? "cpi" : "ppi"), g, b) : failed(g);
+      const g = await officialGet(series, URLS.ppiText, b, "text/html");
+      return g.ok ? settle(series, target, parseBlsRelease(g.text, "ppi"), g, b) : failed(g);
+    }
+    // One page per fetch group (the CPI release; the Employment Situation summary): the holder records every series it states.
+    case "us_cpi_u_nsa_yoy":
+    case "us_cpi_u_sa_mom":
+    case "us_core_cpi_nsa_yoy":
+    case "us_core_cpi_sa_mom":
+    case "us_unemployment_rate":
+    case "us_nonfarm_payrolls_change": {
+      const g = await officialGet(series, OFFICIAL_SERIES[series].primaryUrl, b, "text/html");
+      if (!g.ok) return failed(g);
+      const own = parseBlsSeries(series, g.text)!;
+      const res = await settle(series, target, own, g, b);
+      if (res.kind === "observed") return { ...res, ...siblingsOf(series, target, g, res.obs.raw_sha256, res.obs.fetched_at) };
+      // the page is out without this number (Table A's "-"), or this series' part of it drifted (each series has its
+      // own parser and checks): the others it states for the target are still first prints. A page about another
+      // period (the usual not-yet read, up to 10 per burst) is not parsed again.
+      if (!own.ok && (res.kind === "pending" || res.kind === "error")) {
+        const sib = siblingsOf(series, target, g, await sha256Hex(g.bytes), new Date(b.now()).toISOString());
+        if (sib.siblings.length) return { ...res, ...sib };
+      }
+      return res;
     }
     case "fomc_upper_bound": {
       const rss = await officialGet(series, URLS.fedRss, b, "application/rss+xml, text/xml");
@@ -177,6 +233,65 @@ export async function fetchPrimary(series: OfficialSeriesId, target: string, b: 
 const addDay = (day: string) => new Date(Date.parse(`${day}T00:00:00Z`) + 86_400_000).toISOString().slice(0, 10);
 
 /**
+ * The BLS API v1 series that corroborates each BLS series: an index whose 12-month (yoy) or 1-month (mom) change is
+ * recomputed, a level compared as published (the unemployment rate), or the difference of two employment levels in
+ * thousands (change: valid only while the target month is the API's latest, i.e. still the first print).
+ */
+type BlsApiSeries = "us_cpi_u_nsa_yoy" | "us_ppi_fd_nsa_yoy" | "us_cpi_u_sa_mom" | "us_core_cpi_nsa_yoy" | "us_core_cpi_sa_mom" | "us_unemployment_rate" | "us_nonfarm_payrolls_change";
+export const BLS_API: Record<BlsApiSeries, { id: string; how: "yoy" | "mom" | "level" | "change" }> = {
+  us_cpi_u_nsa_yoy: { id: "CUUR0000SA0", how: "yoy" },
+  us_ppi_fd_nsa_yoy: { id: "WPUFD4", how: "yoy" },
+  us_cpi_u_sa_mom: { id: "CUSR0000SA0", how: "mom" },
+  us_core_cpi_nsa_yoy: { id: "CUUR0000SA0L1E", how: "yoy" },
+  us_core_cpi_sa_mom: { id: "CUSR0000SA0L1E", how: "mom" },
+  us_unemployment_rate: { id: "LNS14000000", how: "level" },
+  us_nonfarm_payrolls_change: { id: "CES0000000001", how: "change" },
+};
+
+/**
+ * Pure: the corroboration a BLS API v1 body gives the release's number (tests and evals call it on saved bodies).
+ * A missing month is "unavailable". A recomputed change within 0.0005 of a rounding boundary is "inconclusive" when
+ * the release printed either side of it, else "disagree"; a payroll level difference one thousand from the release is
+ * "inconclusive" (level rounding); a payroll month that is no longer the API's latest is "single_source".
+ */
+export function blsCorroboration(obs: { series: BlsApiSeries; value: number; value_text: string }, target: string, body: string, url: string, checked_at: string): OfficialCorroboration {
+  const { id, how } = BLS_API[obs.series];
+  const unavailable = (detail: string): OfficialCorroboration => ({ status: "unavailable", source_url: url, value: null, value_text: null, detail: detail.slice(0, 500), checked_at });
+  const said = (status: OfficialCorroboration["status"], valueText: string, detail: string): OfficialCorroboration => ({ status, source_url: url, value: Number(valueText), value_text: valueText, detail: detail.slice(0, 500), checked_at });
+  const compare = (valueText: string, detail: string) => said(sameAtPrecision(obs.series, reading(obs), valueText) ? "agree" : "disagree", valueText, detail);
+  const p = parseBlsApi(body, id);
+  if (!p.ok) return unavailable(`BLS API: ${p.detail}`);
+  if (how === "level") {
+    const v = p.index.get(target);
+    return v ? compare(v, `${id} ${target} = ${v}`) : unavailable(`BLS API ${id} has no ${target} value yet`);
+  }
+  if (how === "change") {
+    // The level difference is the first print only while the target is still the API's latest month: the next
+    // release revises it (February 2026 printed -92 thousand; the levels now differ by -156).
+    if (!p.index.has(target)) return unavailable(`BLS API ${id} has no ${target} level yet`);
+    if (p.latest !== target) return { status: "single_source", source_url: url, value: null, value_text: null, detail: `${id}: the latest month is ${p.latest ?? "unknown"}, so the ${target} levels are a later vintage, not the first print; the release is the only source`, checked_at };
+    const c = blsApiLevelChange(p.index, target);
+    const first = thousandsOf(reading(obs));
+    if (!c || first === undefined) return unavailable(`BLS API ${id} has no whole-thousand levels for ${target} and the month before`);
+    const vt = String(c.change);
+    const detail = `${id} ${target} ${c.current} - ${c.base} = ${vt} thousand`;
+    // BLS may difference unrounded levels: one thousand apart is level rounding, not a disagreement
+    if (Math.abs(c.change - first) === 1) return said("inconclusive", vt, `${detail}; one thousand from the release's ${first} (level rounding)`);
+    return compare(vt, detail);
+  }
+  const y = how === "mom" ? blsApiMom(p.index, target) : blsApiYoy(p.index, target);
+  if (!y) return unavailable(`BLS API ${id} has no ${target} index (or its base month) yet`);
+  const vt = (y.tenths / 10).toFixed(1);
+  if (y.nearTie) {
+    const printed = percentTenths(reading(obs));
+    const sides = [y.tenths, y.alt!].map((t) => (t / 10).toFixed(1)).join(" or ");
+    const tie = `${id} ${y.current}/${y.base}: the unrounded change is within 0.0005 of the rounding boundary (${sides})`;
+    return printed === y.tenths || printed === y.alt ? said("inconclusive", vt, tie) : said("disagree", vt, `${tie}, and the release printed ${obs.value_text}: neither`);
+  }
+  return compare(vt, `${id} ${target} ${y.current} over ${y.base}${how === "mom" ? " (1-month, seasonally adjusted: the same vintage only on release day)" : ""}`);
+}
+
+/**
  * The corroboration source, called once after the primary observed the target. It never throws and never blocks a
  * verdict by being absent: an error, a missing row or a lagging series is "unavailable" (not a disagreement).
  * Only a present value that differs at the published precision is "disagree".
@@ -191,20 +306,18 @@ export async function fetchCorroboration(obs: FetchedObservation, target: string
   });
   switch (series) {
     case "us_cpi_u_nsa_yoy":
-    case "us_ppi_fd_nsa_yoy": {
+    case "us_ppi_fd_nsa_yoy":
+    case "us_cpi_u_sa_mom":
+    case "us_core_cpi_nsa_yoy":
+    case "us_core_cpi_sa_mom":
+    case "us_unemployment_rate":
+    case "us_nonfarm_payrolls_change": {
       // BLS v1 without a key allows 25 queries a day (possibly per shared egress IP): called once per (series,
-      // period), only after the release text named the target month.
-      const id = series === "us_cpi_u_nsa_yoy" ? "CUUR0000SA0" : "WPUFD4";
-      const url = series === "us_cpi_u_nsa_yoy" ? URLS.cpiApi : URLS.ppiApi;
+      // period), only after the release named the target month (a CPI release day: 4; an Employment Situation: 2).
+      const url = blsApiUrl(BLS_API[series].id);
       const g = await officialGet(series, url, b, "application/json");
       if (!g.ok) return unavailable(`BLS API: ${g.error}`, url);
-      const p = parseBlsApi(g.text, id);
-      if (!p.ok) return unavailable(`BLS API: ${p.detail}`, url);
-      const y = blsApiYoy(p.index, target);
-      if (!y) return unavailable(`BLS API has no ${target} index (or its base month) yet`, url);
-      const vt = (y.tenths / 10).toFixed(1);
-      if (y.nearTie) return { status: "inconclusive", source_url: url, value: Number(vt), value_text: vt, detail: `${id} ${y.current}/${y.base}: the unrounded change is within 0.0005 of a rounding boundary`, checked_at };
-      return compare(url, vt, `${id} ${target} ${y.current} over ${y.base}`);
+      return blsCorroboration({ ...obs, series }, target, g.text, url, checked_at);
     }
     case "fomc_upper_bound": {
       const day = addDay(target); // DFEDTARU is dated by the effective date, the day after the decision

@@ -47,8 +47,10 @@ const evOf = (d: Parameters<typeof officialEvidence>[0]) => officialEvidence(d, 
 describe("decimal arithmetic and rounding", () => {
   it("12-month change from index strings, half away from zero, with near-tie detection", () => {
     expect(yoyTenths("334.980", "323.976")).toEqual({ tenths: 34, nearTie: false });
-    expect(yoyTenths("103.450", "100.000")).toEqual({ tenths: 35, nearTie: true }); // exactly 3.45
-    expect(yoyTenths("103.4496", "100.000")).toEqual({ tenths: 34, nearTie: true }); // 3.4496: within 0.0005 of 3.45
+    expect(yoyTenths("103.450", "100.000")).toEqual({ tenths: 35, nearTie: true, alt: 34 }); // exactly 3.45: 3.5, or 3.4
+    expect(yoyTenths("103.4496", "100.000")).toEqual({ tenths: 34, nearTie: true, alt: 35 }); // 3.4496: within 0.0005 of 3.45
+    expect(yoyTenths("99.750", "100.000")).toEqual({ tenths: -3, nearTie: true, alt: -2 }); // exactly -0.25 (a 1-month change)
+    expect(yoyTenths("100.2496", "100.000")).toEqual({ tenths: 2, nearTie: true, alt: 3 });
     expect(yoyTenths("103.4400", "100.000")).toEqual({ tenths: 34, nearTie: false });
     expect(yoyTenths("99.800", "100.000")).toEqual({ tenths: -2, nearTie: false });
     expect(yoyTenths("-", "100")).toBeUndefined();

@@ -1,12 +1,12 @@
 /**
- * Pure parsers for the official_release sources (no I/O; tests/official-parse.test.ts runs every one against the
- * bodies saved on 2026-09-24 in evals/fixtures/official/). Each document parser returns what the DOCUMENT says
- * (its own period, value, the exact deciding sentence); whether that is the market's target is the adapter's and
- * the resolver's question, never the parser's.
+ * Pure parsers for the official_release sources (no I/O; tests/official-parse.test.ts and tests/official-bls.test.ts
+ * run every one against the bodies saved on 2026-09-24 and 2026-09-27 in evals/fixtures/official/). Each document
+ * parser returns what the DOCUMENT says (its own period, value, the exact deciding sentence); whether that is the
+ * market's target is the adapter's and the resolver's question, never the parser's.
  * CPU: Workers Free allows 10 ms per invocation. Feeds are walked item by item with indexOf and only the matching
  * item is decoded; HTML pages are narrowed to one block (<PRE>, #article, <main>) before any regex runs.
  */
-import { parseDecimal, yoyTenths } from "../resolve/official";
+import { parseDecimal, percentTenths, yoyTenths } from "../resolve/official";
 
 export type Direction = "up" | "down" | "unchanged";
 
@@ -161,28 +161,310 @@ export function parseBlsRelease(html: string, kind: "cpi" | "ppi"): DocParse {
   } };
 }
 
-/** BLS public API v1 (unregistered): index levels by "YYYY-MM" as published strings. */
-export function parseBlsApi(json: string, seriesId: string): { ok: true; index: Map<string, string> } | { ok: false; detail: string } {
+/**
+ * BLS public API v1 (unregistered): values by "YYYY-MM" as published strings, and the month the API flags as its
+ * latest (latest: "true"), which says whether a later release has already superseded a month's first print.
+ */
+export function parseBlsApi(json: string, seriesId: string): { ok: true; index: Map<string, string>; latest: string | null } | { ok: false; detail: string } {
   let j: { status?: string; message?: unknown; Results?: { series?: Array<{ seriesID?: string; data?: Array<{ year?: string; period?: string; value?: string }> }> } };
   try { j = JSON.parse(json); } catch { return { ok: false, detail: "BLS API body is not JSON" }; }
   if (j.status !== "REQUEST_SUCCEEDED") return { ok: false, detail: `BLS API status ${String(j.status)} ${JSON.stringify(j.message ?? "").slice(0, 160)}` };
   const s = j.Results?.series?.[0];
   if (!s || s.seriesID !== seriesId || !Array.isArray(s.data)) return { ok: false, detail: `BLS API has no series ${seriesId}` };
   const index = new Map<string, string>();
-  for (const row of s.data) {
-    if (!row.year || !/^M(0[1-9]|1[0-2])$/.test(row.period ?? "") || !row.value || !parseDecimal(row.value)) continue; // "-" = unavailable (2025 lapse)
-    index.set(`${row.year}-${row.period!.slice(1)}`, row.value);
+  let latest: string | null = null;
+  for (const row of s.data as Array<{ year?: string; period?: string; value?: string; latest?: unknown }>) {
+    if (!row.year || !/^M(0[1-9]|1[0-2])$/.test(row.period ?? "")) continue;
+    const key = `${row.year}-${row.period!.slice(1)}`;
+    if (row.latest === "true" || row.latest === true) latest = key;
+    if (!row.value || !parseDecimal(row.value)) continue; // "-" = unavailable (2025 lapse)
+    index.set(key, row.value);
   }
-  return { ok: true, index };
+  return { ok: true, index, latest };
+}
+
+/** "2026-01" -> "2025-12" */
+export function previousMonth(period: string): string {
+  const [y, m] = period.split("-").map(Number) as [number, number];
+  return m === 1 ? `${y - 1}-12` : `${y}-${pad2(m - 1)}`;
+}
+
+/** (I[period] / I[period - 1 month] - 1) * 100 from the API's index strings; undefined when either is missing. */
+export function blsApiMom(index: Map<string, string>, period: string): { tenths: number; nearTie: boolean; alt?: number; current: string; base: string } | undefined {
+  const current = index.get(period), base = index.get(previousMonth(period));
+  if (!current || !base) return undefined;
+  const r = yoyTenths(current, base);
+  return r ? { ...r, current, base } : undefined;
+}
+
+/** L[period] - L[period - 1 month] for a level published in whole thousands (CES); undefined when either is missing or fractional. */
+export function blsApiLevelChange(index: Map<string, string>, period: string): { change: number; current: string; base: string } | undefined {
+  const current = index.get(period), base = index.get(previousMonth(period));
+  const a = current === undefined ? undefined : parseDecimal(current), b = base === undefined ? undefined : parseDecimal(base);
+  if (!a || !b || a.scale !== 0 || b.scale !== 0) return undefined;
+  return { change: Number(a.n - b.n), current: current!, base: base! };
 }
 
 /** (I[period] / I[period - 12 months] - 1) * 100 from the API's index strings; undefined when either is missing. */
-export function blsApiYoy(index: Map<string, string>, period: string): { tenths: number; nearTie: boolean; current: string; base: string } | undefined {
+export function blsApiYoy(index: Map<string, string>, period: string): { tenths: number; nearTie: boolean; alt?: number; current: string; base: string } | undefined {
   const [y, m] = period.split("-");
   const current = index.get(period), base = index.get(`${Number(y) - 1}-${m}`);
   if (!current || !base) return undefined;
   const r = yoyTenths(current, base);
   return r ? { ...r, current, base } : undefined;
+}
+
+// ---- BLS CPI Table A: 1-month SA and 12-month NSA changes of all items and of all items less food and energy ----------
+
+export type CpiTableRow = "all_items" | "core";
+export type CpiTableColumn = "sa_1m" | "nsa_12m";
+const CPI_ROWS: Record<CpiTableRow, { id: string; label: string }> = {
+  all_items: { id: "cpi_pressa.r.1", label: "All items" },
+  core: { id: "cpi_pressa.r.1.3", label: "All items less food and energy" },
+};
+const CPI_TABLE_A_CAPTION = "Table A. Percent changes in CPI for All Urban Consumers (CPI-U): U.S. city average";
+const CPI_SA_GROUP = "Seasonally adjusted changes from preceding month";
+const TABLE_MONTH = /^([A-Z][a-z]{2,8})\.? (\d{4})$/;
+const TABLE_NSA_12M = /^Un- ?adjusted 12-mos\. ended ([A-Z][a-z]{2,8})\.? (\d{4})$/;
+const TABLE_CELL = /^-?\d{1,3}\.\d$/;
+/** What BLS prints in a cell it has no value for (the 2025 lapse left October 2025 as "-"). */
+const TABLE_NO_VALUE = new Set(["-", "–", "—", "(NA)", "NA", "N/A"]);
+// The summary sentences a 1-month cell is cross-checked against when they tie a value to "in <Month>" (both word
+// orders of the headline; "over the 2 months" never matches). A sentence that is absent is not required.
+const CPI_HEADLINE_MOM = [
+  new RegExp(`\\(CPI-U\\) (${BLS_VERBS})(?: (\\d+\\.\\d) percent)? on a seasonally adjusted basis in ([A-Z][a-z]+)\\b`),
+  new RegExp(`\\(CPI-U\\) (${BLS_VERBS})(?: (\\d+\\.\\d) percent)? in ([A-Z][a-z]+) on a seasonally adjusted basis\\b`),
+];
+const CPI_CORE_MOM = [new RegExp(`The index for all items less food and energy (${BLS_VERBS})(?: (\\d+\\.\\d) percent)? in ([A-Z][a-z]+)\\b`)];
+
+interface Cell { headers: string[]; text: string }
+function tableCells(rowHtml: string): Cell[] {
+  const out: Cell[] = [];
+  for (const m of rowHtml.matchAll(/<td\b([^>]*)>([\s\S]*?)<\/td>/g)) {
+    const h = /\bheaders="([^"]*)"/.exec(m[1]!);
+    out.push({ headers: h ? h[1]!.trim().split(/\s+/) : [], text: textOf(m[2]!) });
+  }
+  return out;
+}
+
+/**
+ * One cell of Table A of www.bls.gov/news.release/cpi.nr0.htm, the release the headline 12-month change is read
+ * from. The reference month is the release header's ("CONSUMER PRICE INDEX - AUGUST 2026"); the row is found by its
+ * id AND its exact label, the column by its header text (never by position): the seasonally adjusted month column
+ * must name the header month and be the group's last, the 12-month column must say "ended <header month>". A "-"
+ * cell is not published (never 0); anything else unexpected is schema drift.
+ */
+export function parseBlsCpiTableA(html: string, row: CpiTableRow, column: CpiTableColumn): DocParse {
+  const start = html.search(/<pre\b/i);
+  if (start < 0) return drift("BLS CPI release has no <PRE> block");
+  const rel = html.slice(start, start + 20000).search(/<\/pre>/i);
+  const block = textOf(html.slice(start, rel < 0 ? start + 20000 : start + rel));
+  const h = CPI_HEADER.exec(block);
+  if (!h) return drift("BLS cpi release header not found");
+  const month = monthNumber(h[1]!), year = h[2]!;
+  if (!month) return drift(`BLS cpi header month "${h[1]}" unreadable`);
+  const id = html.indexOf('id="cpi_pressa"', start);
+  const t0 = id < 0 ? -1 : html.lastIndexOf("<table", id);
+  const t1 = t0 < 0 ? -1 : html.indexOf("</table>", t0);
+  if (t0 < 0 || t1 < 0 || t1 - t0 > 60000) return drift("BLS CPI Table A (id cpi_pressa) not found");
+  const table = html.slice(t0, t1);
+  const cap = /<caption>([\s\S]*?)<\/caption>/.exec(table);
+  if (!cap || !textOf(cap[1]!).startsWith(CPI_TABLE_A_CAPTION)) return drift(`BLS CPI Table A caption is not "${CPI_TABLE_A_CAPTION}"`);
+  const body = table.indexOf("<tbody");
+  if (body < 0) return drift("BLS CPI Table A has no <tbody>");
+  const heads: Array<{ id: string; headers: string[]; text: string }> = [];
+  for (const m of table.slice(0, body).matchAll(/<th\b([^>]*)>([\s\S]*?)<\/th>/g)) {
+    const i = /\bid="([^"]+)"/.exec(m[1]!), hh = /\bheaders="([^"]*)"/.exec(m[1]!);
+    if (i) heads.push({ id: i[1]!, headers: hh ? hh[1]!.trim().split(/\s+/) : [], text: textOf(m[2]!) });
+  }
+  const sameMonth = (mon: string, yr: string) => monthNumber(mon) === month && yr === year;
+  const want = `${MONTH_NAMES[month - 1]} ${year}`;
+  let colIds: string[];
+  let colText: string;
+  if (column === "sa_1m") {
+    const group = heads.filter((x) => x.text === CPI_SA_GROUP);
+    if (group.length !== 1) return drift(`BLS CPI Table A has ${group.length} "${CPI_SA_GROUP}" column groups`);
+    const months = heads.filter((x) => x.headers.includes(group[0]!.id));
+    const parsed = months.map((x) => ({ x, m: TABLE_MONTH.exec(x.text) }));
+    if (!months.length || parsed.some((p) => !p.m)) return drift(`BLS CPI Table A month headers unreadable: ${months.map((x) => x.text).join(" | ").slice(0, 160)}`);
+    const hits = parsed.filter((p) => sameMonth(p.m![1]!, p.m![2]!));
+    if (hits.length !== 1) return drift(`BLS CPI Table A has ${hits.length} seasonally adjusted columns for ${want} (header month); columns: ${months.map((x) => x.text).join(" | ").slice(0, 160)}`);
+    if (hits[0]!.x !== months[months.length - 1]) return drift(`BLS CPI Table A: the ${want} column is not the last seasonally adjusted month`);
+    colIds = [group[0]!.id, hits[0]!.x.id];
+    colText = `${CPI_SA_GROUP}, ${hits[0]!.x.text}`;
+  } else {
+    const nsa = heads.filter((x) => /^Un-/.test(x.text));
+    if (nsa.length !== 1) return drift(`BLS CPI Table A has ${nsa.length} unadjusted 12-month columns`);
+    const m = TABLE_NSA_12M.exec(nsa[0]!.text);
+    if (!m) return drift(`BLS CPI Table A 12-month header unreadable: "${nsa[0]!.text.slice(0, 80)}"`);
+    if (!sameMonth(m[1]!, m[2]!)) return drift(`BLS CPI Table A 12-month column is for ${m[1]} ${m[2]}, the header names ${want}`);
+    colIds = [nsa[0]!.id];
+    colText = nsa[0]!.text;
+  }
+  const spec = CPI_ROWS[row];
+  const r0 = table.indexOf(`id="${spec.id}"`, body);
+  const th0 = r0 < 0 ? -1 : table.lastIndexOf("<th", r0);
+  const thEnd = th0 < 0 ? -1 : table.indexOf("</th>", r0);
+  const trEnd = thEnd < 0 ? -1 : table.indexOf("</tr>", thEnd);
+  if (th0 < 0 || thEnd < 0 || trEnd < 0) return drift(`BLS CPI Table A row ${spec.id} not found`);
+  const label = textOf(table.slice(table.indexOf(">", th0) + 1, thEnd));
+  if (label !== spec.label) return drift(`BLS CPI Table A row ${spec.id} is "${label.slice(0, 80)}", expected "${spec.label}"`);
+  const cells = tableCells(table.slice(thEnd, trEnd)).filter((c) => c.headers.includes(spec.id) && colIds.every((x) => c.headers.includes(x)));
+  if (cells.length !== 1) return drift(`BLS CPI Table A has ${cells.length} cells for ${spec.label} / ${colText}`);
+  const v = cells[0]!.text;
+  if (TABLE_NO_VALUE.has(v)) return notYet(`BLS CPI Table A prints "${v}" for ${spec.label}, ${colText}: no value published for ${want}`);
+  if (!TABLE_CELL.test(v)) return drift(`BLS CPI Table A cell for ${spec.label}, ${colText} is "${v.slice(0, 40)}"`);
+  if (column === "sa_1m") {
+    for (const re of row === "all_items" ? CPI_HEADLINE_MOM : CPI_CORE_MOM) {
+      const s = re.exec(block);
+      if (!s) continue;
+      const said = signedPercent(s[1]!, s[2]);
+      if (!said || monthNumber(s[3]!) !== month || percentTenths(said.value_text) !== percentTenths(v)) {
+        return drift(`BLS CPI summary sentence "${s[0].slice(0, 140)}" does not match Table A ${spec.label}, ${colText} = ${v}`);
+      }
+      break;
+    }
+  }
+  return { ok: true, obs: {
+    period: `${year}-${pad2(month)}`, value: Number(v), value_text: v, deciding_text: `${h[0]}: Table A, ${spec.label}, ${colText}: ${v}`, direction: null,
+    meta: { table: "cpi_pressa", row: spec.id, column: colIds.join(" "), embargoed_until: (() => { const e = EMBARGO.exec(block); return e ? squash(e[1]!) : null; })() },
+  } };
+}
+
+// ---- BLS Employment Situation summary text: the unemployment rate and the nonfarm payroll change -------------------
+
+export type EmpsitNumber = "unemployment_rate" | "payrolls_change";
+const EMPSIT_HEADER = /THE EMPLOYMENT SITUATION\s*(?:-{1,2}|[–—])\s*([A-Z]+)\s+(\d{4})/;
+const RATE_PATTERNS = [
+  /\b[Tt]he unemployment rate (?:was unchanged|changed little|was little changed|was essentially unchanged|held steady|held|remained|stayed) at (\d{1,2}\.\d) percent/g,
+  /\b[Tt]he unemployment rate (?:rose|increased|edged up|ticked up|moved up|jumped|declined|decreased|fell|edged down|ticked down|moved down|dropped)(?: by \d\.\d percentage points?)? to (\d{1,2}\.\d) percent/g,
+  /\b[Tt]he unemployment rate, at (\d{1,2}\.\d) percent,/g,
+  /\b[Tt]he unemployment rate \((\d{1,2}\.\d) percent\)/g,
+];
+const PAYROLL_UP = "increased|rose|edged up|grew|advanced|climbed|jumped|expanded";
+const PAYROLL_DOWN = "decreased|declined|fell|edged down|dropped|contracted";
+const COUNT = String.raw`\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)? million`;
+const SIGNED = String.raw`[+\-−]?\d{1,3}(?:,\d{3})+`;
+const LITTLE = "changed little|was little changed|was essentially unchanged|was unchanged|showed little change";
+const MONTH_WORD = "([A-Z][a-z]+)";
+/**
+ * verb: the sign comes from the verb (the count must be unsigned); checkVerb: the count carries its sign, which must
+ * match the verb. Every pattern names TOTAL nonfarm payroll employment ("Total ...", or "Both [total] nonfarm ... and the
+ * unemployment rate"): a qualified count ("Private nonfarm payroll employment ...", "Government ...") is never read.
+ */
+const PAYROLL_PATTERNS: Array<{ re: RegExp; month: number; count: number; verb?: number; checkVerb?: number }> = [
+  { re: new RegExp(String.raw`\b[Tt]otal nonfarm payroll employment (${PAYROLL_UP}|${PAYROLL_DOWN}) by (${COUNT}) in ${MONTH_WORD}\b`, "g"), verb: 1, count: 2, month: 3 },
+  { re: new RegExp(String.raw`\b[Tt]otal nonfarm payroll employment (${PAYROLL_UP}|${PAYROLL_DOWN}) in ${MONTH_WORD} \((${SIGNED})\)`, "g"), checkVerb: 1, month: 2, count: 3 },
+  { re: new RegExp(String.raw`\b[Tt]otal nonfarm payroll employment (?:${LITTLE}) in ${MONTH_WORD} \((${SIGNED})\)`, "g"), month: 1, count: 2 },
+  { re: new RegExp(String.raw`\b[Tt]otal nonfarm payroll employment (?:${LITTLE}) \((${SIGNED})\) in ${MONTH_WORD}\b`, "g"), count: 1, month: 2 },
+  { re: new RegExp(String.raw`\bBoth (?:total )?nonfarm payroll employment \((${SIGNED})\) and the unemployment rate \(\d{1,2}\.\d percent\) (?:changed little|were little changed|showed little change) in ${MONTH_WORD}\b`, "g"), count: 1, month: 2 },
+];
+/** The lead paragraph is found by what it says, never by its position (a boxed note may sit between it and the header). */
+const EMPSIT_LEAD = /\bBureau of Labor Statistics reported today\b/;
+/** A year right after a month word ("September 2025", "September, 2025"). */
+const YEAR_AFTER = /^,? (\d{4})\b/;
+/** A rate tied to its month by the words right after it ("4.1 percent in August"). */
+const RATE_TIED = /^ in ([A-Z][a-z]+)\b(?:,? (\d{4})\b)?/;
+const MONTH_NAMES_RE = new RegExp(String.raw`\b(${MONTH_NAMES.join("|")})\b(?:,? (\d{4})\b)?`, "g");
+
+/** The sentence around a match: from the previous sentence end to the next ("U.S." is not an end). */
+function sentenceAt(text: string, at: number): string {
+  const ends = [...text.matchAll(/(?<!\b[A-Z])\.(?=\s+[A-Z(]|\s*$)/g)].map((m) => m.index!);
+  const before = ends.filter((e) => e < at).pop();
+  const after = ends.find((e) => e >= at);
+  return squash(text.slice(before === undefined ? 0 : before + 1, after === undefined ? text.length : after + 1));
+}
+
+/** A payroll count as printed ("162,000", "-23,000", "+126,000") -> whole thousands, or a reason it is not one. */
+function payrollThousands(s: string, sign: 1 | -1 | null): number | string {
+  if (/million/.test(s)) return `"${s}" is rounded to a tenth of a million, not the change in thousands`;
+  const neg = /^[\-−]/.test(s), pos = /^\+/.test(s);
+  if (sign !== null && (neg || pos)) return `"${s}" is signed after a verb that already gives the sign`;
+  const digits = s.replace(/^[+\-−]/, "").replace(/,/g, "");
+  if (!/^\d+000$/.test(digits)) return `"${s}" is not a whole number of thousands`;
+  const k = Number(digits.slice(0, -3));
+  return (sign ?? (neg ? -1 : 1)) * k || 0;
+}
+
+/**
+ * The first <PRE> of www.bls.gov/news.release/empsit.nr0.htm ("Employment Situation Summary"). The header names the
+ * reference month ("THE EMPLOYMENT SITUATION - AUGUST 2026", "--" in some releases). A number is read only from the
+ * lead paragraph (the one saying "... the U.S. Bureau of Labor Statistics reported today", wherever it sits) and the
+ * first paragraph of its section (Household or Establishment Survey Data), and only when it is tied to the header
+ * month: a payroll count by the month its pattern names, a rate by "X percent in <Month>" or else by a sentence that
+ * names the header month and no other. A month with another year ("September 2025") is another month. Never from the
+ * revisions of earlier months ("The change in total nonfarm payroll employment for June was revised ..."), a
+ * parenthetical prior month or a qualified count ("Private nonfarm ..."). Every reading found must agree; none, a
+ * disagreement or a count in millions is schema drift, never a guess.
+ */
+export function parseEmpsitRelease(html: string, which: EmpsitNumber): DocParse {
+  const start = html.search(/<pre\b/i);
+  if (start < 0) return drift("BLS Employment Situation release has no <PRE> block");
+  const rel = html.slice(start, start + 60000).search(/<\/pre>/i);
+  const raw = decodeEntities(stripTags(html.slice(start, rel < 0 ? start + 60000 : start + rel))).replace(/\r/g, "");
+  const h = EMPSIT_HEADER.exec(raw);
+  if (!h) return drift("BLS Employment Situation header not found");
+  const month = monthNumber(h[1]!);
+  if (!month) return drift(`BLS Employment Situation header month "${h[1]}" unreadable`);
+  const monthName = MONTH_NAMES[month - 1]!;
+  const year = h[2]!;
+  const header = squash(h[0]);
+  const paras = raw.slice(h.index + h[0].length).split(/\n[ \t|]*\n/).map(squash).filter(Boolean);
+  const lead = paras.find((p) => EMPSIT_LEAD.test(p));
+  if (!lead) return drift("BLS Employment Situation lead paragraph (\"... the U.S. Bureau of Labor Statistics reported today\") not found");
+  const heading = which === "unemployment_rate" ? "Household Survey Data" : "Establishment Survey Data";
+  const hi = paras.indexOf(heading);
+  const section = hi >= 0 ? paras[hi + 1] ?? "" : "";
+  // the header month, with no year or the header's year
+  const isHeaderMonth = (mon: number, yr: string | null | undefined) => mon === month && (!yr || yr === year);
+  const monthsIn = (s: string) => [...s.matchAll(MONTH_NAMES_RE)].map((x) => ({ mon: monthNumber(x[1]!), yr: x[2] }));
+  const readings: Array<{ value: number; value_text: string; sentence: string; where: string }> = [];
+  const others: string[] = [];
+  for (const [where, para] of [["lead", lead], [heading, section]] as const) {
+    if (!para) continue;
+    if (which === "unemployment_rate") {
+      for (const re of RATE_PATTERNS) {
+        for (const m of para.matchAll(re)) {
+          const sentence = sentenceAt(para, m.index!);
+          // "4.1 percent in August" binds the rate to August whatever else the sentence names; without such a tie the
+          // sentence must name the header month and no other month ("unchanged at 4.1 percent, ... in August" is August's)
+          const tied = RATE_TIED.exec(para.slice(m.index! + m[0].length));
+          const tiedMonth = tied ? monthNumber(tied[1]!) : 0;
+          const named = monthsIn(sentence);
+          const bound = tiedMonth ? isHeaderMonth(tiedMonth, tied![2]) : named.length > 0 && named.every((x) => isHeaderMonth(x.mon, x.yr));
+          if (!bound) { others.push(sentence); continue; }
+          readings.push({ value: Number(m[1]), value_text: m[1]!, sentence, where });
+        }
+      }
+    } else {
+      for (const p of PAYROLL_PATTERNS) {
+        for (const m of para.matchAll(p.re)) {
+          const sentence = sentenceAt(para, m.index!);
+          const yr = YEAR_AFTER.exec(para.slice(m.index! + m[0].length))?.[1];
+          if (!isHeaderMonth(monthNumber(m[p.month]!), yr)) { others.push(sentence); continue; }
+          const down = (i: number) => new RegExp(`^(?:${PAYROLL_DOWN})$`).test(m[i]!);
+          const sign = p.verb === undefined ? null : down(p.verb) ? -1 : 1;
+          const k = payrollThousands(m[p.count]!, sign);
+          if (typeof k === "string") return drift(`BLS Employment Situation payroll change unreadable: ${k} in "${sentence.slice(0, 160)}"`);
+          if (p.checkVerb !== undefined && k !== 0 && (k < 0) !== down(p.checkVerb)) return drift(`BLS Employment Situation: "${m[p.checkVerb]}" contradicts the signed count ${m[p.count]} in "${sentence.slice(0, 160)}"`);
+          readings.push({ value: k, value_text: String(k), sentence, where });
+        }
+      }
+    }
+  }
+  const what = which === "unemployment_rate" ? "unemployment rate" : "nonfarm payroll change";
+  if (!readings.length) return drift(`BLS Employment Situation: no ${what} sentence for ${monthName} in the lead or the ${heading} paragraph${others.length ? ` (only: ${others[0]!.slice(0, 120)})` : ""}`);
+  const values = new Set(readings.map((r) => r.value));
+  if (values.size !== 1) return drift(`BLS Employment Situation: the ${what} readings disagree (${readings.map((r) => `${r.where} ${r.value_text}`).join(", ")})`);
+  if (which === "unemployment_rate" && others.some((s) => RATE_PATTERNS.some((re) => [...s.matchAll(re)].some((m) => m[1] !== readings[0]!.value_text)))) {
+    return drift(`BLS Employment Situation: an unemployment rate sentence without ${monthName} states another value`);
+  }
+  const r = readings[0]!;
+  const embargo = EMBARGO.exec(squash(raw.slice(0, h.index)));
+  return { ok: true, obs: {
+    period: `${h[2]}-${pad2(month)}`, value: r.value, value_text: r.value_text, deciding_text: `${header}: ${r.sentence}`, direction: null,
+    meta: { unit: which === "payrolls_change" ? "thousands" : "percent", readings: readings.map((x) => x.where).join(" + "), embargoed_until: embargo ? squash(embargo[1]!) : null },
+  } };
 }
 
 // ---- Federal Reserve ----------------------------------------------------------------------------------------------

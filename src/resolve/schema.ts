@@ -53,19 +53,22 @@ export const SOLANA_LOG_REF = /^solana:([1-9A-HJ-NP-Za-km-z]{32,44})$/;
 
 /**
  * official_release series with a deterministic adapter (src/ingest/official.ts). Each names one published number:
- * a 12-month percent change as printed (CPI, PPI, Korea GDP advance) or a policy rate level whose change against
- * prior_level the market decides (FOMC upper bound, ECB deposit facility, BoE Bank Rate, BoK Base Rate, BCB Selic).
+ * a percent as printed (CPI, core CPI and PPI changes, the unemployment rate, Korea GDP advance), a policy rate level
+ * whose change against prior_level the market decides (FOMC upper bound, ECB deposit facility, BoE Bank Rate, BoK
+ * Base Rate, BCB Selic), or the payroll employment change in thousands (US nonfarm payrolls).
  */
 export const OfficialSeries = z.enum([
   "us_cpi_u_nsa_yoy", "us_ppi_fd_nsa_yoy", "fomc_upper_bound", "ecb_dfr", "boe_bank_rate", "bok_base_rate", "kr_gdp_advance_yoy", "bcb_selic_target",
+  "us_cpi_u_sa_mom", "us_core_cpi_nsa_yoy", "us_core_cpi_sa_mom", "us_unemployment_rate", "us_nonfarm_payrolls_change",
 ]);
 /**
- * The rounding the market text prescribes. pct_1dp: the 12-month change at one decimal as published.
+ * The rounding the market text prescribes. pct_1dp: the percent at one decimal as published.
  * bps_away_from_zero_25 (Fed): a change off the 25 bp grid is rounded away from zero to the next 25.
  * bps_nearest_25_min_25 (BoK, ECB, BCB, BoE): 0 < |d| < 25 counts as 25; otherwise nearest 25, ties away from zero.
+ * thousands_as_printed (US payrolls): the signed change in whole thousands as published, never rounded further.
  */
-export const OfficialRounding = z.enum(["pct_1dp", "bps_away_from_zero_25", "bps_nearest_25_min_25"]);
-/** The leg a binary market represents, in the series' decided unit (percent at 1 dp, or basis points of change). */
+export const OfficialRounding = z.enum(["pct_1dp", "bps_away_from_zero_25", "bps_nearest_25_min_25", "thousands_as_printed"]);
+/** The leg a binary market represents, in the series' decided unit (percent at 1 dp, basis points of change, or thousands). */
 export const OfficialBucket = z.object({
   label: z.string().min(1).max(100),
   lo: z.number().finite().optional(),
