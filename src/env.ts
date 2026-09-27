@@ -43,6 +43,7 @@ export interface Env {
   TELEGRAM_OPERATOR_CHAT_ID?: string;
   USDC_RECEIVING_ADDRESS?: string;
   RESOLVE_PUBLIC_URL?: string;
+  PUBLIC_CHANNEL_URL?: string;        // the public Telegram channel link shown on the site (omitted when unset)
   GIT_SHA?: string;
 }
 

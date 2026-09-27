@@ -60,6 +60,7 @@ class Query implements PromiseLike<{ data: any; error: any; count?: number | nul
   lt(col: string, v: string) { this.filters.push((r) => path(r, col) != null && String(path(r, col)) < v); return this; }
   lte(col: string, v: string) { this.filters.push((r) => String(path(r, col)) <= v); return this; }
   gte(col: string, v: string) { this.filters.push((r) => String(path(r, col)) >= v); return this; }
+  not(col: string, op: "is", v: null) { if (op !== "is") throw new Error(`fake-db: not.${op} unsupported`); this.filters.push((r) => (path(r, col) ?? null) !== v); return this; }
   is(col: string, v: null) { this.filters.push((r) => (path(r, col) ?? null) === v); return this; }
   order(col: string, opts?: { ascending?: boolean }) { this.orderBy.push({ col, asc: opts?.ascending !== false }); return this; }
   limit(n: number) { this.max = n; return this; }

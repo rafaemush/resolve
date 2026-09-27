@@ -70,9 +70,14 @@ export async function authenticate<E extends { Bindings: Env }>(c: Context<E>): 
 export function utcMidnightIso(): string { const d = new Date(); d.setUTCHours(24, 0, 0, 0); return d.toISOString(); }
 export function secondsToUtcMidnight(): number { return Math.max(1, Math.ceil((Date.parse(utcMidnightIso()) - Date.now()) / 1000)); }
 
+/** Requests per minute per API key on each plan (the per-key bucket rateLimit applies; shown on GET /pricing). */
+export function perKeyRpm(plan: AuthContext["plan"]): number {
+  return plan === "platform" ? 600 : plan === "growth" ? 300 : 60;
+}
+
 /** Per-key minute bucket + (optionally) the shared Jev buckets. Fails OPEN on DB error because begin_resolution fails closed. */
 export async function rateLimit<E extends { Bindings: Env }>(c: Context<E>, auth: AuthContext, opts: { jev: boolean; jevRpmLimit: number }): Promise<{ allowed: true } | { allowed: false; response: Response }> {
-  const perKey = auth.plan === "platform" ? 600 : auth.plan === "growth" ? 300 : 60;
+  const perKey = perKeyRpm(auth.plan);
   const keys = [`key:${auth.keyId}:min`]; const windows = [60_000]; const limits = [perKey];
   if (opts.jev) { keys.push("upstream:jev:min", `upstream:jev:${auth.tenantId}:min`); windows.push(60_000, 60_000); limits.push(Math.max(1, Math.floor(opts.jevRpmLimit / 2)), Math.max(1, Math.floor(opts.jevRpmLimit / 8))); }
   try {

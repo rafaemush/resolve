@@ -330,7 +330,7 @@ internal.post("/bot/setup", async (c) => {
   const disc = "Automated shadow settlements for long-tail prediction markets. Every verdict is committed by hash before the official outcome and revealed after. Informational signal, not financial advice, not an oracle of record.";
   out.description_set = (await api("setMyDescription", { description: disc })).ok;
   out.short_description_set = (await api("setMyShortDescription", { short_description: "Commit-reveal shadow settlements for long-tail prediction markets. Not financial advice." })).ok;
-  const chat = await api("getChat", { chat_id: ch }); out.channel = chat.ok ? { title: chat.result.title, id: chat.result.id, pinned: chat.result.pinned_message?.message_id ?? null } : chat.description;
+  const chat = await api("getChat", { chat_id: ch }); out.channel = chat.ok ? { title: chat.result.title, id: chat.result.id, username: chat.result.username ?? null, invite_link: chat.result.invite_link ?? null, pinned: chat.result.pinned_message?.message_id ?? null } : chat.description;
   const adm = await api("getChatMember", { chat_id: ch, user_id: me.result.id }); out.bot_membership = adm.ok ? { status: adm.result.status, can_post: adm.result.can_post_messages ?? null } : adm.description;
   if (op) { const dm = await api("sendMessage", { chat_id: op, text: "Resolve operator alerts are wired. One-time test from the settle-bot." }); out.operator_dm = dm.ok ? "sent" : dm.description; }
   if (chat.ok && !chat.result.pinned_message) {

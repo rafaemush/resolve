@@ -1,0 +1,264 @@
+/**
+ * The public site (src/api/site.ts): every page answers 200 with zero rows and with sample rows, escapes every dynamic
+ * value, never names the model or its vendor, prints no percentage before the view marks a platform reportable, keeps
+ * each page to <= 3 database reads, and carries the CSP / nosniff / referrer / cache headers. POST /v1/request-key
+ * validates, rate-limits (failing closed), stores a lead plus an inbound touch, and alerts the operator with a masked email.
+ */
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { Env } from "../src/env";
+import { fakeDb, type FakeDb, type Row } from "./lib/fake-db";
+
+const h = vi.hoisted(() => ({ db: null as unknown as FakeDb, alerts: [] as Array<{ key: string; text: string }> }));
+vi.mock("../src/db/supabase", () => ({ db: () => h.db.client, rpc: async () => { throw new Error("unused"); } }));
+vi.mock("../src/ops/alerts", () => ({ alert: vi.fn(async (_env: unknown, key: string, text: string) => { h.alerts.push({ key, text }); return { sent: true, deduped: false }; }) }));
+
+import { app } from "../src/index";
+import { MarketRegistration } from "../src/resolve/schema";
+import { DOCS_MARKET_EXAMPLE, maskEmail, officialReleaseAt, SITE_CSP, summarizeRecord, upcomingReleases } from "../src/api/site";
+import { KNOWN_RELEASES } from "../src/resolve/official";
+
+const NAMES = /jev|typesafe/i;
+const PAGES = ["/", "/record", "/pricing", "/docs", "/terms"];
+const env = { CREDITS_PER_USDC: "100", PUBLIC_CHANNEL_URL: "https://t.me/resolve_feed" } as unknown as Env;
+const ctx = { waitUntil: () => undefined, passThroughOnException: () => undefined } as unknown as ExecutionContext;
+const NOW = Date.parse("2026-09-28T00:00:00Z");
+const HASH = "ab".repeat(32);
+const text = (html: string) => html.replace(/<style>[\s\S]*?<\/style>/, "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ");
+
+function rateRpc(allowed = true, error: unknown = null) {
+  return async () => ({ data: error ? null : [{ allowed, remaining: 0, reset_at: "2026-09-28T01:00:00Z" }], error });
+}
+const touchRpc = async (db: FakeDb, a: Record<string, any>) => {
+  (db.tables.gtm_touches ??= []).push({ id: `t-${db.tables.gtm_touches.length + 1}`, lead_id: a.p_lead, kind: a.p_kind, direction: a.p_direction, summary: a.p_summary, request_id: a.p_request_id });
+  return { data: "touch-1", error: null };
+};
+
+function sampleDb(): FakeDb {
+  return fakeDb({
+    markets: [
+      { id: "m1", platform: "polymarket", event_key: "official:us_cpi_u_nsa_yoy:2026-09", tenant_id: null, is_test: false, deleted_at: null },
+      { id: "m2", platform: "polymarket", event_key: "official:us_cpi_u_nsa_yoy:2026-09", tenant_id: null, is_test: false, deleted_at: null },
+      { id: "m3", platform: "limitless", event_key: "official:us_cpi_u_nsa_yoy:2026-09", tenant_id: null, is_test: false, deleted_at: null },
+      { id: "m4", platform: "limitless", event_key: "official:us_cpi_u_nsa_yoy:2026-09", tenant_id: null, is_test: true, deleted_at: null },
+    ],
+    v_track_record: [
+      { platform: "polymarket", week: "2026-10-12T00:00:00+00:00", n_events_committed: 2, n_events_reconciled: 1, n_events_reconciled_cumulative: 1, resolved_correct_cumulative: 3, resolved_wrong_cumulative: 1, abstained_cumulative: 0, voided: 0, unresolved_by_platform: 0, reportable: false, precision: null, jev_share: 0 },
+    ],
+    v_venue_report: [
+      { platform: "polymarket", external_id: "<script>alert(1)</script>", event_key: "official:us_unemployment_rate:2026-09", committed_at: "2026-10-02T12:30:41Z", latest_committed_at: "2026-10-02T12:30:41Z", latest_commitment_sha256: HASH, official_at: "2026-10-02T14:00:00Z", agreement: "agree", n_commits: 1 },
+      { platform: "limitless", external_id: "fed-oct", event_key: "limitless:group:9", committed_at: "2026-10-01T09:00:00Z", latest_committed_at: "2026-10-01T09:00:00Z", latest_commitment_sha256: "\"><img>", official_at: null, agreement: null, n_commits: 1 },
+      { platform: "polymarket", external_id: "never", event_key: "x", committed_at: null, latest_committed_at: null, latest_commitment_sha256: null, official_at: null, agreement: null, n_commits: 0 },
+    ],
+    app_config: [{ key: "payg_tiers", value: '[{"min_usdc":1000,"credits_per_usdc":120},{"min_usdc":250,"credits_per_usdc":110},{"min_usdc":0,"credits_per_usdc":100}]' }],
+  });
+}
+
+beforeEach(() => { h.alerts = []; vi.useFakeTimers({ now: NOW, toFake: ["Date"] }); });
+afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
+
+describe("pages", () => {
+  for (const [label, mk] of [["zero rows", () => fakeDb({})], ["sample rows", sampleDb]] as const) {
+    for (const p of PAGES) {
+      it(`${p} answers 200 with ${label}: HTML, headers, no model name, <= 3 reads`, async () => {
+        h.db = mk();
+        const res = await app.request(p, {}, env, ctx);
+        expect(res.status).toBe(200);
+        expect(res.headers.get("content-type")).toContain("text/html");
+        expect(res.headers.get("content-security-policy")).toBe(SITE_CSP);
+        expect(SITE_CSP).toContain("default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'");
+        expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+        expect(res.headers.get("referrer-policy")).toBeTruthy();
+        expect(res.headers.get("cache-control")).toContain("max-age=60");
+        const html = await res.text();
+        expect(html).not.toMatch(NAMES);
+        expect(JSON.stringify([...res.headers])).not.toMatch(NAMES);
+        expect(html).not.toMatch(/<script|https?:\/\/(?!t\.me\/resolve_feed|example\.com|localhost)[a-z]/i);
+        expect(h.db.calls.length).toBeLessThanOrEqual(3);
+        expect(html).toContain('href="https://t.me/resolve_feed"');
+      });
+    }
+  }
+
+  it("the channel link is omitted when PUBLIC_CHANNEL_URL is unset or not https", async () => {
+    h.db = fakeDb({});
+    for (const PUBLIC_CHANNEL_URL of [undefined, "javascript:alert(1)", "http://t.me/x"]) {
+      const html = await (await app.request("/", {}, { ...env, PUBLIC_CHANNEL_URL } as Env, ctx)).text();
+      expect(html).not.toContain("Telegram channel");
+      expect(html).not.toContain("javascript:");
+    }
+  });
+
+  it("/ lists the upcoming known releases with public non-test market counts per venue, and the request form", async () => {
+    h.db = sampleDb();
+    const html = await (await app.request("/", {}, env, ctx)).text();
+    expect(html).toContain("2026-10-14 12:30 UTC");
+    expect(html).toContain("Limitless: 1 market<br>Polymarket: 2 markets");
+    expect(html).toContain('action="/v1/request-key"');
+    for (const l of ["/record", "/pricing", "/docs", "/openapi.json"]) expect(html).toContain(`href="${l}"`);
+  });
+
+  it("upcomingReleases: only releases after now, soonest first", () => {
+    const rows = upcomingReleases(Date.parse("2026-10-03T00:00:00Z"), []);
+    expect(rows.every((r) => Date.parse(r.release_at) > Date.parse("2026-10-03T00:00:00Z"))).toBe(true);
+    expect(rows.map((r) => r.release_at)).toEqual([...rows.map((r) => r.release_at)].sort());
+    expect(rows.find((r) => r.series === "us_unemployment_rate")).toBeUndefined();
+    expect(Object.keys(KNOWN_RELEASES)).toContain("us_unemployment_rate:2026-09");
+  });
+
+  it("/record with zero rows says the record is too young and shows upcoming releases", async () => {
+    h.db = fakeDb({});
+    const html = await (await app.request("/record", {}, env, ctx)).text();
+    expect(html).toContain("The record is too young for percentages");
+    expect(html).toContain("No public commitment has been recorded yet");
+    expect(html).toContain("2026-10-02 12:30 UTC");
+    expect(text(html)).not.toMatch(/\d\s*%(?! interval)/);
+  });
+
+  it("/record with rows: escaped external_id, verify link, seconds from release to commit, no percentage before n >= 100", async () => {
+    h.db = sampleDb();
+    const html = await (await app.request("/record", {}, env, ctx)).text();
+    expect(html).not.toContain("<script>alert(1)</script>");
+    expect(html).toContain("polymarket:&lt;script&gt;alert(1)&lt;/script&gt;");
+    expect(html).toContain(`href="/v1/track-record/verify?hash=${HASH}"`);
+    expect(html).not.toContain("<img>");
+    expect(html).toContain("41 s");
+    expect(html).toContain("The record is too young for percentages");
+    expect(text(html)).not.toMatch(/\d\s*%(?! interval)/);
+    expect(text(html)).toContain("2 events committed");
+    expect(html).not.toContain("never");
+  });
+
+  it("/record prints percentages only once the view marks the platform reportable", async () => {
+    h.db = sampleDb();
+    h.db.tables.v_track_record = [{ platform: "polymarket", week: "2027-03-01T00:00:00+00:00", n_events_reconciled_cumulative: 100, resolved_correct_cumulative: 150, resolved_wrong_cumulative: 3, abstained_cumulative: 4, reportable: true, precision: 0.9804, wilson_low: 0.94, wilson_high: 0.99, event_precision: 0.97, event_wilson_low: 0.92, event_wilson_high: 0.99 }];
+    const html = await (await app.request("/record", {}, env, ctx)).text();
+    expect(html).toContain("98.0 %");
+    expect(html).not.toContain("too young");
+    const s = summarizeRecord(h.db.tables.v_track_record, []);
+    expect(s).toMatchObject({ events_reconciled: 100, agree: 150, disagree: 3, abstained: 4 });
+  });
+
+  it("/record answers 503 HTML when the store is unavailable", async () => {
+    h.db = fakeDb({});
+    const from = h.db.client.from;
+    h.db.client.from = ((t: string) => (t === "v_track_record" ? { select: () => ({ order: () => ({ limit: async () => ({ data: null, error: { message: "down" } }) }) }) } : from(t))) as never;
+    const res = await app.request("/record", {}, env, ctx);
+    expect(res.status).toBe(503);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+  });
+
+  it("officialReleaseAt reads the release time from the event key", () => {
+    expect(officialReleaseAt("official:us_unemployment_rate:2026-09")).toBe("2026-10-02T12:30:00Z");
+    expect(officialReleaseAt("polymarket:event:1")).toBeNull();
+  });
+
+  it("/pricing shows the offers, pack credits from payg_tiers, the payment line and no wallet address", async () => {
+    h.db = sampleDb();
+    const t = text(await (await app.request("/pricing", {}, env, ctx)).text());
+    for (const s of ["$99 a month", "$399 a month", "$750 a month", "$1,000 for 30 days", "300 credits for 30 days", "5,000", "27,500", "120,000", "1 credit", "5 credits", "Invoiced in USD; ask us for payment options", "non-refundable prepayment for API services"]) expect(t).toContain(s);
+    expect(t).not.toMatch(/0x[0-9a-f]{40}/i);
+  });
+
+  it("/docs: the registration example is a valid market; the signature snippet matches the header format", async () => {
+    expect(MarketRegistration.safeParse(DOCS_MARKET_EXAMPLE).success).toBe(true);
+    h.db = fakeDb({});
+    const html = await (await app.request("/docs", {}, env, ctx)).text();
+    expect(html).toContain("X-Resolve-Signature: t=&lt;unix seconds&gt;,v1=&lt;hex&gt;");
+    for (const p of ["/v1/request-key", "/v1/markets", "/v1/resolve", "/v1/webhooks", "/follow", "/v1/track-record/verify"]) expect(html).toContain(p);
+  });
+
+  it("uses the Cache API when present", async () => {
+    h.db = fakeDb({});
+    const put = vi.fn(async () => undefined);
+    vi.stubGlobal("caches", { default: { match: vi.fn(async () => undefined), put } });
+    const res = await app.request("/", {}, env, { waitUntil: (p: Promise<unknown>) => p, passThroughOnException: () => undefined } as unknown as ExecutionContext);
+    expect(res.status).toBe(200);
+    expect(put).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("POST /v1/request-key", () => {
+  const good = { name: "Ada Lovelace", email: "ada@example.com", company: "Example Bots", purpose: "Settle CPI markets", venue: "Polymarket" };
+  const form = (o: Record<string, string>) => ({ method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", "cf-connecting-ip": "203.0.113.9" }, body: new URLSearchParams(o).toString() });
+  const jsonReq = (o: unknown) => ({ method: "POST", headers: { "content-type": "application/json", "cf-connecting-ip": "203.0.113.9" }, body: JSON.stringify(o) });
+  const dbWith = (rate = rateRpc()) => fakeDb({}, {}, { rpc: { rate_limit_hit: rate, log_touch: touchRpc } });
+
+  it("form: stores a prospect lead and an inbound touch, alerts with a masked email, answers an HTML confirmation", async () => {
+    h.db = dbWith();
+    const res = await app.request("/v1/request-key", form(good), env, ctx);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/html");
+    expect(res.headers.get("content-security-policy")).toBe(SITE_CSP);
+    expect(await res.text()).toContain("Request received");
+    expect(h.db.tables.leads).toHaveLength(1);
+    expect(h.db.tables.leads![0]).toMatchObject({ name: "Ada Lovelace", org: "Example Bots", contact: "ada@example.com", status: "prospect", channel: "form", platform: "polymarket" });
+    expect(h.db.tables.gtm_touches![0]).toMatchObject({ lead_id: h.db.tables.leads![0]!.id, kind: "email", direction: "in" });
+    expect(h.alerts).toHaveLength(1);
+    expect(h.alerts[0]!.text).toContain("Example Bots");
+    expect(h.alerts[0]!.text).toContain("Settle CPI markets");
+    expect(h.alerts[0]!.text).toContain("a***@example.com");
+    expect(h.alerts[0]!.text).not.toContain("ada@example.com");
+    expect(h.db.calls.filter((c) => c.table === "rpc:rate_limit_hit")).toHaveLength(2);
+  });
+
+  it("JSON in, JSON out; 'project' is accepted for company", async () => {
+    h.db = dbWith();
+    const { company, ...rest } = good;
+    const res = await app.request("/v1/request-key", jsonReq({ ...rest, project: company }), env, ctx);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ ok: true, data: { received: true } });
+    expect(h.db.tables.leads![0]!.org).toBe("Example Bots");
+  });
+
+  it("rejects a URL in the name, a bad email, missing fields and overlong values; nothing stored", async () => {
+    for (const bad of [{ ...good, name: "Win at https://spam.example" }, { ...good, name: "cheap.xyz deals" }, { ...good, email: "nope" }, { ...good, purpose: "" }, { ...good, purpose: "x".repeat(1001) }, { name: "A" }]) {
+      h.db = dbWith();
+      const res = await app.request("/v1/request-key", jsonReq(bad), env, ctx);
+      expect(res.status).toBe(400);
+      expect(h.db.tables.leads ?? []).toHaveLength(0);
+    }
+    h.db = dbWith();
+    const res = await app.request("/v1/request-key", form({ ...good, name: "<b>x</b> www.spam.test" }), env, ctx);
+    expect(res.status).toBe(400);
+    const html = await res.text();
+    expect(html).not.toContain("<b>x</b>");
+    expect(html).toContain("&lt;b&gt;x&lt;/b&gt;");
+  });
+
+  it("rate limited: 429, nothing stored", async () => {
+    h.db = dbWith(rateRpc(false));
+    const res = await app.request("/v1/request-key", jsonReq(good), env, ctx);
+    expect(res.status).toBe(429);
+    expect(h.db.tables.leads ?? []).toHaveLength(0);
+    expect(h.alerts).toHaveLength(0);
+  });
+
+  it("fails closed with 503 (never 500) when the rate limit or the lead insert cannot be written", async () => {
+    h.db = dbWith(rateRpc(true, { message: "db down" }));
+    let res = await app.request("/v1/request-key", jsonReq(good), env, ctx);
+    expect(res.status).toBe(503);
+    h.db = dbWith(async () => { throw new Error("socket"); });
+    res = await app.request("/v1/request-key", form(good), env, ctx);
+    expect(res.status).toBe(503);
+    expect(await res.text()).toContain("Nothing was stored");
+    h.db = dbWith();
+    const from = h.db.client.from;
+    h.db.client.from = ((t: string) => (t === "leads" ? { insert: () => ({ select: () => ({ single: async () => ({ data: null, error: { message: "x" } }) }) }) } : from(t))) as never;
+    res = await app.request("/v1/request-key", jsonReq(good), env, ctx);
+    expect(res.status).toBe(503);
+    expect(h.alerts).toHaveLength(0);
+  });
+
+  it("a filled honeypot gets the same answer and stores nothing", async () => {
+    h.db = dbWith();
+    const res = await app.request("/v1/request-key", form({ ...good, website: "http://x" }), env, ctx);
+    expect(res.status).toBe(200);
+    expect(h.db.tables.leads ?? []).toHaveLength(0);
+    expect(h.alerts).toHaveLength(0);
+  });
+
+  it("maskEmail", () => {
+    expect(maskEmail("ada@example.com")).toBe("a***@example.com");
+    expect(maskEmail("bad")).toBe("***");
+  });
+});
