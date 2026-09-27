@@ -56,6 +56,9 @@ export interface RawLog { address: string; topics: string[]; data: string; block
 // 2,000 blocks -> -32600), so logs always go to public providers. mainnet.base.org
 // accepts 2,000-block ranges (10,000 -> -32614); base-rpc.publicnode.com serves recent blocks
 // only (historical ranges need a personal token, MEASURED 2026-09-24), so it is a near-head fallback.
+// Both refuse Cloudflare Worker egress (OBSERVED 2026-09-27 from the deployed Worker: mainnet.base.org
+// HTTP 429, publicnode HTTP 403), so the USDC deposit scan reads Alchemy's transfers API first
+// (assetTransfersPage below) and keeps these providers as its fallback only.
 export interface LogsProvider { url: string; maxRange: number }
 export const DEFAULT_LOGS_PROVIDERS: LogsProvider[] = [
   { url: "https://mainnet.base.org", maxRange: 2000 },
@@ -179,4 +182,39 @@ export async function fetchBaseLogs(env: Env, watch: WatchRow, resolver: Resolve
   } catch (e) {
     return { error: `base rpc: ${String(e).slice(0, 200)}` };
   }
+}
+
+// ---- alchemy_getAssetTransfers (the USDC deposit scan's primary source) --------
+// Alchemy's transfers API has no block-range cap on Free (the eth_getLogs cap above does not apply). PROBED 2026-09-27
+// with the configured key: toBlock must be a block number ("safe" is refused: "expected latest, indexed, or a hex/decimal
+// block number"), so callers resolve the safe header first; uniqueId is "<tx hash>:log:<N>" with N the BLOCK-level
+// logIndex (the same number eth_getLogs reports); `value` is a float and never money: rawContract.value is the raw integer.
+
+/** One transfer as alchemy_getAssetTransfers returns it (category erc20). Fields are checked by the caller, never trusted. */
+export interface AssetTransfer {
+  blockNum?: unknown; uniqueId?: unknown; hash?: unknown; from?: unknown; to?: unknown; category?: unknown;
+  rawContract?: { value?: unknown; address?: unknown; decimal?: unknown } | null;
+  metadata?: { blockTimestamp?: unknown } | null;
+}
+export interface AssetTransfersPage { transfers: AssetTransfer[]; pageKey?: string }
+/** Transfers per page (the API's maximum, 0x3e8). */
+export const ASSET_TRANSFERS_PAGE_SIZE = 1000;
+
+/**
+ * One page (one subrequest) of ERC-20 transfers of `contract` to `toAddress` over [fromBlock, toBlock], oldest first.
+ * Pass the previous page's pageKey, with the same range, for the next page. Throws on an HTTP or JSON-RPC error, a
+ * timeout, or a result that is not a page (no transfers array, a pageKey that is not a non-empty string).
+ */
+export async function assetTransfersPage(
+  url: string, q: { fromBlock: number; toBlock: number; toAddress: string; contract: string; pageKey?: string },
+): Promise<AssetTransfersPage> {
+  const r = await rpc<{ transfers?: unknown; pageKey?: unknown } | null>(url, "alchemy_getAssetTransfers", [{
+    fromBlock: hex(q.fromBlock), toBlock: hex(q.toBlock), toAddress: q.toAddress, contractAddresses: [q.contract],
+    category: ["erc20"], withMetadata: true, excludeZeroValue: false, maxCount: hex(ASSET_TRANSFERS_PAGE_SIZE), order: "asc",
+    ...(q.pageKey ? { pageKey: q.pageKey } : {}),
+  }]);
+  if (!r || typeof r !== "object" || !Array.isArray(r.transfers)) throw new Error("alchemy_getAssetTransfers returned no transfers array");
+  if (r.transfers.some((t) => !t || typeof t !== "object")) throw new Error("alchemy_getAssetTransfers returned a transfer that is not an object");
+  if (r.pageKey !== undefined && r.pageKey !== null && (typeof r.pageKey !== "string" || !r.pageKey)) throw new Error("alchemy_getAssetTransfers returned an unusable pageKey");
+  return { transfers: r.transfers as AssetTransfer[], ...(typeof r.pageKey === "string" ? { pageKey: r.pageKey } : {}) };
 }

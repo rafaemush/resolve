@@ -32,7 +32,7 @@ export interface Env {
   ADMIN_API_KEY: string;
   EVAL_REPORT_KEY: string;
   GITHUB_TOKEN?: string;
-  ALCHEMY_BASE_HTTP_URL?: string;
+  ALCHEMY_BASE_HTTP_URL?: string;     // Base headers and calls; the USDC deposit scan's primary source (alchemy_getAssetTransfers)
   HELIUS_API_KEY?: string;
   LIMITLESS_API_KEY?: string;
   TELEGRAM_BOT_TOKEN?: string;

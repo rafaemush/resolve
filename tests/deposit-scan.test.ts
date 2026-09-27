@@ -119,7 +119,7 @@ describe("scanDeposits on the 5-minute invocation's budget", () => {
 
     const raised = [...first.r.alerts];
     let scans = 1;
-    for (let last = first.r; last.detail !== "caught up" && scans < 20; scans++) {
+    for (let last = first.r; last.detail !== "caught up via mainnet.base.org" && scans < 20; scans++) {
       const s = await scan();
       expect(s.used).toBeLessThanOrEqual(DEPOSIT_SCAN_SUBREQUESTS);
       expect(s.r.scanned).toBe(true);
@@ -180,7 +180,7 @@ describe("scanDeposits on the 5-minute invocation's budget", () => {
     // POST /internal/deposits/scan: its own invocation, the whole budget.
     const manual = await scan(new Budget(INVOCATION_SUBREQUESTS));
     expect(manual.used).toBeLessThanOrEqual(INVOCATION_SUBREQUESTS);
-    expect(manual.r).toMatchObject({ scanned: true, stopped_by_budget: false, detail: "caught up" });
+    expect(manual.r).toMatchObject({ scanned: true, stopped_by_budget: false, detail: "caught up via mainnet.base.org" });
     expect(cursorNow()).toBe(1_500);
     expect(credits.size).toBe(14);
   });
@@ -190,7 +190,7 @@ describe("scanDeposits on the 5-minute invocation's budget", () => {
     newDb(1_000, true);
     const { r, used } = await scan();
     expect(used).toBeLessThanOrEqual(DEPOSIT_SCAN_SUBREQUESTS);
-    expect(r).toMatchObject({ scanned: true, detail: "caught up", credited: 3 });
+    expect(r).toMatchObject({ scanned: true, detail: "caught up via mainnet.base.org", credited: 3 });
     expect(h.db.tables.webhook_deliveries!.map((d) => [d.event_type, d.payload])).toEqual([
       ["payment.credited", { tx_hash: "0x44c0000", log_index: 0, amount_usdc: "2.5", credits: 250, balance_after: 250 }],
       ["payment.credited", { tx_hash: "0x44c0001", log_index: 1, amount_usdc: "2.5", credits: 250, balance_after: 500 }],
@@ -227,7 +227,7 @@ describe("scanDeposits on the 5-minute invocation's budget", () => {
     chain = { safe: 1_000, logs: [] };
     newDb(1_000);
     const { r, used } = await scan();
-    expect(r).toMatchObject({ scanned: true, detail: "no new safe blocks", alerts: [] });
+    expect(r).toMatchObject({ scanned: true, detail: "no new safe blocks via mainnet.base.org", alerts: [] });
     expect(used).toBe(3); // cursor read, safe header, loop_runs row
     expect(r.subrequests).toBe(3);
   });
