@@ -743,6 +743,18 @@ function brtDate(isoTs: string | undefined): string | null {
 }
 
 /**
+ * The latest ORDINARY Copom meeting date (BRT) in the history body, or null (not JSON, no rows). The admin probe
+ * (src/ingest/official-probe.ts) reads the live document at this date with parseBcbHistory; the rail never calls it.
+ */
+export function latestOrdinaryCopomMeeting(json: string): string | null {
+  let j: { conteudo?: CopomRow[] } | null;
+  try { j = JSON.parse(json); } catch { return null; }
+  if (!j || !Array.isArray(j.conteudo)) return null;
+  const days = j.conteudo.filter((r) => r && r.ReuniaoExtraordinaria === false).map((r) => brtDate(r.DataReuniaoCopom)).filter((d): d is string => d !== null);
+  return days.sort().pop() ?? null;
+}
+
+/**
  * www.bcb.gov.br/api/servico/sitebcb/historicotaxasjuros: the ORDINARY Copom row whose meeting date is the target.
  * The latest SGS 432 value is never read: that series forward-fills future dates with the current target.
  */

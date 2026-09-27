@@ -50,7 +50,16 @@ export const URLS = {
  * Time and request allowance shared by every fetch of one capture. Every request's timeout is clamped to the
  * deadline and recorded, so no request can outlive it (tests assert this; pg_net and waitUntil both stop at 30 s).
  */
-export interface Budget { deadlineMs: number; requests: number; used: number; now: () => number; timeouts: number[] }
+export interface Budget {
+  deadlineMs: number; requests: number; used: number; now: () => number; timeouts: number[];
+  /** Called once per HTTP exchange officialGet makes (redirect hops included). Only the admin probe sets it. */
+  trace?: (t: FetchTrace) => void;
+}
+/**
+ * One HTTP exchange of officialGet as the admin probe reports it (POST /internal/official/probe): status null when
+ * fetch threw; bytes only for a body that was read (a 200), null for a discarded one.
+ */
+export interface FetchTrace { url: string; status: number | null; content_type: string | null; server: string | null; bytes: number | null; ms: number; location?: string; error?: string }
 export function budget(now: () => number, ms: number, requests: number, deadlineMs?: number): Budget {
   return { deadlineMs: deadlineMs ?? now() + ms, requests, used: 0, now, timeouts: [] };
 }
@@ -66,6 +75,11 @@ type Got = { ok: true; url: string; bytes: Uint8Array; readonly text: string }
 export async function officialGet(series: OfficialSeriesId, url: string, b: Budget, accept: string): Promise<Got> {
   let current = url;
   let res: Response;
+  let t0 = 0;
+  const trace = (r: Response | null, extra: { bytes?: number; location?: string; error?: string } = {}) => b.trace?.({
+    url: current, status: r?.status ?? null, content_type: r?.headers.get("content-type") ?? null, server: r?.headers.get("server") ?? null,
+    bytes: extra.bytes ?? null, ms: Date.now() - t0, ...(extra.location !== undefined ? { location: extra.location } : {}), ...(extra.error !== undefined ? { error: extra.error } : {}),
+  });
   for (let hop = 0; ; hop++) {
     if (!hostAllowed(series, current)) return { ok: false, error: `refused: ${current} is not an https URL on the ${series} host allowlist`, retryable: false };
     if (b.requests <= 0) return { ok: false, error: "request budget exhausted", retryable: false };
@@ -73,12 +87,14 @@ export async function officialGet(series: OfficialSeriesId, url: string, b: Budg
     if (remaining < 500) return { ok: false, error: "time budget exhausted", retryable: false };
     const timeout = Math.min(FETCH_TIMEOUT_MS, remaining);
     b.requests--; b.used++; b.timeouts.push(timeout);
+    t0 = Date.now();
     try {
       res = await fetch(current, { headers: { "User-Agent": OFFICIAL_UA, Accept: accept, "Cache-Control": "no-cache" }, redirect: "manual", signal: AbortSignal.timeout(timeout) });
-    } catch (e) { return { ok: false, error: `fetch ${current} failed: ${String(e).slice(0, 120)}`, retryable: true }; }
+    } catch (e) { trace(null, { error: String(e).slice(0, 120) }); return { ok: false, error: `fetch ${current} failed: ${String(e).slice(0, 120)}`, retryable: true }; }
     if (res.status < 300 || res.status > 399) break;
     const location = res.headers.get("location");
     await discardBody(res);
+    trace(res, location ? { location } : {});
     const moved = { httpStatus: res.status };
     if (!location) return { ok: false, error: `HTTP ${res.status} from ${current} without a Location`, retryable: false, ...moved };
     let next: string;
@@ -91,10 +107,14 @@ export async function officialGet(series: OfficialSeriesId, url: string, b: Budg
   const answered = { httpStatus: res.status, ...(deferSeconds !== undefined ? { deferSeconds } : {}) };
   if (res.status !== 200) {
     await discardBody(res);
+    trace(res);
     // 404 and 5xx right at a release are "not there yet" (a CDN edge behind the feed); 403/429 mean back off.
     return { ok: false, error: `HTTP ${res.status} from ${current}`, retryable: res.status === 404 || res.status >= 500, ...answered };
   }
-  const bytes = new Uint8Array(await res.arrayBuffer());
+  let bytes: Uint8Array;
+  try { bytes = new Uint8Array(await res.arrayBuffer()); }
+  catch (e) { trace(res, { error: `body: ${String(e).slice(0, 120)}` }); throw e; }
+  trace(res, { bytes: bytes.byteLength });
   if (bytes.byteLength > MAX_BODY) return { ok: false, error: `${current} answered ${bytes.byteLength} bytes (cap ${MAX_BODY})`, retryable: false, ...answered };
   let text: string | undefined;
   return { ok: true, url: current, bytes, get text() { return (text ??= new TextDecoder().decode(bytes)); } };
