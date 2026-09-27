@@ -132,9 +132,9 @@ The alarm writes through `record_limitless_observations()` with `observed = fals
 
 `resolved_seen_at` and `winning_outcome_index` stay the poll's first sighting. Reconcile still uses the poll's time. Making reconcile prefer the websocket time needs a migration: a column such as `resolved_at_ws`, with `reconciliations_official_at_source_check` widened to admit `limitless_ws`. That comes once the two clocks have been compared on real markets.
 
-Unknown slugs are never inserted. Automated markets would swamp `v_limitless_cadence`. An event for a slug the table does not have stays queued in the object. It is looked up again after 30 min and after 3 h, then dropped and counted in the day summary (`meta.unknown_dropped`, with up to 10 sample slugs). A manual market the poll never saw before it resolved is not recorded by either path.
+Unknown slugs are never inserted. Automated markets would swamp `v_limitless_cadence`. An event for a slug the table does not have stays queued in the object. It is looked up once more after 2 min (a poll insert racing the event), then dropped and counted in the day summary (`meta.unknown_dropped`, with up to 10 sample slugs). Later lookups could not help: the poll imports only manual markets from `/markets/active`, so a market already resolved is never inserted afterwards. A manual market the poll never saw before it resolved is not recorded by either path.
 
-Compare the websocket and the poll:
+Every 10 min the alarm cross-checks the rows the poll resolved in the last day that carry `meta.ws`, once per slug: an index that differs from `winning_outcome_index`, or a `resolution_date` outside `(last_pending_at, resolved_seen_at]`, raises `limitless_ws_index_disagrees`. The flush also compares the indexes in the rarer order (poll first). Compare the websocket and the poll by hand:
 
 ```sql
 select slug, expiration_at, last_pending_at, resolved_seen_at, winning_outcome_index,
@@ -148,22 +148,31 @@ select slug, expiration_at, last_pending_at, resolved_seen_at, winning_outcome_i
 ### One instance, liveness, deploys
 
 - **One instance.** There is one instance, named `limitless-lifecycle`. The cron's `pingListener()` is the only code that addresses it, and any other name is refused. The object holds the socket 24/7, which comes to 128 MB × 86,400 s = 10,800 GB-s a day.
-- **Workers Free.** Free includes 13,000 GB-s a day, so exactly one instance fits. A second would pass the limit, and past any free limit "further operations of that type will fail" until 00:00 UTC.
+- **Workers Free.** Free includes 13,000 GB-s a day **per account**, shared with every other Worker on the account (OilFlow and the email Workers included). This instance alone uses 83% of it. Past any free limit "further operations of that type will fail" until 00:00 UTC, for every Durable Object on the account. Do not enable the listener on Free without checking the account's Durable Object duration in the dashboard first; Workers Paid is the intended home.
 - **Workers Paid.** Paid includes 400,000 GB-s a month, and this uses about 328,000. Requests and storage are far inside the included amounts either way.
-- **Alarm.** The object runs a 60 s alarm. It reconnects when due, with a backoff of 1 s doubling to 60 s, reset after a minute of stable connection. It drops a socket that has had no server ping for 2 intervals (50 s). It also drops one that has had no subscription confirmation 30 s after the namespace ack. It flushes the queue, writes `loop_runs` and raises alerts.
+- **Alarm.** The object runs a 60 s alarm. It reconnects when due, with a backoff of 1 s doubling to 60 s, reset after a minute of stable connection. It drops a socket that has had no server ping for pingInterval + pingTimeout (85 s), as an Engine.IO v4 client does. It also drops one that has had no subscription confirmation 30 s after the namespace ack. It flushes the queue, writes `loop_runs` and raises alerts.
 - **Why the alarm matters.** An outbound socket keeps the object in memory for 15 minutes at most. After that, the alarm is what stops the 70-140 s idle eviction.
-- **Cron ping.** The every-minute cron also pings the object. This creates it on the first deploy and restarts it after an eviction.
+- **Cron ping.** The every-minute cron also pings the object, after the channel poster (a connect can take up to 10 s). This creates it on the first deploy, with `locationHint: "enam"` (next to Supabase us-east-1; the location is permanent), and restarts it after an eviction.
 - **Deploys.** Every deploy shuts the object down. The stored alarm, or the next cron ping, reconnects within about a minute. Events emitted during that gap are not replayed. The poll still covers those markets.
-- **Off switch.** Set `LIMITLESS_WS_ENABLED = "0"` in wrangler.toml `[vars]` and deploy. The cron stops pinging, and the object clears its alarm and stays idle. Its queue is kept for when it is switched back on.
+- **Switch.** Only `LIMITLESS_WS_ENABLED = "1"` in wrangler.toml `[vars]` runs the listener; it ships `"0"`. Off: the cron stops pinging, and the object clears its alarm, forgets its outage clock (switching back on is not an outage) and stays idle. Its queue is kept for when it is switched back on.
+
+### Turning it on (post-deploy check)
+
+The outbound websocket was verified from Node on the laptop only, not through workerd (`fetch` + `Upgrade: websocket` -> `res.webSocket`) and not from Cloudflare egress, which has refused other providers before (the Base RPCs). So:
+
+1. Optionally first run it under `wrangler dev` with `LIMITLESS_WS_ENABLED=1` and watch `GET /status` on the object reach `phase: "open", subscribed: true`.
+2. Deploy the change to `"1"` on its own, with nothing else in the deploy.
+3. Within 2 minutes there must be a row: `select started_at, meta from loop_runs where loop_name = 'limitless_ws' and meta->>'kind' = 'connected' order by started_at desc limit 1;` and no `job_limitless_ws_exception` in `alerts`.
+4. If not, set it back to `"0"` and deploy: a refused upgrade loops connect failures and bills full duration.
 
 ### Alerts and rows
 
 | Key | When | First look |
 |---|---|---|
-| `limitless_ws_down` (dedup 6 h) | no connection that stayed subscribed for a minute, for 15 min; once per outage | `select started_at, outcome, error, meta from loop_runs where loop_name = 'limitless_ws' order by started_at desc limit 10;` (`meta.last_close`, `meta.attempts`) |
+| `limitless_ws_down` (dedup 15 min) | no connection that stayed subscribed for a minute, for 15 min; once per outage | `select started_at, outcome, error, meta from loop_runs where loop_name = 'limitless_ws' order by started_at desc limit 10;` (`meta.last_close`, `meta.attempts`) |
 | `limitless_ws_recovered` (dedup 1 h) | stable again after an outage that alerted | nothing to do |
 | `limitless_ws_schema` (dedup 24 h) | a `marketResolved` payload the listener refuses (a missing or non-date `resolutionDate`, a bad slug, a date more than 5 min in the future) | `parseResolved` in `src/jobs/limitless-ws.ts` |
-| `limitless_ws_index_disagrees` (dedup 6 h) | the websocket's `winningIndex` differs from the poll's `winning_outcome_index` | both are on the row; nothing picks between them |
+| `limitless_ws_index_disagrees` (dedup 6 h; slugs found inside the window wait for the next send) | the websocket's `winningIndex` differs from the poll's `winning_outcome_index`, or its `resolutionDate` is outside `(last_pending_at, resolved_seen_at]` (flush and the 10-min cross-check) | both are on the row; nothing picks between them |
 | `limitless_ws_write_failing` (dedup 6 h) | 15 alarms in a row could not read `limitless_markets` or call the RPC | the alert's error text. Events stay queued for up to 7 days |
 | `job_limitless_ws_exception` (dedup 1 h) | the cron's ping threw (the binding is missing, or the object is failing) | `wrangler tail`, and the Durable Objects page of the dashboard |
 

@@ -20,8 +20,8 @@
  * Wall time: pg_net hangs up after 30 s and Cloudflare then cancels the invocation, so no request starts after
  * RUN_DEADLINE_MS, the loop_runs row (which decides the answer) is written before the alert, and the alert (a Telegram
  * DM that can take longer than the whole run) goes out under waitUntil when the route gives one.
- * The marketResolved websocket (exact resolutionDate) needs a Durable Object on Workers Paid:
- * docs/runbooks/limitless-recorder.md.
+ * The exact resolutionDate from the marketResolved websocket is recorded in meta.ws by the LimitlessListener Durable
+ * Object (src/jobs/limitless-ws.ts); see docs/runbooks/limitless-recorder.md.
  */
 import { z } from "zod";
 import type { Env } from "../env";

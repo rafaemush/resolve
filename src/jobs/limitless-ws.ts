@@ -17,20 +17,29 @@
  * resolved_seen_at is NOT set: it is the poll's first sighting (reconcile reads it as official_at, limitless_api_poll),
  * set once, and it could never be cross-checked against the poll if the websocket wrote it first. Unknown slugs are
  * never inserted: the lifecycle channel also carries every automated market (BTC/ETH 5-minute markets), which would
- * swamp v_limitless_cadence. A slug the table lacks stays queued and is looked up again 30 min and 3 h later
- * (UNKNOWN_RETRY_MS; the poll inserts a manual market the first time its feed rotation sees it), then dropped and
- * counted in the day summary. The runbook (docs/runbooks/limitless-recorder.md) has the SQL that reads meta.ws.
+ * swamp v_limitless_cadence. A slug the table lacks is looked up once more 2 min later (UNKNOWN_RETRY_MS: a poll insert
+ * racing the event), then dropped and counted in the day summary. Later lookups could not help: the poll imports only
+ * manual markets from /markets/active, so a market already resolved is never inserted afterwards. The runbook
+ * (docs/runbooks/limitless-recorder.md) has the SQL that reads meta.ws.
+ *
+ * Cross-check. At flush time the poll has usually not seen the outcome yet (it polls every 10 min), so every
+ * CROSS_CHECK_MS the alarm also reads the rows the poll resolved in the last day that carry meta.ws, and alerts
+ * (limitless_ws_index_disagrees) when meta.ws.winning_index is not winning_outcome_index or resolution_date is outside
+ * (last_pending_at, resolved_seen_at]. Each slug is checked once (state.checked, kept 2 days).
  *
  * Liveness. A 60 s alarm: reconnect when due (backoff 1 s doubling to 60 s, half jittered, reset after 60 s of stable
- * connection), drop a socket with no server ping for 2 ping intervals (50 s) or no subscription confirmation 30 s after
+ * connection), drop a socket with no server ping for pingInterval + pingTimeout (85 s, as an Engine.IO v4 client) or no subscription confirmation 30 s after
  * the namespace ack, flush the queue, write loop_runs, raise alerts. The alarm also keeps the object in memory: an
  * outbound websocket defers eviction for 15 min at most, then an object with no incoming event for 70-140 s is evicted
  * (Durable Object lifecycle docs, read 2026-09-28). The every-minute cron pings the object (pingListener), which creates
  * it on the first deploy and restarts it after an eviction even if an alarm were lost. No stable connection for 15 min:
- * one alert (limitless_ws_down, dedup 6 h, once per outage), then limitless_ws_recovered. loop_runs (loop_name
+ * one alert (limitless_ws_down, once per outage; dedup 15 min, so a second outage is never swallowed by the first's), then limitless_ws_recovered. loop_runs (loop_name
  * limitless_ws): one row per (re)connect, one per outage alert, one per UTC day with the counters; never per message.
  *
- * Off switch: wrangler.toml LIMITLESS_WS_ENABLED = "0" and a deploy; the object then clears its alarm and stays idle.
+ * Switch: wrangler.toml LIMITLESS_WS_ENABLED; only "1" runs it. It ships "0": the workerd outbound-websocket path and
+ * Cloudflare egress to ws.limitless.exchange are not yet verified (the smoke run used Node), and the Durable Object
+ * duration allowance is per account. Turn it on in its own deploy (runbook: post-deploy check). Off: the object clears
+ * its alarm, forgets its outage clock and stays idle.
  *
  * On deploy. Cloudflare shuts every Durable Object down on a code update. The socket goes without a close event; the
  * stored alarm or the next cron ping (at most ~60 s) starts the new code, which reconnects. Limitless does not replay
@@ -39,12 +48,16 @@
  *
  * Cost (Durable Objects pricing page, read 2026-09-28). An accepted websocket bills duration for as long as it is open
  * and the object cannot hibernate: 128 MB x 86,400 s = 10,800 GB-s a day for the one instance.
- *   Workers Free: 13,000 GB-s/day included; a second instance would pass it, and past any free limit "further operations
- *     of that type will fail" until 00:00 UTC. Requests 100,000/day (~1,440 alarms + 1,440 cron pings + incoming
- *     messages, at most ~5,000). SQLite rows written 100,000/day (~1,500 state saves + ~6 per resolved event).
+ *   Workers Free: 13,000 GB-s/day included PER ACCOUNT (shared with every other Worker on account 2669bd..., OilFlow
+ *     included); this one instance uses 83% of it alone, and past any free limit "further operations of that type will
+ *     fail" until 00:00 UTC for every Durable Object on the account. Enable it on Free only after checking the account's
+ *     Durable Object duration in the dashboard; Workers Paid is the intended home. Requests 100,000/day (~1,440 alarms + 1,440 cron pings + incoming
+ *     messages, at most ~5,000). SQLite rows written 100,000/day (~1,500 state saves + ~2 per
+ *     resolved event, ~4 for an unknown slug: put, requeue put + delete, delete).
  *   Workers Paid: 400,000 GB-s/month included vs ~328,000 used (10,800 x 30.4), so $0 beyond the base fee; incoming
  *     websocket messages bill 20:1 against 1M requests/month; storage is far inside the included amounts.
- * Per alarm at most 13 of 50 subrequests: connect 1 + FLUSH_BATCHES_PER_ALARM x (select + RPC) + loop_runs 1 + one alertMany (5).
+ * Per alarm at most 14 of 50 subrequests: connect 1 + FLUSH_BATCHES_PER_ALARM x (select + RPC) + cross-check 1 + loop_runs 1
+ * + one alertMany (5).
  */
 import { z } from "zod";
 import type { Env } from "../env";
@@ -55,19 +68,20 @@ import { botUa } from "../ops/ua";
 import { GIVE_UP_DAYS, type Observation } from "./limitless-recorder";
 import { emitFrame, namespaceConnect, parseFrame, pongFrame, type SocketPacket } from "./limitless-ws-protocol";
 
-/** The one instance. Two would pass Workers Free's 13,000 GB-s a day (header). */
+/** The one instance. Two would pass Workers Free's 13,000 GB-s a day, an allowance shared by the whole account (header). */
 export const LISTENER_NAME = "limitless-lifecycle";
-/** wrangler.toml LIMITLESS_WS_ENABLED = "0" switches the listener off: the cron stops pinging and the object closes its socket and clears its alarm. */
-export const listenerEnabled = (env: Pick<Env, "LIMITLESS_WS_ENABLED">): boolean => env.LIMITLESS_WS_ENABLED?.trim() !== "0";
+/** Where the one instance is created (permanently): eastern North America, next to Supabase (us-east-1). */
+export const LOCATION_HINT = "enam";
+/** Only wrangler.toml LIMITLESS_WS_ENABLED = "1" runs the listener; anything else (unset included) is off: the cron stops pinging and the object closes its socket and clears its alarm. */
+export const listenerEnabled = (env: Pick<Env, "LIMITLESS_WS_ENABLED">): boolean => env.LIMITLESS_WS_ENABLED?.trim() === "1";
 export const WS_URL = "https://ws.limitless.exchange/socket.io/?EIO=4&transport=websocket";
 export const NAMESPACE = "/markets";
 export const SUBSCRIBE_EVENT = "subscribe_market_lifecycle";
 export const LOOP_NAME = "limitless_ws";
 export const LIVENESS_ALARM_MS = 60_000;
-/** Until the open packet says otherwise (it said 25,000 on 2026-09-28). */
+/** Until the open packet says otherwise (it said 25,000 and 60,000 on 2026-09-28). No server ping for pingInterval + pingTimeout is a dead connection, as for an Engine.IO v4 client. */
 export const DEFAULT_PING_INTERVAL_MS = 25_000;
-/** No server ping for this many intervals is a dead connection, whatever the socket says. */
-export const STALE_PING_INTERVALS = 2;
+export const DEFAULT_PING_TIMEOUT_MS = 60_000;
 /** After the namespace ack, the "Subscribed to market lifecycle events" system message (or any lifecycle event) must come within this. */
 export const SUBSCRIBE_TIMEOUT_MS = 30_000;
 export const BACKOFF_BASE_MS = 1_000;
@@ -76,17 +90,25 @@ export const BACKOFF_MAX_MS = 60_000;
 export const STABLE_MS = 60_000;
 export const CONNECT_TIMEOUT_MS = 10_000;
 export const DOWN_ALERT_MS = 15 * 60_000;
-export const DOWN_ALERT_DEDUP_MINUTES = 360;
+/** Once per outage is kept in state; the dedup only has to stop a double send, so it is the threshold itself (a new outage alerts at the earliest 15 min after it starts, which is after any earlier outage's alert). */
+export const DOWN_ALERT_DEDUP_MINUTES = 15;
 export const RECOVERED_DEDUP_MINUTES = 60;
 export const SCHEMA_DEDUP_MINUTES = 1440;
 export const DISAGREE_DEDUP_MINUTES = 360;
+export const DISAGREE_KEY = "limitless_ws_index_disagrees";
 export const WRITE_FAILING_ALERTS = 15;
 export const WRITE_FAILING_DEDUP_MINUTES = 360;
 /** Slugs per select + RPC (the select's in.(...) list stays well under PostgREST's URL limit). */
 export const FLUSH_BATCH = 50;
 export const FLUSH_BATCHES_PER_ALARM = 3;
-/** When a slug the table does not have is looked up again; after the last one the event is dropped. */
-export const UNKNOWN_RETRY_MS = [30 * 60_000, 3 * 3_600_000] as const;
+/** When a slug the table does not have is looked up again (a poll insert racing the event); after the last one the event is dropped. */
+export const UNKNOWN_RETRY_MS = [2 * 60_000] as const;
+/** How often the alarm cross-checks meta.ws against the poll's sighting, over rows the poll resolved in the last CROSS_CHECK_LOOKBACK_MS. */
+export const CROSS_CHECK_MS = 10 * 60_000;
+export const CROSS_CHECK_LOOKBACK_MS = 86_400_000;
+/** A checked slug is remembered this long (longer than the lookback, so it is never checked twice). */
+export const CHECKED_KEEP_MS = 2 * 86_400_000;
+export const CHECKED_MAX = 5_000;
 /** A queued event this old is dropped whatever happened (a database down for a week). */
 export const MAX_EVENT_AGE_MS = 7 * 86_400_000;
 /** A resolutionDate this far past the moment the event arrived is a clock or unit error, never kept. */
@@ -190,7 +212,7 @@ export function planBatch(entries: Array<[string, QueuedEvent]>, known: Map<stri
     if (!(age <= MAX_EVENT_AGE_MS)) { plan.expired++; continue; }
     const row = known.get(ev.slug);
     if (!row) {
-      const wait = UNKNOWN_RETRY_MS[ev.tries];
+      const wait = (UNKNOWN_RETRY_MS as readonly number[])[ev.tries];
       if (wait === undefined) { plan.unknown_dropped++; plan.dropped_slugs.push(ev.slug); continue; }
       plan.requeue.push([queueKey(now + wait, ev.slug, ev.resolution_date), { ...ev, tries: ev.tries + 1 }]);
       plan.unknown_retried++;
@@ -209,6 +231,36 @@ export function planBatch(entries: Array<[string, QueuedEvent]>, known: Map<stri
   }
   plan.rows = [...patches].map(([slug, meta]) => metaOnlyObservation(slug, meta));
   return plan;
+}
+
+/** A row the poll resolved, as the cross-check reads it. */
+export interface ResolvedRow {
+  slug: string; winning_outcome_index: number | null; last_pending_at: string | null; resolved_seen_at: string | null;
+  meta: Record<string, unknown> | null;
+}
+
+/**
+ * Pure. The rows the poll resolved that carry meta.ws and were not checked yet -> the slugs now checked and the ones
+ * that disagree: meta.ws.winning_index is not winning_outcome_index (both set), or meta.ws.resolution_date is outside
+ * (last_pending_at, resolved_seen_at]. A row without meta.ws yet is left for a later pass.
+ */
+export function crossCheck(rows: ResolvedRow[], checked: Record<string, number>): { checked: string[]; disagreements: Array<{ slug: string; reason: string }> } {
+  const out = { checked: [] as string[], disagreements: [] as Array<{ slug: string; reason: string }> };
+  for (const r of rows) {
+    const ws = r.meta?.ws as Partial<WsRecord> | undefined;
+    if (!ws || typeof ws !== "object" || !r.resolved_seen_at || checked[r.slug] !== undefined) continue;
+    out.checked.push(r.slug);
+    const reasons: string[] = [];
+    if (typeof r.winning_outcome_index === "number" && typeof ws.winning_index === "number" && ws.winning_index !== r.winning_outcome_index) {
+      reasons.push(`index ${ws.winning_index} vs poll ${r.winning_outcome_index}`);
+    }
+    const t = Date.parse(String(ws.resolution_date));
+    const lo = r.last_pending_at ? Date.parse(r.last_pending_at) : -Infinity;
+    const hi = Date.parse(r.resolved_seen_at);
+    if (!(t > lo && t <= hi)) reasons.push(`resolution_date ${ws.resolution_date} outside (${r.last_pending_at ?? "-"}, ${r.resolved_seen_at}]`);
+    if (reasons.length) out.disagreements.push({ slug: r.slug, reason: reasons.join("; ") });
+  }
+  return out;
 }
 
 // ---- persisted state ------------------------------------------------------------------------------------------------
@@ -247,6 +299,9 @@ export interface ListenerState {
   write_error: string | null;
   schema_drift: string | null;
   disagreements: string[];
+  /** Slugs the cross-check (or the flush) already compared with the poll -> when; pruned after CHECKED_KEEP_MS. */
+  checked: Record<string, number>;
+  last_cross_check_at: number;
   /** Time accounting: connected_ms / down_ms are counted up to here. */
   acct_at: number;
   day: string;
@@ -260,7 +315,7 @@ export function restoreState(saved: Partial<ListenerState> | undefined, now: num
   const fresh: ListenerState = {
     down_since: now, attempts: 0, next_connect_at: 0, last_alive_at: null, last_close: null, last_error: null,
     alerted_down_since: null, recovered: null, write_failures: 0, write_error: null, schema_drift: null, disagreements: [],
-    acct_at: now, day: utcDay(now), counters: zeroCounters(), dropped_sample: [], pending_runs: [],
+    checked: {}, last_cross_check_at: 0, acct_at: now, day: utcDay(now), counters: zeroCounters(), dropped_sample: [], pending_runs: [],
   };
   if (!saved || typeof saved !== "object") return fresh;
   const s: ListenerState = { ...fresh, ...saved, counters: { ...zeroCounters(), ...(saved.counters ?? {}) } };
@@ -299,6 +354,7 @@ export class LimitlessListener {
   private connectedAt = 0;
   private lastPingAt = 0;
   private pingIntervalMs = DEFAULT_PING_INTERVAL_MS;
+  private pingTimeoutMs = DEFAULT_PING_TIMEOUT_MS;
   private subscribed = false;
 
   constructor(private readonly ctx: DurableObjectState, private readonly env: Env) {
@@ -335,9 +391,17 @@ export class LimitlessListener {
       this.rollDay(now);
       await this.tick(now);
       await this.flush(Date.now());
+      await this.crossCheckDue(Date.now());
       const alerts = this.alertsDue(Date.now());
       await this.writeRuns();
-      if (alerts.length) await alertMany(this.env, alerts);
+      if (alerts.length) {
+        const r = await alertMany(this.env, alerts);
+        // Disagreements stay pending until an alert actually goes out, so one found inside the dedup window is not lost.
+        if (r.sent.includes(DISAGREE_KEY)) {
+          const sent = new Set((alerts.find((a) => a.key === DISAGREE_KEY)?.meta?.slugs as string[] | undefined) ?? []);
+          this.s.disagreements = this.s.disagreements.filter((x) => !sent.has(x));
+        }
+      }
     } catch (e) {
       console.error(JSON.stringify({ level: "error", job: LOOP_NAME, error: redact(String(e)).slice(0, 300) }));
     } finally {
@@ -346,7 +410,10 @@ export class LimitlessListener {
     }
   }
 
-  /** LIMITLESS_WS_ENABLED = "0": close the socket, clear the alarm, keep the queue and the state (true = switched off). */
+  /**
+   * Switched off: close the socket, clear the alarm, keep the queue and the counters, and forget the outage clock, so
+   * switching back on starts it at that moment instead of alerting the whole off period as an outage (true = off).
+   */
   private async switchedOff(): Promise<boolean> {
     if (listenerEnabled(this.env)) return false;
     const sock = this.sock;
@@ -354,6 +421,10 @@ export class LimitlessListener {
     this.phase = "idle";
     this.subscribed = false;
     if (sock) try { sock.close(1000, "switched off"); } catch { /* already closing */ }
+    const s = this.s, now = Date.now();
+    this.account(now);
+    s.down_since = null; s.alerted_down_since = null; s.last_alive_at = null; s.recovered = null; s.attempts = 0; s.next_connect_at = 0;
+    await this.save().catch(() => {});
     await this.ctx.storage.deleteAlarm();
     return true;
   }
@@ -399,6 +470,7 @@ export class LimitlessListener {
     this.subscribed = false;
     this.lastPingAt = Date.now(); // the handshake gets the same two intervals as a ping
     this.pingIntervalMs = DEFAULT_PING_INTERVAL_MS;
+    this.pingTimeoutMs = DEFAULT_PING_TIMEOUT_MS;
     sock.addEventListener("message", (ev) => this.onFrame(sock, ev.data));
     sock.addEventListener("close", (ev) => this.gone(sock, ev.code ?? null, `closed by the server${ev.reason ? `: ${ev.reason}` : ""}`));
     sock.addEventListener("error", (ev) => this.gone(sock, null, `socket error${(ev as { message?: string }).message ? `: ${(ev as { message?: string }).message}` : ""}`));
@@ -438,10 +510,10 @@ export class LimitlessListener {
     void this.save().then(() => this.arm(Date.now(), false)).catch(() => {});
   }
 
-  /** A socket with no server ping for STALE_PING_INTERVALS, or never confirmed subscribed, is dropped and reconnected. */
+  /** A socket with no server ping for pingInterval + pingTimeout, or never confirmed subscribed, is dropped and reconnected. */
   private checkHealth(now: number): void {
     if (!this.sock) return;
-    const limit = STALE_PING_INTERVALS * this.pingIntervalMs;
+    const limit = this.pingIntervalMs + this.pingTimeoutMs;
     const quiet = now - this.lastPingAt;
     if (quiet > limit) {
       this.s.counters.stale_drops++;
@@ -481,6 +553,7 @@ export class LimitlessListener {
     switch (f.kind) {
       case "open":
         this.pingIntervalMs = f.pingInterval;
+        this.pingTimeoutMs = f.pingTimeout;
         this.lastPingAt = now;
         this.phase = "namespace";
         this.send(namespaceConnect(NAMESPACE));
@@ -615,11 +688,37 @@ export class LimitlessListener {
       c.written += plan.written; c.duplicate += plan.duplicate; c.changed += plan.changed; c.unknown_retried += plan.unknown_retried;
       c.unknown_dropped += plan.unknown_dropped; c.expired += plan.expired; c.disagreements += plan.disagreements.length;
       for (const slug of plan.dropped_slugs) if (s.dropped_sample.length < DROPPED_SAMPLE_MAX) s.dropped_sample.push(slug);
-      for (const slug of plan.disagreements) if (s.disagreements.length < 20 && !s.disagreements.includes(slug)) s.disagreements.push(slug);
+      for (const slug of plan.disagreements) { this.addDisagreement(slug); s.checked[slug] = now; }
       if (due.size < FLUSH_BATCH) break;
     }
     if (failed) { s.write_failures++; s.write_error = failed; s.counters.write_errors++; }
     else { s.write_failures = 0; s.write_error = null; }
+  }
+
+  private addDisagreement(slug: string): void {
+    const d = this.s.disagreements;
+    if (d.length < 20 && !d.includes(slug)) d.push(slug);
+  }
+
+  /** Every CROSS_CHECK_MS: rows the poll resolved in the last day that carry meta.ws, compared once each (crossCheck). */
+  private async crossCheckDue(now: number): Promise<void> {
+    const s = this.s;
+    if (now - s.last_cross_check_at < CROSS_CHECK_MS) return;
+    s.last_cross_check_at = now;
+    for (const [slug, t] of Object.entries(s.checked)) if (now - t > CHECKED_KEEP_MS) delete s.checked[slug];
+    try {
+      const { data, error } = await db(this.env).from("limitless_markets")
+        .select("slug, winning_outcome_index, last_pending_at, resolved_seen_at, meta")
+        .gte("resolved_seen_at", iso(now - CROSS_CHECK_LOOKBACK_MS));
+      if (error) throw new Error(error.message);
+      const r = crossCheck((data ?? []) as ResolvedRow[], s.checked);
+      for (const slug of r.checked) s.checked[slug] = now;
+      for (const d of r.disagreements) { this.addDisagreement(d.slug); s.counters.disagreements++; }
+      const keys = Object.keys(s.checked);
+      for (let i = 0; i < keys.length - CHECKED_MAX; i++) delete s.checked[keys[i]!];
+    } catch (e) {
+      console.error(JSON.stringify({ level: "error", job: LOOP_NAME, error: `cross-check: ${redact(String(e)).slice(0, 300)}` }));
+    }
   }
 
   private pushRun(row: LoopRow): void {
@@ -688,8 +787,8 @@ export class LimitlessListener {
       s.schema_drift = null;
     }
     if (s.disagreements.length) {
-      out.push({ key: "limitless_ws_index_disagrees", dedupMinutes: DISAGREE_DEDUP_MINUTES, text: `The websocket's winningIndex differs from the poll's winning_outcome_index for ${s.disagreements.length} market(s): ${s.disagreements.slice(0, 5).join(", ")}. Both readings are on the row (meta.ws.winning_index, winning_outcome_index); nothing picks between them.`, meta: { slugs: s.disagreements.slice(0, 20) } });
-      s.disagreements = [];
+      // Cleared by alarm() only once alertMany says it was sent: one found inside the dedup window waits for the next send.
+      out.push({ key: DISAGREE_KEY, dedupMinutes: DISAGREE_DEDUP_MINUTES, text: `The websocket's marketResolved disagrees with the poll's sighting for ${s.disagreements.length} market(s): ${s.disagreements.slice(0, 5).join(", ")} (winningIndex differs from winning_outcome_index, or resolutionDate is outside (last_pending_at, resolved_seen_at]). Both readings are on the row (meta.ws, winning_outcome_index); nothing picks between them.`, meta: { slugs: s.disagreements.slice(0, 20) } });
     }
     if (s.write_failures >= WRITE_FAILING_ALERTS && s.write_failures % WRITE_FAILING_ALERTS === 0) {
       out.push({ key: "limitless_ws_write_failing", dedupMinutes: WRITE_FAILING_DEDUP_MINUTES, text: `The Limitless listener could not write to the database for ${s.write_failures} alarms in a row: ${s.write_error ?? "unknown error"}. Events stay queued in the Durable Object (up to 7 days) and are retried every minute.` });
@@ -741,7 +840,7 @@ export async function pingListener(env: Env): Promise<ListenerPing> {
   if (!listenerEnabled(env)) return { ok: true, http_status: 0, phase: "disabled", state: null };
   const ns = env.LIMITLESS_WS;
   if (!ns) throw new Error("the LIMITLESS_WS Durable Object binding is missing (wrangler.toml [[durable_objects.bindings]])");
-  const stub = ns.get(ns.idFromName(LISTENER_NAME));
+  const stub = ns.get(ns.idFromName(LISTENER_NAME), { locationHint: LOCATION_HINT });
   const res = await stub.fetch("https://limitless-listener.internal/ensure", { method: "POST" });
   let state: unknown = null;
   try { state = await res.json(); } catch { /* a non-JSON answer: the status says enough */ }

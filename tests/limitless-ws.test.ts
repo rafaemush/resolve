@@ -29,7 +29,7 @@ vi.mock("../src/ops/alerts", () => ({
 }));
 
 import {
-  backoffMs, daySummaryRow, metaOnlyObservation, parseResolved, pingListener, planBatch, queueKey, restoreState,
+  backoffMs, crossCheck, daySummaryRow, LOCATION_HINT, metaOnlyObservation, parseResolved, pingListener, planBatch, queueKey, restoreState,
   listenerEnabled, LimitlessListener, BACKOFF_MAX_MS, DOWN_ALERT_DEDUP_MINUTES, DOWN_ALERT_MS, LISTENER_NAME, LISTENER_PING_SUBREQUESTS, LIVENESS_ALARM_MS,
   LOOP_NAME, MAX_EVENT_AGE_MS, QUEUE_PREFIX, STABLE_MS, STATE_KEY, SUBSCRIBE_EVENT, SUBSCRIBE_TIMEOUT_MS, UNKNOWN_RETRY_MS, WS_URL,
   type KnownRow, type ListenerState, type QueuedEvent,
@@ -88,7 +88,7 @@ function fakeStorage(initial: Record<string, unknown> = {}) {
 }
 type Storage = ReturnType<typeof fakeStorage>;
 
-const env = { SUPABASE_URL: "u", SUPABASE_SERVICE_ROLE_KEY: "k", RESOLVE_BOT_UA } as unknown as Env;
+const env = { SUPABASE_URL: "u", SUPABASE_SERVICE_ROLE_KEY: "k", RESOLVE_BOT_UA, LIMITLESS_WS_ENABLED: "1" } as unknown as Env;
 const T0 = Date.parse("2026-09-28T10:00:00.000Z");
 const at = (ms: number) => new Date(ms).toISOString();
 const flushMicrotasks = () => new Promise((r) => setTimeout(r, 0));
@@ -112,6 +112,11 @@ function makeDb(rows: Row[] = []) {
         const t = db.tables.limitless_markets!;
         let inserted = 0, updated = 0;
         for (const r of a.p_rows as Array<Record<string, any>>) {
+          // In the SQL, coalesce(excluded.x, t.x) would overwrite any non-null column: the listener may send nothing but meta.
+          for (const [k, v] of Object.entries(r)) {
+            if (k === "slug" || k === "meta") continue;
+            if (v !== null && v !== false) throw new Error(`the listener sent ${k} = ${JSON.stringify(v)}; only meta may move`);
+          }
           const ex = t.find((x) => x.slug === r.slug);
           if (!ex) { inserted++; t.push({ slug: r.slug, meta: r.meta }); continue; }
           updated++;
@@ -142,7 +147,8 @@ beforeEach(() => {
   vi.useFakeTimers({ toFake: ["Date"] });
   vi.setSystemTime(T0);
   vi.spyOn(Math, "random").mockReturnValue(0);
-  vi.mocked(alertMany).mockClear();
+  vi.mocked(alertMany).mockReset();
+  vi.mocked(alertMany).mockImplementation(async (_env, items) => ({ sent: items.map((i) => i.key), deduped: [] }));
   h.rpcError = null; h.selectError = null;
   sockets = []; fetches = []; upgrade = [];
   makeDb();
@@ -251,11 +257,11 @@ describe("marketResolved payload, backoff and the flush plan (pure)", () => {
   });
 
   it("queue keys sort by due time, so the earliest due is listed first", () => {
-    const keys = [queueKey(T0 + 1000, "b", date), queueKey(T0, "z", date), queueKey(T0 + UNKNOWN_RETRY_MS[1], "a", date)];
+    const keys = [queueKey(T0 + 1000, "b", date), queueKey(T0, "z", date), queueKey(T0 + UNKNOWN_RETRY_MS[0] + 1, "a", date)];
     expect([...keys].sort()).toEqual([keys[1], keys[0], keys[2]]);
   });
 
-  it("planBatch: first event -> meta.ws, same again -> duplicate, different -> meta.ws_latest; unknown -> retried then dropped", () => {
+  it("planBatch: first event -> meta.ws, same again -> duplicate, different -> meta.ws_latest; unknown -> retried once then dropped", () => {
     const ev = (slug: string, idx: number, d = date, tries = 0): QueuedEvent => ({ ...(parseResolved({ slug, type: "CLOB", winningIndex: idx, winningOutcome: idx ? "NO" : "YES", resolutionDate: d }, T0) as QueuedEvent), tries });
     const known = new Map<string, KnownRow>([
       ["k1", { slug: "k1", winning_outcome_index: null, meta: {} }],
@@ -266,11 +272,12 @@ describe("marketResolved payload, backoff and the flush plan (pure)", () => {
       ["q4", ev("k2", 1)], ["q5", ev("u1", 1)], ["q6", ev("u2", 1, date, 1)], ["q7", ev("u3", 1, date, 2)],
       ["q8", { ...ev("k1", 1), received_at: at(T0 - MAX_EVENT_AGE_MS - 1) }],
     ], known, T0);
-    expect(p).toMatchObject({ written: 1, duplicate: 2, changed: 1, unknown_retried: 2, unknown_dropped: 1, expired: 1, dropped_slugs: ["u3"], disagreements: [] });
+    expect(p).toMatchObject({ written: 1, duplicate: 2, changed: 1, unknown_retried: 1, unknown_dropped: 2, expired: 1, dropped_slugs: ["u2", "u3"], disagreements: [] });
     expect(p.remove).toEqual(["q1", "q2", "q3", "q4", "q5", "q6", "q7", "q8"]);
     expect(p.requeue.map(([k, e]) => [k, e.slug, e.tries])).toEqual([
-      [queueKey(T0 + UNKNOWN_RETRY_MS[0], "u1", date), "u1", 1], [queueKey(T0 + UNKNOWN_RETRY_MS[1], "u2", date), "u2", 2],
+      [queueKey(T0 + UNKNOWN_RETRY_MS[0], "u1", date), "u1", 1],
     ]);
+    expect(UNKNOWN_RETRY_MS).toEqual([2 * 60_000]);
     expect(p.rows).toHaveLength(1);
     expect(p.rows[0]).toEqual(metaOnlyObservation("k1", {
       ws: { resolution_date: date, winning_index: 1, winning_outcome: "NO", trade_type: "clob", received_at: at(T0), source: "limitless_ws" },
@@ -286,7 +293,11 @@ describe("marketResolved payload, backoff and the flush plan (pure)", () => {
   });
 
   it("the meta-only observation moves nothing but meta in record_limitless_observations", () => {
-    expect(metaOnlyObservation("k", { ws: {} })).toMatchObject({ observed: false, checked: false, observed_at: null, winning_outcome_index: null, void: false, container: false, expired: false });
+    expect(metaOnlyObservation("k", { ws: {} })).toEqual({
+      slug: "k", group_slug: null, container: false, condition_id: null, category: null, trade_type: null, automation_type: null,
+      market_type: null, expiration_at: null, platform_created_at: null, observed: false, observed_at: null, checked: false,
+      expired: false, winning_outcome_index: null, void: false, meta: { ws: {} },
+    });
   });
 
   it("restoreState: a new instance is down since it was last seen alive; the day summary fails on a 15-min outage", () => {
@@ -392,7 +403,7 @@ describe("LimitlessListener (the Durable Object)", () => {
     expect(alertKeys()).toContainEqual(["limitless_ws_index_disagrees", 360]);
   });
 
-  it("an unknown slug is never inserted: looked up again after 30 min and 3 h, then dropped and counted", async () => {
+  it("an unknown slug is never inserted: looked up once more after 2 min, then dropped and counted", async () => {
     const { obj, storage } = make();
     await ensure(obj);
     const sock = sockets[0]!;
@@ -405,14 +416,10 @@ describe("LimitlessListener (the Durable Object)", () => {
     const t1 = T0 + 60_000 + UNKNOWN_RETRY_MS[0];
     keepAlive(t1 - 1000);
     await alarmAt(obj, t1);
-    expect(queue(storage)).toEqual([queueKey(t1 + UNKNOWN_RETRY_MS[1], "synthetic-btc-5-min-1", at(T0 - 100))]);
-    const t2 = t1 + UNKNOWN_RETRY_MS[1];
-    keepAlive(t2 - 1000);
-    await alarmAt(obj, t2);
     expect(queue(storage)).toEqual([]);
     expect(rpcCalls).toEqual([]);
     expect(h.db.tables.limitless_markets).toEqual([]);
-    expect(saved(storage)).toMatchObject({ counters: { unknown_retried: 2, unknown_dropped: 1, written: 0 }, dropped_sample: ["synthetic-btc-5-min-1"] });
+    expect(saved(storage)).toMatchObject({ counters: { unknown_retried: 1, unknown_dropped: 1, written: 0 }, dropped_sample: ["synthetic-btc-5-min-1"] });
   });
 
   it("a failed database read or write keeps the event queued and retries it on the next alarm", async () => {
@@ -493,14 +500,16 @@ describe("LimitlessListener (the Durable Object)", () => {
     expect(saved(storage).counters.max_down_ms).toBe(t - T0);
   });
 
-  it("stale: no server ping for two intervals -> dropped by us and reconnected", async () => {
+  it("stale: no server ping for pingInterval + pingTimeout (85 s) -> dropped by us and reconnected", async () => {
     const { obj, storage } = make();
     await ensure(obj);
     const sock = sockets[0]!;
     sock.handshake();
-    await alarmAt(obj, T0 + 50_000); // exactly two intervals: still fine
+    await alarmAt(obj, T0 + 50_001); // one late ping is within the protocol's allowance
     expect(sock.closedBy).toBeNull();
-    await alarmAt(obj, T0 + 50_001);
+    await alarmAt(obj, T0 + 85_000); // exactly the limit: still fine
+    expect(sock.closedBy).toBeNull();
+    await alarmAt(obj, T0 + 85_001);
     expect(sock.closedBy).toMatchObject({ code: 1000 });
     expect(saved(storage)).toMatchObject({ counters: { stale_drops: 1 }, last_close: { reason: expect.stringContaining("stale") } });
     // a late frame from the dropped socket changes nothing
@@ -596,7 +605,7 @@ describe("LimitlessListener (the Durable Object)", () => {
     sock.handshake();
     vi.setSystemTime(T0 + 21 * 60_000 + 30_000); sock.recv("2");
     await alarmAt(obj, T0 + 22 * 60_000);
-    expect(alertKeys()).toEqual([["limitless_ws_down", 360], ["limitless_ws_recovered", 60]]);
+    expect(alertKeys()).toEqual([["limitless_ws_down", DOWN_ALERT_DEDUP_MINUTES], ["limitless_ws_recovered", 60]]);
     expect(saved(storage)).toMatchObject({ down_since: null, alerted_down_since: null, recovered: null });
   });
 
@@ -613,7 +622,7 @@ describe("LimitlessListener (the Durable Object)", () => {
       t += 60_000;
       await alarmAt(obj, t);
     }
-    expect(alertKeys()).toEqual([["limitless_ws_down", 360]]);
+    expect(alertKeys()).toEqual([["limitless_ws_down", DOWN_ALERT_DEDUP_MINUTES]]);
   });
 
   it("loop_runs: one row per reconnect and one per UTC day, never one per message", async () => {
@@ -658,8 +667,122 @@ describe("LimitlessListener (the Durable Object)", () => {
     expect(on.storage.alarm).toBeNull();
     expect(fetches).toHaveLength(1);
     expect(listenerEnabled({ LIMITLESS_WS_ENABLED: "1" })).toBe(true);
-    expect(listenerEnabled({})).toBe(true);
+    expect(listenerEnabled({})).toBe(false);
     expect(listenerEnabled({ LIMITLESS_WS_ENABLED: " 0 " })).toBe(false);
+  });
+
+  it("a second outage soon after an alerted one still alerts (the dedup is no longer than the threshold)", async () => {
+    // alertMany as it dedups: a key sent within its dedupMinutes is reported deduped, not sent
+    const last = new Map<string, number>();
+    vi.mocked(alertMany).mockImplementation(async (_e, items) => {
+      const sent: string[] = [], deduped: string[] = [];
+      for (const i of items) {
+        const t = last.get(i.key);
+        if (t !== undefined && Date.now() - t < (i.dedupMinutes ?? 60) * 60_000) deduped.push(i.key);
+        else { sent.push(i.key); last.set(i.key, Date.now()); }
+      }
+      return { sent, deduped };
+    });
+    const { obj } = make();
+    upgrade = Array(20).fill("throw");
+    await ensure(obj);
+    for (let m = 1; m <= 16; m++) await alarmAt(obj, T0 + m * 60_000);
+    expect(alertKeys()).toEqual([["limitless_ws_down", DOWN_ALERT_DEDUP_MINUTES]]);
+    // stable again for a minute
+    upgrade = [];
+    await alarmAt(obj, T0 + 17 * 60_000);
+    const sock = sockets.at(-1)!;
+    sock.handshake();
+    vi.setSystemTime(T0 + 17 * 60_000 + 30_000); sock.recv("2");
+    await alarmAt(obj, T0 + 18 * 60_000);
+    expect(alertKeys().map(([k]) => k)).toEqual(["limitless_ws_down", "limitless_ws_recovered"]);
+    // down again one minute later; the new outage's alert is not within DOWN_ALERT_DEDUP_MINUTES of the first
+    vi.setSystemTime(T0 + 19 * 60_000); sock.serverClose(1006, ""); await flushMicrotasks();
+    upgrade = Array(40).fill("throw");
+    const t0 = T0 + 19 * 60_000;
+    for (let m = 1; m <= 16; m++) await alarmAt(obj, t0 + m * 60_000);
+    const downs = (await Promise.all(vi.mocked(alertMany).mock.results.map((r) => r.value))).flatMap((r) => r.sent).filter((k) => k === "limitless_ws_down");
+    expect(downs).toHaveLength(2);
+  });
+
+  it("switched off for days, then on again: no outage alert for the off period", async () => {
+    const e = { ...env } as Env;
+    const { obj, storage } = make(fakeStorage(), LISTENER_NAME, e);
+    await ensure(obj);
+    sockets[0]!.handshake();
+    pingAt(sockets[0]!, T0 + 30_000);
+    await alarmAt(obj, T0 + 60_000);
+    expect(saved(storage).last_alive_at).toBe(T0 + 60_000);
+    e.LIMITLESS_WS_ENABLED = "0";
+    await alarmAt(obj, T0 + 120_000);
+    // three days later a deploy turns it back on: a new instance from the stored state
+    const later = T0 + 3 * 86_400_000;
+    vi.setSystemTime(later);
+    const on = make(storage, LISTENER_NAME, { ...env } as Env);
+    await ensure(on.obj);
+    vi.setSystemTime(later + 200);
+    sockets.at(-1)!.handshake();
+    pingAt(sockets.at(-1)!, later + 30_000);
+    await alarmAt(on.obj, later + 60_000);
+    pingAt(sockets.at(-1)!, later + 90_000);
+    await alarmAt(on.obj, later + 120_000);
+    expect(alertKeys()).toEqual([]);
+    expect(runs().filter((r) => r.meta.kind === "down")).toEqual([]);
+    expect(runs().filter((r) => r.meta.kind === "day" && r.outcome === "failure")).toEqual([]);
+  });
+
+  it("cross-check, normal order: websocket first, the poll resolves later with another index -> one alert per slug", async () => {
+    makeDb([{ slug: S1, winning_outcome_index: null, resolved_seen_at: null, last_pending_at: at(T0 - 600_000), meta: {} }]);
+    const { obj, storage } = make();
+    await ensure(obj);
+    const sock = sockets[0]!;
+    sock.handshake();
+    sock.recv(resolvedFrame(S1, 1, at(T0 - 200)));
+    pingAt(sock, T0 + 30_000);
+    await alarmAt(obj, T0 + 60_000);
+    expect(alertKeys()).toEqual([]);
+    // the poll sees the outcome 8 min later, with index 0
+    const row = h.db.tables.limitless_markets![0]!;
+    Object.assign(row, { winning_outcome_index: 0, resolved_seen_at: at(T0 + 8 * 60_000) });
+    let t = T0 + 60_000;
+    for (let i = 0; i < 12; i++) { t += 60_000; pingAt(sock, t - 10_000); await alarmAt(obj, t); }
+    expect(alertKeys()).toEqual([["limitless_ws_index_disagrees", 360]]);
+    expect(vi.mocked(alertMany).mock.calls.flatMap((c) => c[1]).find((i) => i.key === "limitless_ws_index_disagrees")!.meta).toEqual({ slugs: [S1] });
+    expect(saved(storage).checked[S1]).toBeDefined();
+    expect(saved(storage).disagreements).toEqual([]);
+    // checked once: later passes stay quiet
+    for (let i = 0; i < 12; i++) { t += 60_000; pingAt(sock, t - 10_000); await alarmAt(obj, t); }
+    expect(alertKeys()).toHaveLength(1);
+  });
+
+  it("a disagreement found inside the dedup window is kept and sent later, not dropped", async () => {
+    vi.mocked(alertMany).mockImplementationOnce(async (_e, items) => ({ sent: [], deduped: items.map((i) => i.key) }));
+    makeDb([{ slug: S1, winning_outcome_index: 0, resolved_seen_at: at(T0 - 60_000), meta: {} }]);
+    const { obj, storage } = make();
+    await ensure(obj);
+    sockets[0]!.handshake();
+    sockets[0]!.recv(resolvedFrame(S1, 1, at(T0 - 90_000)));
+    pingAt(sockets[0]!, T0 + 25_000);
+    await alarmAt(obj, T0 + 60_000);
+    expect(saved(storage).disagreements).toEqual([S1]);
+    pingAt(sockets[0]!, T0 + 100_000);
+    await alarmAt(obj, T0 + 120_000);
+    expect(saved(storage).disagreements).toEqual([]);
+    expect(alertKeys()).toEqual([["limitless_ws_index_disagrees", 360], ["limitless_ws_index_disagrees", 360]]);
+  });
+
+  it("crossCheck (pure): index and resolution window, rows without meta.ws left for later, checked slugs skipped", () => {
+    const ws = (i: number, d: string) => ({ ws: { resolution_date: d, winning_index: i } });
+    const rows = [
+      { slug: "a", winning_outcome_index: 1, last_pending_at: at(T0 - 600_000), resolved_seen_at: at(T0), meta: ws(1, at(T0 - 60_000)) },
+      { slug: "b", winning_outcome_index: 0, last_pending_at: at(T0 - 600_000), resolved_seen_at: at(T0), meta: ws(1, at(T0 - 60_000)) },
+      { slug: "c", winning_outcome_index: 1, last_pending_at: at(T0 - 600_000), resolved_seen_at: at(T0), meta: ws(1, at(T0 + 1)) },
+      { slug: "d", winning_outcome_index: 1, last_pending_at: at(T0 - 600_000), resolved_seen_at: at(T0), meta: {} },
+      { slug: "e", winning_outcome_index: 0, last_pending_at: null, resolved_seen_at: at(T0), meta: ws(1, at(T0 - 60_000)) },
+    ];
+    const r = crossCheck(rows, { e: T0 });
+    expect(r.checked).toEqual(["a", "b", "c"]);
+    expect(r.disagreements.map((d) => d.slug)).toEqual(["b", "c"]);
   });
 
   it("any instance but the named one refuses to run", async () => {
@@ -682,6 +805,8 @@ describe("pingListener (the every-minute cron's side)", () => {
     };
     const r = await pingListener({ ...env, LIMITLESS_WS: ns } as unknown as Env);
     expect(ns.idFromName).toHaveBeenCalledWith(LISTENER_NAME);
+    expect(ns.get).toHaveBeenCalledWith({ name: LISTENER_NAME }, { locationHint: "enam" });
+    expect(LOCATION_HINT).toBe("enam");
     expect(calls).toEqual([["https://limitless-listener.internal/ensure", { method: "POST" }]]);
     expect(r).toMatchObject({ ok: true, http_status: 200, phase: "open" });
     expect(LISTENER_PING_SUBREQUESTS).toBe(1);

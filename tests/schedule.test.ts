@@ -41,8 +41,8 @@ const env = {} as Env;
 const alerts = () => vi.mocked(alert).mock.calls.map((c) => [c[1], c[3]?.dedupMinutes]);
 
 describe("jobsForCron", () => {
-  it("every minute: liveness, the listener ping, then the channel poster; drain + deposits every 5 min; dispatch check + reconcile every 10", () => {
-    expect(jobsForCron("* * * * *")).toEqual(["liveness", "limitless_ws", "channel_post"]);
+  it("every minute: liveness, the channel poster, then the listener ping (never delaying the poster); drain + deposits every 5 min; dispatch check + reconcile every 10", () => {
+    expect(jobsForCron("* * * * *")).toEqual(["liveness", "channel_post", "limitless_ws"]);
     expect(jobsForCron("*/5 * * * *")).toEqual(["webhook_drain", "deposit_scan"]);
     expect(jobsForCron("*/10 * * * *")).toEqual(["dispatch_check", "reconcile"]);
   });
@@ -127,8 +127,8 @@ describe("runScheduled", () => {
 
   it("the every-minute invocation runs the tick, pings the listener, then the channel poster on its own budget (at most 4 events)", async () => {
     const r = await runScheduled(env, "* * * * *");
-    expect(h.state.ran).toEqual(["liveness", "limitless_ws", "channel_post"]);
-    expect(r.jobs.map((j) => [j.job, j.ok])).toEqual([["liveness", true], ["limitless_ws", true], ["channel_post", true]]);
+    expect(h.state.ran).toEqual(["liveness", "channel_post", "limitless_ws"]);
+    expect(r.jobs.map((j) => [j.job, j.ok])).toEqual([["liveness", true], ["channel_post", true], ["limitless_ws", true]]);
     const [, budget, limits] = vi.mocked(postPending).mock.calls.at(-1)! as unknown as [unknown, Budget, typeof CHANNEL_POST_LIMITS];
     expect(budget.limit).toBe(CHANNEL_POST_SUBREQUESTS);
     expect(limits).toEqual({ commitEvents: 4, revealGroups: 4 });
@@ -148,8 +148,8 @@ describe("runScheduled", () => {
   it("a listener ping that throws (binding missing, object down) is alerted and the channel poster still runs", async () => {
     h.state.throwIn = "limitless_ws";
     const r = await runScheduled(env, "* * * * *");
-    expect(h.state.ran).toEqual(["liveness", "limitless_ws", "channel_post"]);
-    expect(r.jobs.map((j) => [j.job, j.ok])).toEqual([["liveness", true], ["limitless_ws", false], ["channel_post", true]]);
+    expect(h.state.ran).toEqual(["liveness", "channel_post", "limitless_ws"]);
+    expect(r.jobs.map((j) => [j.job, j.ok])).toEqual([["liveness", true], ["channel_post", true], ["limitless_ws", false]]);
     expect(alerts()).toEqual([["job_limitless_ws_exception", 60]]);
   });
 
@@ -164,7 +164,7 @@ describe("runScheduled", () => {
   it("the liveness tick reads the recorder when recorderCheckDue says so for the current time", async () => {
     const before = Date.now();
     await runScheduled(env, "* * * * *");
-    expect(h.state.ran).toEqual(["liveness", "limitless_ws", "channel_post"]);
+    expect(h.state.ran).toEqual(["liveness", "channel_post", "limitless_ws"]);
     expect(vi.mocked(recorderCheckDue).mock.calls.at(-1)![0]).toBeGreaterThanOrEqual(before);
     expect(vi.mocked(runTick).mock.calls.at(-1)![1]).toEqual({ checkRecorder: true });
   });

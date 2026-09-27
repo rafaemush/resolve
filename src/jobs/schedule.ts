@@ -2,12 +2,13 @@
  * Cron routing (plan §16.4 P0 steps 7 and 10). Workers Free runs each cron trigger as its own invocation with its own
  * 50 subrequests, so the jobs are grouped by cost and ordered by what running out of subrequests would break:
  *   every minute   liveness: a worker_liveness row and one read of the newest dispatch row, at :05, :15, ... one more
- *                  read, of the newest Limitless recorder run (TICK_SUBREQUESTS = 8 with its alert), then one request
- *                  to the Limitless lifecycle listener, a Durable Object (LISTENER_PING_SUBREQUESTS = 1: it creates the
- *                  one instance on the first deploy and wakes it after an eviction or a deploy, src/jobs/limitless-ws.ts),
- *                  then the channel poster on what is left (CHANNEL_POST_SUBREQUESTS = 36): pending commits of at most 4 events (the legs
+ *                  read, of the newest Limitless recorder run (TICK_SUBREQUESTS = 8 with its alert), then the channel
+ *                  poster on what is left (CHANNEL_POST_SUBREQUESTS = 36): pending commits of at most 4 events (the legs
  *                  of an event as one message) and pending reveals of at most 4 commit messages, under the channel lease
- *                  and at most 15 messages a minute (src/bot/post.ts, src/bot/channel.ts)
+ *                  and at most 15 messages a minute (src/bot/post.ts, src/bot/channel.ts), then one request to the
+ *                  Limitless lifecycle listener, a Durable Object (LISTENER_PING_SUBREQUESTS = 1: it creates the one
+ *                  instance on the first deploy and wakes it after an eviction or a deploy, src/jobs/limitless-ws.ts).
+ *                  The ping goes last: it can wait up to 10 s on a websocket connect, and the poster is customer-facing.
  *   every 5 min    webhook drain first (cap 5 on a fixed budget of 2 + 5 x 4 + 5 = 27: a claimed row it could not finish
  *                  would sit in 'delivering' until the stale sweep), then the USDC deposit scan on what is left
  *                  (DEPOSIT_SCAN_SUBREQUESTS = 18; safe to cut off: credits are INSERT-first and the cursor moves only
@@ -52,7 +53,7 @@ export const DEPOSIT_SCAN_SUBREQUESTS = INVOCATION_SUBREQUESTS - drainSubrequest
 /** The jobs one cron trigger runs, in order (pure); [] for a cron this code does not route. */
 export function jobsForCron(cron: string): JobName[] {
   switch (cron) {
-    case CRONS.liveness: return ["liveness", "limitless_ws", "channel_post"];
+    case CRONS.liveness: return ["liveness", "channel_post", "limitless_ws"];
     case CRONS.fiveMinutes: return ["webhook_drain", "deposit_scan"];
     case CRONS.tenMinutes: return ["dispatch_check", "reconcile"];
     default: return [];

@@ -23,9 +23,12 @@ mode = "smart"
 crons = ["* * * * *", "*/5 * * * *", "*/10 * * * *"]
 
 # The Limitless lifecycle listener (src/jobs/limitless-ws.ts): ONE instance, named "limitless-lifecycle", holding an
-# outbound websocket 24/7 = ~10,800 GB-s a day at 128 MB. Workers Free includes 13,000 GB-s a day and only SQLite-backed
-# classes, so exactly one fits; Workers Paid includes 400,000 GB-s a month (~328,000 used). A deploy restarts it; its
-# alarm or the every-minute cron ping reconnects it within about a minute. Off switch: LIMITLESS_WS_ENABLED = "0" in [vars].
+# outbound websocket 24/7 = ~10,800 GB-s a day at 128 MB. Workers Free includes 13,000 GB-s a day PER ACCOUNT (shared with
+# every other Worker on the account, OilFlow included; past it every Durable Object on the account fails until 00:00 UTC);
+# Workers Paid includes 400,000 GB-s a month (~328,000 used). A deploy restarts it; its alarm or the every-minute cron
+# ping reconnects it within about a minute. Switch: LIMITLESS_WS_ENABLED in [vars], only "1" runs it. It ships "0" until
+# Workers Paid is active (or account-wide DO duration is checked) and the workerd websocket path is verified; turn it on
+# in its own deploy and run the post-deploy check in docs/runbooks/limitless-recorder.md.
 [[durable_objects.bindings]]
 name = "LIMITLESS_WS"
 class_name = "LimitlessListener"
@@ -57,4 +60,4 @@ BASE_FALLBACK_HTTP_URL = "https://mainnet.base.org"
 BASE_LOGS_HTTP_URL = "https://mainnet.base.org"
 SOLANA_FALLBACK_HTTP_URL = "https://api.mainnet-beta.solana.com"
 RESOLVE_BOT_UA = "ResolveBot/1.0 (+https://resolve.rafaemush.workers.dev/bot)"
-LIMITLESS_WS_ENABLED = "1"
+LIMITLESS_WS_ENABLED = "0"
