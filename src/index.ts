@@ -66,6 +66,9 @@ app.route("/v1", v1);
 
 app.notFound((c) => err(c, "not_found", `no route ${c.req.method} ${c.req.path}`, 404));
 
+/** Durable Object classes are exported from the main module (wrangler.toml [[durable_objects.bindings]]). */
+export { LimitlessListener } from "./jobs/limitless-ws";
+
 export default {
   fetch: app.fetch,
   /** Routing, budgets and exception alerts live in src/jobs/schedule.ts. */

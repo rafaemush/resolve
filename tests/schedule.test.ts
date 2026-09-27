@@ -20,6 +20,7 @@ const h = vi.hoisted(() => {
 });
 vi.mock("../src/jobs/tick", () => ({ LIVENESS_CRON: "* * * * *", TICK_SUBREQUESTS: 8, runTick: h.job("liveness", { inserted: true, alerts: [] }), recorderCheckDue: vi.fn(() => true) }));
 vi.mock("../src/bot/post", () => ({ postPending: h.job("channel_post", { errors: [], send_errors: [], messages: 0 }) }));
+vi.mock("../src/jobs/limitless-ws", () => ({ LISTENER_PING_SUBREQUESTS: 1, pingListener: h.job("limitless_ws", { ok: true, http_status: 200, phase: "open", state: {} }) }));
 vi.mock("../src/jobs/dispatch", () => ({ checkDispatchFailures: h.job("dispatch_check", { ok: true }) }));
 vi.mock("../src/jobs/reconcile", async (actual) => ({ ...(await actual<typeof import("../src/jobs/reconcile")>()), runReconcile: h.job("reconcile", { errors: [], unreachable: 0 }) }));
 vi.mock("../src/jobs/deposits", async (actual) => ({ ...(await actual<typeof import("../src/jobs/deposits")>()), scanDeposits: h.job("deposit_scan", { scanned: true }) }));
@@ -40,8 +41,8 @@ const env = {} as Env;
 const alerts = () => vi.mocked(alert).mock.calls.map((c) => [c[1], c[3]?.dedupMinutes]);
 
 describe("jobsForCron", () => {
-  it("every minute: liveness, then the channel poster; drain + deposits every 5 min; dispatch check + reconcile every 10", () => {
-    expect(jobsForCron("* * * * *")).toEqual(["liveness", "channel_post"]);
+  it("every minute: liveness, the listener ping, then the channel poster; drain + deposits every 5 min; dispatch check + reconcile every 10", () => {
+    expect(jobsForCron("* * * * *")).toEqual(["liveness", "limitless_ws", "channel_post"]);
     expect(jobsForCron("*/5 * * * *")).toEqual(["webhook_drain", "deposit_scan"]);
     expect(jobsForCron("*/10 * * * *")).toEqual(["dispatch_check", "reconcile"]);
   });
@@ -52,7 +53,7 @@ describe("jobsForCron", () => {
   it("every job runs on exactly one cron", () => {
     const all = Object.values(CRONS).flatMap((c) => jobsForCron(c));
     expect(new Set(all).size).toBe(all.length);
-    expect(new Set(all)).toEqual(new Set<JobName>(["liveness", "channel_post", "webhook_drain", "deposit_scan", "dispatch_check", "reconcile"]));
+    expect(new Set(all)).toEqual(new Set<JobName>(["liveness", "limitless_ws", "channel_post", "webhook_drain", "deposit_scan", "dispatch_check", "reconcile"]));
   });
   it("wrangler.toml [triggers] lists exactly the routed crons", () => {
     const toml = readFileSync(resolve(import.meta.dirname, "../wrangler.toml"), "utf8");
@@ -95,10 +96,12 @@ describe("per-invocation subrequest budgets (Workers Free: 50)", async () => {
     expect(fallbackLeft).toBe(8);
     expect(fallbackLeft).toBeGreaterThanOrEqual(2 * COST.http + COST.db);
   });
-  it("every-minute invocation: the tick (dispatch read, recorder read, insert, one alertMany) + the channel poster's budget + one exception alert = 50", async () => {
+  it("every-minute invocation: the tick (dispatch read, recorder read, insert, one alertMany) + the listener ping + the channel poster's budget + one exception alert = 50", async () => {
     const { TICK_SUBREQUESTS } = await vi.importActual<typeof import("../src/jobs/tick")>("../src/jobs/tick");
+    const { LISTENER_PING_SUBREQUESTS } = await vi.importActual<typeof import("../src/jobs/limitless-ws")>("../src/jobs/limitless-ws");
     expect(TICK_SUBREQUESTS).toBe(3 * COST.db + COST.alert);
-    expect(TICK_SUBREQUESTS + CHANNEL_POST_SUBREQUESTS + EXCEPTION_RESERVE).toBe(INVOCATION_SUBREQUESTS);
+    expect(LISTENER_PING_SUBREQUESTS).toBe(1); // one Durable Object request
+    expect(TICK_SUBREQUESTS + LISTENER_PING_SUBREQUESTS + CHANNEL_POST_SUBREQUESTS + EXCEPTION_RESERVE).toBe(INVOCATION_SUBREQUESTS);
     // the poster's claim + release, the three reads and one message with its alert fit
     expect(CHANNEL_POST_SUBREQUESTS).toBeGreaterThanOrEqual(2 * COST.db + 3 * COST.db + COST.telegram + COST.db + COST.alert);
   });
@@ -122,10 +125,10 @@ describe("runScheduled", () => {
     expect(alerts()).toEqual([]);
   });
 
-  it("the every-minute invocation runs the tick, then the channel poster on its own budget (at most 4 events)", async () => {
+  it("the every-minute invocation runs the tick, pings the listener, then the channel poster on its own budget (at most 4 events)", async () => {
     const r = await runScheduled(env, "* * * * *");
-    expect(h.state.ran).toEqual(["liveness", "channel_post"]);
-    expect(r.jobs.map((j) => [j.job, j.ok])).toEqual([["liveness", true], ["channel_post", true]]);
+    expect(h.state.ran).toEqual(["liveness", "limitless_ws", "channel_post"]);
+    expect(r.jobs.map((j) => [j.job, j.ok])).toEqual([["liveness", true], ["limitless_ws", true], ["channel_post", true]]);
     const [, budget, limits] = vi.mocked(postPending).mock.calls.at(-1)! as unknown as [unknown, Budget, typeof CHANNEL_POST_LIMITS];
     expect(budget.limit).toBe(CHANNEL_POST_SUBREQUESTS);
     expect(limits).toEqual({ commitEvents: 4, revealGroups: 4 });
@@ -142,6 +145,14 @@ describe("runScheduled", () => {
     expect(text).not.toContain("abc123secret");
   });
 
+  it("a listener ping that throws (binding missing, object down) is alerted and the channel poster still runs", async () => {
+    h.state.throwIn = "limitless_ws";
+    const r = await runScheduled(env, "* * * * *");
+    expect(h.state.ran).toEqual(["liveness", "limitless_ws", "channel_post"]);
+    expect(r.jobs.map((j) => [j.job, j.ok])).toEqual([["liveness", true], ["limitless_ws", false], ["channel_post", true]]);
+    expect(alerts()).toEqual([["job_limitless_ws_exception", 60]]);
+  });
+
   it("reconcile and deposit scan exceptions are alerted under their own keys", async () => {
     h.state.throwIn = "reconcile";
     await runScheduled(env, "*/10 * * * *");
@@ -153,7 +164,7 @@ describe("runScheduled", () => {
   it("the liveness tick reads the recorder when recorderCheckDue says so for the current time", async () => {
     const before = Date.now();
     await runScheduled(env, "* * * * *");
-    expect(h.state.ran).toEqual(["liveness", "channel_post"]);
+    expect(h.state.ran).toEqual(["liveness", "limitless_ws", "channel_post"]);
     expect(vi.mocked(recorderCheckDue).mock.calls.at(-1)![0]).toBeGreaterThanOrEqual(before);
     expect(vi.mocked(runTick).mock.calls.at(-1)![1]).toEqual({ checkRecorder: true });
   });

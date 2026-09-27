@@ -15,7 +15,7 @@ process.env.JEV_MODEL ??= "jev-1.13.0";
 process.env.THRESHOLDS_VERSION ??= "v1";
 process.env.SPOTLIGHT_SECRET = LIVE ? (process.env.SPOTLIGHT_SECRET ?? "eval-spotlight-v1") : "eval-spotlight-v1";
 
-const BLOCKED_HOSTS = ["api.typesafe.ai", "supabase.co", "api.telegram.org", "api.github.com", "alchemy.com", "helius-rpc.com", "gamma-api.polymarket.com", "api.limitless.exchange"];
+const BLOCKED_HOSTS = ["api.typesafe.ai", "supabase.co", "api.telegram.org", "api.github.com", "alchemy.com", "helius-rpc.com", "gamma-api.polymarket.com", "api.limitless.exchange", "ws.limitless.exchange"];
 const realFetch = globalThis.fetch;
 globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;

@@ -8,6 +8,8 @@ import { botUa } from "./ops/ua";
 export interface Env {
   RAW: R2Bucket;
   BACKUPS: R2Bucket;
+  /** The Limitless lifecycle listener (src/jobs/limitless-ws.ts): one instance, LISTENER_NAME. Optional so tests need no stub. */
+  LIMITLESS_WS?: DurableObjectNamespace;
   // vars
   JEV_MODEL: string;
   JEV_RPM_LIMIT: string;
@@ -23,6 +25,7 @@ export interface Env {
   BASE_LOGS_HTTP_URL?: string;        // eth_getLogs provider (never Alchemy Free: 10-block cap on Base)
   SOLANA_FALLBACK_HTTP_URL: string;
   RESOLVE_BOT_UA: string;
+  LIMITLESS_WS_ENABLED?: string;      // "0" switches the Limitless lifecycle listener off (src/jobs/limitless-ws.ts)
   // secrets
   TYPESAFE_API_KEY?: string;
   SPOTLIGHT_SECRET: string;

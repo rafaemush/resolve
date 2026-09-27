@@ -10,8 +10,8 @@
  * a later observation never moves them, last_pending_at frozen at the first sighting, a failed check only moves the
  * queue, the last duplicate wins), the due order (never checked first, then least recently checked; containers,
  * outcomes and give-ups excluded), the observed_at guard, the set-once trigger and CHECK, least privilege, comments,
- * the cadence view (its week boundary to the second), and dispatch_internal's signature, skip and failure rows, and the
- * cron job where pg_cron exists.
+ * the cadence view (its week boundary to the second), dispatch_internal's signature, skip and failure rows, the cron
+ * job where pg_cron exists, and the websocket listener's meta-only row (src/jobs/limitless-ws.ts: only meta moves).
  */
 import { spawnSync } from "node:child_process";
 import { loadEnv } from "../lib/env";
@@ -25,7 +25,7 @@ declare
   p constant text := 'selftest-rec-';
   obs text := (now() - interval '1 minute')::text;
   cur text := now()::text;
-  r1 jsonb; r2 jsonb; r3 jsonb; r4 jsonb; q record; v_req bigint; v_secret text; v_minute text; v_bool boolean;
+  r1 jsonb; r2 jsonb; r3 jsonb; r4 jsonb; w0 jsonb; w1 jsonb; q record; v_req bigint; v_secret text; v_minute text; v_bool boolean;
   out jsonb := '{}'::jsonb;
 begin
   delete from limitless_markets; -- rolled back with the block: real rows come back untouched
@@ -94,6 +94,20 @@ begin
   ), 0, 21);
   select * into q from limitless_markets where slug = p || 'dup';
   out := out || jsonb_build_object('dup_counts', r3 - 'due' - 'groups_missing_legs', 'dup_last_wins', q.winning_outcome_index = 1 and q.resolved_seen_at = now());
+
+  -- 3b. the websocket listener's write (src/jobs/limitless-ws.ts): observed = false, checked = false, meta only. On a
+  --     row the poll saw resolved and on a pending one, every column but meta keeps its value and meta gains the ws key
+  --     with the other keys kept, even when the websocket's index disagrees with the poll's (old: poll 1, ws 0).
+  select jsonb_object_agg(l.slug, to_jsonb(l)) into w0 from limitless_markets l where l.slug in (p || 'old', p || 's-fut');
+  w1 := record_limitless_observations(jsonb_build_array(
+    jsonb_build_object('slug', p || 'old', 'observed', false, 'checked', false, 'meta', jsonb_build_object('ws', jsonb_build_object('resolution_date', '2026-09-27T22:53:02.774Z', 'winning_index', 0, 'source', 'limitless_ws'))),
+    jsonb_build_object('slug', p || 's-fut', 'observed', false, 'checked', false, 'meta', jsonb_build_object('ws', jsonb_build_object('resolution_date', '2026-09-27T22:53:04.042Z', 'winning_index', 1, 'source', 'limitless_ws')))
+  ), 0, 21);
+  out := out || jsonb_build_object('ws_counts', w1 - 'due' - 'groups_missing_legs', 'ws_meta_only', (
+    select bool_and((to_jsonb(l) - 'meta') = ((w0->l.slug) - 'meta')
+                    and l.meta = (w0->l.slug->'meta') || jsonb_build_object('ws', l.meta->'ws')
+                    and l.meta->'ws'->>'source' = 'limitless_ws') and count(*) = 2
+      from limitless_markets l where l.slug in (p || 'old', p || 's-fut')));
 
   -- 4. what the write path refuses
   begin perform record_limitless_observations(jsonb_build_array(jsonb_build_object('slug', p || 'stale', 'observed', true, 'observed_at', (now() - interval '20 minutes')::text)), 0, 21);
@@ -230,6 +244,7 @@ const EXPECT: Record<string, unknown> = {
   check_due: [`${P}c2`, `${P}c1`, `${P}g1-a`],
   check_resolved: true, check_failed: true, index_kept: true, pending_bound_frozen: true,
   dup_counts: { inserted: 1, updated: 0, newly_expired: 1, newly_resolved: 1 }, dup_last_wins: true,
+  ws_counts: { inserted: 0, updated: 2, newly_expired: 0, newly_resolved: 0 }, ws_meta_only: true,
   stale_observed_at: "refused", missing_observed_at: "refused", non_array: "refused",
   move_sighting: "refused", change_index: "refused", index_after_void: "refused", index_without_sighting: "refused",
   set_from_null: "allowed", meta_on_resolved: "allowed",

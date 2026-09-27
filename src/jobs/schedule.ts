@@ -2,8 +2,10 @@
  * Cron routing (plan §16.4 P0 steps 7 and 10). Workers Free runs each cron trigger as its own invocation with its own
  * 50 subrequests, so the jobs are grouped by cost and ordered by what running out of subrequests would break:
  *   every minute   liveness: a worker_liveness row and one read of the newest dispatch row, at :05, :15, ... one more
- *                  read, of the newest Limitless recorder run (TICK_SUBREQUESTS = 8 with its alert), then the channel
- *                  poster on what is left (CHANNEL_POST_SUBREQUESTS = 37): pending commits of at most 4 events (the legs
+ *                  read, of the newest Limitless recorder run (TICK_SUBREQUESTS = 8 with its alert), then one request
+ *                  to the Limitless lifecycle listener, a Durable Object (LISTENER_PING_SUBREQUESTS = 1: it creates the
+ *                  one instance on the first deploy and wakes it after an eviction or a deploy, src/jobs/limitless-ws.ts),
+ *                  then the channel poster on what is left (CHANNEL_POST_SUBREQUESTS = 36): pending commits of at most 4 events (the legs
  *                  of an event as one message) and pending reveals of at most 4 commit messages, under the channel lease
  *                  and at most 15 messages a minute (src/bot/post.ts, src/bot/channel.ts)
  *   every 5 min    webhook drain first (cap 5 on a fixed budget of 2 + 5 x 4 + 5 = 27: a claimed row it could not finish
@@ -32,15 +34,16 @@ import { runReconcile } from "./reconcile";
 import { scanDeposits } from "./deposits";
 import { drainWebhooks, drainSubrequests, DRAIN_MAX } from "../webhooks/deliver";
 import { postPending } from "../bot/post";
+import { pingListener, LISTENER_PING_SUBREQUESTS } from "./limitless-ws";
 import { alert } from "../ops/alerts";
 import { Budget, EXCEPTION_RESERVE, INVOCATION_SUBREQUESTS } from "../ops/budget";
 import { redact } from "../ops/redact";
 
 export const CRONS = { liveness: LIVENESS_CRON, fiveMinutes: "*/5 * * * *", tenMinutes: "*/10 * * * *" } as const;
-export type JobName = "liveness" | "channel_post" | "webhook_drain" | "deposit_scan" | "dispatch_check" | "reconcile";
+export type JobName = "liveness" | "limitless_ws" | "channel_post" | "webhook_drain" | "deposit_scan" | "dispatch_check" | "reconcile";
 export const JOB_EXCEPTION_DEDUP_MINUTES = 60;
-/** The channel poster's share of the every-minute invocation: what the tick and one exception alert leave. */
-export const CHANNEL_POST_SUBREQUESTS = INVOCATION_SUBREQUESTS - TICK_SUBREQUESTS - EXCEPTION_RESERVE;
+/** The channel poster's share of the every-minute invocation: what the tick, the listener ping and one exception alert leave. */
+export const CHANNEL_POST_SUBREQUESTS = INVOCATION_SUBREQUESTS - TICK_SUBREQUESTS - LISTENER_PING_SUBREQUESTS - EXCEPTION_RESERVE;
 /** Per minute: events whose pending commits are posted, and commit messages whose pending reveals are posted. */
 export const CHANNEL_POST_LIMITS = { commitEvents: 4, revealGroups: 4 } as const;
 /** The deposit scan's share of the 5-minute invocation: what the drain's fixed budget and one exception alert leave. */
@@ -49,7 +52,7 @@ export const DEPOSIT_SCAN_SUBREQUESTS = INVOCATION_SUBREQUESTS - drainSubrequest
 /** The jobs one cron trigger runs, in order (pure); [] for a cron this code does not route. */
 export function jobsForCron(cron: string): JobName[] {
   switch (cron) {
-    case CRONS.liveness: return ["liveness", "channel_post"];
+    case CRONS.liveness: return ["liveness", "limitless_ws", "channel_post"];
     case CRONS.fiveMinutes: return ["webhook_drain", "deposit_scan"];
     case CRONS.tenMinutes: return ["dispatch_check", "reconcile"];
     default: return [];
@@ -65,6 +68,8 @@ export interface ScheduledReport { cron: string; jobs: JobReport[] }
 async function execute(env: Env, job: JobName): Promise<{ ok: boolean; result: unknown }> {
   switch (job) {
     case "liveness": { const r = await runTick(env, { checkRecorder: recorderCheckDue(Date.now()) }); return { ok: r.inserted && r.alerts.length === 0, result: r }; }
+    // ok: the ping reached the object; the listener raises its own alerts about the connection (limitless_ws_down).
+    case "limitless_ws": { const r = await pingListener(env); return { ok: r.ok, result: r }; }
     case "channel_post": { const r = await postPending(env, new Budget(CHANNEL_POST_SUBREQUESTS), CHANNEL_POST_LIMITS); return { ok: r.errors.length === 0 && r.send_errors.length === 0, result: r }; }
     case "webhook_drain": { const r = await drainWebhooks(env, DRAIN_MAX); return { ok: r.claim_error === null && r.errors === 0, result: r }; }
     case "deposit_scan": { const r = await scanDeposits(env, parseConfig(env), new Budget(DEPOSIT_SCAN_SUBREQUESTS)); return { ok: r.scanned, result: r }; }
@@ -90,6 +95,7 @@ export async function runJob(env: Env, job: JobName): Promise<JobReport> {
 /** Whether a healthy report is routine enough to leave out of the logs. */
 function quiet(r: JobReport): boolean {
   if (r.job === "liveness") return true;
+  if (r.job === "limitless_ws") { const phase = (r.result as { phase?: string | null } | undefined)?.phase; return phase === "open" || phase === "disabled"; }
   return r.job === "channel_post" && (r.result as { messages?: number } | undefined)?.messages === 0;
 }
 

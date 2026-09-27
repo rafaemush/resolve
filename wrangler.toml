@@ -14,12 +14,25 @@ mode = "smart"
 
 # Three cron triggers (Free allows 5 per account); each is its own invocation with its own 50 subrequests.
 # Routing and per-invocation budgets: src/jobs/schedule.ts (tests/schedule.test.ts checks this list against it).
-#   every minute  -> worker_liveness row + dispatch (select_due_watches) check, then the channel poster (pending
-#                    commits and reveals, the legs of an event as one message, at most 15 messages a minute)
+#   every minute  -> worker_liveness row + dispatch (select_due_watches) check, a ping of the Limitless lifecycle
+#                    listener (one Durable Object request), then the channel poster (pending commits and reveals, the
+#                    legs of an event as one message, at most 15 messages a minute)
 #   every 5 min   -> webhook delivery drain (cap 5), then the USDC deposit scan
 #   every 10 min  -> pg_net dispatch-failure count, then reconcile shadow verdicts against official outcomes
 [triggers]
 crons = ["* * * * *", "*/5 * * * *", "*/10 * * * *"]
+
+# The Limitless lifecycle listener (src/jobs/limitless-ws.ts): ONE instance, named "limitless-lifecycle", holding an
+# outbound websocket 24/7 = ~10,800 GB-s a day at 128 MB. Workers Free includes 13,000 GB-s a day and only SQLite-backed
+# classes, so exactly one fits; Workers Paid includes 400,000 GB-s a month (~328,000 used). A deploy restarts it; its
+# alarm or the every-minute cron ping reconnects it within about a minute. Off switch: LIMITLESS_WS_ENABLED = "0" in [vars].
+[[durable_objects.bindings]]
+name = "LIMITLESS_WS"
+class_name = "LimitlessListener"
+
+[[migrations]]
+tag = "v1-limitless-listener"
+new_sqlite_classes = ["LimitlessListener"]
 
 [[r2_buckets]]
 binding = "RAW"
@@ -44,3 +57,4 @@ BASE_FALLBACK_HTTP_URL = "https://mainnet.base.org"
 BASE_LOGS_HTTP_URL = "https://mainnet.base.org"
 SOLANA_FALLBACK_HTTP_URL = "https://api.mainnet-beta.solana.com"
 RESOLVE_BOT_UA = "ResolveBot/1.0 (+https://resolve.rafaemush.workers.dev/bot)"
+LIMITLESS_WS_ENABLED = "1"

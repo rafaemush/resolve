@@ -1,10 +1,10 @@
 # Limitless resolution-latency recorder
 
-Plan §17.3 (P0 row) and §19.3. Code: `src/jobs/limitless-recorder.ts`. Schema: `supabase/migrations/018_limitless_recorder.sql`. Report: `scripts/limitless-cadence.ts`. Last updated 2026-09-24.
+Plan §17.3 (P0 row) and §19.3. Code: `src/jobs/limitless-recorder.ts`. Schema: `supabase/migrations/018_limitless_recorder.sql`. Report: `scripts/limitless-cadence.ts`. Websocket listener: `src/jobs/limitless-ws.ts` (last section). Last updated 2026-09-28.
 
 ## Why it exists
 
-Nobody has measured how long Limitless takes to resolve a manual market. The "24 to 72 h" figure comes from their docs, not from a measurement. `GET /markets/<slug>` has no resolution timestamp. `updatedAt` is not one: it comes 16 to 22 h *before* `expirationTimestamp` on sampled markets (plan §17.1). On Workers Free, the only honest official time is the first poll that sees the outcome. The same rows also give the weekly creation cadence of manual markets, which is the rank-1 inventory number of plan §17.2.
+Nobody has measured how long Limitless takes to resolve a manual market. The "24 to 72 h" figure comes from their docs, not from a measurement. `GET /markets/<slug>` has no resolution timestamp. `updatedAt` is not one: it comes 16 to 22 h *before* `expirationTimestamp` on sampled markets (plan §17.1). The only honest official time reconcile can use today is the first poll that sees the outcome. The websocket listener (last section) records Limitless's exact `resolutionDate` next to it. The same rows also give the weekly creation cadence of manual markets, which is the rank-1 inventory number of plan §17.2.
 
 ## What it records
 
@@ -107,20 +107,64 @@ Database assertions for migration 018 roll back and are never run against produc
 RESOLVE_SELFTEST_NON_PRODUCTION=1 npx tsx scripts/selftest/recorder.ts
 ```
 
-## Upgrade path: exact resolution time from the websocket (Workers Paid)
+## Websocket listener: the exact resolution time
 
-Only the `marketResolved` websocket event carries Limitless's exact `resolutionDate`. Keeping that 24/7 outbound socket open needs a Durable Object, and plan §17.3 puts it on Workers Paid, where it fits the included Durable Object duration. It does not run on Workers Free, and it cannot run as a GitHub Actions job, because their terms treat that as serverless misuse. Build it when Workers Paid is turned on, at the first external test key (plan §17.4, week 4).
+Code: `src/jobs/limitless-ws.ts` (the Durable Object) and `src/jobs/limitless-ws-protocol.ts` (the framing). Binding: wrangler.toml `LIMITLESS_WS`, class `LimitlessListener`, SQLite backend. No migration.
 
-Verified 2026-09-24:
+Only the `marketResolved` websocket event carries Limitless's exact `resolutionDate`. The poll above gives an upper bound within about 10 minutes. The listener adds the exact time next to it and changes nothing a customer sees.
 
-- URL `wss://ws.limitless.exchange`, Socket.IO namespace `/markets`, websocket transport only (no long-polling). No authentication is required.
-- After connecting, emit `subscribe_market_lifecycle` with no arguments.
-- Event `marketResolved`: `{ slug, type, winningOutcome: 'YES' | 'NO', winningIndex, resolutionDate }`.
-- The server pings every 25 s. The client answers each ping (the standard Socket.IO heartbeat).
+### The protocol (verified 2026-09-28)
 
-Design:
+A read-only capture from this laptop (Node's built-in WebSocket, 8 minutes) and a 7-minute live run of the listener class itself against the real server confirmed the following. The samples are in `private/limitless-ws/` (gitignored, because they contain market titles):
 
-1. **Durable Object `LimitlessLifecycle`** (one instance). It opens the socket with a Socket.IO client framing: the namespace connect, the subscribe emit, and pong on ping. Confirm the server's Engine.IO protocol version on the first connect instead of assuming it. An alarm checks liveness every minute and reconnects with backoff. A run of reconnect failures raises one alert, `limitless_ws_down`.
-2. **On `marketResolved`**, it writes through a new RPC (a new migration) the exact `resolutionDate` into a new column such as `limitless_markets.resolved_at_ws`, with source `limitless_ws`. The same migration widens `reconciliations_official_at_source_check` to admit `limitless_ws`. `resolved_seen_at` stays the poll's first sighting, set once as today.
-3. **The websocket and the poll check each other.** `winningIndex` must equal the poll's `winning_outcome_index`. A disagreement is held and alerted, never picked. `resolutionDate` must fall inside (`last_pending_at`, `resolved_seen_at`]. If it does not, one of the two clocks is wrong: alert.
-4. **Reconcile prefers `resolved_at_ws`** (exact) over the poll's upper bound when both exist. The poll keeps running as the fallback for any gap in the socket.
+- Handshake `wss://ws.limitless.exchange/socket.io/?EIO=4&transport=websocket`, no authentication. The server opens with Engine.IO v4: `0{"sid":…,"upgrades":[],"pingInterval":25000,"pingTimeout":60000,"maxPayload":1000000}`.
+- The client sends `40/markets,`. The server acks with `40/markets,{"sid":…}`.
+- The client emits `42/markets,["subscribe_market_lifecycle"]`. The server answers with two `system` events. The second is `Subscribed to market lifecycle events`. No ack packet comes back.
+- The server pings (`2`) every 25 s, and the client answers each one with `3`.
+- `marketCreated {slug, title, type, categoryIds, createdAt}` and `marketResolved {slug, type, winningOutcome, winningIndex, resolutionDate}`. The channel carries every market, automated ones included. BTC and ETH 5-minute markets are created and resolved every 5 minutes.
+
+### Where the time goes
+
+The alarm writes through `record_limitless_observations()` with `observed = false, checked = false` rows. For those rows the RPC only merges `meta`. `scripts/selftest/recorder.ts` asserts this on Postgres (`ws_meta_only`). The alarm writes:
+
+- `meta.ws`: `{resolution_date, winning_index, winning_outcome, trade_type, received_at, source: "limitless_ws", poll_index?}`. This is the first event for the slug, and it is never replaced.
+- `meta.ws_latest`: the same shape, written when a later event for the slug says something different.
+
+`resolved_seen_at` and `winning_outcome_index` stay the poll's first sighting. Reconcile still uses the poll's time. Making reconcile prefer the websocket time needs a migration: a column such as `resolved_at_ws`, with `reconciliations_official_at_source_check` widened to admit `limitless_ws`. That comes once the two clocks have been compared on real markets.
+
+Unknown slugs are never inserted. Automated markets would swamp `v_limitless_cadence`. An event for a slug the table does not have stays queued in the object. It is looked up again after 30 min and after 3 h, then dropped and counted in the day summary (`meta.unknown_dropped`, with up to 10 sample slugs). A manual market the poll never saw before it resolved is not recorded by either path.
+
+Compare the websocket and the poll:
+
+```sql
+select slug, expiration_at, last_pending_at, resolved_seen_at, winning_outcome_index,
+       (meta->'ws'->>'resolution_date')::timestamptz as ws_resolved_at, (meta->'ws'->>'winning_index')::int as ws_index,
+       (meta->'ws'->>'resolution_date')::timestamptz > coalesce(last_pending_at, '-infinity')
+         and (meta->'ws'->>'resolution_date')::timestamptz <= coalesce(resolved_seen_at, 'infinity') as inside_poll_window,
+       meta ? 'ws_latest' as changed
+  from limitless_markets where meta ? 'ws' order by ws_resolved_at desc limit 50;
+```
+
+### One instance, liveness, deploys
+
+- **One instance.** There is one instance, named `limitless-lifecycle`. The cron's `pingListener()` is the only code that addresses it, and any other name is refused. The object holds the socket 24/7, which comes to 128 MB × 86,400 s = 10,800 GB-s a day.
+- **Workers Free.** Free includes 13,000 GB-s a day, so exactly one instance fits. A second would pass the limit, and past any free limit "further operations of that type will fail" until 00:00 UTC.
+- **Workers Paid.** Paid includes 400,000 GB-s a month, and this uses about 328,000. Requests and storage are far inside the included amounts either way.
+- **Alarm.** The object runs a 60 s alarm. It reconnects when due, with a backoff of 1 s doubling to 60 s, reset after a minute of stable connection. It drops a socket that has had no server ping for 2 intervals (50 s). It also drops one that has had no subscription confirmation 30 s after the namespace ack. It flushes the queue, writes `loop_runs` and raises alerts.
+- **Why the alarm matters.** An outbound socket keeps the object in memory for 15 minutes at most. After that, the alarm is what stops the 70-140 s idle eviction.
+- **Cron ping.** The every-minute cron also pings the object. This creates it on the first deploy and restarts it after an eviction.
+- **Deploys.** Every deploy shuts the object down. The stored alarm, or the next cron ping, reconnects within about a minute. Events emitted during that gap are not replayed. The poll still covers those markets.
+- **Off switch.** Set `LIMITLESS_WS_ENABLED = "0"` in wrangler.toml `[vars]` and deploy. The cron stops pinging, and the object clears its alarm and stays idle. Its queue is kept for when it is switched back on.
+
+### Alerts and rows
+
+| Key | When | First look |
+|---|---|---|
+| `limitless_ws_down` (dedup 6 h) | no connection that stayed subscribed for a minute, for 15 min; once per outage | `select started_at, outcome, error, meta from loop_runs where loop_name = 'limitless_ws' order by started_at desc limit 10;` (`meta.last_close`, `meta.attempts`) |
+| `limitless_ws_recovered` (dedup 1 h) | stable again after an outage that alerted | nothing to do |
+| `limitless_ws_schema` (dedup 24 h) | a `marketResolved` payload the listener refuses (a missing or non-date `resolutionDate`, a bad slug, a date more than 5 min in the future) | `parseResolved` in `src/jobs/limitless-ws.ts` |
+| `limitless_ws_index_disagrees` (dedup 6 h) | the websocket's `winningIndex` differs from the poll's `winning_outcome_index` | both are on the row; nothing picks between them |
+| `limitless_ws_write_failing` (dedup 6 h) | 15 alarms in a row could not read `limitless_markets` or call the RPC | the alert's error text. Events stay queued for up to 7 days |
+| `job_limitless_ws_exception` (dedup 1 h) | the cron's ping threw (the binding is missing, or the object is failing) | `wrangler tail`, and the Durable Objects page of the dashboard |
+
+`loop_runs` rows with `loop_name = 'limitless_ws'`: `meta.kind = 'connected'` for each (re)connect, `'down'` for each outage alert, and `'day'` once per UTC day with the counters (frames, pings, events, written, duplicates, unknown retried and dropped, connects, closes, stale drops, connected and down ms). A day row is a failure when the day had a 15-minute outage or a failed flush. There is never a row per message.
