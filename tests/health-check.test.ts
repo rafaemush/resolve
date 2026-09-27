@@ -107,4 +107,13 @@ describe("healthReport", () => {
     expect(healthReport({ kind: "unreachable", detail: "x" }, URL_, SHA).lines.join("\n")).toContain(`curl -s ${URL_}/health (git_sha must be ${SHA})`);
     expect(healthReport({ kind: "not_worker", status: 403 }, URL_, SHA).lines.join("\n")).toContain(`curl -s ${URL_}/health (git_sha must be ${SHA})`);
   });
+
+  it("a config_error body (which names no setting) points at the log that names them", () => {
+    const body = JSON.stringify({ ok: false, error: { code: "config_error", message: "The service is misconfigured. The request_id is logged." }, request_id: "req_0123", schema_version: "1" });
+    const r = healthReport({ kind: "unhealthy", status: 500, gitSha: null, body }, URL_, SHA);
+    expect(r.code).toBe(1);
+    expect(r.lines[0]).toContain("req_0123");
+    expect(r.lines[1]).toContain("wrangler tail");
+    expect(healthReport({ kind: "unhealthy", status: 503, gitSha: null, body: "" }, URL_, SHA).lines).toHaveLength(1);
+  });
 });

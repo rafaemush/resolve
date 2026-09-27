@@ -98,6 +98,7 @@ import { publishEvent } from "../src/webhooks/deliver";
 import { publishShadowCommitted } from "../src/shadow/events";
 import { projectForChange } from "../src/ingest/projection";
 import { sha256Hex } from "../src/resolve/text";
+import { engineVersion } from "../src/api/public-names";
 
 const WATCH_ID = "11111111-1111-4111-8111-111111111111";
 const MARKET_ID = "22222222-2222-4222-8222-222222222222";
@@ -401,6 +402,26 @@ describe("publishing a verdict that looked (plan §18 (a): first delivery attemp
     const [, to, type, payload, opts] = vi.mocked(publishEvent).mock.calls[0]!;
     expect([to, type, opts]).toEqual([tenant, "market.unresolved_update", { waitUntil }]);
     expect(payload).toMatchObject({ market_id: MARKET_ID, request_id: r.resolution_id, verdict: { resolution_status: "UNRESOLVED" } });
+  });
+
+  it("tenant market: the queued verdict is in public names (web_evidence, engine_version, web_evidence_call), never the model's", async () => {
+    const tenant = "33333333-3333-4333-8333-333333333333";
+    resetWatch({ markets: { ...market(7 * 86_400_000), tenant_id: tenant } });
+    h.state.verdict = {
+      market_id: MARKET_ID, resolution_status: "RESOLVED", winning_outcome: "OPTION_A", confidence_score: 0.92, error_code: null, error_reason: null, caveats: [],
+      determination_basis: "jev", evidence: null, checks: [{ name: "jev_call", pass: true, detail: "jev-1.13.0 900 tokens 300 ms" }], jev_model: "jev-1.13.0", thresholds_version: "v1", latency_ms: 310,
+    };
+    h.rpc.mockImplementation(async (_c: unknown, fn: string) => {
+      if (fn === "begin_resolution") return [{ request_id: "stub4", ok: true, charged: 5 }];
+      if (fn === "claim_low_credit_notice") return [{ crossed: false, balance: 995, threshold: 500 }];
+      throw new Error(`rpc ${fn} not expected`);
+    });
+    serve(200, JSON.stringify(pr(1)));
+    await runWatch(env(), cfg, WATCH_ID, { waitUntil });
+    const [, , type, payload] = vi.mocked(publishEvent).mock.calls[0]!;
+    expect(type).toBe("market.resolved");
+    expect(payload).toMatchObject({ verdict: { determination_basis: "web_evidence", engine_version: engineVersion("jev-1.13.0"), checks: [{ name: "web_evidence_call", pass: true }] } });
+    expect(JSON.stringify(payload)).not.toMatch(/jev|typesafe/i);
   });
 });
 

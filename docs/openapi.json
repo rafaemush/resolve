@@ -476,7 +476,7 @@
                   "SOURCE_UNREACHABLE",
                   "RENDER_BUDGET_EXHAUSTED",
                   "BILLING_UNAVAILABLE",
-                  "PAID_JEV_DISABLED"
+                  "WEB_EVIDENCE_DISABLED"
                 ]
               },
               {
@@ -496,7 +496,7 @@
                 "type": "string",
                 "enum": [
                   "structured",
-                  "jev"
+                  "web_evidence"
                 ]
               },
               {
@@ -596,7 +596,8 @@
               "additionalProperties": false
             }
           },
-          "jev_model": {
+          "engine_version": {
+            "description": "Opaque label of the resolution engine version behind a web-evidence verdict; it changes when the engine changes. null when no web-evidence call was made.",
             "type": [
               "string",
               "null"
@@ -622,7 +623,7 @@
           "determination_basis",
           "evidence",
           "checks",
-          "jev_model",
+          "engine_version",
           "thresholds_version",
           "latency_ms"
         ],
@@ -826,7 +827,7 @@
         },
         "responses": {
           "200": {
-            "description": "Verdict (or StrictV0Verdict for strict_v0 tenants) plus request_id, credits_charged, credits_refunded, balance, route",
+            "description": "Verdict (or StrictV0Verdict for strict_v0 tenants) plus request_id, credits_charged, credits_refunded, balance, route (precheck | structured | web_evidence)",
             "content": {
               "application/json": {
                 "schema": {
@@ -1097,7 +1098,7 @@
         ],
         "responses": {
           "200": {
-            "description": "resolutions[]",
+            "description": "resolutions[] (id, resolution_status, winning_outcome, confidence_score, error_code, error_reason, caveats, determination_basis, engine_version, thresholds_version, credits_charged, credits_refunded, created_at)",
             "content": {
               "application/json": {
                 "schema": {
@@ -1692,7 +1693,7 @@
         ],
         "responses": {
           "200": {
-            "description": "usage",
+            "description": "window_days, credits_by_reason, resolutions_by_route (keys <route>/<resolution_status>, route precheck | structured | web_evidence), recent_ledger",
             "content": {
               "application/json": {
                 "schema": {
@@ -2021,7 +2022,7 @@
         "summary": "Liveness + one database read",
         "responses": {
           "200": {
-            "description": "service status",
+            "description": "service, schema_version, thresholds_version, engine_version (opaque engine label), web_evidence_routes_enabled, migrations_applied, git_sha",
             "content": {
               "application/json": {
                 "schema": {

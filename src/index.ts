@@ -8,6 +8,7 @@ import { internal } from "./api/internal";
 import { v1 } from "./api/v1";
 import { webhooks } from "./api/webhooks";
 import { pub } from "./api/public";
+import { engineVersion } from "./api/public-names";
 import openapi from "./generated/openapi.json";
 
 type Vars = { requestId: string; schemaVersion: string };
@@ -21,7 +22,11 @@ app.use("*", async (c, next) => {
 });
 
 app.onError((e, c) => {
-  if (e instanceof ConfigError) return err(c, "config_error", e.message, 500);
+  if (e instanceof ConfigError) {
+    // The missing names (never values) go to the log only: the caller's body names no variable, secret or model.
+    console.error(JSON.stringify({ level: "error", request_id: c.get("requestId"), path: c.req.path, error: "config_error", missing: e.missing }));
+    return err(c, "config_error", "The service is misconfigured. The request_id is logged.", 500);
+  }
   console.error(JSON.stringify({ level: "error", request_id: c.get("requestId"), path: c.req.path, error: String(e) }));
   return err(c, "internal_error", "Unexpected error. The request_id is logged.", 500);
 });
@@ -35,8 +40,9 @@ app.get("/health", async (c) => {
     service: "resolve",
     schema_version: cfg.schemaVersion,
     thresholds_version: cfg.thresholdsVersion,
-    jev_model: cfg.jevModel,
-    jev_paid_routes_enabled: cfg.jevPaidRoutesEnabled,
+    // public names (src/api/public-names.ts): an opaque engine label, never the model id
+    engine_version: engineVersion(cfg.jevModel),
+    web_evidence_routes_enabled: cfg.jevPaidRoutesEnabled,
     migrations_applied: count ?? 0,
     git_sha: cfg.gitSha,
   });

@@ -13,6 +13,7 @@ import { z } from "zod";
 import type { Db } from "../db/supabase";
 import { CommittedVerdict, DISCLAIMER, marketRef, type CommittedFields } from "../bot/commit";
 import type { MarketRow } from "../ingest/types";
+import { venueBasis } from "../api/public-names";
 
 export const PLANS = ["free", "payg", "builder", "growth", "platform"] as const;
 export const Plan = z.enum(PLANS);
@@ -118,11 +119,10 @@ export async function followerTenants(client: Db, marketId: string): Promise<{ t
 
 /**
  * How a venue-facing surface names the route: "web_evidence" for the model route. Customer-facing surfaces never name
- * the model (plan §2.1, MCA §2.3(a)); the venue report prints the same wording.
+ * the model (plan §2.1, MCA §2.3(a)); the venue report prints the same wording. Defined with the other public names in
+ * src/api/public-names.ts and re-exported here for existing imports.
  */
-export function venueBasis(basis: CommittedFields["determination_basis"]): "structured" | "web_evidence" | null {
-  return basis === "jev" ? "web_evidence" : basis;
-}
+export { venueBasis };
 
 /** The verdict fields a follower sees: the committed (public-floored) verdict, never the preimage or the nonce. */
 export function shadowVerdict(c: CommittedFields): Record<string, unknown> {

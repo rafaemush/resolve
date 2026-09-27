@@ -11,6 +11,7 @@
  */
 import { z } from "zod";
 import { toCsv } from "../../src/ops/csv";
+import { publicBasis, publicText } from "../../src/api/public-names";
 
 export const REPORT_PLATFORMS = ["limitless", "polymarket", "custom"] as const;
 export type ReportPlatform = (typeof REPORT_PLATFORMS)[number];
@@ -188,8 +189,14 @@ export function duration(seconds: number): string {
   return `${n(seconds)} s (${seconds < 0 ? "-" : ""}${human})`;
 }
 
+/**
+ * Pure. The Route column: the public route name (publicBasis, src/api/public-names.ts) in words. A value outside the
+ * public names prints through publicText, so no internal name reaches a venue.
+ */
 export function basisLabel(b: string | null): string {
-  return b === "jev" ? "web evidence" : b === "structured" ? "structured" : b === null ? "pre-check" : b;
+  if (b === null) return "pre-check";
+  const p = publicBasis(b);
+  return p === "web_evidence" ? "web evidence" : p === "structured" ? "structured" : publicText(b);
 }
 
 /** Pure. An ISO time as the tables print it: "2026-10-10 00:00:05Z" (the CSV keeps the full ISO value). */

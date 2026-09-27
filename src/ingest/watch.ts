@@ -15,6 +15,7 @@ import { resolveWithRuntime, JevUnavailableError } from "../resolve/runtime";
 import type { EvidenceInput, Verdict } from "../resolve/schema";
 import { commitVerdict } from "../bot/commit";
 import { publishEvent, type WaitUntil } from "../webhooks/deliver";
+import { toPublicVerdict } from "../api/public-names";
 import { publishShadowCommitted } from "../shadow/events";
 import { noteCharge } from "../billing/events";
 import { alert } from "../ops/alerts";
@@ -343,7 +344,8 @@ export async function runWatch(env: Env, cfg: Config, watchId: string, opts: Wat
       }
     } else if (market.tenant_id) {
       const type = v.resolution_status === "RESOLVED" ? "market.resolved" : v.resolution_status === "ERROR" ? "market.error" : "market.unresolved_update";
-      await publishEvent(env, market.tenant_id, type, { market_id: market.id, external_id: market.external_id, request_id: rt.resolutionId, verdict: v }, { waitUntil: opts.waitUntil });
+      // The tenant's verdict in its public shape (engine_version, web_evidence; src/api/public-names.ts).
+      await publishEvent(env, market.tenant_id, type, { market_id: market.id, external_id: market.external_id, request_id: rt.resolutionId, verdict: toPublicVerdict(v) }, { waitUntil: opts.waitUntil });
     }
     // A charge that looked stands (only a could-not-look verdict is refunded): credits.low once per crossing. noteCharge
     // never throws; 1 subrequest, 3 at the crossing, + 1 alert on a failure.

@@ -24,6 +24,7 @@ import { chunks, entitledFollows, exportCsv, exportRows, EXPORT_COLUMNS, EXPORT_
 import { DISCLAIMER } from "../bot/commit";
 import { noteCharge } from "../billing/events";
 import { effectiveTiers, packQuotes, paygRate } from "../billing/tiers";
+import { publicBasis, publicRoute, publicText, publicVerdictRecord, publicWatchSummary, toPublicVerdict } from "./public-names";
 import { challengeMessage, newNonce, registerAnswer, signedBy, REGISTER_RESULTS, SIGNATURE, WALLET_ADDRESS, type RegisterResult } from "../billing/wallet";
 
 type Vars = { requestId: string; schemaVersion: string; auth: AuthContext };
@@ -75,13 +76,14 @@ const ResolveBody = z.object({
   fetch: z.boolean().default(false),
 }).refine((b) => !!b.market_id || (!!b.market && !!b.evidence), { message: "provide market_id, or market + evidence" });
 
+/** The verdict in its public shape (src/api/public-names.ts): engine_version, web_evidence, public error_reason and checks. */
 function verdictResponse(c: Parameters<typeof ok>[0], auth: AuthContext, v: Verdict, extra: Record<string, unknown>) {
   if (auth.strictV0) {
     const s = toStrictV0(v);
     if (s.kind === "http") return err(c, s.code, s.message, s.status, { retryAfterSeconds: 30 });
     return ok(c, { ...s.body, ...extra });
   }
-  return ok(c, { ...v, ...extra });
+  return ok(c, { ...toPublicVerdict(v), ...extra });
 }
 
 /**
@@ -153,10 +155,11 @@ v1.post("/resolve", async (c) => {
         : err(c, "UPSTREAM_UNAVAILABLE", `could not lease the watch, the fetch did not run: ${redact(leased.error).slice(0, 200)}`, 503);
       const s = await runWatch(c.env, cfg, w.id as string, { waitUntil: waitUntilOf(c), dispatch: "tenant_fetch" });
       if (s.resolution_id) {
+        // The verdict as GET /v1/resolutions/:id answers it, never the raw row (it holds the model's own answers).
         const { data: r } = await client.from("resolutions").select("*").eq("id", s.resolution_id).single();
-        return ok(c, { request_id: s.resolution_id, watch: s, resolution: r });
+        return ok(c, { request_id: s.resolution_id, watch: publicWatchSummary(s), resolution: r ? resolutionBody(r) : null });
       }
-      if (s.outcome === "failure") return err(c, "UPSTREAM_UNAVAILABLE", `fetch failed: ${s.detail}`, 503);
+      if (s.outcome === "failure") return err(c, "UPSTREAM_UNAVAILABLE", `fetch failed: ${publicText(s.detail)}`, 503);
     }
     const { data: e } = await client.from("evidence").select("*").eq("market_id", market.id).order("created_at", { ascending: false }).limit(1).maybeSingle();
     if (!e) return err(c, "not_found", "no evidence stored for this market yet; register sources or pass evidence inline", 404);
@@ -206,7 +209,7 @@ v1.post("/resolve", async (c) => {
     if (!r || r.status_row !== "complete") return ok(c, { request_id: br.request_id, status_row: r?.status_row ?? "pending", message: "original request still in flight" }, 202);
     return ok(c, { request_id: br.request_id, ...rowToVerdict(r), replayed: true, credits_charged: r.credits_charged, balance: br.balance });
   }
-  if (!br.ok) return err(c, "insufficient_credits", `This request costs ${amount} credit(s); balance is ${br.balance}. Top up at GET /v1/payments/address.`, 402, { extra: { balance: br.balance, price_credits: amount, route: plan.route } });
+  if (!br.ok) return err(c, "insufficient_credits", `This request costs ${amount} credit(s); balance is ${br.balance}. Top up at GET /v1/payments/address.`, 402, { extra: { balance: br.balance, price_credits: amount, route: publicRoute(plan.route) } });
 
   // 4. resolve
   let rt: RuntimeOutput;
@@ -225,12 +228,24 @@ v1.post("/resolve", async (c) => {
     const wu = waitUntilOf(c);
     if (wu) wu(low); else await low;
   }
-  return verdictResponse(c, auth, rt.result.verdict, { request_id: br.request_id, credits_charged: br.charged - refunded, credits_refunded: refunded, balance: br.balance + refunded, route: plan.route });
+  return verdictResponse(c, auth, rt.result.verdict, { request_id: br.request_id, credits_charged: br.charged - refunded, credits_refunded: refunded, balance: br.balance + refunded, route: publicRoute(plan.route) });
 });
 
+/**
+ * A stored resolutions row as the public verdict (PublicVerdict's fields; src/api/public-names.ts): the one mapping
+ * shared by the replays, GET /v1/resolutions/:id and the fetch:true answer. Stored values keep their internal names.
+ */
 function rowToVerdict(r: Record<string, unknown>) {
-  return { market_id: r.market_id, resolution_status: r.resolution_status, winning_outcome: r.winning_outcome, confidence_score: Number(r.confidence_score), error_code: r.error_code, error_reason: r.error_reason, caveats: r.caveats, determination_basis: r.determination_basis, checks: r.checks, jev_model: r.jev_model, thresholds_version: r.thresholds_version, latency_ms: r.duration_ms };
+  return publicVerdictRecord({ market_id: r.market_id, resolution_status: r.resolution_status, winning_outcome: r.winning_outcome, confidence_score: Number(r.confidence_score), error_code: r.error_code, error_reason: r.error_reason, caveats: r.caveats, determination_basis: r.determination_basis, checks: r.checks, jev_model: r.jev_model, thresholds_version: r.thresholds_version, latency_ms: r.duration_ms });
 }
+
+/** GET /v1/resolutions/:id's body for a stored row. */
+function resolutionBody(r: Record<string, unknown>) {
+  return { request_id: r.id, ...rowToVerdict(r), credits_charged: r.credits_charged, credits_refunded: r.credits_refunded, created_at: r.created_at };
+}
+
+/** GET /v1/markets/:id/resolutions: the columns read, each row answered in public names (jev_model is engine_version). */
+const HISTORY_COLUMNS = ["id", "resolution_status", "winning_outcome", "confidence_score", "error_code", "error_reason", "caveats", "determination_basis", "jev_model", "thresholds_version", "credits_charged", "credits_refunded", "created_at"] as const;
 
 /**
  * The tenant's watch_limit is held inside register_market (migration 019) under a lock on the tenant row: active
@@ -268,8 +283,9 @@ v1.delete("/markets/:id", async (c) => {
   return ok(c, { deleted: id });
 });
 v1.get("/markets/:id/resolutions", async (c) => {
-  const { data } = await db(c.env).from("resolutions").select("id, resolution_status, winning_outcome, confidence_score, error_code, error_reason, caveats, determination_basis, jev_model, thresholds_version, credits_charged, credits_refunded, created_at").eq("market_id", c.req.param("id")).eq("tenant_id", c.get("auth").tenantId).eq("status_row", "complete").order("created_at", { ascending: false }).limit(50);
-  return ok(c, { resolutions: data ?? [] });
+  const { data } = await db(c.env).from("resolutions").select(HISTORY_COLUMNS.join(", ")).eq("market_id", c.req.param("id")).eq("tenant_id", c.get("auth").tenantId).eq("status_row", "complete").order("created_at", { ascending: false }).limit(50);
+  const rows = (data ?? []) as unknown as Array<Record<string, unknown>>;
+  return ok(c, { resolutions: rows.map((r) => publicVerdictRecord(Object.fromEntries(HISTORY_COLUMNS.map((k) => [k, r[k]])))) });
 });
 
 // ---- follows and the private early reveal (plan §17.3 P7-lite) ---------------------------------------------------
@@ -436,7 +452,7 @@ v1.get("/shadow/:market_id", async (c) => {
 v1.get("/resolutions/:id", async (c) => {
   const { data } = await db(c.env).from("resolutions").select("*").eq("id", c.req.param("id")).eq("tenant_id", c.get("auth").tenantId).maybeSingle();
   if (!data) return err(c, "not_found", "resolution not found", 404);
-  return ok(c, { request_id: data.id, ...rowToVerdict(data), credits_charged: data.credits_charged, credits_refunded: data.credits_refunded, created_at: data.created_at });
+  return ok(c, resolutionBody(data));
 });
 v1.get("/account", async (c) => {
   const auth = c.get("auth");
@@ -454,7 +470,8 @@ v1.get("/usage", async (c) => {
   const byReason: Record<string, number> = {};
   for (const l of ledger ?? []) byReason[l.reason as string] = (byReason[l.reason as string] ?? 0) + Number(l.delta);
   const byBasis: Record<string, number> = {};
-  for (const r of res ?? []) { const k = `${r.determination_basis ?? "precheck"}/${r.resolution_status}`; byBasis[k] = (byBasis[k] ?? 0) + 1; }
+  // keyed by the public route name: precheck | structured | web_evidence
+  for (const r of res ?? []) { const k = `${publicBasis(r.determination_basis) ?? "precheck"}/${r.resolution_status}`; byBasis[k] = (byBasis[k] ?? 0) + 1; }
   return ok(c, { window_days: days, credits_by_reason: byReason, resolutions_by_route: byBasis, recent_ledger: (ledger ?? []).slice(0, 50) });
 });
 /**

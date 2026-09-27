@@ -6,6 +6,7 @@ import { db } from "../db/supabase";
 import { CommittedVerdict, type Agreement, type OfficialRecord } from "../bot/commit";
 import { botPageHtml } from "./bot";
 import { botUa } from "../ops/ua";
+import { publicTrackRecordRow, venueBasis } from "./public-names";
 
 type Vars = { requestId: string; schemaVersion: string };
 export const pub = new Hono<{ Bindings: Env; Variables: Vars }>();
@@ -26,16 +27,30 @@ export function shapeTrackRecordRow(r: Record<string, unknown>): Record<string, 
 }
 
 /**
+ * Pure. The rows GET /v1/track-record serves: each view row gated (shapeTrackRecordRow), then in public names
+ * (src/api/public-names.ts): the view's jev_share column is served as web_evidence_share; the view keeps its column.
+ */
+export function trackRecordRows(data: readonly Record<string, unknown>[]): Record<string, unknown>[] {
+  return data.map((r) => publicTrackRecordRow(shapeTrackRecordRow(r)));
+}
+
+/**
+ * The Cache API key of the track record. It names the response shape, so a response cached in an earlier shape is never
+ * served after a deploy that changes it (shape 2: public column names).
+ */
+export const TRACK_RECORD_CACHE_PATH = "/v1/track-record?shape=2";
+
+/**
  * Public track record, rendered from v_track_record only, cached 60 s through the Cache API. Percentages (cumulative per
  * platform) are shown only once the view marks the row reportable (>= 100 reconciled distinct events on that platform).
  */
 pub.get("/v1/track-record", async (c) => {
-  const cacheKey = new Request(new URL("/v1/track-record", c.req.url).toString());
+  const cacheKey = new Request(new URL(TRACK_RECORD_CACHE_PATH, c.req.url).toString());
   const cached = await caches.default.match(cacheKey);
   if (cached) return cached;
   const { data, error } = await db(c.env).from("v_track_record").select("*").order("week", { ascending: false }).limit(52);
   if (error) return err(c, "UPSTREAM_UNAVAILABLE", "track record store unavailable", 503);
-  const rows = (data ?? []).map((r) => shapeTrackRecordRow(r as Record<string, unknown>));
+  const rows = trackRecordRows((data ?? []) as Record<string, unknown>[]);
   const res = ok(c, { note: "Every number here is a database row; test markets are excluded and each market counts once, by its latest commit. The legs of one multi-outcome event (a ladder) are one event: n_events_* count events, and percentages are cumulative per platform and appear only once 100 events on that platform have been reconciled against the platform of record. precision (per market) and event_precision (an event is wrong if any of its resolved legs disagreed) carry 95 % Wilson intervals. median_lead_seconds uses the platform's own resolution time only; median_lead_seconds_poll uses the first poll that saw the outcome, so it overstates the lead by up to the poll delay. Any commitment can be checked at /v1/track-record/verify?hash=<sha256>. Informational signal, not financial advice, not an oracle of record.", rows });
   res.headers.set("Cache-Control", "public, max-age=60, s-maxage=60");
   c.executionCtx.waitUntil(caches.default.put(cacheKey, res.clone()));
@@ -50,7 +65,8 @@ export interface VerifyReveal { channel: string; message_id: number | null; tele
 /**
  * Pure. Before a reveal row exists the answer proves only that the commitment was recorded (and when it was posted):
  * the nonce, the preimage and the committed verdict are never returned, because with them anyone could learn the
- * verdict before the platform resolves. After the reveal, everything needed to recompute sha256(preimage).
+ * verdict before the platform resolves. After the reveal, everything needed to recompute sha256(preimage). The committed
+ * determination_basis is served by its public name (venueBasis); the preimage binds neither the basis nor the model.
  */
 export function shapeVerify(commit: VerifyCommit, reveal: VerifyReveal | null): Record<string, unknown> {
   const base = {
@@ -72,7 +88,7 @@ export function shapeVerify(commit: VerifyCommit, reveal: VerifyReveal | null): 
     preimage_version: committed.success ? committed.data.preimage_version : null,
     preimage: committed.success ? committed.data.preimage : null,
     nonce: commit.nonce,
-    committed: committed.success ? { resolution_status: committed.data.resolution_status, winning_outcome: committed.data.winning_outcome, confidence_score: committed.data.confidence_score, caveats: committed.data.caveats, canonical_sha256: committed.data.canonical_sha256, raw_sha256: committed.data.raw_sha256, thresholds_version: committed.data.thresholds_version, determination_basis: committed.data.determination_basis } : null,
+    committed: committed.success ? { resolution_status: committed.data.resolution_status, winning_outcome: committed.data.winning_outcome, confidence_score: committed.data.confidence_score, caveats: committed.data.caveats, canonical_sha256: committed.data.canonical_sha256, raw_sha256: committed.data.raw_sha256, thresholds_version: committed.data.thresholds_version, determination_basis: venueBasis(committed.data.determination_basis) } : null,
     official,
     agreement: (reveal.payload.agreement ?? null) as Agreement | null,
     how_to_verify: "sha256(preimage) must equal commitment_sha256; the preimage's last field is the nonce.",

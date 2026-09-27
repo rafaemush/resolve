@@ -12,6 +12,7 @@ import { hmacHex, sha256Hex } from "../resolve/text";
 import { alert, alertMany, type AlertItem } from "../ops/alerts";
 import { Budget, COST } from "../ops/budget";
 import { redact } from "../ops/redact";
+import { publicEventPayload } from "../api/public-names";
 
 /**
  * Every event a tenant endpoint can subscribe to (POST /v1/webhooks). An endpoint registered without an events list gets
@@ -227,7 +228,9 @@ async function attempt(client: Db, d: Row, r: DeliveryResult, state: { settled: 
     await write(r, `delivery ${id} dlq`, client.from("webhook_deliveries").update({ status: "dlq", attempt: attemptNo, last_error: "endpoint inactive", lease_until: null }).eq("id", id));
     return;
   }
-  const body = JSON.stringify({ id: d.event_id, type: d.event_type, created_at: d.created_at, data: d.payload });
+  // A market.* or shadow.* payload queued before the public names keeps its stored form (stored values never change): it
+  // is sent, and re-sent on every retry and replay, in the public shape (src/api/public-names.ts). Idempotent for newer rows.
+  const body = JSON.stringify({ id: d.event_id, type: d.event_type, created_at: d.created_at, data: publicEventPayload(String(d.event_type), d.payload) });
   const t = Math.floor(Date.now() / 1000);
   const sig = await hmacHex(ep.secret as string, `${t}.${body}`);
   let status: number | null = null, err: string | null = null;

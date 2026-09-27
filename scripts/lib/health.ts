@@ -83,6 +83,10 @@ export function healthReport(o: HealthOutcome, baseUrl: string, sha: string): { 
     case "not_worker": return { code: 0, lines: [`WARN: ${baseUrl}/health answered HTTP ${o.status} without X-Resolve-Version: not the Worker's answer (a proxy, a block page or Cloudflare refusing this client); the deploy went through.`, byHand] };
     case "stale": return { code: 1, lines: [`FAIL: deployed, but the Worker still reports version ${o.version}, not ${sha}`] };
     case "worker_failed": return { code: 1, lines: [`FAIL: deployed ${sha}, but Cloudflare answered /health with HTTP ${o.status} and no X-Resolve-Version on the last attempt (cf-ray ${o.ray || "none"}): the Worker failed before answering (error 1101 = it threw, 1102 = CPU or memory limit; wrangler tail shows it): ${o.body}`] };
-    case "unhealthy": return { code: 1, lines: [`FAIL: deployed ${sha}, but /health answered HTTP ${o.status} with git_sha ${JSON.stringify(o.gitSha)}: ${o.body}`] };
+    case "unhealthy": return { code: 1, lines: [
+      `FAIL: deployed ${sha}, but /health answered HTTP ${o.status} with git_sha ${JSON.stringify(o.gitSha)}: ${o.body}`,
+      // A public route never names a setting (src/index.ts); the Worker logs the missing names, never their values.
+      ...(o.body.includes('"config_error"') ? ["A setting is missing or invalid: the Worker logged which ones (names only) under the request_id above. Read them with wrangler tail or in the Worker's Logs on the Cloudflare dashboard."] : []),
+    ] };
   }
 }

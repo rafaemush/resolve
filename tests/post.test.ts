@@ -16,7 +16,7 @@ vi.mock("../src/ops/alerts", () => ({ alert: vi.fn(async () => ({ sent: true, de
 import { BATCH_MAX_WAIT_S, BATCH_QUIET_S, commitBatchMessages, planCommitPosts, planRevealPosts, postPending, RETRY_AFTER_S, REVEAL_MAX_WAIT_S, revealBatchMessages, revealLeg, revealMessageIds, type PendingCommitRow, type PendingRevealRow, type RevealLeg } from "../src/bot/post";
 import { MESSAGE_MAX, PACE, POSTER_LEASE_S, SEND_WORST_MS } from "../src/bot/channel";
 import { RECHECK_PENDING_S, UNPOSTED_ALERT_MINUTES } from "../src/jobs/reconcile";
-import { buildPreimage, buildReveal, committedFields, type CommittedVerdict, type OfficialRecord } from "../src/bot/commit";
+import { buildPreimage, buildReveal, commitText, committedFields, type CommittedVerdict, type OfficialRecord } from "../src/bot/commit";
 import { Budget, COST } from "../src/ops/budget";
 import { CHANNEL_POST_LIMITS, CHANNEL_POST_SUBREQUESTS } from "../src/jobs/schedule";
 import { sha256Hex } from "../src/resolve/text";
@@ -144,6 +144,29 @@ describe("revealBatchMessages (pure)", () => {
     expect(msgs.flatMap((m) => m.ids)).toEqual(legs.map((l) => l.id));
     // a shared official source is printed once, in the header
     expect(msgs[0]!.text.split("\n\n")[0]).toContain("official source https://polymarket.com/event/cpi-sep at 2026-10-14T12:30:05.000Z (gamma_closed_time)");
+  });
+});
+
+describe("channel posts name neither the model nor its vendor (plan §2.1, the vendor's MCA §2.3(a))", () => {
+  it("a model-routed leg's commit and reveal texts, batched and single, carry no model name", async () => {
+    const NAMES = /jev|typesafe/i;
+    const ref = "polymarket:700001";
+    const nonce = "nonceweb".padEnd(24, "0");
+    const v = { ...verdict(1), determination_basis: "jev", jev_model: "jev-1.13.0", checks: [{ name: "jev_call", pass: true, detail: "jev-1.13.0 900 tokens 300 ms" }] } as Verdict;
+    const fields = committedFields(v);
+    expect(fields.determination_basis).toBe("jev"); // what the committed verdict behind the reveal holds
+    const committed: CommittedVerdict = { preimage_version: "v2", preimage: buildPreimage(ref, fields, nonce), ...fields };
+    const commitment = await sha256Hex(committed.preimage);
+    const leg: RevealLeg = { id: "rvw", ref, commitment, nonce, committed, official: OFFICIAL_NO, agreement: "agree" };
+    const market = { platform: "polymarket", external_id: "700001" } as const;
+    const texts = [
+      ...commitBatchMessages(CPI, [{ id: "cw", ref, commitment, created_at: ago(5) }]).map((m) => m.text),
+      ...revealBatchMessages(CPI, [leg]).map((m) => m.text),
+      commitText(market, commitment, fields.raw_sha256, ago(5)),
+      buildReveal(market, { id: "cw", commitment_sha256: commitment, nonce }, committed, OFFICIAL_NO, "agree").text,
+    ];
+    expect(texts).toHaveLength(4);
+    for (const t of texts) expect(t).not.toMatch(NAMES);
   });
 });
 

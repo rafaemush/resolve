@@ -1,5 +1,6 @@
 import { Verdict, type Check, type EvidenceInput, type StrictV0Verdict } from "./schema";
 import type { PrecheckResult } from "./precheck";
+import { publicErrorReason } from "../api/public-names";
 
 export interface VerdictParts {
   marketId: string;
@@ -51,9 +52,13 @@ export function assembleVerdict(parts: VerdictParts, pre: PrecheckResult | null,
   return Verdict.parse(v);
 }
 
-/** strict_v0 tenants: the founder's two-code body, or an HTTP-level condition with no verdict body. */
+/**
+ * strict_v0 tenants: the founder's two-code body, or an HTTP-level condition with no verdict body. The message names the
+ * error_reason by its public name (src/api/public-names.ts): PAID_JEV_DISABLED is WEB_EVIDENCE_DISABLED.
+ */
 export function toStrictV0(v: Verdict): { kind: "verdict"; body: StrictV0Verdict } | { kind: "http"; status: 422 | 503; code: "UNSAFE_INPUT" | "UPSTREAM_UNAVAILABLE"; message: string } {
-  if (v.error_code === "UNSAFE_INPUT") return { kind: "http", status: 422, code: "UNSAFE_INPUT", message: `Evidence rejected (${v.error_reason}). Do not retry with more of the same source.` };
-  if (v.error_code === "UPSTREAM_UNAVAILABLE") return { kind: "http", status: 503, code: "UPSTREAM_UNAVAILABLE", message: `Resolution engine unavailable (${v.error_reason}). Retry after the Retry-After interval; no credits were charged.` };
+  const reason = v.error_reason === null ? "unspecified" : publicErrorReason(v.error_reason);
+  if (v.error_code === "UNSAFE_INPUT") return { kind: "http", status: 422, code: "UNSAFE_INPUT", message: `Evidence rejected (${reason}). Do not retry with more of the same source.` };
+  if (v.error_code === "UPSTREAM_UNAVAILABLE") return { kind: "http", status: 503, code: "UPSTREAM_UNAVAILABLE", message: `Resolution engine unavailable (${reason}). Retry after the Retry-After interval; no credits were charged.` };
   return { kind: "verdict", body: { market_id: v.market_id, resolution_status: v.resolution_status, winning_outcome: v.winning_outcome, confidence_score: v.confidence_score, error_code: v.error_code } };
 }
