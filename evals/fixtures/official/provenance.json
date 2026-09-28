@@ -326,7 +326,115 @@
    "sha256": "5fc342fda696ebd2b6fe0c91abfdb5c543c71cc7f355fd16af20eb8b331648e7",
    "file": "bls_v1_payrolls.json",
    "what": "Total nonfarm employment level, seasonally adjusted, thousands (2026-08 latest, preliminary)"
+  },
+  "tse_2022_br_c0001_e000544_r_20221002T210340Z.json": {
+   "fetched_at": "2022-10-02T21:03:40Z",
+   "url": "https://resultados.tse.jus.br/oficial/ele2022/544/dados-simplificados/br/br-c0001-e000544-r.json",
+   "via": "https://web.archive.org/web/20221002210340id_/https://resultados.tse.jus.br/oficial/ele2022/544/dados-simplificados/br/br-c0001-e000544-r.json",
+   "http_status": 200,
+   "content_type": "application/json",
+   "bytes": 3428,
+   "sha256": "59e04b5a18ac4bb557c31e07a5dad087211c1768a5b5fe0a127d92310c3d3178",
+   "file": "tse_2022_br_c0001_e000544_r_20221002T210340Z.json",
+   "what": "2022 first round, President, national file generated 02/10/2022 17:55:04 BRT: 1.99% of sections totalized, md=N, tf=n (JAIR BOLSONARO ahead)"
+  },
+  "tse_2022_br_c0001_e000544_r_20221003T155646Z.json": {
+   "fetched_at": "2022-10-03T15:56:46Z",
+   "url": "https://resultados.tse.jus.br/oficial/ele2022/544/dados-simplificados/br/br-c0001-e000544-r.json",
+   "via": "https://web.archive.org/web/20221003155646id_/https://resultados.tse.jus.br/oficial/ele2022/544/dados-simplificados/br/br-c0001-e000544-r.json",
+   "http_status": 200,
+   "content_type": "application/json",
+   "bytes": 3472,
+   "sha256": "8d323d9d44bcb56b9bdc54dfa5a4f2b8d74876d141fd07e3398c771d738da8a6",
+   "file": "tse_2022_br_c0001_e000544_r_20221003T155646Z.json",
+   "what": "2022 first round, President, national file generated 03/10/2022 10:13:47 BRT: 99.99% of sections, md=S, tf=n (10 sections left)"
+  },
+  "tse_2022_br_c0001_e000544_r_20221004T163422Z.json": {
+   "fetched_at": "2022-10-04T16:34:22Z",
+   "url": "https://resultados.tse.jus.br/oficial/ele2022/544/dados-simplificados/br/br-c0001-e000544-r.json",
+   "via": "https://web.archive.org/web/20221004163422id_/https://resultados.tse.jus.br/oficial/ele2022/544/dados-simplificados/br/br-c0001-e000544-r.json",
+   "http_status": 200,
+   "content_type": "application/json",
+   "bytes": 3589,
+   "sha256": "a87a25b7f7d7d5329e765c63cee49c30a160050efc4a19a0a5ad89f6e57d5d70",
+   "file": "tse_2022_br_c0001_e000544_r_20221004T163422Z.json",
+   "what": "2022 first round, President, national FINAL file (tf=s, dg 04/10/2022 12:07:13 BRT); byte-identical to the 2022-10-10 capture"
+  },
+  "tse_2022_ac_c0001_e000544_r_20221007T210406Z.json": {
+   "fetched_at": "2022-10-07T21:04:06Z",
+   "url": "https://resultados.tse.jus.br/oficial/ele2022/544/dados-simplificados/ac/ac-c0001-e000544-r.json",
+   "via": "https://web.archive.org/web/20221007210406id_/https://resultados.tse.jus.br/oficial/ele2022/544/dados-simplificados/ac/ac-c0001-e000544-r.json",
+   "http_status": 200,
+   "content_type": "application/json",
+   "bytes": 3521,
+   "sha256": "b561e70bb0961e732df9f836dca4ca8c947057bad65310b6ec2a028b83358ab2",
+   "file": "tse_2022_ac_c0001_e000544_r_20221007T210406Z.json",
+   "what": "2022 first round, President, Acre FINAL file (tf=s)"
+  },
+  "tse_2022_sp_c0001_e000544_r_20221003T011620Z.json": {
+   "fetched_at": "2022-10-03T01:16:20Z",
+   "url": "https://resultados.tse.jus.br/oficial/ele2022/544/dados-simplificados/sp/sp-c0001-e000544-r.json",
+   "via": "https://web.archive.org/web/20221003011620id_/https://resultados.tse.jus.br/oficial/ele2022/544/dados-simplificados/sp/sp-c0001-e000544-r.json",
+   "http_status": 200,
+   "content_type": "application/json",
+   "bytes": 3454,
+   "sha256": "620b3a13bf3195c30f9d14725fc7a0a70bc84ed2ffe34137f5230f4ab8eca7ca",
+   "file": "tse_2022_sp_c0001_e000544_r_20221003T011620Z.json",
+   "what": "2022 first round, President, Sao Paulo partial file: 99.90% of sections, md=S, tf=n"
+  },
+  "tse_2022_mg_c0001_e000544_r_20221013T152145Z.json": {
+   "fetched_at": "2022-10-13T15:21:45Z",
+   "url": "https://resultados.tse.jus.br/oficial/ele2022/544/dados-simplificados/mg/mg-c0001-e000544-r.json",
+   "via": "https://web.archive.org/web/20221013152145id_/https://resultados.tse.jus.br/oficial/ele2022/544/dados-simplificados/mg/mg-c0001-e000544-r.json",
+   "http_status": 200,
+   "content_type": "application/json",
+   "bytes": 3561,
+   "sha256": "22cc5f6c0b8cb71920911ffe2334aa79ba9bcb0304ea5a9a0e9cd4d51dcc4536",
+   "file": "tse_2022_mg_c0001_e000544_r_20221013T152145Z.json",
+   "what": "2022 first round, President, Minas Gerais FINAL file (tf=s)"
+  },
+  "tse_2022_config_ele-c_20221004T163421Z.json": {
+   "fetched_at": "2022-10-04T16:34:21Z",
+   "url": "https://resultados.tse.jus.br/oficial/ele2022/comum/config/ele-c.json",
+   "via": "https://web.archive.org/web/20221004163421id_/https://resultados.tse.jus.br/oficial/ele2022/comum/config/ele-c.json",
+   "http_status": 200,
+   "content_type": "application/json",
+   "bytes": 1042,
+   "sha256": "75368468076211fd13113207f35ba443aebafe81941423c24b8ef03c9a6df92f",
+   "file": "tse_2022_config_ele-c_20221004T163421Z.json",
+   "what": "2022 results configuration: pleito 406 dated 02/10/2022, election 544 = federal first round (tp 8, t 1, President)"
+  },
+  "tse_sim2026_br_c0001_e021270_u.json": {
+   "fetched_at": "2026-09-27T22:59:13Z",
+   "url": "https://resultados-sim.tse.jus.br/simulado/simulado2026/ele2026/21270/dados/br/br-c0001-e021270-u.json",
+   "http_status": 200,
+   "content_type": "application/json",
+   "bytes": 10059,
+   "sha256": "1860e54766737384802036b1e0b4d2c37fb59f13cda1c5a79754e05a8b0e92ec",
+   "file": "tse_sim2026_br_c0001_e021270_u.json",
+   "what": "2026 TSE SIMULATION (f=s, fictitious candidates), EA20 unified layout, President national file: tf=s and=f; candidate 57 is 'Anulado sub judice' (10,503,573 votes, more than any valid candidate)"
+  },
+  "tse_sim2026_config_ele-c.json": {
+   "fetched_at": "2026-09-27T23:23:16Z",
+   "url": "https://resultados-sim.tse.jus.br/simulado/simulado2026/comum/config/ele-c.json",
+   "http_status": 200,
+   "content_type": "application/json",
+   "bytes": 1857,
+   "sha256": "6484af59423d8ff01ebf41f3ba5f5e487b338b8014a76af2be75970a9fa6de16",
+   "file": "tse_sim2026_config_ele-c.json",
+   "what": "2026 TSE SIMULATION results configuration (f=s): pleito 17801 dated 26/04/2026 with c=ele2026 inside the pleito; election 21270 = federal first round; arq lists the unified-file directory template"
+  },
+  "eq_gen2022_resultats.json": {
+   "fetched_at": "2026-09-27T22:47:13Z",
+   "url": "https://donnees.electionsquebec.qc.ca/production/provincial/resultats/archives/gen2022-10-03/resultats.json",
+   "http_status": 200,
+   "content_type": "application/json",
+   "bytes": 337451,
+   "sha256": "66a4410f46b2c664dc0b0f54a6b35e5406f6a9fc15b147b63077c01953573f2e",
+   "file": "eq_gen2022_resultats.json.gz",
+   "what": "Élections Québec, general election of 2022-10-03, final archive of the live results file (isResultatsFinaux true, 125/125 ridings, iso8601DateMAJ 2022-10-06T11:55:41,000-04:00). Comprend des données ouvertes octroyées sous la licence d'utilisation des données ouvertes du directeur général des élections disponible à l'adresse Web dgeq.org. L'octroi de la licence n'implique aucune approbation par le directeur général des élections de l'utilisation des données ouvertes qui en est faite."
   }
  },
- "_note_2026_09_27": "Entries fetched 2026-09-27 (BLS CPI Table A siblings, Employment Situation, BLS API v1 CUSR0000SA0 / CUSR0000SA0L1E / CUUR0000SA0L1E / LNS14000000 / CES0000000001) by curl with the same UA; every request answered 200 with Accept text/html or application/json (no browser-like header needed). Archived release pages (1.1-1.4 MB) are kept as byte-exact excerpts (excerpt_of names the full body's size and sha256, kept says which bytes); US government public-domain text. sha256 is of the stored excerpt."
+ "_note_2026_09_27": "Entries fetched 2026-09-27 (BLS CPI Table A siblings, Employment Situation, BLS API v1 CUSR0000SA0 / CUSR0000SA0L1E / CUUR0000SA0L1E / LNS14000000 / CES0000000001) by curl with the same UA; every request answered 200 with Accept text/html or application/json (no browser-like header needed). Archived release pages (1.1-1.4 MB) are kept as byte-exact excerpts (excerpt_of names the full body's size and sha256, kept says which bytes); US government public-domain text. sha256 is of the stored excerpt.",
+ "_note_2026_09_28_elections": "Election fixtures (2026-09-28): TSE 2022 first-round files and configuration are Wayback Machine captures (via names the id_ capture URL; fetched_at is the capture time; the original TSE URL is url), saved 2026-09-27 by the research runs because every TSE host answered 403 to ResolveBot from the founder's machine; the 2026 TSE simulation files and the Élections Québec 2022 archive were fetched directly with ResolveBot's UA. Brazilian electoral results are public records; the Élections Québec data is used under its open-data licence (the attribution notice is in the entry's what). The 2022 files use the simplified layout (-r.json); the 2026 simulation file is the EA20 unified layout the 2026 official files are expected to use (UNVERIFIED for the official environment)."
 }

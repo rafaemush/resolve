@@ -28,15 +28,24 @@ import {
 } from "../src/ingest/official-parse";
 import { BLS_API, blsCorroboration } from "../src/ingest/official";
 import { buildLegRegistration, type LegGroup } from "../src/markets/official-legs";
-import { officialFixture, officialFixtureBytes, OFFICIAL_FIXTURE_DIR } from "./lib/official-fixtures";
+import { parseTseConfig, parseTseResult, parseEqResults } from "../src/ingest/election-parse";
+import { snapshotForSeries, type ElectionSeriesId, type ElectionSnapshot } from "../src/resolve/election";
+import { buildElectionLeg, tseRegistryFromSnapshot, eqRegistryFromSnapshot, type ElectionEventInput, type Registries } from "../src/markets/election-legs";
+import { officialFixture, officialFixtureBytes, officialFixtureFetchedAt, OFFICIAL_FIXTURE_DIR } from "./lib/official-fixtures";
 
 const sha = (s: string | Uint8Array) => createHash("sha256").update(s).digest("hex");
 const DIR = resolve(process.cwd(), "evals/official-cases");
 const CASES_FILE = resolve(DIR, "cases.jsonl");
 const MANIFEST = resolve(DIR, "manifest.sha256");
 
-export type OfficialGroup = "release_gate" | "first_print";
-type Parser = "bls_cpi_text" | "bls_ppi_text" | "bls_api_yoy" | "fed_statement" | "ecb_release" | "boe_rss" | "bok_decision_rss" | "bok_gdp_rss" | "ecos_quarter" | "bcb_latest_row" | "bcb_history" | "sgs432_row"
+/**
+ * Election groups (src/resolve/election.ts): election_final (rail election_final_count), election_margin (rail
+ * election_safety_margin), election_mapping (leg building: a label must map to exactly one authority entry; no rail,
+ * every case is a control). Election cases read TSE 2022 first-round files (Wayback captures), the TSE 2026 simulation
+ * (EA20 layout) and the Élections Québec 2022 archive with the production parsers.
+ */
+export type OfficialGroup = "release_gate" | "first_print" | "election_final" | "election_margin" | "election_mapping";
+type Parser = "tse_result" | "eq_result" | "bls_cpi_text" | "bls_ppi_text" | "bls_api_yoy" | "fed_statement" | "ecb_release" | "boe_rss" | "bok_decision_rss" | "bok_gdp_rss" | "ecos_quarter" | "bcb_latest_row" | "bcb_history" | "sgs432_row"
   | "bls_cpi_table" | "bls_empsit_text" | "bls_api_mom" | "bls_api_level" | "bls_api_change";
 /** bls_api_yoy and bls_api run the production corroboration (src/ingest/official.ts blsCorroboration) on the saved body. */
 type CorrParser = "bls_api_yoy" | "bls_api" | "fred" | "ecb_dfr" | "iadb" | "ecos_daily" | "ecos_quarter" | "single_source";
@@ -46,9 +55,15 @@ type Edits = Array<[string, string]>;
  * own_capture: this market's own watch made the observation (default). For events outside KNOWN_RELEASES the
  * release-time part of gate 1 applies only to such observations (src/resolve/official.ts).
  */
-interface Read { fixture: string; parser: Parser; select?: string; observed_at: string; own_capture?: boolean; edits?: Edits; corroboration?: { fixture?: string; parser: CorrParser; select?: string; edits?: Edits } }
+/** tse_result: select is the election day looked up in the saved configuration `config`; eq_result: select is the election day. */
+/** url (election reads only): the URL the saved body is attributed to, when not its provenance URL (a SYNTHETIC relocation). */
+interface Read { fixture: string; parser: Parser; url?: string; select?: string; observed_at: string; own_capture?: boolean; edits?: Edits; config?: string; config_edits?: Edits; corroboration?: { fixture?: string; parser: CorrParser; select?: string; edits?: Edits } }
 interface Expect { status: "RESOLVED" | "UNRESOLVED" | "ERROR"; outcome: "OPTION_A" | "OPTION_B" | "NONE"; caveats_include?: readonly string[]; error_reason?: string }
-export interface OfficialCase { id: string; group: OfficialGroup; control: boolean; title: string; market: Reg; stored?: Read; fetched: Read; expect: Expect }
+export interface ResolveCase { id: string; group: OfficialGroup; control: boolean; title: string; market: Reg; stored?: Read; fetched: Read; expect: Expect }
+/** A leg built at run time from an authority registry saved as a fixture: refused (reason substring) or mapped (subject id). */
+interface BuildSpec { event: ElectionEventInput; label: string; registry: { authority: "tse" | "eq"; fixture: string; config?: string } | null }
+export interface BuildCase { id: string; group: OfficialGroup; control: boolean; title: string; build: BuildSpec; expect: { refused_includes?: string; subject_id?: string } }
+export type OfficialCase = ResolveCase | BuildCase;
 
 // ---- authored cases ------------------------------------------------------------------------------------------------
 
@@ -211,6 +226,110 @@ function blsCases(): OfficialCase[] {
   ];
 }
 
+// ---- election cases (src/resolve/election.ts) ------------------------------------------------------------------------
+
+const EL = {
+  br2022: { first: "tse_2022_br_c0001_e000544_r_20221002T210340Z.json", mdS: "tse_2022_br_c0001_e000544_r_20221003T155646Z.json", final: "tse_2022_br_c0001_e000544_r_20221004T163422Z.json" },
+  ac2022: "tse_2022_ac_c0001_e000544_r_20221007T210406Z.json", mg2022: "tse_2022_mg_c0001_e000544_r_20221013T152145Z.json",
+  sp2022: "tse_2022_sp_c0001_e000544_r_20221003T011620Z.json", sim2026: "tse_sim2026_br_c0001_e021270_u.json", eq2022: "eq_gen2022_resultats.json",
+};
+const TSE_DAY_2022 = "2022-10-02", EQ_DAY_2022 = "2022-10-03";
+/** 2022 polls closed 17:00 Brasília (20:00Z) and 20:00 EDT in Quebec (00:00Z the next day). */
+const TSE_CLOSE_2022 = "2022-10-02T20:00:00Z", EQ_CLOSE_2022 = "2022-10-04T00:00:00Z";
+/** Paraphrase of the platform rule on brackets (the leg builder refuses a percent ladder whose text does not settle ties). */
+const TIE_TEXT = "A value exactly between two brackets resolves to the higher bracket.";
+
+function tseRegistryOf(fixture: string, day: string): Registries["tse"] {
+  const p = parseTseResult(officialFixture(fixture), day);
+  if (!p.ok) throw new Error(`${fixture}: ${p.detail}`);
+  return tseRegistryFromSnapshot(p.snap, urlOf(fixture), officialFixtureFetchedAt(fixture));
+}
+function eqRegistryOf(fixture: string): Registries["eq"] {
+  const p = parseEqResults(officialFixture(fixture));
+  if (!p.ok) throw new Error(`${fixture}: ${p.detail}`);
+  return eqRegistryFromSnapshot(p.snap, urlOf(fixture), officialFixtureFetchedAt(fixture));
+}
+const authorityOf = (s: ElectionSeriesId) => (s.startsWith("qc_") ? "eq" : "tse");
+function mapEv(series: ElectionSeriesId, labels: string[], extra: Partial<ElectionEventInput> = {}): ElectionEventInput {
+  const tse = authorityOf(series) === "tse";
+  return { series, period: tse ? TSE_DAY_2022 : EQ_DAY_2022, release_at: tse ? TSE_CLOSE_2022 : EQ_CLOSE_2022, title: `Eval: ${series} (2022 count)`, criteria: `Paraphrased eval rules. ${TIE_TEXT}`, labels, ...extra };
+}
+/** An election leg built by the production leg builder (src/markets/election-legs.ts) against the authority's own registry. */
+function electionLeg(series: ElectionSeriesId, label: string, reg: Registries, opts: { labels?: string[]; party?: string; unit?: string } = {}): Reg {
+  const ev = mapEv(series, opts.labels ?? [label], { ...(opts.party ? { party: opts.party } : {}), ...(opts.unit ? { unit: opts.unit } : {}) });
+  const b = buildElectionLeg(ev, { external_id: `eval-${series}-${label}`.replace(/[^A-Za-z0-9-]+/g, "-").slice(0, 80), label, open_at: "2022-09-01T00:00:00Z", deadline_utc: "2027-06-30T23:59:00Z" }, reg);
+  if (!b.ok) throw new Error(`electionLeg ${series} "${label}": ${b.reason}`);
+  return b.market;
+}
+const tseRead = (fixture: string, edits?: Edits): Read => ({ fixture, parser: "tse_result", select: TSE_DAY_2022, observed_at: officialFixtureFetchedAt(fixture), ...(edits ? { edits } : {}) });
+const eqRead = (fixture: string): Read => ({ fixture, parser: "eq_result", select: EQ_DAY_2022, observed_at: officialFixtureFetchedAt(fixture) });
+const EL_YES = { status: "RESOLVED", outcome: "OPTION_A", caveats_include: ["first_print", "single_source"] } as const;
+const EL_NO = { status: "RESOLVED", outcome: "OPTION_B", caveats_include: ["first_print", "single_source"] } as const;
+const PENDING = (c: string) => ({ status: "UNRESOLVED", outcome: "NONE", caveats_include: [c] }) as const;
+const NOT_FINAL = PENDING("count_not_final");
+/** SYNTHETIC: Acre's two leaders brought within 96 votes (0.02 pp of 440,917 valid votes); their sum and every total unchanged. */
+const AC_NEAR_TIE: Edits = [['"vap" : "275582"', '"vap" : "202350"'], ['"vap" : "129022"', '"vap" : "202254"']];
+function eqRidingCode(name: string): string {
+  const p = parseEqResults(officialFixture(EL.eq2022));
+  if (!p.ok) throw new Error(p.detail);
+  const r = p.snap.ridings.filter((x) => x.name === name);
+  if (r.length !== 1) throw new Error(`riding ${name}: ${r.length}`);
+  return r[0]!.id;
+}
+
+/**
+ * Election legs on the 2022 counts (TSE first round of 2022-10-02, Wayback captures of the official files; Élections
+ * Québec 2022 archive) and the TSE 2026 simulation, each built by the production leg builder against the authority's
+ * registry: final vs not-final counts, near ties, bucket edges and label mapping.
+ */
+function electionCases(): OfficialCase[] {
+  const br: Registries = { tse: tseRegistryOf(EL.br2022.final, TSE_DAY_2022) };
+  const ac: Registries = { tse: tseRegistryOf(EL.ac2022, TSE_DAY_2022) };
+  const mg: Registries = { tse: tseRegistryOf(EL.mg2022, TSE_DAY_2022) };
+  const sp: Registries = { tse: tseRegistryOf(EL.sp2022, TSE_DAY_2022) };
+  const eq: Registries = { eq: eqRegistryOf(EL.eq2022) };
+  const named = ["Lula", "Jair Bolsonaro", "Simone Tebet", "Ciro Gomes"];
+  const tasch = eqRidingCode("Taschereau");
+  const taschWinner = (() => {
+    const p = parseEqResults(officialFixture(EL.eq2022));
+    if (!p.ok) throw new Error(p.detail);
+    const r = p.snap.ridings.find((x) => x.id === tasch)!;
+    return [...r.candidates].sort((a, b) => Number(b.votes) - Number(a.votes))[0]!;
+  })();
+  const L = electionLeg;
+  const sim = L("br_pres_r1_winner", "Lula", br, { labels: named });
+  const simMarket: Reg = { ...sim, resolver: { ...(sim.resolver as Extract<Reg["resolver"], { kind: "official_release" }>), period: "2026-10-04", release_at: "2026-10-04T20:00:00Z" }, sources: [{ kind: "official_release", ref: "official:br_pres_r1_winner:2026-10-04" }] };
+  return [
+    // --- election_final: only the authority's own final count decides (red when election_final_count is off) -------
+    { id: "EL-F01", group: "election_final", control: false, title: "TSE 2022 national file at 1.99% of sections (17:55 BRT, Bolsonaro 48.8% ahead): the national-winner leg for Bolsonaro stays pending", market: L("br_pres_r1_winner", "Jair Bolsonaro", br, { labels: named }), fetched: tseRead(EL.br2022.first), expect: NOT_FINAL },
+    { id: "EL-F02", group: "election_final", control: false, title: "TSE 2022 national file at 99.99% (md=S, tf=n, 10 sections left): Lula's 1st place is mathematically settled but not totalized; pending", market: L("br_pres_r1_winner", "Lula", br, { labels: named }), fetched: tseRead(EL.br2022.mdS), expect: NOT_FINAL },
+    { id: "EL-F03", group: "election_final", control: false, title: "TSE 2022 São Paulo file at 99.9% of sections (tf=n): Bolsonaro's 1st place in the state is not final; pending", market: L("br_pres_r1_first_sp", "Jair Bolsonaro", sp, { labels: named }), fetched: tseRead(EL.sp2022), expect: NOT_FINAL },
+    { id: "EL-F04", group: "election_final", control: false, title: "TSE 2022 national 1.99% file: Lula's 4th-place leg (No once final) stays pending, never No from a partial count", market: L("br_pres_r1_fourth", "Lula", br, { labels: named }), fetched: tseRead(EL.br2022.first), expect: NOT_FINAL },
+    { id: "EL-FC1", group: "election_final", control: true, title: "TSE 2022 national final count (tf=s, 04/10 10:27 BRT): Lula 1st nationally, Yes", market: L("br_pres_r1_winner", "Lula", br, { labels: named }), fetched: tseRead(EL.br2022.final), expect: EL_YES },
+    { id: "EL-FC2", group: "election_final", control: true, title: "TSE 2022 national final count: Bolsonaro's national-winner leg is No", market: L("br_pres_r1_winner", "Jair Bolsonaro", br, { labels: named }), fetched: tseRead(EL.br2022.final), expect: EL_NO },
+    { id: "EL-FC3", group: "election_final", control: true, title: "TSE 2022 Acre final count: Bolsonaro 1st in Acre (62.5% of valid votes), Yes", market: L("br_pres_r1_first_ac", "Jair Bolsonaro", ac, { labels: named }), fetched: tseRead(EL.ac2022), expect: EL_YES },
+    { id: "EL-FC4", group: "election_final", control: true, title: "TSE 2022 Minas Gerais final count: Lula 1st in the state (48.3% vs 43.6%), Yes", market: L("br_pres_r1_first_mg", "Lula", mg, { labels: named }), fetched: tseRead(EL.mg2022), expect: EL_YES },
+    { id: "EL-FC5", group: "election_final", control: true, title: "TSE 2022 national final count: Simone Tebet 3rd (4.16% vs Ciro 3.04%), Yes", market: L("br_pres_r1_third", "Simone Tebet", br, { labels: named }), fetched: tseRead(EL.br2022.final), expect: EL_YES },
+    { id: "EL-FC6", group: "election_final", control: true, title: "TSE 2022 national final count: Ciro Gomes 4th, Yes", market: L("br_pres_r1_fourth", "Ciro Gomes", br, { labels: named }), fetched: tseRead(EL.br2022.final), expect: EL_YES },
+    { id: "EL-FC7", group: "election_final", control: true, title: "TSE 2022 national final count: turnout 79.05% (over eligible voters and over installed sections alike) is in 75-80%, Yes", market: L("br_pres_r1_turnout", "75-80%", br), fetched: tseRead(EL.br2022.final), expect: EL_YES },
+    { id: "EL-FC8", group: "election_final", control: true, title: "TSE 2026 SIMULATION file from resultados-sim.tse.jus.br: not the series' host, never evidence", market: simMarket, fetched: { fixture: EL.sim2026, parser: "tse_result", select: "2026-10-04", observed_at: officialFixtureFetchedAt(EL.sim2026) }, expect: { status: "ERROR", outcome: "NONE", error_reason: "SOURCE_REF_MISMATCH" } },
+    { id: "EL-FC10", group: "election_final", control: true, title: "SYNTHETIC: the 2026 simulation bytes (f=s, final flags, stamped 24/09/2026) served at the official host and read after polls close: never a result", market: simMarket, fetched: { fixture: EL.sim2026, parser: "tse_result", select: "2026-10-04", observed_at: "2026-10-05T12:00:00Z", url: "https://resultados.tse.jus.br/oficial/ele2026/21270/dados/br/br-c0001-e021270-u.json" }, expect: AWAIT },
+    { id: "EL-FC9", group: "election_final", control: true, title: `Élections Québec 2022 final file (every riding final): ${taschWinner.name} wins Taschereau, Yes`, market: L("qc_riding_751", taschWinner.name, eq, { unit: tasch }), fetched: eqRead(EL.eq2022), expect: EL_YES },
+    // --- election_margin: a decisive number inside the safety margin stays pending (red when election_safety_margin is off)
+    { id: "EL-M01", group: "election_margin", control: false, title: "SYNTHETIC Acre final count with the leaders 96 votes apart (0.02 pp): Bolsonaro's 1st-place leg abstains (near_tie)", market: L("br_pres_r1_first_ac", "Jair Bolsonaro", ac, { labels: named }), fetched: tseRead(EL.ac2022, AC_NEAR_TIE), expect: PENDING("near_tie") },
+    { id: "EL-M02", group: "election_margin", control: false, title: "TSE 2022 national final: Lula's margin 5.2332 pp is 0.017 pp from the 5.25% bucket edge: the 'Lula 5.25%+' leg abstains", market: L("br_pres_r1_margin", "Lula 5.25%+", br), fetched: tseRead(EL.br2022.final), expect: PENDING("near_bucket_edge") },
+    { id: "EL-M03", group: "election_margin", control: false, title: "TSE 2022 national final: Lula's 48.4312% of valid votes is 0.019 pp from the 48.45% edge: the '45-48.45%' share leg abstains", market: L("br_pres_r1_share_lula", "45-48.45%", br), fetched: tseRead(EL.br2022.final), expect: PENDING("near_bucket_edge") },
+    { id: "EL-MC1", group: "election_margin", control: true, title: "TSE 2022 national final: Lula's margin 5.23 pp is in 5-7.5%, far from both edges, Yes", market: L("br_pres_r1_margin", "Lula 5-7.5%", br), fetched: tseRead(EL.br2022.final), expect: EL_YES },
+    { id: "EL-MC2", group: "election_margin", control: true, title: "TSE 2022 national final: Lula's share 48.43% is in 45-50%, Yes", market: L("br_pres_r1_share_lula", "45-50%", br), fetched: tseRead(EL.br2022.final), expect: EL_YES },
+    // --- election_mapping: a label must map to exactly one authority entry (every case a control) -------------------
+    { id: "EL-B01", group: "election_mapping", control: true, title: "'Lula' maps to TSE ballot number 13 in the 2022 registry", build: { event: mapEv("br_pres_r1_winner", named), label: "Lula", registry: { authority: "tse", fixture: EL.br2022.final } }, expect: { subject_id: "13" } },
+    { id: "EL-B02", group: "election_mapping", control: true, title: "'Tarcísio de Freitas' (not a 2022 presidential candidate) matches no TSE candidate: refused", build: { event: mapEv("br_pres_r1_third", ["Tarcísio de Freitas", "Lula"]), label: "Tarcísio de Freitas", registry: { authority: "tse", fixture: EL.br2022.final } }, expect: { refused_includes: "matches no" } },
+    { id: "EL-B03", group: "election_mapping", control: true, title: "No TSE registry (every TSE host answered 403): a candidate leg is refused, never registered by label", build: { event: mapEv("br_pres_r1_winner", named), label: "Lula", registry: null }, expect: { refused_includes: "no TSE candidate registry" } },
+    { id: "EL-B04", group: "election_mapping", control: true, title: "Quebec riding leg naming a person who is not a candidate in that riding: refused", build: { event: mapEv("qc_riding_751", ["Vincent Marissal"], { unit: tasch }), label: "Vincent Marissal", registry: { authority: "eq", fixture: EL.eq2022 } }, expect: { refused_includes: "matches no" } },
+    { id: "EL-B05", group: "election_mapping", control: true, title: "'Parti' matches more than one Élections Québec party: ambiguous, refused", build: { event: mapEv("qc_second_place", ["Parti"]), label: "Parti", registry: { authority: "eq", fixture: EL.eq2022 } }, expect: { refused_includes: "ambiguous" } },
+  ];
+}
+
 export function authorCases(): OfficialCase[] {
   const target = { open: "2026-09-15T08:56:56.799Z" };
   return [
@@ -252,6 +371,7 @@ export function authorCases(): OfficialCase[] {
     { id: "OFF-FC3", group: "first_print", control: true, title: "PPI August 2026: the API's 5.4 agrees with the stored 5.4", market: leg(PPI_AUG, "5.4%", "2026-08-01T00:00:00Z", "2026-09-11T03:59:00Z"), stored: ppiText(AT.ppi), fetched: { fixture: "bls_v1_ppi.json", parser: "bls_api_yoy", select: "2026-08", observed_at: AT.blsApiPpi }, expect: YES },
     { id: "OFF-FC4", group: "first_print", control: true, title: "Korea GDP Q2: no stored first print yet, the first read decides", market: leg(GDP_Q2, "3.5–3.9%", "2026-04-24T00:00:00Z", "2026-07-23T00:00:00Z"), fetched: gdpQ2(AT.press), expect: YES },
     ...blsCases(),
+    ...electionCases(),
   ];
 }
 
@@ -345,8 +465,28 @@ function parse(read: Read): DocObservation | { missing: string } {
       const [d, m, y] = row.data.split("/");
       return { period: `${y}-${m}-${d}`, value: Number(row.valor), value_text: row.valor, deciding_text: `SGS 432 ${row.data} = ${row.valor}`, direction: null, meta: {} };
     }
+    case "tse_result": case "eq_result": throw new Error(`${read.parser} is read by electionDoc`);
     default: { const never: never = read.parser; throw new Error(`unhandled parser ${String(never)}`); }
   }
+}
+
+/** An election read as the rail stores it: the production parser's snapshot, the part the series keeps, and a deciding text naming the day. */
+function electionDoc(r: OfficialResolver, read: Read): OfficialDoc {
+  const body = bodyOf(read.fixture, read.edits);
+  const p = read.parser === "tse_result" ? parseTseResult(body, read.select!) : parseEqResults(body);
+  if (!p.ok) throw new Error(`${read.fixture} ${read.parser}: ${p.reason} ${p.detail}`);
+  const snap = p.snap as ElectionSnapshot;
+  const valid = snap.authority === "tse" ? snap.votes.valid : snap.valid;
+  const deciding = snap.authority === "tse"
+    ? `TSE President first-round count for ${snap.scope}, election day ${snap.election_day} (election ${snap.election_id}, environment ${snap.environment}): tf=${snap.flags.tf} dv=${snap.flags.dv}; ${snap.sections.totalized} of ${snap.sections.total} sections totalized; ${snap.votes.valid} valid votes.`
+    : `Élections Québec general election results for election day ${read.select}: ${snap.ridings_with_result} of ${snap.ridings_total} ridings; updated ${snap.as_of}; ${snap.valid} valid votes.`;
+  const at = new Date(read.observed_at).toISOString();
+  return {
+    kind: "official_observation", series: r.series, period: read.select!, value: Number(valid), value_text: valid, deciding_text: deciding,
+    source_url: read.url ?? urlOf(read.fixture), raw_sha256: sha(bytesOf(read)), observed_at: at, direction: null,
+    corroboration: { status: "single_source", source_url: null, value: null, value_text: null, detail: "no second source publishes the count on election night", checked_at: at },
+    stated_prior: null, stated_step_bps: null, contest: snapshotForSeries(r.series as ElectionSeriesId, snap),
+  };
 }
 
 function corroborate(series: OfficialSeriesId, obs: DocObservation, spec: Read["corroboration"], at: string): OfficialCorroboration | null {
@@ -371,6 +511,7 @@ function corroborate(series: OfficialSeriesId, obs: DocObservation, spec: Read["
 }
 
 function docOf(r: OfficialResolver, read: Read): OfficialDoc {
+  if (read.parser === "tse_result" || read.parser === "eq_result") return electionDoc(r, read);
   const series = r.series;
   const obs = parse(read);
   if ("missing" in obs) {
@@ -392,6 +533,7 @@ export function renderCases(): { body: string; manifest: string } {
   const lines = authorCases().map((k) => {
     if (ids.has(k.id)) throw new Error(`duplicate case id ${k.id}`);
     ids.add(k.id);
+    if ("build" in k) return JSON.stringify(k);
     const m = MarketRegistration.safeParse(k.market);
     if (!m.success) throw new Error(`${k.id}: market invalid: ${m.error.issues.map((i) => i.path.join(".") + " " + i.message).join("; ")}`);
     return JSON.stringify({ ...k, market: m.data });
@@ -412,7 +554,28 @@ export function loadOfficialCases(): { cases: OfficialCase[]; suite: string } {
 export interface OfficialOutcome { id: string; group: string; control: boolean; result: "pass" | "grader_fail" | "harness_error"; failures: string[] }
 export interface OfficialSummary { suite_sha256: string; cases: number; passed: number; grader_fail: number; harness_error: number; skipped: number; false_resolved: number; outcomes: OfficialOutcome[]; label?: string }
 
+/** A leg built from the authority's registry: refused with the expected reason, or mapped to the expected id. */
+function runBuild(k: BuildCase): { failures: string[]; falseResolved: boolean } {
+  const reg: Registries = { tseUnavailable: "every TSE host answered 403 (eval)" };
+  const spec = k.build.registry;
+  if (spec?.authority === "tse") reg.tse = tseRegistryOf(spec.fixture, k.build.event.period);
+  if (spec?.authority === "eq") reg.eq = eqRegistryOf(spec.fixture);
+  const b = buildElectionLeg(k.build.event, { external_id: k.id, label: k.build.label, open_at: "2022-09-01T00:00:00Z", deadline_utc: "2027-06-30T23:59:00Z" }, reg);
+  const f: string[] = [];
+  const subjectOf = (m: Reg) => (m.resolver as { election?: { subject?: { id: string } } }).election?.subject?.id;
+  if (k.expect.refused_includes !== undefined) {
+    if (b.ok) f.push(`registered (subject ${subjectOf(b.market)}), expected refused: ${k.expect.refused_includes}`);
+    else if (!b.reason.includes(k.expect.refused_includes)) f.push(`refused for "${b.reason.slice(0, 120)}", expected "${k.expect.refused_includes}"`);
+  }
+  if (k.expect.subject_id !== undefined) {
+    if (!b.ok) f.push(`refused (${b.reason.slice(0, 120)}), expected subject ${k.expect.subject_id}`);
+    else if (subjectOf(b.market) !== k.expect.subject_id) f.push(`subject ${subjectOf(b.market)} != ${k.expect.subject_id}`);
+  }
+  return { failures: f, falseResolved: b.ok && k.expect.refused_includes !== undefined };
+}
+
 async function runCase(k: OfficialCase): Promise<{ failures: string[]; falseResolved: boolean }> {
+  if ("build" in k) return runBuild(k);
   const r = k.market.resolver;
   if (r?.kind !== "official_release") throw new Error("case market has no official_release resolver");
   const fetched = docOf(r, k.fetched);

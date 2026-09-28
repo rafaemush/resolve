@@ -1,0 +1,16 @@
+
+{ "dg" : "02/10/2022", "hg" : "21:18:55", "f" : "O", "c" : "ele2022", "pl" : [ 
+{ "cd" : "406", "cdpr" : "395", "dt" : "02/10/2022", "dtlim" : "02/09/2024", "e" : [ 
+{ "cd" : "546", "cdt2" : "547", "nm" : "Eleição Ordinária Estadual - 2022 1&#186; Turno", "t" : "1", "tp" : "1", "abr" : [ 
+{ "cd" : "BR", "cp" : [ 
+{ "cd" : "3", "ds" : "Governador", "tp" : "1" }, 
+{ "cd" : "5", "ds" : "Senador", "tp" : "1" }, 
+{ "cd" : "6", "ds" : "Deputado Federal", "tp" : "2" }, 
+{ "cd" : "7", "ds" : "Deputado Estadual", "tp" : "2" }, 
+{ "cd" : "8", "ds" : "Deputado Distrital", "tp" : "2" } ] } ] }, 
+{ "cd" : "544", "cdt2" : "545", "nm" : "Eleição Ordinária Federal - 2022 1&#186; Turno", "t" : "1", "tp" : "8", "abr" : [ 
+{ "cd" : "BR", "cp" : [ 
+{ "cd" : "1", "ds" : "Presidente", "tp" : "1" } ] } ] }, 
+{ "cd" : "548", "cdt2" : "", "nm" : "Eleição Ordinária Municipal - 2022 - 02/10/2022 1&#186; Turno", "t" : "1", "tp" : "3", "abr" : [ 
+{ "cd" : "BR", "cp" : [ 
+{ "cd" : "25", "ds" : "Conselheiro Distrital", "tp" : "1" } ] } ] } ] } ] }

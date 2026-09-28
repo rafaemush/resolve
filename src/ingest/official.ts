@@ -5,7 +5,9 @@
  * URL as a typed error with httpStatus + deferSeconds: a non-200 body is never parsed, so it can never be evidence.
  * A document that is readable but still about an earlier period is "pending", never an observation.
  */
-import { OFFICIAL_SERIES, fetchGroupOf, hostAllowed, sameAtPrecision, reading, thousandsOf, percentTenths, type OfficialCorroboration, type OfficialSeriesId } from "../resolve/official";
+import { OFFICIAL_SERIES, fetchGroupOf, hostAllowed, sameAtPrecision, reading, thousandsOf, percentTenths, knownRelease, TSE_CONFIG_URL, EQ_RESULTS_URL, type OfficialCorroboration, type OfficialSeriesId } from "../resolve/official";
+import { ELECTION_SERIES, isElectionSeries, snapshotForSeries, tseNotFinal, eqNotFinal, type ElectionSeriesId, type ElectionSnapshot } from "../resolve/election";
+import { parseTseConfig, parseTseResult, parseEqResults, tseResultUrl } from "./election-parse";
 import { sha256Hex } from "../resolve/text";
 import { discardBody, retryAfterSeconds } from "./http";
 import { RESOLVE_BOT_UA } from "../ops/ua";
@@ -140,6 +142,8 @@ export interface FetchedObservation extends DocObservation {
   raw: Uint8Array;
   raw_sha256: string;
   fetched_at: string;
+  /** Election series: the authority's count (stored as meta.contest with the first print). */
+  contest?: ElectionSnapshot;
 }
 
 export type PrimaryResult =
@@ -196,8 +200,90 @@ function siblingsOf(series: OfficialSeriesId, target: string, g: Extract<Got, { 
   return { siblings, siblingNotes };
 }
 
+// ---- elections ---------------------------------------------------------------------------------------------------
+
+/** The DGEQ open-data licence's attribution notice, which must accompany every use of the data (dgeq.org/licence.html, OBSERVED 2026-09-27T22:46:48Z). */
+export const DGEQ_ATTRIBUTION = "Comprend des données ouvertes octroyées sous la licence d'utilisation des données ouvertes du directeur général des élections disponible à l'adresse Web dgeq.org. L'octroi de la licence n'implique aucune approbation par le directeur général des élections de l'utilisation des données ouvertes qui en est faite.";
+/** A missing TSE file is never retried soon: the TSE FAQ warns that requests answered 404 can get the address blocked. */
+export const ELECTION_DEFER_S = 600;
+/** The TSE configuration is read at most once a minute per isolate (the TSE asks for polls no more often than every 60 s). */
+export const TSE_CONFIG_TTL_MS = 60_000;
+let tseConfigMemo: { at: number; text: string; url: string } | null = null;
+/** Tests only: forget the memoised configuration. */
+export function __resetElectionMemo(): void { tseConfigMemo = null; }
+
+/** One election file as the observation of `series` (and, from the same bytes, of the other series of its fetch group). */
+function electionObservation(series: ElectionSeriesId, snap: ElectionSnapshot, day: string, deciding: string, g: Extract<Got, { ok: true }>, raw_sha256: string, fetched_at: string): FetchedObservation {
+  const valid = snap.authority === "tse" ? snap.votes.valid : snap.valid;
+  return {
+    series, period: day, value: Number(valid), value_text: valid, deciding_text: deciding.slice(0, 4000), direction: null,
+    meta: {}, contest: snapshotForSeries(series, snap), source_url: g.url, raw: g.bytes, raw_sha256, fetched_at,
+  };
+}
+
+async function electionObserved(series: ElectionSeriesId, snap: ElectionSnapshot, day: string, deciding: string, g: Extract<Got, { ok: true }>, b: Budget): Promise<PrimaryResult> {
+  const raw_sha256 = await sha256Hex(g.bytes);
+  const fetched_at = new Date(b.now()).toISOString();
+  const obs = electionObservation(series, snap, day, deciding, g, raw_sha256, fetched_at);
+  const siblings = fetchGroupOf(series).slice(1).filter(isElectionSeries).map((s) => electionObservation(s, snap, day, deciding, g, raw_sha256, fetched_at));
+  return { kind: "observed", obs, siblings };
+}
+
+/** A failed election GET: a 404 or a refusal (403/429) waits ELECTION_DEFER_S unless the source named its own wait. */
+function electionFailed(g: Extract<Got, { ok: false }>): PrimaryResult {
+  const refused = g.httpStatus === 404 || g.httpStatus === 403 || g.httpStatus === 429;
+  return { kind: "error", error: g.error, httpStatus: g.httpStatus, deferSeconds: g.deferSeconds ?? (refused ? ELECTION_DEFER_S : undefined), retryable: refused ? false : g.retryable, drift: false };
+}
+
+/**
+ * The count an election series reads, recorded only once it is FINAL by the authority's own flags (a partial count is
+ * "pending", never an observation). TSE: the configuration first (the election's id is known only from it), then the
+ * scope's unified file built from it; Élections Québec: the one results file, accepted only when the authority stamped
+ * it at or after polls close (the same URL served the simulation of 2026-09-20).
+ */
+async function fetchElection(series: ElectionSeriesId, target: string, b: Budget): Promise<PrimaryResult> {
+  const def = ELECTION_SERIES[series];
+  if (def.authority === "tse") {
+    let cfgText: string;
+    const now = b.now();
+    if (tseConfigMemo && now - tseConfigMemo.at < TSE_CONFIG_TTL_MS) cfgText = tseConfigMemo.text;
+    else {
+      const cfg = await officialGet(series, TSE_CONFIG_URL, b, "application/json");
+      if (!cfg.ok) return electionFailed(cfg);
+      cfgText = cfg.text;
+      tseConfigMemo = { at: now, text: cfgText, url: cfg.url };
+    }
+    const c = parseTseConfig(cfgText, target);
+    if (!c.ok) return notFound(c);
+    if (c.snap.environment !== "o") return { kind: "pending", detail: `the TSE configuration is the ${c.snap.environment === "s" ? "simulation" : c.snap.environment} environment` };
+    const url = tseResultUrl(c.snap, def.scope);
+    const g = await officialGet(series, url, b, "application/json");
+    if (!g.ok) return electionFailed(g);
+    const p = parseTseResult(g.text, c.snap.electionDay);
+    if (!p.ok) return notFound(p);
+    const s = p.snap;
+    if (s.scope !== def.scope || s.election_id !== c.snap.electionId || s.office !== "1" || s.round !== "1") return { kind: "error", error: `schema drift: ${url} is the ${s.scope} office ${s.office} round ${s.round} file of election ${s.election_id}`, retryable: false, drift: true };
+    const nf = tseNotFinal(s);
+    if (nf.length) return { kind: "pending", detail: `TSE ${s.scope} count not final (${s.sections.totalized} of ${s.sections.total} sections, as of ${s.as_of}): ${nf.join("; ")}` };
+    const deciding = `TSE President first-round count for ${s.scope === "BR" ? "Brazil" : s.scope}, election day ${s.election_day} (${c.snap.cycle}, election ${s.election_id}, environment ${s.environment}): tf=${s.flags.tf}${s.flags.and !== null ? ` and=${s.flags.and}` : ""} dv=${s.flags.dv} esae=${s.flags.esae}; ${s.sections.totalized} of ${s.sections.total} sections totalized; last totalization ${s.as_of}; ${s.votes.valid} valid votes, ${s.turnout} voters of ${s.electorate} eligible.`;
+    return electionObserved(series, s, s.election_day, deciding, g, b);
+  }
+  const g = await officialGet(series, EQ_RESULTS_URL, b, "application/json");
+  if (!g.ok) return electionFailed(g);
+  const p = parseEqResults(g.text);
+  if (!p.ok) return notFound(p);
+  const s = p.snap;
+  const known = knownRelease(series, target);
+  if (!known || Date.parse(s.as_of) < Date.parse(known.release_at)) return { kind: "pending", detail: `the Élections Québec file is stamped ${s.as_of}, before polls closed on ${target} (a simulation or an earlier election)` };
+  const nf = eqNotFinal(s);
+  if (nf.length) return { kind: "pending", detail: `Élections Québec count not final (as of ${s.as_of}): ${nf.join("; ")}` };
+  const deciding = `Élections Québec general election results for election day ${target}: isResultatsFinaux true; ${s.ridings_with_result} of ${s.ridings_total} ridings, ${s.polls_done} of ${s.polls_total} polling stations; updated ${s.as_of}; ${s.valid} valid votes, ${s.cast} votes cast, ${s.registered} registered electors. ${DGEQ_ATTRIBUTION}`;
+  return electionObserved(series, s, target, deciding, g, b);
+}
+
 /** One attempt at the primary source of `series` for the target period. Requests are counted in `b`. */
 export async function fetchPrimary(series: OfficialSeriesId, target: string, b: Budget): Promise<PrimaryResult> {
+  if (isElectionSeries(series)) return fetchElection(series, target, b);
   switch (series) {
     case "us_ppi_fd_nsa_yoy": {
       const g = await officialGet(series, URLS.ppiText, b, "text/html");
@@ -338,6 +424,9 @@ export async function fetchCorroboration(obs: FetchedObservation, target: string
     status: sameAtPrecision(series, reading(obs), valueText) ? "agree" : "disagree",
     source_url, value: Number(valueText), value_text: valueText, detail: detail.slice(0, 500), checked_at,
   });
+  if (isElectionSeries(series)) {
+    return { status: "single_source", source_url: null, value: null, value_text: null, detail: "no second source publishes the count on election night (the TSE open-data files appeared four days after the 2022 vote; Élections Québec has one results feed)", checked_at };
+  }
   switch (series) {
     case "us_cpi_u_nsa_yoy":
     case "us_ppi_fd_nsa_yoy":

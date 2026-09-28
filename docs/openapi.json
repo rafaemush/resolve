@@ -322,7 +322,73 @@
                       "us_core_cpi_nsa_yoy",
                       "us_core_cpi_sa_mom",
                       "us_unemployment_rate",
-                      "us_nonfarm_payrolls_change"
+                      "us_nonfarm_payrolls_change",
+                      "br_pres_r1_first_ac",
+                      "br_pres_r1_first_al",
+                      "br_pres_r1_first_ap",
+                      "br_pres_r1_first_am",
+                      "br_pres_r1_first_ba",
+                      "br_pres_r1_first_ce",
+                      "br_pres_r1_first_df",
+                      "br_pres_r1_first_es",
+                      "br_pres_r1_first_go",
+                      "br_pres_r1_first_ma",
+                      "br_pres_r1_first_mt",
+                      "br_pres_r1_first_ms",
+                      "br_pres_r1_first_mg",
+                      "br_pres_r1_first_pa",
+                      "br_pres_r1_first_pb",
+                      "br_pres_r1_first_pr",
+                      "br_pres_r1_first_pe",
+                      "br_pres_r1_first_pi",
+                      "br_pres_r1_first_rj",
+                      "br_pres_r1_first_rn",
+                      "br_pres_r1_first_rs",
+                      "br_pres_r1_first_ro",
+                      "br_pres_r1_first_rr",
+                      "br_pres_r1_first_sc",
+                      "br_pres_r1_first_sp",
+                      "br_pres_r1_first_se",
+                      "br_pres_r1_first_to",
+                      "br_pres_r1_winner",
+                      "br_pres_r1_third",
+                      "br_pres_r1_fourth",
+                      "br_pres_r1_margin",
+                      "br_pres_r1_turnout",
+                      "br_pres_r1_share_lula",
+                      "br_pres_r1_share_flavio_bolsonaro",
+                      "br_pres_r1_share_renan_santos",
+                      "br_pres_r1_share_augusto_cury",
+                      "qc_riding_119",
+                      "qc_riding_137",
+                      "qc_riding_141",
+                      "qc_riding_151",
+                      "qc_riding_179",
+                      "qc_riding_199",
+                      "qc_riding_227",
+                      "qc_riding_281",
+                      "qc_riding_307",
+                      "qc_riding_317",
+                      "qc_riding_319",
+                      "qc_riding_577",
+                      "qc_riding_693",
+                      "qc_riding_697",
+                      "qc_riding_709",
+                      "qc_riding_749",
+                      "qc_riding_751",
+                      "qc_riding_757",
+                      "qc_riding_767",
+                      "qc_riding_791",
+                      "qc_riding_799",
+                      "qc_seats_caq",
+                      "qc_seats_pq",
+                      "qc_seats_plq",
+                      "qc_seats_pcq",
+                      "qc_second_place",
+                      "qc_third_place",
+                      "qc_pq_majority",
+                      "qc_pvq_seat",
+                      "qc_seat_margin"
                     ]
                   },
                   "period": {
@@ -371,8 +437,54 @@
                       "pct_1dp",
                       "bps_away_from_zero_25",
                       "bps_nearest_25_min_25",
-                      "thousands_as_printed"
+                      "thousands_as_printed",
+                      "election_exact"
                     ]
+                  },
+                  "election": {
+                    "type": "object",
+                    "properties": {
+                      "subject": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string",
+                            "pattern": "^[0-9]{1,9}$"
+                          },
+                          "name": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 200
+                          },
+                          "full_name": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 300
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "name"
+                        ],
+                        "additionalProperties": false
+                      },
+                      "unit": {
+                        "type": "string",
+                        "pattern": "^[0-9]{1,9}$"
+                      },
+                      "listed": {
+                        "maxItems": 40,
+                        "type": "array",
+                        "items": {
+                          "type": "string",
+                          "pattern": "^[0-9]{1,9}$"
+                        }
+                      },
+                      "other_leader": {
+                        "type": "boolean"
+                      }
+                    },
+                    "additionalProperties": false
                   }
                 },
                 "required": [

@@ -89,6 +89,7 @@ export function parseBucketLabel(label: string, decides: SeriesDef["decides"]): 
     case "percent": return percentBucket(label);
     case "rate_change_bps": return bpsBucket(label);
     case "change_thousands": return thousandsBucket(label);
+    case "election": return null; // election legs are built by src/markets/election-legs.ts (subject mapping first)
     default: { const never: never = decides; throw new Error(`unhandled decided unit ${String(never)}`); }
   }
 }

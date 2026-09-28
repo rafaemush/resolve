@@ -31,6 +31,8 @@ const M: Mutation[] = [
   { name: "11_projection_off", suite: "ingest", rails: ["stable_projection"], classes: ["projection"] },
   { name: "12_official_gate_off", suite: "official", rails: ["official_release_gate"], classes: ["release_gate"] },
   { name: "13_first_print_off", suite: "official", rails: ["first_print_lock"], classes: ["first_print"] },
+  { name: "15_election_final_off", suite: "official", rails: ["election_final_count"], classes: ["election_final"] },
+  { name: "16_election_margin_off", suite: "official", rails: ["election_safety_margin"], classes: ["election_margin"] },
   { name: "14_registration_policy_off", suite: "registration", rails: ["registration_policy"], classes: ["policy"] },
 ];
 

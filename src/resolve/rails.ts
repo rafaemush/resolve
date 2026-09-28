@@ -23,6 +23,14 @@ const rails = {
   official_release_gate: true,
   /** the stored first print decides; a later (revised) read of the same period never replaces it. */
   first_print_lock: true,
+  // election series of the official_release rail (src/resolve/election.ts). Off = the failure each one exists for.
+  /** only the authority's own final count decides (TSE tf=s, and=f, every section totalized; Élections Québec every riding final). */
+  election_final_count: true,
+  /**
+   * a rank, share, margin or seat count inside the safety margin of a boundary, or one that annulled sub judice votes
+   * could still move, is never decided (off: the exact count as printed decides, and sub judice votes are ignored).
+   */
+  election_safety_margin: true,
   // Registration rail (src/markets/policy.ts, src/markets/source-checks.ts, src/ingest/robots.ts). Off = the pre-P1a
   // behaviour; evals/registration.ts proves it.
   /**

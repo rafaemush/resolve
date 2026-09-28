@@ -57,17 +57,41 @@ export const SOLANA_LOG_REF = /^solana:([1-9A-HJ-NP-Za-km-z]{32,44})$/;
  * whose change against prior_level the market decides (FOMC upper bound, ECB deposit facility, BoE Bank Rate, BoK
  * Base Rate, BCB Selic), or the payroll employment change in thousands (US nonfarm payrolls).
  */
+/**
+ * Election contests of the official_release rail (src/resolve/election.ts). One series per platform EVENT, so every
+ * Polymarket event is its own public event key official:<series>:<election day> (migration 017 market_event_key(); no
+ * migration: the key only joins the two strings). Brazil (TSE, first round of 2026-10-04): 1st place per state, the
+ * national winner, 3rd and 4th place, one vote-share event per named candidate, the margin of victory and the turnout.
+ * Quebec (Élections Québec, general election of 2026-10-05): one winner event per riding (2026 riding code), seats per
+ * party, 2nd and 3rd place by seats, the PQ majority, a PVQ seat and the seat margin.
+ */
+export const ElectionSeries = z.enum([
+  "br_pres_r1_first_ac", "br_pres_r1_first_al", "br_pres_r1_first_ap", "br_pres_r1_first_am", "br_pres_r1_first_ba", "br_pres_r1_first_ce",
+  "br_pres_r1_first_df", "br_pres_r1_first_es", "br_pres_r1_first_go", "br_pres_r1_first_ma", "br_pres_r1_first_mt", "br_pres_r1_first_ms",
+  "br_pres_r1_first_mg", "br_pres_r1_first_pa", "br_pres_r1_first_pb", "br_pres_r1_first_pr", "br_pres_r1_first_pe", "br_pres_r1_first_pi",
+  "br_pres_r1_first_rj", "br_pres_r1_first_rn", "br_pres_r1_first_rs", "br_pres_r1_first_ro", "br_pres_r1_first_rr", "br_pres_r1_first_sc",
+  "br_pres_r1_first_sp", "br_pres_r1_first_se", "br_pres_r1_first_to",
+  "br_pres_r1_winner", "br_pres_r1_third", "br_pres_r1_fourth", "br_pres_r1_margin", "br_pres_r1_turnout",
+  "br_pres_r1_share_lula", "br_pres_r1_share_flavio_bolsonaro", "br_pres_r1_share_renan_santos", "br_pres_r1_share_augusto_cury",
+  "qc_riding_119", "qc_riding_137", "qc_riding_141", "qc_riding_151", "qc_riding_179", "qc_riding_199", "qc_riding_227", "qc_riding_281",
+  "qc_riding_307", "qc_riding_317", "qc_riding_319", "qc_riding_577", "qc_riding_693", "qc_riding_697", "qc_riding_709", "qc_riding_749",
+  "qc_riding_751", "qc_riding_757", "qc_riding_767", "qc_riding_791", "qc_riding_799",
+  "qc_seats_caq", "qc_seats_pq", "qc_seats_plq", "qc_seats_pcq", "qc_second_place", "qc_third_place", "qc_pq_majority", "qc_pvq_seat", "qc_seat_margin",
+]);
 export const OfficialSeries = z.enum([
   "us_cpi_u_nsa_yoy", "us_ppi_fd_nsa_yoy", "fomc_upper_bound", "ecb_dfr", "boe_bank_rate", "bok_base_rate", "kr_gdp_advance_yoy", "bcb_selic_target",
   "us_cpi_u_sa_mom", "us_core_cpi_nsa_yoy", "us_core_cpi_sa_mom", "us_unemployment_rate", "us_nonfarm_payrolls_change",
+  ...ElectionSeries.options,
 ]);
 /**
  * The rounding the market text prescribes. pct_1dp: the percent at one decimal as published.
  * bps_away_from_zero_25 (Fed): a change off the 25 bp grid is rounded away from zero to the next 25.
  * bps_nearest_25_min_25 (BoK, ECB, BCB, BoE): 0 < |d| < 25 counts as 25; otherwise nearest 25, ties away from zero.
  * thousands_as_printed (US payrolls): the signed change in whole thousands as published, never rounded further.
+ * election_exact (election series): ranks, shares, margins and seats computed exactly from the authority's integer counts;
+ * a value inside the series' safety margin of a rank or bucket boundary is never decided (src/resolve/election.ts).
  */
-export const OfficialRounding = z.enum(["pct_1dp", "bps_away_from_zero_25", "bps_nearest_25_min_25", "thousands_as_printed"]);
+export const OfficialRounding = z.enum(["pct_1dp", "bps_away_from_zero_25", "bps_nearest_25_min_25", "thousands_as_printed", "election_exact"]);
 /** The leg a binary market represents, in the series' decided unit (percent at 1 dp, basis points of change, or thousands). */
 export const OfficialBucket = z.object({
   label: z.string().min(1).max(100),
@@ -77,6 +101,28 @@ export const OfficialBucket = z.object({
   hi_inclusive: z.boolean(),
 });
 export type OfficialBucket = z.infer<typeof OfficialBucket>;
+
+/**
+ * What an election leg is about, pinned to the authority's own identifiers at registration (scripts/election-legs.ts
+ * maps each platform label to exactly one authority entry or refuses the leg). subject: a TSE candidate number (the
+ * ballot number) or an Élections Québec numeroCandidat / numeroPartiPolitique, with the authority's name for it.
+ * unit: the Quebec riding (numeroCirconscription). listed: every authority id the event names (Brazil rank events: the
+ * ranking is checked both over all candidates and over the named ones, and only an agreement decides).
+ * other_leader: "Another Party Wins" of a seat-margin event (a party other than subject has the most seats outright).
+ */
+export const ElectionSubject = z.object({
+  id: z.string().regex(/^[0-9]{1,9}$/),
+  name: z.string().min(1).max(200),
+  full_name: z.string().min(1).max(300).optional(),
+});
+export type ElectionSubject = z.infer<typeof ElectionSubject>;
+export const ElectionLeg = z.object({
+  subject: ElectionSubject.optional(),
+  unit: z.string().regex(/^[0-9]{1,9}$/).optional(),
+  listed: z.array(z.string().regex(/^[0-9]{1,9}$/)).max(40).optional(),
+  other_leader: z.boolean().optional(),
+});
+export type ElectionLeg = z.infer<typeof ElectionLeg>;
 
 export const Resolver = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("github_pr_merged"), repo, pr: z.number().int().positive() }),
@@ -89,13 +135,15 @@ export const Resolver = z.discriminatedUnion("kind", [
    * A binary leg of an official-release ladder: Yes iff the decided value falls in `bucket`, else No (a positive
    * determination of another bucket, never an absence). period: YYYY-MM (monthly print), YYYY-Qn (quarterly) or
    * YYYY-MM-DD (the decision day). release_at: the scheduled publication time; nothing is fetched before it.
-   * prior_level: the rate before the meeting, required for rate-change series. Cross-field rules are enforced at
-   * registration (officialRegistrationIssues, src/resolve/official.ts).
+   * prior_level: the rate before the meeting, required for rate-change series. election: the leg's subject pinned to
+   * authority identifiers, for election series only (polls close is release_at; the period is the election day).
+   * Cross-field rules are enforced at registration (officialRegistrationIssues, src/resolve/official.ts).
    */
   z.object({
     kind: z.literal("official_release"), series: OfficialSeries,
     period: z.string().regex(/^\d{4}-(?:\d{2}(?:-\d{2})?|Q[1-4])$/, "YYYY-MM | YYYY-Qn | YYYY-MM-DD"),
     release_at: iso, prior_level: z.number().finite().optional(), bucket: OfficialBucket, rounding: OfficialRounding,
+    election: ElectionLeg.optional(),
   }),
 ]);
 export type Resolver = z.infer<typeof Resolver>;

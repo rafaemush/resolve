@@ -35,6 +35,21 @@
  * makes 5 (load, read, claim, watches update, loop_runs) and the capture task <= 23 for its own series plus, for a
  * fetch group, 1 read of the siblings' rows and per missing sibling (3 at most, the CPI group) corroboration 1 +
  * record 1 + one alert 3 (a sibling is either inserted, and alerted on a disagreement, or a revision) = 16: 44.
+ *
+ * Election series (src/resolve/election.ts) poll differently: no burst (a count is final hours after polls close, never
+ * in the first minute), the fetch lease of a contest is extended to ELECTION_REFETCH_S after every pending or failed
+ * capture so each contest file is requested at most once per 4 minutes however many legs poll it, the holder's leg
+ * polls again in 5 minutes and every other leg every 15, and the count may take 72 h (not 6) before the legs are
+ * reported release_not_observed, after which every leg polls hourly. Upstream-failure alerts are per authority (tse,
+ * eq), not per series. A capture: TSE configuration (at most once a minute per isolate) + contest file = 2 upstream
+ * requests; the Élections Québec file = 1. The holder's waitUntil records its own series and the siblings of its fetch
+ * group from the same bytes: request 5 + upstream 2 + R2 1 + record 1 + siblings read 1 + one record per sibling (the
+ * TSE national file: 8; the Québec file: 29, no corroboration request exists for elections) = 39 at most, with a lease
+ * extension 1 and an alert 3 when a capture fails instead.
+ * Workers Free budget (100,000 requests a day), from polls close until the counts are final (72 h at most): every leg
+ * polls once per 15 minutes (96 a day) and each contest's holder once per 5 minutes (288 a day), so a day costs
+ * 96 x legs + 288 x contests Worker requests; the upstream sees at most 360 requests a day per contest (720 for a TSE
+ * contest: configuration + file) and 1 per 4 minutes. After 72 h: 24 a day per leg; once stored: 4 a day per leg.
  */
 import type { Env } from "../env";
 import { db, rpc } from "../db/supabase";
@@ -42,9 +57,10 @@ import type { FetchOutcome, MarketRow, WatchRow } from "./types";
 import { MAX_DEFER_S } from "./http";
 import { fetchPrimary, fetchCorroboration, budget, type FetchedObservation, type PrimaryResult } from "./official";
 import {
-  OFFICIAL_SERIES, OfficialCorroboration, firstPrintFor, officialEvidence, priorLevelProblem, releaseAtOf, fallbackEndMs, fetchSlotOf,
+  OFFICIAL_SERIES, OfficialCorroboration, firstPrintFor, officialEvidence, priorLevelProblem, releaseAtOf, fallbackEndMs, fetchSlotOf, missingAfterMs,
   type OfficialObservationDoc, type OfficialMissingDoc, type OfficialResolver, type OfficialSeriesId,
 } from "../resolve/official";
+import { ELECTION_SERIES, canonicalSnapshot, isElectionSeries } from "../resolve/election";
 import { alert } from "../ops/alerts";
 
 export const BURST_INTERVAL_MS = 3000;
@@ -62,6 +78,10 @@ export const MISSING_AFTER_MS = 6 * 3600_000;
 export const LATE_DAILY_MS = 7 * 86_400_000;
 /** A dispatch this close before release_at waits for it instead of losing the release minute. */
 export const EARLY_WAIT_MS = 5000;
+/** Election contests: after a capture that found no final count, nobody fetches the contest again for this long. */
+export const ELECTION_REFETCH_S = 240;
+/** Election cadence while awaiting the final count: the holder's leg, every other leg, and after missingAfterMs. */
+export const ELECTION_POLL_MIN = { holder: 5, other: 15, missing: 60 } as const;
 
 export interface OfficialDeps { now(): number; sleep(ms: number): Promise<void>; waitUntil?: (p: Promise<unknown>) => void }
 const REAL: Pick<OfficialDeps, "now" | "sleep"> = { now: () => Date.now(), sleep: (ms) => new Promise((r) => setTimeout(r, ms)) };
@@ -72,10 +92,11 @@ const minuteStart = (ms: number) => Math.floor(ms / MIN) * MIN;
 const iso = (ms: number) => new Date(ms).toISOString();
 
 export type OfficialPhase = "before" | "awaiting" | "observed" | "missing";
-export interface OfficialSchedule { releaseAtMs: number; fallbackEndMs: number }
+/** election: the series is an election contest (its cadence and missing window, src/resolve/election.ts). */
+export interface OfficialSchedule { releaseAtMs: number; fallbackEndMs: number; missingAfterMs?: number; election?: boolean }
 
 export function officialSchedule(r: OfficialResolver): OfficialSchedule {
-  return { releaseAtMs: Date.parse(releaseAtOf(r)), fallbackEndMs: fallbackEndMs(r) };
+  return { releaseAtMs: Date.parse(releaseAtOf(r)), fallbackEndMs: fallbackEndMs(r), missingAfterMs: missingAfterMs(r.series), election: isElectionSeries(r.series) };
 }
 
 /**
@@ -84,8 +105,16 @@ export function officialSchedule(r: OfficialResolver): OfficialSchedule {
  * until the fallback window ends, then daily. Observed: the first print is final, so every 6 h (an audited
  * corroboration re-check is picked up then) until the fallback window ends.
  */
-export function officialIdleNextPoll(nowMs: number, s: OfficialSchedule, phase: OfficialPhase): string {
+export function officialIdleNextPoll(nowMs: number, s: OfficialSchedule, phase: OfficialPhase, opts: { holder?: boolean } = {}): string {
   const late = nowMs >= s.fallbackEndMs;
+  if (s.election && (phase === "awaiting" || phase === "missing")) {
+    // an election count is final hours after polls close: the holder's leg every 5 minutes, the others every 15, hourly
+    // once the missing window has passed, daily after the fallback window
+    if (late) return iso(minuteStart(nowMs) + DAY);
+    const since = nowMs - s.releaseAtMs;
+    const min = phase === "missing" || since >= (s.missingAfterMs ?? MISSING_AFTER_MS) ? ELECTION_POLL_MIN.missing : opts.holder ? ELECTION_POLL_MIN.holder : ELECTION_POLL_MIN.other;
+    return iso(minuteStart(nowMs) + min * MIN);
+  }
   switch (phase) {
     case "before": { const m = minuteStart(s.releaseAtMs); return iso(m > nowMs ? m : Math.max(s.releaseAtMs, nowMs + 1000)); }
     case "awaiting": {
@@ -124,6 +153,8 @@ export function docFromRow(row: StoredRow): OfficialObservationDoc {
     direction: dir === "up" || dir === "down" || dir === "unchanged" ? dir : null,
     corroboration: c.success ? c.data : null,
     stated_prior: strOrNull(row.meta?.stated_prior), stated_step_bps: numOrNull(row.meta?.stated_step_bps),
+    // an election first print carries the count it was read from; a row without one decides nothing (value_unreadable)
+    ...(row.meta?.contest !== undefined ? { contest: canonicalSnapshot(row.meta.contest) } : {}),
   };
 }
 
@@ -132,8 +163,12 @@ function docFromFetch(obs: FetchedObservation, corroboration: OfficialCorroborat
     kind: "official_observation", series: obs.series, period: obs.period, value: obs.value, value_text: obs.value_text, deciding_text: obs.deciding_text,
     source_url: obs.source_url, raw_sha256: obs.raw_sha256, observed_at: obs.fetched_at, direction: obs.direction, corroboration,
     stated_prior: strOrNull(obs.meta.stated_prior), stated_step_bps: numOrNull(obs.meta.stated_step_bps),
+    ...(obs.contest ? { contest: obs.contest } : {}),
   };
 }
+
+/** Upstream-failure alerts of an election series are per authority (one TSE outage is one alert, not 36). */
+const upstreamAlertKey = (r: OfficialResolver) => `official_upstream_${isElectionSeries(r.series) ? ELECTION_SERIES[r.series].authority : r.series}_${r.period}`;
 
 async function safeAlert(env: Env, key: string, text: string, dedupMinutes: number, meta: Record<string, unknown>): Promise<void> {
   try { await alert(env, key, text, { dedupMinutes, meta }); }
@@ -151,7 +186,7 @@ async function recordObservation(env: Env, obs: FetchedObservation, period: stri
   const row = await rpc<StoredRow>(db(env), "record_official_observation", {
     p_series: obs.series, p_period: period, p_value: obs.value, p_value_text: obs.value_text, p_deciding_text: obs.deciding_text,
     p_source_url: obs.source_url, p_raw_sha256: obs.raw_sha256, p_corroboration: corroboration,
-    p_meta: { ...obs.meta, direction: obs.direction, doc_period: obs.period, fetched_at: obs.fetched_at, ...meta },
+    p_meta: { ...obs.meta, direction: obs.direction, doc_period: obs.period, fetched_at: obs.fetched_at, ...(obs.contest ? { contest: obs.contest } : {}), ...meta },
   });
   if (row.revision_differs) {
     await safeAlert(env, `official_revision_${obs.series}_${period}`, `${obs.series} ${period}: stored first print ${row.value_text} (${new Date(row.observed_at).toISOString()}); a later read offered ${obs.value_text} from ${obs.source_url}. The first print stands.`, 1440, alertMeta);
@@ -223,23 +258,31 @@ export async function captureOfficial(env: Env, r: OfficialResolver, marketId: s
     if (b.requests <= 0 || next >= b.deadlineMs) break;
     await deps.sleep(Math.max(0, next - deps.now()));
   }
+  const election = isElectionSeries(r.series);
   if (res.kind === "pending") {
+    // An election count that is not final yet: nobody fetches this contest again for ELECTION_REFETCH_S.
+    if (election) {
+      try { await rpc(db(env), "extend_official_fetch", { p_series: fetchSlotOf(r.series), p_period: r.period, p_seconds: ELECTION_REFETCH_S }); }
+      catch (e) { console.error(JSON.stringify({ level: "error", job: "official_capture", series: r.series, period: r.period, error: `extend_official_fetch: ${String(e).slice(0, 200)}` })); }
+    }
     // the page is out without this series' number: the other series it states are still recorded (waitUntil only)
     if (!mode.siblings || !res.siblings?.length) return { kind: "pending", detail: res.detail, requests: b.used };
     return { kind: "pending", detail: res.detail, requests: b.used, siblings: await recordPageSiblings(env, r, marketId, res, b.used, deps, hardStop) };
   }
   if (res.kind === "error") {
-    // The source asked to wait: the whole ladder backs off (every leg's claim fails while the lease lives).
-    if (res.deferSeconds !== undefined) {
-      try { await rpc(db(env), "extend_official_fetch", { p_series: fetchSlotOf(r.series), p_period: r.period, p_seconds: Math.min(MAX_DEFER_S, Math.max(FETCH_LEASE_S, res.deferSeconds)) }); }
-      catch (e) { await safeAlert(env, `official_upstream_${r.series}_${r.period}`, `${r.series} ${r.period}: could not extend the fetch lease for Retry-After ${res.deferSeconds} s: ${String(e).slice(0, 200)}`, 60, meta); }
+    // The source asked to wait: the whole ladder backs off (every leg's claim fails while the lease lives). An election
+    // contest always backs off for at least ELECTION_REFETCH_S after a failed capture.
+    const defer = res.deferSeconds ?? (election ? ELECTION_REFETCH_S : undefined);
+    if (defer !== undefined) {
+      try { await rpc(db(env), "extend_official_fetch", { p_series: fetchSlotOf(r.series), p_period: r.period, p_seconds: Math.min(MAX_DEFER_S, Math.max(FETCH_LEASE_S, defer)) }); }
+      catch (e) { await safeAlert(env, upstreamAlertKey(r), `${r.series} ${r.period}: could not extend the fetch lease for a wait of ${defer} s: ${String(e).slice(0, 200)}`, 60, meta); }
     }
     // The fetch lease rotates across the legs of a ladder, so no single watch accumulates an error streak: the
     // alert is per series. Only a retryable answer inside the release-minute burst (the burst itself retries) waits.
     // A drift in this series' part of a shared page does not hold back the other series the page states (waitUntil only).
     const siblings = mode.siblings && res.siblings?.length ? await recordPageSiblings(env, r, marketId, res, b.used, deps, hardStop) : undefined;
-    if (res.drift) await safeAlert(env, `official_schema_${r.series}`, `${r.series} ${r.period}: the source no longer parses (${res.error}). Nothing was recorded for ${r.series}${siblings ? ` (from the same page: ${siblings.join("; ").slice(0, 300)})` : ""}; the parser needs a look before the release window closes.`, 360, meta);
-    else if (!res.retryable || !mode.burst) await safeAlert(env, `official_upstream_${r.series}_${r.period}`, `${r.series} ${r.period}: ${res.error}. Nothing was recorded; the next poll retries.`, 60, meta);
+    if (res.drift) await safeAlert(env, election ? `official_schema_${ELECTION_SERIES[r.series as keyof typeof ELECTION_SERIES].authority}` : `official_schema_${r.series}`, `${r.series} ${r.period}: the source no longer parses (${res.error}). Nothing was recorded for ${r.series}${siblings ? ` (from the same page: ${siblings.join("; ").slice(0, 300)})` : ""}; the parser needs a look before the release window closes.`, 360, meta);
+    else if (!res.retryable || !mode.burst) await safeAlert(env, upstreamAlertKey(r), `${r.series} ${r.period}: ${res.error}. Nothing was recorded; the next poll retries.`, 60, meta);
     return { kind: "error", error: `${res.error} (${b.used} upstream requests)`, retryable: res.retryable, drift: res.drift, httpStatus: res.httpStatus, deferSeconds: res.deferSeconds, requests: b.used, ...(siblings ? { siblings } : {}) };
   }
   const obs = res.obs;
@@ -270,13 +313,15 @@ async function observedOutcome(env: Env, r: OfficialResolver, stored: OfficialOb
 async function missingOutcome(env: Env, r: OfficialResolver, nowMs: number, s: OfficialSchedule, why: string): Promise<FetchOutcome> {
   const meta = { series: r.series, period: r.period };
   const stopAt = s.fallbackEndMs + LATE_DAILY_MS;
-  const doc: OfficialMissingDoc = { kind: "official_missing", series: r.series, period: r.period, release_at: releaseAtOf(r), source_url: OFFICIAL_SERIES[r.series].primaryUrl, detail: "not observed by release_at + 6 h" };
+  const hours = Math.round((s.missingAfterMs ?? MISSING_AFTER_MS) / 3600_000);
+  const cadence = s.election ? "hourly" : "every 15 min";
+  const doc: OfficialMissingDoc = { kind: "official_missing", series: r.series, period: r.period, release_at: releaseAtOf(r), source_url: OFFICIAL_SERIES[r.series].primaryUrl, detail: `not observed by release_at + ${hours} h` };
   const { evidence, rawBytes } = officialEvidence(doc, iso(nowMs));
   if (nowMs >= stopAt) {
     await safeAlert(env, `official_stopped_${r.series}_${r.period}`, `${r.series} ${r.period} was never observed; its fallback window ended ${iso(s.fallbackEndMs)} and a week of daily polls found nothing. The watches stop; the legs stay UNRESOLVED (release_not_observed). Last: ${why}`, 14_400, meta);
     return { evidence, rawBytes, nextPollAt: officialIdleNextPoll(nowMs, s, "missing"), note: `release_not_observed, polling stopped: ${why}`, stop: "never observed; the fallback window and a week of daily polls have passed" };
   }
-  await safeAlert(env, `official_missing_${r.series}_${r.period}`, `${r.series} ${r.period} was not observed by release_at + 6 h (release ${releaseAtOf(r)}). Its legs are UNRESOLVED (release_not_observed) and keep polling (every 15 min until ${iso(s.fallbackEndMs)}, then daily); nothing resolves from an older period. Last: ${why}`, 720, meta);
+  await safeAlert(env, `official_missing_${r.series}_${r.period}`, `${r.series} ${r.period} was not observed by release_at + ${hours} h (release ${releaseAtOf(r)}). Its legs are UNRESOLVED (release_not_observed) and keep polling (${cadence} until ${iso(s.fallbackEndMs)}, then daily); nothing resolves from an older period. Last: ${why}`, 720, meta);
   return { evidence, rawBytes, nextPollAt: officialIdleNextPoll(nowMs, s, "missing"), note: `release_not_observed: ${why}` };
 }
 
@@ -304,7 +349,7 @@ async function pollOfficial(env: Env, watch: WatchRow, market: MarketRow, deps: 
     return observedOutcome(env, r, docFromRow(row), null, row.meta?.captured_by_market === market.id, now, s, "stored first print");
   }
 
-  const missing = now - s.releaseAtMs >= MISSING_AFTER_MS;
+  const missing = now - s.releaseAtMs >= (s.missingAfterMs ?? MISSING_AFTER_MS);
   let holder: boolean;
   try { holder = (await rpc<boolean>(client, "claim_official_fetch", { p_series: fetchSlotOf(r.series), p_period: r.period, p_seconds: FETCH_LEASE_S })) === true; }
   catch (e) { return { error: `claim_official_fetch: ${String(e).slice(0, 200)}` }; }
@@ -313,21 +358,22 @@ async function pollOfficial(env: Env, watch: WatchRow, market: MarketRow, deps: 
     return { notModified: true, nextPollAt: officialIdleNextPoll(now, s, "awaiting"), note: "awaiting_observation: another leg of this event holds the fetch lease" };
   }
 
-  const burst = !missing && inReleaseMinute(now, s.releaseAtMs);
+  // an election count is never final in the first minute after polls close: no burst for election contests
+  const burst = !missing && !s.election && inReleaseMinute(now, s.releaseAtMs);
   if (deps.waitUntil) {
     // pg_net stops waiting after 30 s: the capture never runs inside the request when it can run after it.
     const task = captureOfficial(env, r, market.id, { burst, siblings: true }, deps)
       .then((c) => console.log(JSON.stringify({ job: "official_capture", series: r.series, period: r.period, burst, outcome: c.kind, requests: c.requests, detail: c.kind === "recorded" ? c.stored.value_text : c.kind === "pending" ? c.detail : c.error, ...(c.siblings?.length ? { siblings: c.siblings } : {}) })))
-      .catch((e) => safeAlert(env, `official_upstream_${r.series}_${r.period}`, `${r.series} ${r.period}: the capture threw: ${String(e).slice(0, 200)}`, 60, { series: r.series, period: r.period }));
+      .catch((e) => safeAlert(env, upstreamAlertKey(r), `${r.series} ${r.period}: the capture threw: ${String(e).slice(0, 200)}`, 60, { series: r.series, period: r.period }));
     deps.waitUntil(task);
     if (missing) return missingOutcome(env, r, now, s, "the capture continues in waitUntil");
-    return { notModified: true, nextPollAt: iso(minuteStart(now) + MIN), note: `${burst ? "release minute: the capture burst" : "the capture"} continues in waitUntil; every leg resolves from the stored first print on its next poll` };
+    return { notModified: true, nextPollAt: s.election ? officialIdleNextPoll(now, s, "awaiting", { holder: true }) : iso(minuteStart(now) + MIN), note: `${burst ? "release minute: the capture burst" : "the capture"} continues in waitUntil; every leg resolves from the stored first print on its next poll` };
   }
 
   const c = await captureOfficial(env, r, market.id, { burst }, deps);
   switch (c.kind) {
     case "recorded": return observedOutcome(env, r, c.stored, c.fetched, c.ownCapture, deps.now(), s, c.inserted ? "first print recorded" : "first print already stored");
-    case "pending": return missing ? missingOutcome(env, r, now, s, c.detail) : { notModified: true, nextPollAt: officialIdleNextPoll(deps.now(), s, "awaiting"), note: `awaiting_observation: ${c.detail}` };
+    case "pending": return missing ? missingOutcome(env, r, now, s, c.detail) : { notModified: true, nextPollAt: officialIdleNextPoll(deps.now(), s, "awaiting", { holder: true }), note: `awaiting_observation: ${c.detail}` };
     // httpStatus is recorded for diagnostics; no leg ever stores a 200 for an official source, so runWatch's per-watch
     // 200 -> non-200 alert stays quiet and the per-series alert above is the one that fires.
     case "error": return missing ? missingOutcome(env, r, now, s, c.error) : { error: c.error, ...(c.httpStatus !== undefined ? { httpStatus: c.httpStatus } : {}), ...(c.deferSeconds !== undefined ? { deferSeconds: c.deferSeconds } : {}) };

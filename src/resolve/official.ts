@@ -12,6 +12,7 @@ import { z } from "zod";
 import { OfficialSeries, type OfficialBucket, type EvidenceInput, type MarketRegistration, type Resolver } from "./schema";
 import type { StructuredDecision } from "./structured";
 import { railEnabled } from "./rails";
+import { ELECTION_SERIES, ELECTION_EVENTS, ElectionSnapshot, canonicalSnapshot, decideElection, electionRegistrationIssues, isElectionSeries, type ElectionSeriesId } from "./election";
 
 export type OfficialSeriesId = z.infer<typeof OfficialSeries>;
 export type OfficialRoundingRule = Extract<Resolver, { kind: "official_release" }>["rounding"];
@@ -28,9 +29,10 @@ export interface SeriesDef {
   /**
    * percent: the percent as published (1 dp: a 1- or 12-month change, or a rate such as unemployment).
    * rate_change_bps: the new level minus prior_level, in bps. change_thousands: a signed change in whole thousands
-   * as published (payroll employment), never rounded further.
+   * as published (payroll employment), never rounded further. election: a leg of an election event, decided from the
+   * authority's whole count (src/resolve/election.ts: ranks, shares, margins, seats).
    */
-  decides: "percent" | "rate_change_bps" | "change_thousands";
+  decides: "percent" | "rate_change_bps" | "change_thousands" | "election";
   /** The rounding the market texts for this series prescribe (research 2026-09-24). */
   rounding: OfficialRoundingRule;
   period: "month" | "quarter" | "day";
@@ -46,6 +48,12 @@ export interface SeriesDef {
    * per release however many ladders depend on it.
    */
   fetchGroup?: string;
+  /**
+   * Election series: how long after release_at the count may take before the legs are reported release_not_observed
+   * (the 2022 TSE final totalization came about 40 h after polls closed); they also poll on a slower cadence
+   * (src/ingest/official-watch.ts). Default 6 h.
+   */
+  missingAfterMs?: number;
 }
 
 export const OFFICIAL_SERIES: Record<OfficialSeriesId, SeriesDef> = {
@@ -66,7 +74,36 @@ export const OFFICIAL_SERIES: Record<OfficialSeriesId, SeriesDef> = {
   // SGS series 432 forward-fills future dates with the current target (a documented trap), so it cannot corroborate
   // a decision before its effective date; the Copom history row for the meeting is the only source.
   bcb_selic_target: { id: "bcb_selic_target", label: "Banco Central do Brasil Selic target (Copom history)", decides: "rate_change_bps", rounding: "bps_nearest_25_min_25", period: "day", hosts: ["www.bcb.gov.br"], primaryUrl: "https://www.bcb.gov.br/api/servico/sitebcb/historicotaxasjuros", corroboration: "none" },
+  ...electionSeriesDefs(),
 };
+
+/** The TSE results configuration (ele-c.json): the only TSE URL the rail requests that is not built from its contents. */
+export const TSE_CONFIG_URL = "https://resultados.tse.jus.br/oficial/comum/config/ele-c.json";
+/** The Élections Québec results file its own live page reads (page_resultat.js, OBSERVED 2026-09-27T22:44:38Z). */
+export const EQ_RESULTS_URL = "https://donnees.electionsquebec.qc.ca/production/provincial/resultats/resultats.json";
+/** Election counts are final hours after polls close (TSE 2022: about 40 h): release_not_observed only after 72 h. */
+export const ELECTION_MISSING_AFTER_MS = 72 * 3600_000;
+
+/**
+ * Election series in the registry. One fetch serves every series read from the same file: the TSE national file (the
+ * winner, 3rd and 4th place, margin, turnout and the four vote-share events) and the Élections Québec file (every Quebec
+ * event); each TSE state file serves its own 1st-place event. No second source exists on election night (the TSE open
+ * data CSVs appeared four days after the 2022 vote), so every verdict is single-source and says so.
+ */
+function electionSeriesDefs(): Record<ElectionSeriesId, SeriesDef> {
+  const out = {} as Record<ElectionSeriesId, SeriesDef>;
+  for (const d of Object.values(ELECTION_SERIES)) {
+    const tse = d.authority === "tse";
+    out[d.id] = {
+      id: d.id, label: d.label, decides: "election", rounding: "election_exact", period: "day",
+      hosts: [tse ? "resultados.tse.jus.br" : "donnees.electionsquebec.qc.ca"],
+      primaryUrl: tse ? "https://resultados.tse.jus.br/oficial/comum/config/ele-c.json" : "https://donnees.electionsquebec.qc.ca/production/provincial/resultats/resultats.json",
+      corroboration: "none", missingAfterMs: 72 * 3600_000,
+      ...(tse ? (d.scope === "BR" ? { fetchGroup: "tse_pres_r1_br" } : {}) : { fetchGroup: "eq_general" }),
+    };
+  }
+  return out;
+}
 
 /** Series that exist as markets but have no deterministic adapter, with the reason registration refuses them. */
 export const UNSUPPORTED_OFFICIAL_SERIES: Record<string, string> = {
@@ -121,6 +158,9 @@ export const KNOWN_RELEASES: Record<string, KnownRelease> = {
   "ecb_dfr:2026-10-29": { release_at: "2026-10-29T13:15:00Z", fallback_until: "2026-12-17T13:15:00Z", basis: "ECB Governing Council October 29 (14:15 CET UNVERIFIED); next meeting December 16-17" },
   "bcb_selic_target:2026-11-04": { release_at: "2026-11-04T21:30:00Z", fallback_until: null, basis: "Copom November 3-4 (~18:30 BRT UNVERIFIED)" },
   "boe_bank_rate:2026-11-05": { release_at: "2026-11-05T12:00:00Z", fallback_until: null, basis: "BoE MPC Thursday 5 November, 12:00 UK (UNVERIFIED for November)" },
+  // Election days: release_at is polls close. The texts wait until 2027 ("Other" or the lowest bracket after that), so
+  // no fallback is named and the 45-day cap ends the polling.
+  ...Object.fromEntries(Object.values(ELECTION_SERIES).flatMap((d) => ELECTION_EVENTS.filter((e) => e.authority === d.authority).map((e): [string, KnownRelease] => [`${d.id}:${e.day}`, { release_at: e.polls_close, fallback_until: null, basis: e.basis }]))),
 };
 /** No official number is awaited longer than this after its release_at (the markets' fallbacks are shorter). */
 export const FALLBACK_MAX_MS = 45 * 86_400_000;
@@ -138,6 +178,9 @@ export function fallbackEndMs(r: Pick<OfficialResolver, "series" | "period" | "r
   const named = knownRelease(r.series, r.period)?.fallback_until;
   return named ? Math.min(Date.parse(named), cap) : cap;
 }
+
+/** How long after release_at the legs wait before they are reported release_not_observed (6 h; elections 72 h). */
+export function missingAfterMs(series: OfficialSeriesId): number { return OFFICIAL_SERIES[series].missingAfterMs ?? 6 * 3600_000; }
 
 export function hostAllowed(series: OfficialSeriesId, url: string): boolean {
   try { return OFFICIAL_SERIES[series].hosts.includes(new URL(url).hostname.toLowerCase()) && new URL(url).protocol === "https:"; }
@@ -286,7 +329,7 @@ export function roundedChangeBps(hundredths: number, rule: OfficialRoundingRule)
   switch (rule) {
     case "bps_away_from_zero_25": return sign * Math.ceil(a / 2500) * 25;
     case "bps_nearest_25_min_25": return sign * (a < 2500 ? 25 : Math.floor((a + 1250) / 2500) * 25);
-    case "pct_1dp": case "thousands_as_printed": throw new Error(`${rule} is not a basis-point rule`);
+    case "pct_1dp": case "thousands_as_printed": case "election_exact": throw new Error(`${rule} is not a basis-point rule`);
     default: { const never: never = rule; throw new Error(`unhandled rounding ${String(never)}`); }
   }
 }
@@ -294,6 +337,7 @@ export function roundedChangeBps(hundredths: number, rule: OfficialRoundingRule)
 /** Two readings of the same number agree at the precision the series is published and decided in. */
 export function sameAtPrecision(series: OfficialSeriesId, a: string | number, b: string | number): boolean {
   const d = OFFICIAL_SERIES[series].decides;
+  if (d === "election") return String(a) === String(b);
   if (d === "percent") { const x = percentTenths(a), y = percentTenths(b); return x !== undefined && x === y; }
   if (d === "change_thousands") { const x = thousandsOf(a), y = thousandsOf(b); return x !== undefined && x === y; }
   const x = levelBps(a), y = levelBps(b);
@@ -306,6 +350,7 @@ export function roundingFits(decides: SeriesDef["decides"], rule: OfficialRoundi
     case "percent": return rule === "pct_1dp";
     case "change_thousands": return rule === "thousands_as_printed";
     case "rate_change_bps": return rule === "bps_away_from_zero_25" || rule === "bps_nearest_25_min_25";
+    case "election": return rule === "election_exact";
     default: { const never: never = decides; throw new Error(`unhandled decided unit ${String(never)}`); }
   }
 }
@@ -328,6 +373,7 @@ export function bucketContains(b: OfficialBucket, decides: SeriesDef["decides"],
 /** Why a bucket can never be Yes (empty, off-grid, or holding no reachable value), or null. */
 export function bucketProblem(b: OfficialBucket, decides: SeriesDef["decides"]): string | null {
   if (b.lo === undefined && b.hi === undefined) return "bucket has neither lo nor hi";
+  if (decides === "election") return null; // the grid depends on the event's measure: electionRegistrationIssues
   const lo = b.lo === undefined ? undefined : gridUnits(b.lo, decides);
   const hi = b.hi === undefined ? undefined : gridUnits(b.hi, decides);
   const grid = decides === "percent" ? "a multiple of 0.1" : decides === "change_thousands" ? "a whole number of thousands" : "a whole number of bps";
@@ -374,6 +420,8 @@ export const OfficialObservationDoc = z.object({
   stated_prior: z.string().nullable().optional(),
   /** The step the document states (Fed "by 1/4 percentage point" = 25, BoK/ECB "by 25 basis points"). */
   stated_step_bps: z.number().nullable().optional(),
+  /** Election series: the authority's count the legs decide from (src/resolve/election.ts), stored in meta.contest. */
+  contest: ElectionSnapshot.nullable().optional(),
 });
 export type OfficialObservationDoc = z.infer<typeof OfficialObservationDoc>;
 
@@ -401,6 +449,8 @@ export function officialDocJson(doc: OfficialDoc): string {
     source_url: doc.source_url, raw_sha256: doc.raw_sha256, observed_at: doc.observed_at, direction: doc.direction,
     corroboration: c ? { status: c.status, source_url: c.source_url, value: c.value, value_text: c.value_text, detail: c.detail, checked_at: c.checked_at } : null,
     stated_prior: doc.stated_prior ?? null, stated_step_bps: doc.stated_step_bps ?? null,
+    // only an election document carries a contest: every other document keeps its bytes
+    ...(doc.contest ? { contest: canonicalSnapshot(doc.contest) } : {}),
   });
 }
 
@@ -448,6 +498,7 @@ export function reading(doc: Pick<OfficialObservationDoc, "value" | "value_text"
 /** The decided value in grid units (tenths of a percent, thousands, or bps of change after the market's rounding). */
 export function decidedUnits(r: OfficialResolver, doc: Pick<OfficialObservationDoc, "value" | "value_text">): { units: number; shown: string } | { error: string } {
   const def = OFFICIAL_SERIES[r.series];
+  if (def.decides === "election") return { error: `${r.series} legs decide from the contest, not one number` };
   if (def.decides === "percent") {
     const t = percentTenths(reading(doc));
     return t === undefined ? { error: `unreadable value ${doc.value_text}` } : { units: t, shown: `${(t / 10).toFixed(1)}%` };
@@ -512,6 +563,9 @@ export function decideOfficial(market: MarketRegistration, ev: EvidenceInput): S
     if ((known || own) && Date.parse(doc.observed_at) < Date.parse(releaseAt)) problems.push(`observed ${doc.observed_at} before the scheduled release ${releaseAt}`);
     if (doc.period !== r.period) problems.push(`document is about ${doc.period}, market is ${r.period}`);
     if (!namesPeriod(r.series, r.period, doc.deciding_text)) problems.push(`deciding text does not name ${periodMentions(r.series, r.period).join(" | ")}`);
+    // an election count the authority itself stamped before polls closed is a simulation or another election
+    const asOf = doc.contest?.as_of;
+    if (asOf && Date.parse(asOf) < Date.parse(releaseAt)) problems.push(`the count is stamped ${asOf}, before polls closed at ${releaseAt}`);
     if (problems.length) return unresolved("awaiting_release", problems.join("; "));
     // From the fallback the market texts settle on an earlier period, which the rail never decides from, so a first
     // print first seen at or after it (a lapse in appropriations can push a release that far) decides nothing.
@@ -519,6 +573,13 @@ export function decideOfficial(market: MarketRegistration, ev: EvidenceInput): S
     if (known?.fallback_until && Date.parse(doc.observed_at) >= Date.parse(known.fallback_until)) {
       return unresolved("released_after_fallback", `${r.series} ${r.period} first observed ${doc.observed_at}, at or after the market's fallback ${known.fallback_until} (${known.basis}); the market texts then settle on an earlier period, which the rail never decides from`);
     }
+  }
+
+  // Election legs decide from the authority's whole count (src/resolve/election.ts); no second source exists that night.
+  if (isElectionSeries(r.series)) {
+    const c = doc.corroboration;
+    if (c?.status === "disagree") return unresolved("sources_disagree", c.detail);
+    return decideElection(market, r, doc.contest ?? null, ["first_print", c?.status === "agree" ? "corroborated" : "single_source"]);
   }
 
   const decided = decidedUnits(r, doc);
@@ -584,6 +645,7 @@ export function officialRegistrationIssues(reg: MarketRegistration): string[] {
   if (def.decides === "rate_change_bps" && r.prior_level === undefined) issues.push(`${r.series} decides a change in bps: prior_level is required`);
   if (def.decides === "percent" && r.prior_level !== undefined) issues.push(`${r.series} decides a published percent: prior_level must be absent`);
   if (def.decides === "change_thousands" && r.prior_level !== undefined) issues.push(`${r.series} decides a published change: prior_level must be absent`);
+  issues.push(...electionRegistrationIssues(r));
   if (!roundingFits(def.decides, r.rounding)) issues.push(`rounding ${r.rounding} does not fit ${r.series} (${def.decides})`);
   const bp = bucketProblem(r.bucket, def.decides);
   if (bp) issues.push(bp);
