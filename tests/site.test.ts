@@ -181,7 +181,7 @@ describe("POST /v1/request-key", () => {
   const good = { name: "Ada Lovelace", email: "ada@example.com", company: "Example Bots", purpose: "Settle CPI markets", venue: "Polymarket" };
   const form = (o: Record<string, string>) => ({ method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", "cf-connecting-ip": "203.0.113.9" }, body: new URLSearchParams(o).toString() });
   const jsonReq = (o: unknown) => ({ method: "POST", headers: { "content-type": "application/json", "cf-connecting-ip": "203.0.113.9" }, body: JSON.stringify(o) });
-  const dbWith = (rate = rateRpc()) => fakeDb({}, {}, { rpc: { rate_limit_hit: rate, log_touch: touchRpc } });
+  const dbWith = (rate: (db: any, a: Record<string, any>) => Promise<{ data: any; error: any }> = rateRpc()) => fakeDb({}, {}, { rpc: { rate_limit_hit: rate, log_touch: touchRpc } });
 
   it("form: stores a prospect lead and an inbound touch, alerts with a masked email, answers an HTML confirmation", async () => {
     h.db = dbWith();
@@ -231,6 +231,27 @@ describe("POST /v1/request-key", () => {
     expect(res.status).toBe(429);
     expect(h.db.tables.leads ?? []).toHaveLength(0);
     expect(h.alerts).toHaveLength(0);
+  });
+
+  it("per-IP bucket alone gives 429; the key comes from CF-Connecting-IP, not X-Forwarded-For", async () => {
+    const keys: string[] = [];
+    h.db = dbWith(async (_db: unknown, a: Record<string, any>) => { keys.push(a.p_key); return { data: [{ allowed: a.p_key !== "request_key:ip:203.0.113.9", remaining: 0, reset_at: "2026-09-28T01:00:00Z" }], error: null }; });
+    const res = await app.request("/v1/request-key", { method: "POST", headers: { "content-type": "application/json", "cf-connecting-ip": "203.0.113.9", "x-forwarded-for": "198.51.100.7" }, body: JSON.stringify(good) }, env, ctx);
+    expect(res.status).toBe(429);
+    expect(keys).toContain("request_key:ip:203.0.113.9");
+    expect(keys.some((k) => k.includes("198.51.100.7"))).toBe(false);
+    expect(h.db.tables.leads ?? []).toHaveLength(0);
+    expect(h.alerts).toHaveLength(0);
+  });
+
+  it("rejects an oversized or multipart body with 400", async () => {
+    h.db = dbWith();
+    let res = await app.request("/v1/request-key", { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", "cf-connecting-ip": "203.0.113.9" }, body: "name=" + "a".repeat(20_000) }, env, ctx);
+    expect(res.status).toBe(400);
+    const fd = new FormData(); fd.set("name", "A");
+    res = await app.request("/v1/request-key", { method: "POST", body: fd, headers: { "cf-connecting-ip": "203.0.113.9" } }, env, ctx);
+    expect(res.status).toBe(400);
+    expect(h.db.tables.leads ?? []).toHaveLength(0);
   });
 
   it("fails closed with 503 (never 500) when the rate limit or the lead insert cannot be written", async () => {

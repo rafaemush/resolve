@@ -6,7 +6,7 @@
  * (a test-key request: stored as a lead with an inbound touch, the operator alerted; no key is issued automatically).
  *
  * Rules every page keeps (tests/site.test.ts): every dynamic value is HTML-escaped; no page names the model or its
- * vendor; no accuracy percentage appears before the view marks a platform reportable (100 reconciled events); no number
+ * vendor; no accuracy percentage appears before the view marks a platform reportable (100 reconciled markets); no number
  * is printed that is not read from the database or from code; each page makes at most 3 database reads, in parallel;
  * a strict Content-Security-Policy (no script at all) and a 60 s public cache.
  */
@@ -124,7 +124,7 @@ async function cached(c: Context<{ Bindings: Env; Variables: Vars }>, key: strin
   const req = new Request(new URL(key, c.req.url).toString());
   if (store) { const hit = await store.match(req); if (hit) return hit; }
   const res = await render();
-  if (store && res.status === 200) {
+  if (store && res.status === 200 && !/no-store/i.test(res.headers.get("cache-control") ?? "")) {
     try { c.executionCtx.waitUntil(store.put(req, res.clone())); } catch { /* no execution context (tests) */ }
   }
   return res;
@@ -215,10 +215,10 @@ export function landingHtml(o: { upcoming: UpcomingRelease[]; countsOk: boolean;
 <p class="lede">Resolve reads the official release (a statistics office, a central bank, a public API) and decides each market's outcome from it. It is an API with webhooks for bot operators, data teams and venues.</p>
 <h2>How it works</h2>
 <ul>
-<li><strong>From the source.</strong> For an official release, Resolve polls the publisher from the release minute and decides from the published figure, not from news or social posts.</li>
+<li><strong>From the source.</strong> For an official release, Resolve reads the publisher's own release after it is published and decides from the published figure, not from news or social posts.</li>
 <li><strong>Committed before, revealed after.</strong> Each verdict is posted first as a SHA-256 commitment, before the venue resolves the market. After the venue resolves, the verdict and the text behind the hash are revealed, so anyone can recompute the hash and check that nothing was changed.</li>
-<li><strong>Checked against the venue.</strong> Every public verdict is reconciled with the venue's own resolution, and the result is on the <a href="/record">public record</a>, including disagreements.</li>
-<li><strong>No accuracy claim yet.</strong> Percentages appear only after 100 events on a venue have been reconciled. Until then the record shows counts and times only.</li>
+<li><strong>Checked against the venue.</strong> Once the venue resolves a market, Resolve compares its verdict with the venue's resolution and publishes the result on the <a href="/record">public record</a>, including disagreements.</li>
+<li><strong>No accuracy claim yet.</strong> Percentages appear for a venue once 100 of its markets have been reconciled against the venue's own resolution. Until then the record shows counts and times only.</li>
 </ul>
 <h2>Next scheduled releases</h2>
 ${upcomingTable(o.upcoming, o.countsOk)}
@@ -292,13 +292,13 @@ function recordBody(s: RecordSummary, rows: readonly RecordRow[], upcoming: stri
   const stat = (n: number, label: string) => `<div class="stat"><b>${int(n)}</b><span>${label}</span></div>`;
   const young = s.platforms.every((p) => !p.reportable);
   const gate = young
-    ? `<p class="note">The record is too young for percentages. They appear for a venue once 100 of its events have been reconciled against the venue's own resolution (the legs of one multi-outcome event count once). Until then this page shows counts and times only.</p>`
+    ? `<p class="note">The record is too young for percentages. Percentages appear for a venue once 100 of its markets have been reconciled against the venue's own resolution. Until then this page shows counts and times only.</p>`
     : "";
   const perPlatform = s.platforms.length ? `<div class="table"><table>
 <thead><tr><th scope="col">Venue</th><th scope="col">Events reconciled</th><th scope="col">Per-market precision (95 % interval)</th><th scope="col">Per-event precision (95 % interval)</th></tr></thead>
 <tbody>${s.platforms.map((p) => p.reportable
       ? `<tr><td>${esc(platformName(p.platform))}</td><td class="n">${int(p.events_reconciled)}</td><td class="n">${esc(pct(p.row.precision))} (${esc(pct(p.row.wilson_low))} to ${esc(pct(p.row.wilson_high))})</td><td class="n">${esc(pct(p.row.event_precision))} (${esc(pct(p.row.event_wilson_low))} to ${esc(pct(p.row.event_wilson_high))})</td></tr>`
-      : `<tr><td>${esc(platformName(p.platform))}</td><td class="n">${int(p.events_reconciled)}</td><td colspan="2" class="muted">not yet reportable: percentages appear at 100 reconciled events</td></tr>`).join("\n")}</tbody>
+      : `<tr><td>${esc(platformName(p.platform))}</td><td class="n">${int(p.events_reconciled)}</td><td colspan="2" class="muted">not yet reportable: percentages appear at 100 reconciled markets</td></tr>`).join("\n")}</tbody>
 </table></div>` : "";
   const table = rows.length ? `<h2>Most recent commitments</h2>
 <p class="muted">One row per market, newest first. Release to commit: seconds from the scheduled official release to the first commitment. The hash links to the public verification of the latest commitment.</p>
@@ -347,7 +347,7 @@ site.get("/record", (c) => cached(c, "/record?site=1", async () => {
 /** The plans as sold (docs/pricing.md); follow limits and request rates come from the code that enforces them. */
 export const PUBLIC_PLANS: ReadonlyArray<{ plan: Plan | null; name: string; price: string; contents: string }> = [
   { plan: "free", name: "Free test key", price: "$0", contents: "300 credits for 30 days, structured verdicts only." },
-  { plan: "payg", name: "Pay as you go", price: "Packs of $50, $250 or $1,000", contents: "Credits that never expire." },
+  { plan: "payg", name: "Pay as you go", price: "Packs of $50, $250 or $1,000", contents: "Credits do not expire while the account is open." },
   { plan: "builder", name: "Builder", price: "$99 a month", contents: "12,000 credits a month, 50 watches, webhooks and private early reveals." },
   { plan: "growth", name: "Growth", price: "$399 a month", contents: "60,000 credits a month, 500 watches, a higher request rate." },
   { plan: null, name: "Venue Design Partner", price: "$750 a month", contents: "Your venue's markets, webhooks in your venue's payload shape (including a proposed winning outcome index), and a weekly reconciliation report." },
@@ -364,7 +364,7 @@ export function pricingHtml(o: { packs: PaygCredit[] | null; channel: string | n
     ? `<div class="table"><table><thead><tr><th scope="col">Pack</th><th scope="col">Credits</th></tr></thead><tbody>${o.packs.map((p) => `<tr><td class="n">$${esc(int(Number(p.usdc)))}</td><td class="n">${esc(int(p.credits))}</td></tr>`).join("")}</tbody></table></div>`
     : `<p class="muted">Pack credit amounts are unavailable right now; ask us for a quote.</p>`;
   const body = `<h1>Pricing</h1>
-<p class="lede">Prices are in US dollars. One credit is one cent.</p>
+<p class="lede">Prices are in US dollars. The smallest pack gives 100 credits per dollar; larger packs give more (see the table below).</p>
 <h2>Credits per call</h2>
 <ul>
 <li>A structured verdict (machine-readable sources such as official releases, GitHub objects, on-chain logs): <strong>1 credit</strong>.</li>
@@ -377,6 +377,7 @@ export function pricingHtml(o: { packs: PaygCredit[] | null; channel: string | n
 <thead><tr><th scope="col">Plan</th><th scope="col">Price</th><th scope="col">What you get</th><th scope="col">Followed markets (early reveals)</th><th scope="col">Requests per minute per key</th></tr></thead>
 <tbody>${PUBLIC_PLANS.map((p) => `<tr><td>${esc(p.name)}</td><td>${esc(p.price)}</td><td>${esc(p.contents)}</td>${limits(p.plan)}</tr>`).join("\n")}</tbody>
 </table></div>
+<p class="muted">Monthly plans and venue offers are set up by agreement; the figures above are what the plan includes.</p>
 <h2>Pay-as-you-go packs</h2>
 ${packs}
 <h2>Payment</h2>
@@ -384,7 +385,7 @@ ${packs}
 <p><strong>Credits are a non-refundable prepayment for API services.</strong> They cannot be withdrawn, transferred, or exchanged for money or crypto.</p>
 <h2>What we do not claim</h2>
 <ul>
-<li>No accuracy percentage until 100 events on a venue have been reconciled; until then, measured facts only.</li>
+<li>No accuracy percentage until 100 markets on a venue have been reconciled; until then, measured facts only.</li>
 <li>No lead-time promise and no SLA.</li>
 <li>${DISCLAIMER}</li>
 </ul>
@@ -537,6 +538,7 @@ site.post("/v1/request-key", async (c) => {
     json ? err(c, code, text, status) : htmlAnswer(status, title, text, form);
 
   let raw: Record<string, unknown>;
+  if (Number(c.req.header("content-length") ?? 0) > 16_384) return fail(400, "validation_error", "Request too large", "The request body is too large.");
   try {
     if (isJson) {
       const text = await c.req.text();
@@ -544,9 +546,10 @@ site.post("/v1/request-key", async (c) => {
       const parsed = JSON.parse(text) as unknown;
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an object");
       raw = parsed as Record<string, unknown>;
-    } else if (ctype.includes("application/x-www-form-urlencoded") || ctype.includes("multipart/form-data")) {
-      const form = await c.req.parseBody();
-      raw = Object.fromEntries(Object.entries(form).filter(([, v]) => typeof v === "string"));
+    } else if (ctype.includes("application/x-www-form-urlencoded")) {
+      const text = await c.req.text();
+      if (text.length > 8192) return fail(400, "validation_error", "Request too large", "The request body is too large.");
+      raw = Object.fromEntries(new URLSearchParams(text));
     } else {
       return fail(400, "validation_error", "Unsupported request", "Send the form, or JSON with content-type application/json.");
     }
