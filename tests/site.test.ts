@@ -2,7 +2,9 @@
  * The public site (src/api/site.ts): every page answers 200 with zero rows and with sample rows, escapes every dynamic
  * value, never names the model or its vendor, prints no percentage before the view marks a platform reportable, keeps
  * each page to <= 3 database reads, and carries the CSP / nosniff / referrer / cache headers. POST /v1/request-key
- * validates, rate-limits (failing closed), stores a lead plus an inbound touch, and alerts the operator with a masked email.
+ * validates, rate-limits (failing closed), stores a lead plus an inbound touch, and alerts the operator with a masked email;
+ * here with keys on the spot switched off (REQUEST_KEY_DAILY_CAP "0"), which is exactly the form without them. The key
+ * it issues otherwise is tests/instant-key.test.ts.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
@@ -95,6 +97,10 @@ describe("pages", () => {
     expect(html).toContain("Limitless: 1 market<br>Polymarket: 2 markets");
     expect(html).toContain('action="/v1/request-key"');
     for (const l of ["/record", "/pricing", "/docs", "/openapi.json"]) expect(html).toContain(`href="${l}"`);
+    // the form says the key is shown on the next page, with its terms from the code that issues it
+    expect(html).toContain("A free test key carries 300 credits for 30 days, for structured verdicts, with up to 5 watches");
+    expect(html).toContain("the key is shown on the next page, once");
+    expect(html).not.toMatch(/no key is issued automatically/i);
   });
 
   it("upcomingReleases: only releases after now, soonest first", () => {
@@ -205,6 +211,10 @@ describe("pages", () => {
     const html = await (await app.request("/docs", {}, env, ctx)).text();
     expect(html).toContain("X-Resolve-Signature: t=&lt;unix seconds&gt;,v1=&lt;hex&gt;");
     for (const p of ["/v1/request-key", "/v1/markets", "/v1/resolve", "/v1/webhooks", "/follow", "/v1/track-record/verify"]) expect(html).toContain(p);
+    // the key comes back in the answer (tests/instant-key.test.ts), with the terms the code issues
+    expect(html).toContain("The answer carries a test key, once (<code>data.key</code>");
+    expect(html).toContain("carries 300 credits for 30 days, for structured verdicts, with up to 5 watches");
+    expect(html).not.toContain("sends the key by email");
   });
 
   it("uses the Cache API when present", async () => {
@@ -218,6 +228,7 @@ describe("pages", () => {
 });
 
 describe("POST /v1/request-key", () => {
+  const off = { ...env, REQUEST_KEY_DAILY_CAP: "0" } as Env;
   const good = { name: "Ada Lovelace", email: "ada@example.com", company: "Example Bots", purpose: "Settle CPI markets", venue: "Polymarket" };
   const form = (o: Record<string, string>) => ({ method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", "cf-connecting-ip": "203.0.113.9" }, body: new URLSearchParams(o).toString() });
   const jsonReq = (o: unknown) => ({ method: "POST", headers: { "content-type": "application/json", "cf-connecting-ip": "203.0.113.9" }, body: JSON.stringify(o) });
@@ -225,7 +236,7 @@ describe("POST /v1/request-key", () => {
 
   it("form: stores a prospect lead and an inbound touch, alerts with a masked email, answers an HTML confirmation", async () => {
     h.db = dbWith();
-    const res = await app.request("/v1/request-key", form(good), env, ctx);
+    const res = await app.request("/v1/request-key", form(good), off, ctx);
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toContain("text/html");
     expect(res.headers.get("content-security-policy")).toBe(SITE_CSP);
@@ -238,27 +249,29 @@ describe("POST /v1/request-key", () => {
     expect(h.alerts[0]!.text).toContain("Settle CPI markets");
     expect(h.alerts[0]!.text).toContain("a***@example.com");
     expect(h.alerts[0]!.text).not.toContain("ada@example.com");
+    expect(h.alerts[0]!.text).toContain("Key: not issued (REQUEST_KEY_DAILY_CAP is 0)");
     expect(h.db.calls.filter((c) => c.table === "rpc:rate_limit_hit")).toHaveLength(2);
+    expect(h.db.tables.tenants ?? []).toHaveLength(0);
   });
 
   it("JSON in, JSON out; 'project' is accepted for company", async () => {
     h.db = dbWith();
     const { company, ...rest } = good;
-    const res = await app.request("/v1/request-key", jsonReq({ ...rest, project: company }), env, ctx);
+    const res = await app.request("/v1/request-key", jsonReq({ ...rest, project: company }), off, ctx);
     expect(res.status).toBe(200);
-    expect(await res.json()).toMatchObject({ ok: true, data: { received: true } });
+    expect(await res.json()).toMatchObject({ ok: true, data: { received: true, key_issued: false } });
     expect(h.db.tables.leads![0]!.org).toBe("Example Bots");
   });
 
   it("rejects a URL in the name, a bad email, missing fields and overlong values; nothing stored", async () => {
     for (const bad of [{ ...good, name: "Win at https://spam.example" }, { ...good, name: "cheap.xyz deals" }, { ...good, email: "nope" }, { ...good, purpose: "" }, { ...good, purpose: "x".repeat(1001) }, { name: "A" }]) {
       h.db = dbWith();
-      const res = await app.request("/v1/request-key", jsonReq(bad), env, ctx);
+      const res = await app.request("/v1/request-key", jsonReq(bad), off, ctx);
       expect(res.status).toBe(400);
       expect(h.db.tables.leads ?? []).toHaveLength(0);
     }
     h.db = dbWith();
-    const res = await app.request("/v1/request-key", form({ ...good, name: "<b>x</b> www.spam.test" }), env, ctx);
+    const res = await app.request("/v1/request-key", form({ ...good, name: "<b>x</b> www.spam.test" }), off, ctx);
     expect(res.status).toBe(400);
     const html = await res.text();
     expect(html).not.toContain("<b>x</b>");
@@ -267,7 +280,7 @@ describe("POST /v1/request-key", () => {
 
   it("rate limited: 429, nothing stored", async () => {
     h.db = dbWith(rateRpc(false));
-    const res = await app.request("/v1/request-key", jsonReq(good), env, ctx);
+    const res = await app.request("/v1/request-key", jsonReq(good), off, ctx);
     expect(res.status).toBe(429);
     expect(h.db.tables.leads ?? []).toHaveLength(0);
     expect(h.alerts).toHaveLength(0);
@@ -276,7 +289,7 @@ describe("POST /v1/request-key", () => {
   it("per-IP bucket alone gives 429; the key comes from CF-Connecting-IP, not X-Forwarded-For", async () => {
     const keys: string[] = [];
     h.db = dbWith(async (_db: unknown, a: Record<string, any>) => { keys.push(a.p_key); return { data: [{ allowed: a.p_key !== "request_key:ip:203.0.113.9", remaining: 0, reset_at: "2026-09-28T01:00:00Z" }], error: null }; });
-    const res = await app.request("/v1/request-key", { method: "POST", headers: { "content-type": "application/json", "cf-connecting-ip": "203.0.113.9", "x-forwarded-for": "198.51.100.7" }, body: JSON.stringify(good) }, env, ctx);
+    const res = await app.request("/v1/request-key", { method: "POST", headers: { "content-type": "application/json", "cf-connecting-ip": "203.0.113.9", "x-forwarded-for": "198.51.100.7" }, body: JSON.stringify(good) }, off, ctx);
     expect(res.status).toBe(429);
     expect(keys).toContain("request_key:ip:203.0.113.9");
     expect(keys.some((k) => k.includes("198.51.100.7"))).toBe(false);
@@ -286,33 +299,33 @@ describe("POST /v1/request-key", () => {
 
   it("rejects an oversized or multipart body with 400", async () => {
     h.db = dbWith();
-    let res = await app.request("/v1/request-key", { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", "cf-connecting-ip": "203.0.113.9" }, body: "name=" + "a".repeat(20_000) }, env, ctx);
+    let res = await app.request("/v1/request-key", { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", "cf-connecting-ip": "203.0.113.9" }, body: "name=" + "a".repeat(20_000) }, off, ctx);
     expect(res.status).toBe(400);
     const fd = new FormData(); fd.set("name", "A");
-    res = await app.request("/v1/request-key", { method: "POST", body: fd, headers: { "cf-connecting-ip": "203.0.113.9" } }, env, ctx);
+    res = await app.request("/v1/request-key", { method: "POST", body: fd, headers: { "cf-connecting-ip": "203.0.113.9" } }, off, ctx);
     expect(res.status).toBe(400);
     expect(h.db.tables.leads ?? []).toHaveLength(0);
   });
 
   it("fails closed with 503 (never 500) when the rate limit or the lead insert cannot be written", async () => {
     h.db = dbWith(rateRpc(true, { message: "db down" }));
-    let res = await app.request("/v1/request-key", jsonReq(good), env, ctx);
+    let res = await app.request("/v1/request-key", jsonReq(good), off, ctx);
     expect(res.status).toBe(503);
     h.db = dbWith(async () => { throw new Error("socket"); });
-    res = await app.request("/v1/request-key", form(good), env, ctx);
+    res = await app.request("/v1/request-key", form(good), off, ctx);
     expect(res.status).toBe(503);
     expect(await res.text()).toContain("Nothing was stored");
     h.db = dbWith();
     const from = h.db.client.from;
     h.db.client.from = ((t: string) => (t === "leads" ? { insert: () => ({ select: () => ({ single: async () => ({ data: null, error: { message: "x" } }) }) }) } : from(t))) as never;
-    res = await app.request("/v1/request-key", jsonReq(good), env, ctx);
+    res = await app.request("/v1/request-key", jsonReq(good), off, ctx);
     expect(res.status).toBe(503);
     expect(h.alerts).toHaveLength(0);
   });
 
   it("a filled honeypot gets the same answer and stores nothing", async () => {
     h.db = dbWith();
-    const res = await app.request("/v1/request-key", form({ ...good, website: "http://x" }), env, ctx);
+    const res = await app.request("/v1/request-key", form({ ...good, website: "http://x" }), off, ctx);
     expect(res.status).toBe(200);
     expect(h.db.tables.leads ?? []).toHaveLength(0);
     expect(h.alerts).toHaveLength(0);

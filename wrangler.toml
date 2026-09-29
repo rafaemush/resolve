@@ -61,3 +61,6 @@ BASE_LOGS_HTTP_URL = "https://mainnet.base.org"
 SOLANA_FALLBACK_HTTP_URL = "https://api.mainnet-beta.solana.com"
 RESOLVE_BOT_UA = "ResolveBot/1.0 (+https://resolve.rafaemush.workers.dev/bot)"
 LIMITLESS_WS_ENABLED = "1"
+# Evaluation keys the request form issues on the spot per UTC day (src/api/evaluation-key.ts). Past it, and when it is
+# "0", the form stores the request and alerts the operator, who answers by email. Not a whole number from 0 to 1000 = 0.
+REQUEST_KEY_DAILY_CAP = "25"

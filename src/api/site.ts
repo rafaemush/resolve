@@ -3,12 +3,14 @@
  * scheduled official releases and how many public markets each covers), GET /record (the public record, from the same
  * views the API reads: v_track_record as GET /v1/track-record serves it, and v_venue_report for the per-market commit
  * rows whose hashes GET /v1/track-record/verify checks), GET /pricing, GET /docs, GET /terms, and POST /v1/request-key
- * (a test-key request: stored as a lead with an inbound touch, the operator alerted; no key is issued automatically).
+ * (a test-key request: stored as a lead with an inbound touch; an evaluation key is issued on the spot and shown once
+ * when src/api/evaluation-key.ts allows it, otherwise a person answers by email; the operator is alerted either way,
+ * never with the key).
  *
  * Rules every page keeps (tests/site.test.ts): every dynamic value is HTML-escaped; no page names the model or its
  * vendor; no accuracy percentage appears before the view marks a platform reportable (100 reconciled markets); no number
  * is printed that is not read from the database or from code; each page makes at most 3 database reads, in parallel;
- * a strict Content-Security-Policy (no script at all) and a 60 s public cache.
+ * a strict Content-Security-Policy (no script at all) and a 60 s public cache (the POST answers: no-store).
  */
 import { Hono, type Context } from "hono";
 import { z } from "zod";
@@ -22,6 +24,8 @@ import { effectiveTiers, packQuotes, type PaygCredit } from "../billing/tiers";
 import { followCap, type Plan } from "../shadow/follows";
 import { perKeyRpm } from "./auth";
 import { alert } from "../ops/alerts";
+import { EVALUATION_KEY_DAYS, EVALUATION_WATCH_LIMIT, FREE_EVALUATION_CREDITS } from "./keys";
+import { issueEvaluationKey, type AutoKeyOutcome } from "./evaluation-key";
 
 type Vars = { requestId: string; schemaVersion: string };
 export const site = new Hono<{ Bindings: Env; Variables: Vars }>();
@@ -229,7 +233,7 @@ function upcomingTable(rows: UpcomingRelease[], countsOk: boolean): string {
 export function requestKeyForm(values: Partial<Record<string, string>> = {}, error: string | null = null): string {
   const v = (k: string) => esc(values[k] ?? "");
   return `<h2 id="request-key">Request a test key</h2>
-<p>A free test key carries 300 credits for 30 days, for structured verdicts. Tell us who you are and what you want to settle; we answer by email. No key is issued automatically.</p>
+<p>A free test key carries ${int(FREE_EVALUATION_CREDITS)} credits for ${EVALUATION_KEY_DAYS} days, for structured verdicts, with up to ${EVALUATION_WATCH_LIMIT} watches. Tell us who you are and what you want to settle: the key is shown on the next page, once. One key per email address every ${EVALUATION_KEY_DAYS} days; when a key cannot be issued on the spot, a person reads the request and answers by email.</p>
 ${error ? `<p class="note" role="alert">${esc(error)}</p>` : ""}
 <form method="post" action="/v1/request-key">
 <label>Name <input name="name" required maxlength="100" autocomplete="name" value="${v("name")}"></label>
@@ -462,7 +466,7 @@ export function docsHtml(o: { base: string; channel: string | null }): string {
 <pre>curl -X POST ${b}/v1/request-key \\
   -H 'content-type: application/json' \\
   -d '{"name":"Ada","email":"ada@example.com","company":"Example Bots","purpose":"Settle CPI markets for our bot"}'</pre>
-<p>A person reads each request and sends the key by email. A test key starts with <code>rsl_test_</code>.</p>
+<p>The answer carries a test key, once (<code>data.key</code>; the form shows it on the next page). Store it then: Resolve keeps only its hash. A test key starts with <code>rsl_test_</code> and carries ${int(FREE_EVALUATION_CREDITS)} credits for ${EVALUATION_KEY_DAYS} days, for structured verdicts, with up to ${EVALUATION_WATCH_LIMIT} watches. One key per email address every ${EVALUATION_KEY_DAYS} days; when a key cannot be issued on the spot (<code>key_issued: false</code>), a person reads the request and answers by email.</p>
 <h2>2. Register a market</h2>
 <pre>curl -X POST ${b}/v1/markets \\
   -H "Authorization: Bearer $RESOLVE_KEY" -H 'content-type: application/json' \\
@@ -555,11 +559,42 @@ export function maskEmail(email: string): string {
 
 const VENUES = new Set(["polymarket", "limitless"]);
 
+/** The page that shows a new evaluation key: the key exactly once, what it can do, and where to start. Never cached. */
+export function keyIssuedHtml(o: { key: string; expiresAt: string; base: string; channel: string | null }): string {
+  const body = `<h1>Your test key</h1>
+<p class="note" role="alert">Copy it now: this is the only time it is shown. Resolve keeps only a hash of it, so it cannot be shown again or recovered.</p>
+<pre><code>${esc(o.key)}</code></pre>
+<h2>What it can do</h2>
+<ul>
+<li>Structured verdicts only: markets settled from machine-readable sources (official releases, GitHub objects, on-chain logs), 1 credit each.</li>
+<li>${int(FREE_EVALUATION_CREDITS)} credits, valid ${EVALUATION_KEY_DAYS} days: until ${esc(utc(o.expiresAt))}.</li>
+<li>Up to ${EVALUATION_WATCH_LIMIT} watches.</li>
+</ul>
+<h2>Next</h2>
+<p>Send it as <code>Authorization: Bearer &lt;key&gt;</code> (or <code>X-Api-Key</code>). Check it:</p>
+<pre>curl ${esc(o.base)}/v1/account -H "Authorization: Bearer $RESOLVE_KEY"</pre>
+<p>The <a href="/docs">quickstart</a> registers a market, resolves it and sets up webhooks. <a href="/pricing">Pricing</a> lists what comes after the test key.</p>`;
+  return layout({ title: "Your test key · Resolve", path: "/v1/request-key", description: "Your Resolve test key.", body, channel: o.channel });
+}
+
+/** Pure. What happened to the key, for the operator alert: ids and reasons, never the key. */
+export function keyOutcomeLine(o: AutoKeyOutcome): string {
+  switch (o.result) {
+    case "issued": return `issued on the spot: tenant ${o.tenantId}, key id ${o.keyId}, ${o.credits} credits, expires ${utc(o.expiresAt)}`;
+    case "off": return `not issued (${o.reason}); answer by email`;
+    case "known_address": return `not issued: this address had a key in the last ${EVALUATION_KEY_DAYS} days, or another request for it is being handled; answer by email`;
+    case "cap_reached": return `not issued: today's cap of ${o.cap} keys issued on the spot is reached; answer by email (scripts/issue-test-key.ts issues one by hand)`;
+    case "db_error": return `not issued: database error at ${o.step}: ${o.detail}${o.tenantId ? `; tenant ${o.tenantId} was created without a key` : ""}; answer by email`;
+  }
+}
+
 function wantsJson(c: Context<{ Bindings: Env; Variables: Vars }>, isJsonBody: boolean): boolean {
   return isJsonBody || (c.req.header("accept") ?? "").includes("application/json");
 }
 
 site.post("/v1/request-key", async (c) => {
+  // No answer of this route is ever cached, JSON or HTML, error or not: one of them carries a key.
+  c.header("Cache-Control", "no-store");
   const ctype = (c.req.header("content-type") ?? "").toLowerCase();
   const isJson = ctype.includes("application/json");
   const json = wantsJson(c, isJson);
@@ -597,9 +632,11 @@ site.post("/v1/request-key", async (c) => {
     return fail(400, "validation_error", "Please check the form", `Please check the form: ${msg}.`, { values, error: msg });
   }
   const r = p.data;
+  // One neutral answer for every request that gets no key (a known address, the daily cap, a database error, a bot):
+  // it never says which.
   const done = () => json
-    ? ok(c, { received: true, note: "A person reads each request and answers by email. No key is issued automatically." })
-    : htmlAnswer(200, "Request received", "Thank you. A person reads each request and answers by email. No key is issued automatically.");
+    ? ok(c, { received: true, key_issued: false, note: "No key was issued with this answer. A person reads the request and answers by email." })
+    : htmlAnswer(200, "Request received", "Thank you. No key was issued on this page; a person reads your request and answers by email.");
   // A filled honeypot is a bot: it gets the same answer and nothing is stored.
   if (r.website && r.website.trim() !== "") return done();
 
@@ -629,16 +666,31 @@ site.post("/v1/request-key", async (c) => {
     leadId = String((data as { id: string }).id);
   } catch { return unavailable(); }
 
+  // The key, when every check passes (src/api/evaluation-key.ts). Anything else, a database error included, is the
+  // neutral answer below with the lead stored and the operator alerted.
+  const issued = await issueEvaluationKey(client, { email: r.email, company: r.company, leadId, requestId: c.get("requestId"), now: Date.now(), dailyCap: c.env.REQUEST_KEY_DAILY_CAP });
+
   let touch = "recorded";
   try {
-    const { error } = await client.rpc("log_touch", { p_lead: leadId, p_kind: "email", p_direction: "in", p_summary: `Test-key request via the web form: ${r.purpose}`.slice(0, 1200), p_request_id: `request-key:${c.get("requestId")}` });
+    const keyNote = issued.result === "issued" ? `evaluation key issued on the spot (key id ${issued.keyId}, expires ${utc(issued.expiresAt)})` : "no key issued on the spot";
+    const { error } = await client.rpc("log_touch", { p_lead: leadId, p_kind: "email", p_direction: "in", p_summary: `Test-key request via the web form; ${keyNote}. Purpose: ${r.purpose}`.slice(0, 1200), p_request_id: `request-key:${c.get("requestId")}` });
     if (error) touch = `not recorded (${String(error.message ?? "").slice(0, 120)})`;
   } catch (e) { touch = `not recorded (${String(e).slice(0, 120)})`; }
 
+  const ids = issued.result === "issued" ? { tenant_id: issued.tenantId, key_id: issued.keyId } : issued.result === "db_error" && issued.tenantId ? { tenant_id: issued.tenantId } : {};
   await alert(c.env, `request_key_${leadId}`, [
     "Test-key request (web form)",
     `Name: ${r.name}`, `Project: ${r.company}`, `Purpose: ${r.purpose.slice(0, 600)}`, venue ? `Venue: ${venue}` : null,
-    `Email: ${maskEmail(r.email)} (full address in leads ${leadId})`, `Touch: ${touch}`,
-  ].filter(Boolean).join("\n"), { dedupMinutes: 1, meta: { lead_id: leadId } });
-  return done();
+    `Email: ${maskEmail(r.email)} (full address in leads ${leadId})`, `Key: ${keyOutcomeLine(issued)}`, `Touch: ${touch}`,
+  ].filter(Boolean).join("\n"), { dedupMinutes: 1, meta: { lead_id: leadId, key_result: issued.result, ...ids } });
+
+  if (issued.result !== "issued") return done();
+  if (json) {
+    return ok(c, {
+      received: true, key_issued: true, key: issued.key, key_id: issued.keyId, environment: "test", plan: "free", credits: issued.credits,
+      watch_limit: EVALUATION_WATCH_LIMIT, expires_at: issued.expiresAt, docs: `${baseUrl(c)}/docs`,
+      note: "Shown once: Resolve keeps only its hash. Structured verdicts only.",
+    });
+  }
+  return page(c, keyIssuedHtml({ key: issued.key, expiresAt: issued.expiresAt, base: baseUrl(c), channel }), 200, false);
 });

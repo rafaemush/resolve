@@ -1,6 +1,6 @@
 # Resolve pricing
 
-Prices are in US dollars and paid in USDC on Base. Last updated 2026-09-24.
+Prices are in US dollars and paid in USDC on Base. Last updated 2026-09-30.
 
 ## Credits
 
@@ -29,7 +29,7 @@ Web-evidence verdicts are not generally available yet. Until they are, paid plan
 | Growth | $399 / month | 60,000 credits a month | 500 | up to 500 | 300 |
 | Platform | $1,500 to $3,000 / month, invoiced | by agreement | by agreement | unlimited | 600 |
 
-**Free.** An evaluation key (`rsl_test_...`) for structured verdicts, issued to a named integration, with 300 credits. Early reveals are not a Free feature; an evaluation key may follow up to 50 shadow markets while it is valid, so the early reveal can be judged before buying. When the key expires (30 days after issue) or is revoked, its follows stop: no further `shadow.committed` or `shadow.revealed` webhook is sent. Rotating the key does not extend it: the new key keeps the old key's expiry. There are no discounts.
+**Free.** An evaluation key (`rsl_test_...`) for structured verdicts, with 300 credits and up to 5 watches. The request form on the home page (or `POST /v1/request-key`) issues it on the spot and shows it once, one key per email address every 30 days, up to a daily number of keys; past either, a person reads the request and answers by email. Resolve also issues it by hand to a named integration. Early reveals are not a Free feature; an evaluation key may follow up to 50 shadow markets while it is valid, so the early reveal can be judged before buying. When the key expires (30 days after issue) or is revoked, its follows stop: no further `shadow.committed` or `shadow.revealed` webhook is sent. Rotating the key does not extend it: the new key keeps the old key's expiry. There are no discounts.
 
 **Pay as you go.** Credit packs:
 

@@ -26,6 +26,7 @@ export interface Env {
   SOLANA_FALLBACK_HTTP_URL: string;
   RESOLVE_BOT_UA: string;
   LIMITLESS_WS_ENABLED?: string;      // "0" switches the Limitless lifecycle listener off (src/jobs/limitless-ws.ts)
+  REQUEST_KEY_DAILY_CAP?: string;     // evaluation keys POST /v1/request-key issues per UTC day (default 25, "0" = none; src/api/evaluation-key.ts)
   // secrets
   TYPESAFE_API_KEY?: string;
   SPOTLIGHT_SECRET: string;

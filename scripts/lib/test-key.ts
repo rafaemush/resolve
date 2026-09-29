@@ -1,5 +1,9 @@
 /** Argument rules of scripts/issue-test-key.ts (pure; tests/issue-test-key.test.ts). */
 import { Plan, PLANS } from "../../src/shadow/follows";
+import { EVALUATION_KEY_DAYS, FREE_EVALUATION_CREDITS } from "../../src/api/keys";
+
+// The evaluation terms and the grant's ledger request_id are shared with POST /v1/request-key (src/api/keys.ts).
+export { FREE_EVALUATION_CREDITS, grantRequestId } from "../../src/api/keys";
 
 export interface TestKeyArgs {
   /** tenants.display_name: an existing live tenant with this exact name is reused, otherwise one is created. */
@@ -37,7 +41,7 @@ function int(flag: string, v: string, min: number, max: number): number {
 
 /** Pure. Throws UsageError for anything it does not understand, so a typo never becomes a write. */
 export function parseTestKeyArgs(argv: string[]): TestKeyArgs {
-  const out: TestKeyArgs = { name: "", plan: null, credits: null, follow: [], expiresDays: 30, apply: false };
+  const out: TestKeyArgs = { name: "", plan: null, credits: null, follow: [], expiresDays: EVALUATION_KEY_DAYS, apply: false };
   let dryRun = false;
   for (let i = 0; i < argv.length; i++) {
     const raw = argv[i]!;
@@ -76,9 +80,6 @@ export function parseTestKeyArgs(argv: string[]): TestKeyArgs {
   return out;
 }
 
-/** Credits an evaluation key comes with (docs/pricing.md, plan §17.5 "Free: 300 credits"). */
-export const FREE_EVALUATION_CREDITS = 300;
-
 /**
  * Pure. The grant when --credits is not given: the Free evaluation grant on the free plan, nothing on a paid plan (paid
  * credits come from a deposit or an explicit --credits). Without this default a forgotten flag issued a key whose
@@ -89,5 +90,3 @@ export function evaluationCredits(plan: Plan, credits: number | null): number {
   return plan === "free" ? FREE_EVALUATION_CREDITS : 0;
 }
 
-/** The ledger request_id that makes the evaluation grant once per tenant (credit_ledger UNIQUE(reason, request_id)). */
-export const grantRequestId = (tenantId: string): string => `issue-test-key:${tenantId}`;
