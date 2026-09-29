@@ -48,6 +48,13 @@ const rails = {
    */
   election_qc_complete_file: true,
   /**
+   * Élections Québec capture: a final-flagged file whose own arithmetic does not add up (eqIntegrity on the whole file:
+   * its statistics, party totals and polling stations against its ridings, and each riding's candidates) is pending with
+   * an alert, never the first read of a first print nor the read that confirms one (off: the capture checks the file's
+   * completeness only, and a riding event's one-riding copy is all the resolver ever checks).
+   */
+  election_qc_capture_integrity: true,
+  /**
    * Québec seat-margin event: a leg is decided only when the party with the most seats is settled in every case (off: a
    * leader that is not settled is answered No, "Another Party Wins" included, where the rail must abstain).
    */

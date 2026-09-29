@@ -6,7 +6,7 @@
  * A document that is readable but still about an earlier period is "pending", never an observation.
  */
 import { OFFICIAL_SERIES, fetchGroupOf, hostAllowed, sameAtPrecision, reading, thousandsOf, percentTenths, knownRelease, TSE_CONFIG_URL, EQ_RESULTS_URL, type OfficialCorroboration, type OfficialSeriesId } from "../resolve/official";
-import { ELECTION_SERIES, isElectionSeries, snapshotForSeries, tseNotFinal, eqNotFinal, eqCompleteness, eqExpectedRidings, type ElectionSeriesId, type ElectionSnapshot, type EqSnapshot } from "../resolve/election";
+import { ELECTION_SERIES, isElectionSeries, snapshotForSeries, tseNotFinal, eqNotFinal, eqFileRefusal, type ElectionSeriesId, type ElectionSnapshot, type EqSnapshot } from "../resolve/election";
 import { parseTseConfig, parseTseResult, parseEqResults, tseResultUrl, tseConfigEnvironment } from "./election-parse";
 import { sha256Hex } from "../resolve/text";
 import { discardBody, retryAfterSeconds } from "./http";
@@ -232,7 +232,7 @@ let tseConfigMemo: { at: number; text: string; url: string } | null = null;
  */
 export const TSE_CONFIG_MISSING_ALERT_MS = 6 * 3600_000;
 export const TSE_CONFIG_ALERT_DEDUP_MIN = 360;
-/** A final-flagged Élections Québec file that is not every riding once: the operator hears it at most this often. */
+/** A final-flagged Élections Québec file that is not every riding once, or does not add up: the operator hears each at most this often. */
 export const EQ_INCOMPLETE_ALERT_DEDUP_MIN = 60;
 /** Tests only: forget the memoised configuration. */
 export function __resetElectionMemo(): void { tseConfigMemo = null; }
@@ -268,10 +268,12 @@ function electionFailed(g: Extract<Got, { ok: false }>): PrimaryResult {
  * The count an election series reads, recorded only once it is FINAL by the authority's own flags (a partial count is
  * "pending", never an observation). TSE: the configuration first (the election's id is known only from it), then the
  * scope's unified file built from it; Élections Québec: the one results file, accepted only when the authority stamped
- * it at or after polls close (the same URL served the simulation of 2026-09-20) and it lists every riding of the
- * election exactly once (eqCompleteness, against the rail's own riding count), and returned with a ConfirmRead: the
- * capture records it only when a read at least EQ_STABLE_MS later shows the same counts. A final-flagged file that lost
- * ridings is "pending" with an alert, so it is never the first candidate of a first print nor the read that confirms one.
+ * it at or after polls close (the same URL served the simulation of 2026-09-20), it lists every riding of the election
+ * exactly once (against the rail's own riding count) and the whole file adds up (its statistics, party totals and polling
+ * stations against its ridings: eqFileRefusal), and returned with a ConfirmRead: the capture records it only when a read
+ * at least EQ_STABLE_MS later shows the same counts. A final-flagged file that lost ridings or does not add up is
+ * "pending" with an alert, so it is never the first candidate of a first print nor the read that confirms one: a riding
+ * event stores a one-riding copy, on which the resolver can no longer compare the whole file's sums.
  */
 async function fetchElection(series: ElectionSeriesId, target: string, b: Budget): Promise<PrimaryResult> {
   const def = ELECTION_SERIES[series];
@@ -318,11 +320,17 @@ async function fetchElection(series: ElectionSeriesId, target: string, b: Budget
   if (!known || Date.parse(s.as_of) < Date.parse(known.release_at)) return { kind: "pending", detail: `the Élections Québec file is stamped ${s.as_of}, before polls closed on ${target} (a simulation or an earlier election)` };
   const nf = eqNotFinal(s);
   if (nf.length) return { kind: "pending", detail: `Élections Québec count not final (as of ${s.as_of}): ${nf.join("; ")}` };
-  // the whole file, before any series keeps its part of it: a read that lost ridings never reaches the confirming-read state
-  const gaps = eqCompleteness(s, eqExpectedRidings(target));
-  if (gaps.length) {
-    const detail = `the Élections Québec file (as of ${s.as_of}) is flagged final but is not every riding of the ${target} election once: ${gaps.join("; ")}`;
+  // the whole file, before any series keeps its part of it (a riding event keeps a one-riding copy, on which the
+  // whole-file sums can no longer be compared): a read that lost ridings or does not add up never reaches the
+  // confirming-read state
+  const refused = eqFileRefusal(s, target);
+  if (refused?.kind === "incomplete") {
+    const detail = `the Élections Québec file (as of ${s.as_of}) is flagged final but is not every riding of the ${target} election once: ${refused.problems.join("; ")}`;
     return { kind: "pending", detail, alert: { key: `official_eq_incomplete_${target}`, dedupMinutes: EQ_INCOMPLETE_ALERT_DEDUP_MIN, text: `Élections Québec: ${detail}. Nothing was recorded and every Quebec leg stays pending; the next poll reads the file again. If this persists, compare ${EQ_RESULTS_URL} with QC_RIDING_COUNT in src/resolve/election.ts.` } };
+  }
+  if (refused?.kind === "inconsistent") {
+    const detail = `the Élections Québec file (as of ${s.as_of}) is flagged final but does not add up: ${refused.problems.join("; ")}`;
+    return { kind: "pending", detail, alert: { key: `official_eq_inconsistent_${target}`, dedupMinutes: EQ_INCOMPLETE_ALERT_DEDUP_MIN, text: `Élections Québec: ${detail}. Nothing was recorded and every Quebec leg stays pending; the next poll reads the file again. If this persists, compare the statistiques of ${EQ_RESULTS_URL} with its circonscriptions (eqIntegrity in src/resolve/election.ts).` } };
   }
   const deciding = `Élections Québec general election results for election day ${target}: isResultatsFinaux true; ${s.ridings_with_result} of ${s.ridings_total} ridings, ${s.polls_done} of ${s.polls_total} polling stations; updated ${s.as_of}; ${s.valid} valid votes, ${s.cast} votes cast, ${s.registered} registered electors. ${DGEQ_ATTRIBUTION}`;
   // one final-flagged read never locks the first print: the capture waits for the same counts on a read 10 min later

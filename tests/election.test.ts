@@ -11,7 +11,7 @@ import { officialFixture as fx } from "../evals/lib/official-fixtures";
 import { eqApply, QC_TOP_TIE_RIDINGS, type EqOps } from "../evals/lib/eq-synthetic";
 import { parseTseConfig, parseTseResult, parseEqResults, tseResultUrl, eqIso, voteStatus } from "../src/ingest/election-parse";
 import {
-  ELECTION_EVENTS, ELECTION_SERIES, QC_RIDING_COUNT, decideElection, eqCompleteness, eqExpectedRidings, tseNotFinal, tseIntegrity, eqNotFinal, eqIntegrity,
+  ELECTION_EVENTS, ELECTION_SERIES, QC_RIDING_COUNT, decideElection, eqCompleteness, eqExpectedRidings, eqFileRefusal, tseNotFinal, tseIntegrity, eqNotFinal, eqIntegrity,
   electionRegistrationIssues, normName, namesAgree, snapshotForSeries, type ElectionSeriesId, type EqSnapshot, type LegResolver,
 } from "../src/resolve/election";
 import { KNOWN_RELEASES, OFFICIAL_SERIES, fetchGroupOf } from "../src/resolve/official";
@@ -319,6 +319,58 @@ describe("Élections Québec completeness: every riding of the election, each on
   });
 });
 
+describe("Élections Québec integrity: the whole file adds up", () => {
+  const withParty = (s: EqSnapshot, id: string, by: number): EqSnapshot => ({ ...s, parties: s.parties.map((x) => (x.id === id ? { ...x, votes: String(Number(x.votes) + by) } : x)) });
+  it("compares every party's total in the statistics, party 0 (the independents) included, with its candidates over the ridings", () => {
+    const s = eqSnap();
+    expect(eqIntegrity(s)).toEqual([]);
+    expect(eqIntegrity(withParty(s, "8", 1000))).toEqual(["party totals do not add up to their candidates' votes: party 8 601708 vs 600708 over the ridings"]);
+    expect(eqIntegrity(withParty(s, "0", 1))).toEqual(["party totals do not add up to their candidates' votes: party 0 2122 vs 2121 over the ridings"]);
+    // a party whose candidates have votes but that the statistics do not list, and one listed twice
+    expect(eqIntegrity({ ...s, parties: s.parties.filter((x) => x.id !== "10") })).toEqual(["party totals do not add up to their candidates' votes: party 10 (not listed) vs 31054 over the ridings"]);
+    const twice = eqIntegrity({ ...s, parties: [...s.parties, { ...s.parties.find((x) => x.id === "8")!, votes: "0" }] });
+    expect(twice).toEqual(["party 8 is listed more than once in the file's statistics"]);
+    // a listed party without a candidate and without votes adds up
+    expect(eqIntegrity({ ...s, parties: [...s.parties, { id: "77", abbr: "X", name: "Parti sans candidat", votes: "0" }] })).toEqual([]);
+  });
+  it("compares the polling stations and the reported polling stations with the ridings'", () => {
+    const s = eqSnap();
+    expect(eqIntegrity({ ...s, polls_total: String(Number(s.polls_total) + 1), polls_done: String(Number(s.polls_done) + 1) })).toEqual([
+      "the ridings' polling stations do not add up to the file's 21898 (nbBureauVote)",
+      "the ridings' reported polling stations do not add up to the file's 21898 (nbBureauVoteRempli)",
+    ]);
+  });
+  it("a riding event's one-riding copy cannot show a whole-file sum: the resolver alone decides a riding leg from a file that does not add up", () => {
+    // the reviewer's reproduction: nbVoteValide and nbVoteExerce each 1,000 above the ridings' (Taschereau under its 2026 code 751)
+    const bad = eqSnap(undefined, (b) => b.replace('"numeroCirconscription": 730,', '"numeroCirconscription": 751,').replace('"nbVoteValide": 4112821,', '"nbVoteValide": 4113821,').replace('"nbVoteExerce": 4169137,', '"nbVoteExerce": 4170137,'));
+    expect(eqIntegrity(bad)).toEqual(["the ridings' votes cast do not add up to the file's", "the ridings' valid votes do not add up to the file's"]);
+    const copy = snapshotForSeries("qc_riding_751", bad) as EqSnapshot;
+    expect(copy.ridings.map((r) => r.id)).toEqual(["751"]);
+    expect(eqIntegrity(copy)).toEqual([]);
+    expect(eqIntegrity(withParty(copy, "8", 1000))).toEqual([]); // nor a party total
+    // which is why the capture refuses the whole file before any series keeps its part (eqFileRefusal, src/ingest/official.ts)
+    expect(eqFileRefusal(bad, EQ_DAY)).toEqual({ kind: "inconsistent", problems: eqIntegrity(bad) });
+  });
+  it("the capture's gate: every riding once first, then the whole file's arithmetic; the consistent 2022 archive passes", () => {
+    const s = eqSnap();
+    expect(eqFileRefusal(s, EQ_DAY)).toBeNull();
+    expect(eqFileRefusal(eqSnap({ drop: PQ_RIDINGS }), EQ_DAY)).toEqual({ kind: "incomplete", problems: ["the file lists 122 of its 125 ridings"] });
+    expect(eqFileRefusal(s, "2026-10-05")).toMatchObject({ kind: "incomplete" });
+    expect(eqFileRefusal(withParty(s, "8", 1000), EQ_DAY)).toMatchObject({ kind: "inconsistent", problems: [expect.stringContaining("party 8 601708 vs 600708")] });
+    const truncated = eqSnap({ unlist: [s.ridings.find((r) => r.id === "842")!.candidates.at(-1)!.id] });
+    expect(eqFileRefusal(truncated, EQ_DAY)).toMatchObject({ kind: "inconsistent", problems: [expect.stringContaining("Matane-Matapédia: the candidates add up to 29623, valid 29746"), expect.stringContaining("party 99275 1042 vs 919")] });
+    // off: completeness only
+    __setRailsForMutationTesting(["election_qc_capture_integrity"]);
+    expect(eqFileRefusal(withParty(s, "8", 1000), EQ_DAY)).toBeNull();
+  });
+  it("every SYNTHETIC operation but drop and unlist leaves the file consistent with itself", () => {
+    for (const ops of [TOP_TIE, PQ_LEADS, PQ_TOP_TIE, { dropRestated: ["842"] }, { votes: [["2467", 13241], ["2311", 2062]] }] as EqOps[]) {
+      expect(eqIntegrity(eqSnap(ops)), JSON.stringify(ops).slice(0, 80)).toEqual([]);
+    }
+    expect(eqSnap({ dropRestated: ["842"] }).ridings_total).toBe("124");
+  });
+});
+
 describe("Québec seat-margin, PQ-majority and PVQ-seat legs", () => {
   const margin = (label: string, snap: EqSnapshot) => decide("qc_seat_margin", label, snap, { party: PQ, labels: SEAT_MARGIN });
   it("2022 as counted (CAQ 88 to 90 seats, PLQ 21 to 22, PQ 3): Another Party Wins is Yes, every PQ margin bucket No", () => {
@@ -343,13 +395,15 @@ describe("Québec seat-margin, PQ-majority and PVQ-seat legs", () => {
   });
   it("SYNTHETIC exact tie for the most seats with no riding inside the margin (CAQ 55, PLQ 55): Another Party Wins is unresolved", () => {
     // the near-tie above, with Fabre going to the PLQ and Beauce-Nord to the PCQ, each by a lead widened to 2,000 votes
-    const s = eqSnap({ trade: [{ parties: ["27", "6"], ridings: [...QC_TOP_TIE_RIDINGS, "466"] }, { parties: ["27", "22"], ridings: ["806"] }] });
-    const wide = (r: EqSnapshot["ridings"][number], lead: number): EqSnapshot["ridings"][number] => {
-      const c = [...r.candidates].sort((a, b) => Number(b.votes) - Number(a.votes));
+    const trade: EqOps["trade"] = [{ parties: ["27", "6"], ridings: [...QC_TOP_TIE_RIDINGS, "466"] }, { parties: ["27", "22"], ridings: ["806"] }];
+    const s = eqSnap({ trade });
+    // the leader and the runner-up of the riding trade votes (EqOps.votes restates their parties' totals)
+    const wide = (id: string, lead: number): Array<[string, number]> => {
+      const c = [...s.ridings.find((r) => r.id === id)!.candidates].sort((a, b) => Number(b.votes) - Number(a.votes));
       const moved = Math.ceil((lead - (Number(c[0]!.votes) - Number(c[1]!.votes))) / 2);
-      return { ...r, candidates: r.candidates.map((x) => (x.id === c[0]!.id ? { ...x, votes: String(Number(x.votes) + moved) } : x.id === c[1]!.id ? { ...x, votes: String(Number(x.votes) - moved) } : x)) };
+      return [[c[0]!.id, Number(c[0]!.votes) + moved], [c[1]!.id, Number(c[1]!.votes) - moved]];
     };
-    const settled: EqSnapshot = { ...s, ridings: s.ridings.map((r) => (r.id === "806" || r.id === "466" ? wide(r, 2000) : r)) };
+    const settled = eqSnap({ trade, votes: [...wide("806", 2000), ...wide("466", 2000)] });
     expect(eqIntegrity(settled)).toEqual([]);
     const d = margin("Another Party Wins", settled);
     expect(d.detail).toContain("0 riding(s) inside the recount margin; seats by party number 27:55, 6:55, 40:11, 8:3, 22:1");

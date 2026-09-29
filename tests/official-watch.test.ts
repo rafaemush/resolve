@@ -112,12 +112,13 @@ import { fetchOfficial, officialIdleNextPoll, inReleaseMinute, BURST_MAX_REQUEST
 import { fetchPrimary, officialGet, budget, OFFICIAL_UA, __resetElectionMemo } from "../src/ingest/official";
 import { buildElectionLeg, eqRegistryFromSnapshot, type ElectionEventInput } from "../src/markets/election-legs";
 import { parseEqResults } from "../src/ingest/election-parse";
-import { eqAs2026, eqText, type EqBody } from "../evals/lib/eq-synthetic";
+import { eqApply, eqAs2026, eqText, type EqBody } from "../evals/lib/eq-synthetic";
 import { TSE_CONFIG_URL, EQ_RESULTS_URL } from "../src/resolve/official";
 import { alert } from "../src/ops/alerts";
 import type { MarketRow, WatchRow } from "../src/ingest/types";
 import { buildLegRegistration } from "../src/markets/official-legs";
 import { decideOfficial } from "../src/resolve/official";
+import { __setRailsForMutationTesting } from "../src/resolve/rails";
 
 const WATCH_ID = "33333333-3333-4333-8333-333333333333";
 const MARKET_ID = "44444444-4444-4444-8444-444444444444";
@@ -178,7 +179,7 @@ beforeEach(() => {
   put = vi.fn(async () => ({}));
   vi.mocked(alert).mockClear();
 });
-afterEach(() => { vi.unstubAllGlobals(); });
+afterEach(() => { vi.unstubAllGlobals(); __setRailsForMutationTesting([]); });
 
 describe("schedule", () => {
   it("polls at the release minute, then every minute for 10 minutes, every 5 to 6 h, then every 15; observed legs every 6 h", () => {
@@ -801,16 +802,8 @@ const eq2026 = (): EqBody => eqAs2026(fx("eq_gen2022_resultats.json"));
 const EQ_2026 = eqText(eq2026());
 /** SYNTHETIC: the same file without the 3 ridings the PQ won in 2022; its statistics still state 127 ridings, all final. */
 const EQ_2026_CUT = (() => { const d = eq2026(); d.circonscriptions = d.circonscriptions.filter((r) => ![370, 858, 842].includes(r.numeroCirconscription)); return eqText(d); })();
-/** SYNTHETIC: one vote moved from St-Hilaire (CAQ) to Robin (PQ) in Taschereau: every total unchanged, the counts differ. */
-function eqMoved(body: string): string {
-  const edit = (id: number, from: number, to: number) => (b: string) => {
-    const at = b.indexOf(`"numeroCandidat": ${id},`);
-    const end = b.indexOf(`"nbVoteTotal": ${from}`, at);
-    if (at < 0 || end < 0) throw new Error(`candidate ${id}`);
-    return b.slice(0, end) + `"nbVoteTotal": ${to}` + b.slice(end + `"nbVoteTotal": ${from}`.length);
-  };
-  return edit(2311, 7537, 7536)(edit(2467, 7757, 7758)(body));
-}
+/** SYNTHETIC: one vote moved from St-Hilaire (CAQ) to Robin (PQ) in Taschereau: the riding's and the file's totals unchanged, the two parties' restated, the counts differ. */
+const eqMoved = (body: string): string => eqApply(body, { votes: [["2311", 7536], ["2467", 7758]] });
 function eqSeatsCaq(): MarketRow {
   const p = parseEqResults(EQ_2026);
   if (!p.ok) throw new Error(p.detail);
@@ -819,6 +812,29 @@ function eqSeatsCaq(): MarketRow {
 }
 const CONFIRM_KEY = "official_confirm:eq_general:2026-10-05";
 const EQ_INCOMPLETE_ALERT = ["official_eq_incomplete_2026-10-05", 60];
+const EQ_INCONSISTENT_ALERT = ["official_eq_inconsistent_2026-10-05", 60];
+/** SYNTHETIC: EQ_2026 with Taschereau (730 on the 2022 map) under its 2026 code 751, so the qc_riding_751 event keeps its own one-riding copy. */
+const eq2026Tasch = (): EqBody => { const d = eq2026(); d.circonscriptions.find((r) => r.numeroCirconscription === 730)!.numeroCirconscription = 751; return d; };
+const EQ_2026_751 = eqText(eq2026Tasch());
+/**
+ * SYNTHETIC files that do not add up, each flagged final with every riding once (the reviewer's reproductions): the
+ * statistics state 1,000 more valid votes and votes cast than the ridings add up to; another riding's candidate list
+ * lost its last candidate; the PQ's total in the statistics is 1,000 above its candidates'; one polling station more.
+ */
+const EQ_2026_751_BAD = {
+  statistics: (() => { const d = eq2026Tasch(); d.statistiques.nbVoteValide += 1000; d.statistiques.nbVoteExerce += 1000; return eqText(d); })(),
+  truncated: (() => { const d = eq2026Tasch(); d.circonscriptions.find((r) => r.numeroCirconscription === 842)!.candidats.pop(); return eqText(d); })(),
+  party: (() => { const d = eq2026Tasch(); d.statistiques.partisPolitiques.find((x) => x.numeroPartiPolitique === 8)!.nbVoteTotal += 1000; return eqText(d); })(),
+  polls: (() => { const d = eq2026Tasch(); d.statistiques.nbBureauVote++; d.statistiques.nbBureauVoteRempli++; return eqText(d); })(),
+};
+/** The Taschereau (751) winner leg of the 2026 event on EQ_2026_751: its leader, Grandmont, by more than 1% of the votes cast. */
+function eqRidingTasch(): MarketRow {
+  const p = parseEqResults(EQ_2026_751);
+  if (!p.ok) throw new Error(p.detail);
+  const eq = eqRegistryFromSnapshot(p.snap, EQ_RESULTS_URL, "2026-09-27T22:51:18Z");
+  const winner = [...p.snap.ridings.find((r) => r.id === "751")!.candidates].sort((a, b) => Number(b.votes) - Number(a.votes))[0]!.name;
+  return electionMarket({ series: "qc_riding_751", period: "2026-10-05", release_at: "2026-10-06T00:00:00Z", title: "Taschereau winner", criteria: "The candidate who wins the riding.", labels: [winner] }, winner, { eq });
+}
 
 describe("election captures", () => {
   it("TSE: an official configuration that still lists no President first round 6 h after polls close keeps the legs pending and alerts the operator", async () => {
@@ -916,6 +932,68 @@ describe("election captures", () => {
     const other = await read(eqText(eqAs2026(fx("eq_gen2022_resultats.json"), 125)));
     expect(other).toMatchObject({ kind: "pending", alert: { key: EQ_INCOMPLETE_ALERT[0] } });
     expect((other as { detail: string }).detail).toContain("the file states 125 ridings; the election has 127");
+  });
+
+  it("Élections Québec: a final file, every riding once, that does not add up is pending with an alert, never an observation awaiting its confirming read", async () => {
+    const read = async (body: string) => {
+      serve((url) => (url === EQ_RESULTS_URL ? ok(body, "application/json") : new Response("", { status: 404 })));
+      return fetchPrimary("qc_riding_751", "2026-10-05", budget(() => Date.parse("2026-10-06T03:40:00Z"), 10_000, 2));
+    };
+    // control: the consistent file is observed, the riding event keeps its one riding
+    const whole = await read(EQ_2026_751);
+    expect(whole).toMatchObject({ kind: "observed", confirm: { fingerprint: expect.stringMatching(/^[0-9a-f]{64}$/) } });
+    expect(whole.kind === "observed" && whole.obs.contest?.authority === "eq" && whole.obs.contest.ridings.map((r) => r.id)).toEqual(["751"]);
+    const cases: Array<[keyof typeof EQ_2026_751_BAD, string]> = [
+      ["statistics", "the ridings' valid votes do not add up to the file's"],
+      ["truncated", "Matane-Matapédia: the candidates add up to"],
+      ["party", "party 8 "],
+      ["polls", "the ridings' polling stations do not add up to the file's"],
+    ];
+    for (const [k, why] of cases) {
+      const r = await read(EQ_2026_751_BAD[k]);
+      expect(r, k).toMatchObject({ kind: "pending", alert: { key: EQ_INCONSISTENT_ALERT[0], dedupMinutes: EQ_INCONSISTENT_ALERT[1] } });
+      expect(r, k).not.toHaveProperty("confirm");
+      expect(r, k).not.toHaveProperty("obs");
+      expect((r as { detail: string }).detail, k).toContain("is flagged final but does not add up");
+      expect((r as { detail: string }).detail, k).toContain(why);
+    }
+    // what the gate exists for: without it the statistics file is observed, and the riding copy it keeps cannot show the sums
+    __setRailsForMutationTesting(["election_qc_capture_integrity"]);
+    expect(await read(EQ_2026_751_BAD.statistics)).toMatchObject({ kind: "observed" });
+  });
+
+  it("Élections Québec: a riding leg on a file whose statistics disagree with its ridings stays pending; such a read neither starts nor confirms a first print", async () => {
+    const m = eqRidingTasch();
+    setWatch(m);
+    let body = EQ_2026_751_BAD.statistics;
+    serve((url) => (url === EQ_RESULTS_URL ? ok(body, "application/json") : new Response("", { status: 404 })));
+    const first = await fetchOfficial(env(), watchRow(), m, clock("2026-10-06T03:40:00Z").deps);
+    expect(first).toMatchObject({ notModified: true });
+    expect(first.evidence).toBeUndefined();
+    expect(first.note).toContain("is flagged final but does not add up");
+    expect(h.state.appConfig.has(CONFIRM_KEY)).toBe(false); // never the first candidate
+    expect(alertKeys()).toEqual([EQ_INCONSISTENT_ALERT]);
+    // the same bytes 10 min later: still nothing kept, nothing recorded
+    const again = await fetchOfficial(env(), watchRow(), m, clock("2026-10-06T03:50:00Z").deps);
+    expect(again.evidence).toBeUndefined();
+    expect(h.state.appConfig.has(CONFIRM_KEY)).toBe(false);
+    expect(h.state.obs.size).toBe(0);
+    // the consistent file: its first read starts the wait
+    body = EQ_2026_751;
+    const whole = await fetchOfficial(env(), watchRow(), m, clock("2026-10-06T03:55:00Z").deps);
+    expect(whole.note).toContain("first read of this final count");
+    expect(JSON.parse(h.state.appConfig.get(CONFIRM_KEY)!).first_read_at).toBe("2026-10-06T03:55:00.000Z");
+    // 11 min later a read that does not add up (another riding truncated): it confirms nothing and leaves the kept read alone
+    body = EQ_2026_751_BAD.truncated;
+    const cut = await fetchOfficial(env(), watchRow(), m, clock("2026-10-06T04:06:00Z").deps);
+    expect(cut.evidence).toBeUndefined();
+    expect(h.state.obs.size).toBe(0);
+    expect(JSON.parse(h.state.appConfig.get(CONFIRM_KEY)!).first_read_at).toBe("2026-10-06T03:55:00.000Z");
+    // the consistent file again: recorded from the confirming read, and the leg resolves from its riding copy
+    body = EQ_2026_751;
+    const done = await fetchOfficial(env(), watchRow(), m, clock("2026-10-06T04:11:00Z").deps);
+    expect(done.evidence!.structured).toMatchObject({ kind: "official_observation", series: "qc_riding_751", period: "2026-10-05" });
+    expect(decideOfficial(m, done.evidence!)).toMatchObject({ status: "RESOLVED", outcome: "OPTION_A" });
   });
 
   it("Élections Québec: two identical truncated reads 10 min apart never lock a first print, and a truncated read neither starts nor confirms one", async () => {

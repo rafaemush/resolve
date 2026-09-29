@@ -47,11 +47,12 @@
  * contest reads the configuration again). The Élections Québec capture requests the one file, and a final count is
  * recorded only on a read that confirms an earlier one (EQ_STABLE_MS; the first read is kept in app_config, 1 read and
  * at most 1 write per capture). A final-flagged file that is not every riding of the election once (a read that lost
- * ridings) is pending with an alert before that state is touched: it is never kept as a first read and never confirms
- * one (src/ingest/official.ts). The holder's waitUntil records its own series and the siblings of its fetch group from
- * the same bytes: request 5 + upstream 2 (Québec: 1 + the app_config read 1) + R2 1 + record 1 + siblings read 1 + one
- * record per sibling (the TSE national file: 8; the Québec file: 29, no corroboration request exists for elections) =
- * 39 at most, with a lease extension 1 and an alert 3 when a capture fails or waits instead.
+ * ridings), or whose statistics, party totals or polling stations do not add up to its ridings, is pending with an
+ * alert before that state is touched: it is never kept as a first read and never confirms one (src/ingest/official.ts).
+ * The holder's waitUntil records its own series and the siblings of its fetch group from the same bytes: request 5 +
+ * upstream 2 (Québec: 1 + the app_config read 1) + R2 1 + record 1 + siblings read 1 + one record per sibling (the TSE
+ * national file: 8; the Québec file: 29, no corroboration request exists for elections) = 39 at most, with a lease
+ * extension 1 and an alert 3 when a capture fails or waits instead.
  * Workers Free budget (100,000 requests a day), from polls close until the counts are final (72 h at most): every leg
  * polls once per 15 minutes (96 a day) and each contest's holder once per 5 minutes (288 a day), so a day costs
  * 96 x legs + 288 x contests Worker requests; the upstream sees at most 360 requests a day per contest (720 for a TSE

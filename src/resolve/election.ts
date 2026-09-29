@@ -8,7 +8,9 @@
  * What decides (every rule fails closed: a leg that cannot be decided exactly stays UNRESOLVED with a caveat):
  *   - finality (rail election_final_count): TSE f=o, tf=s, and=f (EA20), dv=s, esae=n and every section totalized;
  *     Élections Québec isResultatsFinaux on the file and on every riding, every polling station reported.
- *   - integrity: the file's own totals add up (valid votes = the sum of the valid candidates, and so on).
+ *   - integrity: the file's own totals add up (valid votes = the sum of the valid candidates, and so on; an Élections
+ *     Québec file's statistics, party totals and polling stations against its ridings). The capture checks a whole
+ *     Québec file before a riding event keeps its one-riding copy (eqFileRefusal), since the copy cannot show them.
  *   - completeness (rail election_qc_complete_file): an Élections Québec snapshot lists every riding of the election
  *     exactly once, and the election's riding count comes from the rail's registry (QC_RIDING_COUNT), never from the
  *     file alone; a riding event's stored copy holds exactly its one riding. A file that lost ridings would otherwise
@@ -379,10 +381,21 @@ export function eqIntegrity(s: EqSnapshot): string[] {
     if (new Set(r.candidates.map((c) => c.id)).size !== r.candidates.length) p.push(`${r.name}: a candidate number appears twice`);
   }
   // a riding-event copy keeps one riding; the whole-file totals are checked when every riding is there (eqCompleteness
-  // refuses every snapshot that is neither)
+  // refuses every snapshot that is neither, and the capture checks the whole file before a riding copy is kept:
+  // eqFileRefusal)
   if (full) {
     if (sum(s.ridings.map((r) => big(r.cast))) !== big(s.cast)) p.push("the ridings' votes cast do not add up to the file's");
     if (sum(s.ridings.map((r) => big(r.valid))) !== big(s.valid)) p.push("the ridings' valid votes do not add up to the file's");
+    if (sum(s.ridings.map((r) => big(r.polls_total))) !== big(s.polls_total)) p.push(`the ridings' polling stations do not add up to the file's ${s.polls_total} (nbBureauVote)`);
+    if (sum(s.ridings.map((r) => big(r.polls_done))) !== big(s.polls_done)) p.push(`the ridings' reported polling stations do not add up to the file's ${s.polls_done} (nbBureauVoteRempli)`);
+    // every party's total (party 0, the independents, included) is its candidates' votes over the ridings; a party the
+    // statistics do not list counts 0 there, and one listed twice is refused
+    const ridingsSay = new Map<string, bigint>(), fileSays = new Map<string, bigint>(), twice = new Set<string>();
+    for (const r of s.ridings) for (const c of r.candidates) ridingsSay.set(c.party, (ridingsSay.get(c.party) ?? 0n) + big(c.votes));
+    for (const x of s.parties) { if (fileSays.has(x.id)) twice.add(x.id); fileSays.set(x.id, (fileSays.get(x.id) ?? 0n) + big(x.votes)); }
+    if (twice.size) p.push(`party ${[...twice].slice(0, 3).join(", ")} is listed more than once in the file's statistics`);
+    const off = [...new Set([...ridingsSay.keys(), ...fileSays.keys()])].sort().filter((id) => (fileSays.get(id) ?? 0n) !== (ridingsSay.get(id) ?? 0n));
+    if (off.length) p.push(`party totals do not add up to their candidates' votes: ${off.slice(0, 3).map((id) => `party ${id} ${fileSays.has(id) ? fileSays.get(id) : "(not listed)"} vs ${ridingsSay.get(id) ?? 0n} over the ridings`).join(", ")}`);
   }
   return p.slice(0, 5);
 }
@@ -413,6 +426,24 @@ export function eqCompleteness(s: EqSnapshot, expected: number | undefined, copy
   for (const r of s.ridings) { if (seen.has(r.id)) twice.add(r.id); seen.add(r.id); }
   if (twice.size) p.push(`riding ${[...twice].slice(0, 3).join(", ")} is listed more than once`);
   return p;
+}
+
+/**
+ * The capture's gate on a whole Élections Québec file (src/ingest/official.ts), before any series keeps its part of it:
+ * every riding of the election once (eqCompleteness, against the rail's riding count for the day), then the whole file's
+ * arithmetic (eqIntegrity with every riding present: the statistics against the ridings, the party totals and polling
+ * stations, and each riding's own sums). A riding event stores a one-riding copy (snapshotForSeries), on which the
+ * resolver can no longer compare whole-file sums, so a file refused here must never be the first read of a first print
+ * nor the read that confirms one. null: the file may be.
+ */
+export function eqFileRefusal(s: EqSnapshot, day: string): { kind: "incomplete" | "inconsistent"; problems: string[] } | null {
+  const gaps = eqCompleteness(s, eqExpectedRidings(day));
+  if (gaps.length) return { kind: "incomplete", problems: gaps };
+  if (railEnabled("election_qc_capture_integrity")) {
+    const bad = eqIntegrity(s);
+    if (bad.length) return { kind: "inconsistent", problems: bad };
+  }
+  return null;
 }
 
 interface Ctx { r: LegResolver; positive: Option; margin: boolean }

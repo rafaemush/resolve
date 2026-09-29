@@ -29,10 +29,10 @@ import {
 import { BLS_API, blsCorroboration } from "../src/ingest/official";
 import { buildLegRegistration, type LegGroup } from "../src/markets/official-legs";
 import { parseTseConfig, parseTseResult, parseEqResults } from "../src/ingest/election-parse";
-import { snapshotForSeries, type ElectionSeriesId, type ElectionSnapshot } from "../src/resolve/election";
+import { eqFileRefusal, snapshotForSeries, type ElectionSeriesId, type ElectionSnapshot } from "../src/resolve/election";
 import { buildElectionLeg, tseRegistryFromSnapshot, eqRegistryFromSnapshot, type ElectionEventInput, type Registries } from "../src/markets/election-legs";
 import { officialFixture, officialFixtureBytes, officialFixtureFetchedAt, OFFICIAL_FIXTURE_DIR } from "./lib/official-fixtures";
-import { eqApply, QC_TOP_TIE_RIDINGS, type EqOps } from "./lib/eq-synthetic";
+import { eqApply, eqChangesBody, eqParse, QC_TOP_TIE_RIDINGS, type EqOps } from "./lib/eq-synthetic";
 
 const sha = (s: string | Uint8Array) => createHash("sha256").update(s).digest("hex");
 const DIR = resolve(process.cwd(), "evals/official-cases");
@@ -44,7 +44,8 @@ const MANIFEST = resolve(DIR, "manifest.sha256");
  * election_safety_margin, and each of its margins alone: election_qc_riding_lead, election_qc_party_votes,
  * election_br_turnout_agree, election_sub_judice; evals/mutate.ts 16-20; and rail election_qc_leader_settled, 22: the
  * Québec seat-margin legs abstain while the party with the most seats is not settled), election_complete (rail
- * election_qc_complete_file, 21: a Québec snapshot that is not every riding of the election once decides nothing),
+ * election_qc_complete_file, 21: a Québec snapshot that is not every riding of the election once decides nothing; and
+ * rail election_qc_capture_integrity, 23: the capture records no Québec file that does not add up, Read.capture),
  * election_mapping (leg building: a label must map to exactly one authority entry; no rail, every case is a control).
  * Election cases read TSE 2022 first-round files (Wayback captures), the TSE 2026 simulation (EA20 layout) and the
  * Élections Québec 2022 archive with the production parsers.
@@ -63,7 +64,12 @@ type Edits = Array<[string, string]>;
 /** tse_result: select is the election day looked up in the saved configuration `config`; eq_result: select is the election day. */
 /** url (election reads only): the URL the saved body is attributed to, when not its provenance URL (a SYNTHETIC relocation). */
 /** eq (eq_result reads only): SYNTHETIC operations on the body's JSON, applied after `edits` (evals/lib/eq-synthetic.ts); each must apply. */
-interface Read { fixture: string; parser: Parser; url?: string; select?: string; observed_at: string; own_capture?: boolean; edits?: Edits; eq?: EqOps; config?: string; config_edits?: Edits; corroboration?: { fixture?: string; parser: CorrParser; select?: string; edits?: Edits } }
+/**
+ * capture (eq_result reads only): the read first goes through the capture's gate on the whole file (eqFileRefusal, as
+ * src/ingest/official.ts applies it before any series keeps its part); a read it refuses is never stored, so the leg's
+ * document is the release_not_observed one the watch records once polls closed 72 h ago.
+ */
+interface Read { fixture: string; parser: Parser; url?: string; select?: string; observed_at: string; own_capture?: boolean; edits?: Edits; eq?: EqOps; capture?: true; config?: string; config_edits?: Edits; corroboration?: { fixture?: string; parser: CorrParser; select?: string; edits?: Edits } }
 /** detail_includes: text the structured resolver's own account of the decision must contain (the seat ranges a SYNTHETIC case claims; never on a control, whose ranges close when a margin rail is off). */
 interface Expect { status: "RESOLVED" | "UNRESOLVED" | "ERROR"; outcome: "OPTION_A" | "OPTION_B" | "NONE"; caveats_include?: readonly string[]; error_reason?: string; detail_includes?: readonly string[] }
 export interface ResolveCase { id: string; group: OfficialGroup; control: boolean; title: string; market: Reg; stored?: Read; fetched: Read; expect: Expect }
@@ -270,21 +276,35 @@ function electionLeg(series: ElectionSeriesId, label: string, reg: Registries, o
 }
 const tseRead = (fixture: string, edits?: Edits): Read => ({ fixture, parser: "tse_result", select: TSE_DAY_2022, observed_at: officialFixtureFetchedAt(fixture), ...(edits ? { edits } : {}) });
 const eqRead = (fixture: string, edits?: Edits, eq?: EqOps): Read => ({ fixture, parser: "eq_result", select: EQ_DAY_2022, observed_at: officialFixtureFetchedAt(fixture), ...(edits ? { edits } : {}), ...(eq ? { eq } : {}) });
+/** The 2022 Élections Québec archive as the production parser reads it (the SYNTHETIC helpers check their inputs against it). */
+const EQ2022 = (() => { const p = parseEqResults(officialFixture(EL.eq2022)); if (!p.ok) throw new Error(p.detail); return p.snap; })();
 /**
- * SYNTHETIC Québec edit: candidate `id`'s vote count set to `to`. The edit is the saved text from the candidate's number
- * to its vote count (unique in the file), so it can only touch that one candidate.
+ * SYNTHETIC Québec: candidate `id`, who has `from` votes in the 2022 archive, set to `to` (an EqOps.votes pair: its
+ * riding's valid votes and votes cast, the file's and its party's total move with it, so the file stays consistent).
  */
-function eqVotes(id: string, to: number): [string, string] {
-  const body = officialFixture(EL.eq2022);
-  const start = body.indexOf(`"numeroCandidat": ${id},`);
-  if (start < 0 || body.indexOf(`"numeroCandidat": ${id},`, start + 1) >= 0) throw new Error(`candidate ${id}: not exactly once in ${EL.eq2022}`);
-  const m = /"nbVoteTotal": (\d+)/.exec(body.slice(start));
-  if (!m) throw new Error(`candidate ${id}: no nbVoteTotal`);
-  const from = body.slice(start, start + m.index + m[0].length);
-  return [from, from.replace(/"nbVoteTotal": \d+$/, `"nbVoteTotal": ${to}`)];
+function eqSet(id: string, from: number, to: number): [string, number] {
+  const c = EQ2022.ridings.flatMap((r) => r.candidates).filter((x) => x.id === id);
+  if (c.length !== 1 || Number(c[0]!.votes) !== from) throw new Error(`candidate ${id}: ${c.length} in ${EL.eq2022}${c[0] ? ` with ${c[0].votes} votes, not ${from}` : ""}`);
+  return [id, to];
 }
-/** SYNTHETIC: two candidates of one riding trade vote counts (every riding and file total unchanged). */
-function eqSwap(a: [string, number], b: [string, number]): Edits { return [eqVotes(a[0], b[1]), eqVotes(b[0], a[1])]; }
+/** SYNTHETIC: two candidates of one riding trade vote counts (their riding's and the file's totals unchanged, their parties' restated). */
+function eqSwap(a: [string, number], b: [string, number]): Array<[string, number]> { return [eqSet(a[0], a[1], b[1]), eqSet(b[0], b[1], a[1])]; }
+/** SYNTHETIC Québec edit of one file-wide statistic of the 2022 archive (the text `"key": value,` is unique in the saved body). */
+function eqStat(key: "nbVoteValide" | "nbVoteExerce" | "nbBureauVote" | "nbBureauVoteRempli", by: number): [string, string] {
+  const body = officialFixture(EL.eq2022);
+  const v = eqParse(body).statistiques[key];
+  const from = `"${key}": ${v},`;
+  if (body.split(from).length !== 2) throw new Error(`${from} is not exactly once in ${EL.eq2022}`);
+  return [from, `"${key}": ${v + by},`];
+}
+/** SYNTHETIC Québec edit of one party's total in the 2022 archive's statistics, nothing else changed. */
+function eqPartyTotal(party: number, by: number): [string, string] {
+  const body = officialFixture(EL.eq2022);
+  const p = eqParse(body).statistiques.partisPolitiques.filter((x) => x.numeroPartiPolitique === party);
+  const from = p.length === 1 ? `"nbVoteTotal": ${p[0]!.nbVoteTotal},` : "";
+  if (!from || body.split(from).length !== 2) throw new Error(`party ${party}: its total is not exactly once in ${EL.eq2022}`);
+  return [from, `"nbVoteTotal": ${p[0]!.nbVoteTotal + by},`];
+}
 const EL_YES = { status: "RESOLVED", outcome: "OPTION_A", caveats_include: ["first_print", "single_source"] } as const;
 const EL_NO = { status: "RESOLVED", outcome: "OPTION_B", caveats_include: ["first_print", "single_source"] } as const;
 const PENDING = (c: string) => ({ status: "UNRESOLVED", outcome: "NONE", caveats_include: [c] }) as const;
@@ -292,19 +312,109 @@ const NOT_FINAL = PENDING("count_not_final");
 /**
  * SYNTHETIC Taschereau 2022 (34,691 votes cast; 1% is 346.91): Robin (PQ) brought to 346 votes behind Grandmont (QS),
  * inside the riding-lead margin, or to 347 behind, just outside it; the votes come from St-Hilaire (CAQ), so the
- * riding's valid votes are unchanged.
+ * riding's valid votes are unchanged. TASCH_LEAD_EXACT: 9 fewer votes leave St-Hilaire, so 34,700 are cast and Robin
+ * 347 behind is exactly 1% of them (inside the margin, which only a lead of MORE than 1% clears); TASCH_LEAD_348: the
+ * same 34,700 cast with Robin 348 behind, just outside.
  */
-const TASCH_LEAD_346: Edits = [eqVotes("2467", 13242), eqVotes("2311", 2052)];
-const TASCH_LEAD_347: Edits = [eqVotes("2467", 13241), eqVotes("2311", 2053)];
+const tasch = (robin: number, stHilaire: number): EqOps => ({ votes: [eqSet("2467", 7757, robin), eqSet("2311", 7537, stHilaire)] });
+const TASCH_LEAD_346 = tasch(13242, 2052), TASCH_LEAD_347 = tasch(13241, 2053), TASCH_LEAD_EXACT = tasch(13241, 2062), TASCH_LEAD_348 = tasch(13240, 2063);
 /**
  * SYNTHETIC 2022 Québec seat tie: in Rosemont, Taschereau, Maurice-Richard and Jean-Lesage the QS and PQ candidates
  * trade vote counts, so QS and PQ both hold 7 seats (every lead stays above 1% of the votes cast) and PQ's valid votes
  * (618,745) end 18,091 ahead of QS's (600,654), less than 1% of the 4,112,821 valid votes: 3rd place is not settled.
  */
-const QC_SEAT_TIE: Edits = [
+const QC_SEAT_TIE_VOTES: Array<[string, number]> = [
   ...eqSwap(["2229", 13311], ["2436", 7527]), ...eqSwap(["2505", 13588], ["2467", 7757]),
   ...eqSwap(["2378", 10903], ["2793", 4612]), ...eqSwap(["2504", 11390], ["2374", 3337]),
 ];
+const QC_SEAT_TIE: EqOps = { votes: QC_SEAT_TIE_VOTES };
+/** The 3 ridings the PQ won in 2022: Camille-Laurin (370), Îles-de-la-Madeleine (858) and Matane-Matapédia (842). */
+const PQ_RIDINGS_2022 = ["370", "858", "842"];
+/**
+ * SYNTHETIC 2022 Québec seat tie (QC_SEAT_TIE: QS and PQ at 7 seats) with the PQ's valid votes brought ahead of QS's by
+ * about `pct`% of the file's valid votes (QC_PARTY_VOTES is 1%), or by exactly 1% (pct "1 exactly"): votes are added to
+ * the PQ's candidates in the 3 ridings it won in 2022 (each still wins, by more), and for the exact case up to 98 to the
+ * CAQ's candidate with the widest lead in the file, so the valid votes are a multiple of 100. Returns the operations and
+ * the gap it reaches, checked exactly.
+ */
+function qcPartyGap(pct: 0.95 | 1.05 | "1 exactly"): { ops: EqOps; gap: string; pct: string } {
+  const at = (ops: EqOps) => { const p = parseEqResults(eqApply(officialFixture(EL.eq2022), ops)); if (!p.ok) throw new Error(p.detail); return p.snap; };
+  const votesOf = (snap: typeof EQ2022, party: string) => snap.ridings.flatMap((r) => r.candidates).filter((c) => c.party === party).reduce((a, c) => a + Number(c.votes), 0);
+  const base = at(QC_SEAT_TIE);
+  const d0 = votesOf(base, "8") - votesOf(base, "40"), V0 = Number(base.valid);
+  const f = pct === "1 exactly" ? 0.01 : pct / 100;
+  // PQ + a, valid + a + b: exactly 1% needs 100 (d0 + a) = V0 + a + b
+  const a = pct === "1 exactly" ? Math.ceil((V0 - 100 * d0) / 99) : Math.round((f * V0 - d0) / (1 - f));
+  const b = pct === "1 exactly" ? 100 * (d0 + a) - (V0 + a) : 0;
+  if (a <= 0 || b < 0 || b > 98) throw new Error(`qcPartyGap ${pct}: a=${a} b=${b}`);
+  const pq = PQ_RIDINGS_2022.map((id) => { const c = EQ2022.ridings.find((r) => r.id === id)!.candidates.filter((x) => x.party === "8"); if (c.length !== 1) throw new Error(`riding ${id}: ${c.length} PQ candidates`); return c[0]!; });
+  const lead = (r: typeof EQ2022.ridings[number]) => { const v = r.candidates.map((c) => Number(c.votes)).sort((x, y) => y - x); return v[0]! - v[1]!; };
+  const caqSafe = [...EQ2022.ridings].filter((r) => [...r.candidates].sort((x, y) => Number(y.votes) - Number(x.votes))[0]!.party === "27").sort((x, y) => lead(y) - lead(x))[0]!;
+  const caq = caqSafe.candidates.find((c) => c.party === "27")!;
+  const add: Array<[string, number]> = pq.map((c, i) => eqSet(c.id, Number(c.votes), Number(c.votes) + Math.floor(a / 3) + (i === 0 ? a % 3 : 0)));
+  const ops: EqOps = { votes: [...QC_SEAT_TIE_VOTES, ...add, ...(b ? [eqSet(caq.id, Number(caq.votes), Number(caq.votes) + b)] : [])] };
+  const s = at(ops), d = votesOf(s, "8") - votesOf(s, "40"), V = Number(s.valid);
+  const ok = pct === "1 exactly" ? d * 100 === V : pct === 0.95 ? d * 100 < V && d * 1000 > 9 * V && Math.abs(d / V - 0.0095) < 0.00005 : d * 100 > V && Math.abs(d / V - 0.0105) < 0.00005;
+  if (!ok) throw new Error(`qcPartyGap ${pct}: the PQ leads QS by ${d} of ${V} valid votes`);
+  return { ops, gap: `${d.toLocaleString("en-US")} of ${V.toLocaleString("en-US")} valid votes`, pct: `${(100 * d / V).toFixed(4)}%` };
+}
+/**
+ * SYNTHETIC TSE edit (2022 simplified layout): the named candidates' vote counts (vap, by ballot number) set, with the
+ * file's valid votes (vv), nominal votes counted (vvc), total votes (tv) and turnout (c) moved by the net change, so the
+ * file still adds up (tseIntegrity). Each edit spans the saved text from the ballot number to its vote count, or is one
+ * top-level field, each exactly once in the file.
+ */
+function tseVotes(fixture: string, set: Array<[string, number]>): Edits {
+  const body = officialFixture(fixture);
+  const once = (needle: string | RegExp): RegExpExecArray => {
+    const re = typeof needle === "string" ? new RegExp(needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g") : new RegExp(needle.source, "g");
+    const m = [...body.matchAll(re)];
+    if (m.length !== 1) throw new Error(`${fixture}: ${String(needle)} is found ${m.length} times`);
+    return m[0] as RegExpExecArray;
+  };
+  const edits: Edits = [];
+  let net = 0;
+  for (const [n, to] of set) {
+    const start = once(`"n" : "${n}",`).index!;
+    const m = /"vap" : "(\d+)"/.exec(body.slice(start));
+    if (!m) throw new Error(`${fixture}: candidate ${n} has no vap`);
+    const from = body.slice(start, start + m.index + m[0].length);
+    net += to - Number(m[1]);
+    edits.push([from, from.replace(/"vap" : "\d+"$/, `"vap" : "${to}"`)]);
+  }
+  if (net !== 0) {
+    for (const k of ["vv", "vvc", "tv", "c"]) {
+      const m = once(new RegExp(`"${k}" : "(\\d+)"`));
+      edits.push([m[0], `"${k}" : "${Number(m[1]) + net}"`]);
+    }
+  }
+  return edits;
+}
+/** A TSE file's candidate by ballot number, as the production parser reads it. */
+function tseVotesOf(fixture: string, n: string): number {
+  const p = parseTseResult(officialFixture(fixture), TSE_DAY_2022);
+  if (!p.ok) throw new Error(p.detail);
+  const c = p.snap.candidates.filter((x) => x.id === n);
+  if (c.length !== 1) throw new Error(`${fixture}: candidate ${n} ${c.length} times`);
+  return Number(c[0]!.votes);
+}
+/**
+ * SYNTHETIC Acre final count with Lula at 202,000 and Bolsonaro `gap` votes ahead, Constituinte Eymael's count moved so
+ * the valid votes are 441,000 (0.1 percentage point of them, BR_RANK_GAP, is 441 votes); every total restated.
+ */
+function acGap(gap: number): Edits {
+  const f = EL.ac2022, V = 441_000, lula = 202_000;
+  const others = 440_917 - tseVotesOf(f, "22") - tseVotesOf(f, "13") - tseVotesOf(f, "27");
+  const eymael = V - lula - (lula + gap) - others;
+  if (eymael < 0) throw new Error(`acGap ${gap}: Eymael ${eymael}`);
+  return tseVotes(f, [["13", lula], ["22", lula + gap], ["27", eymael]]);
+}
+/** SYNTHETIC 2022 national final with Lula `gap` votes ahead of Bolsonaro, their sum (and every total) unchanged; `gap` must be odd (the sum is). */
+function brLead(gap: number): Edits {
+  const f = EL.br2022.final, sum = tseVotesOf(f, "13") + tseVotesOf(f, "22");
+  if ((sum + gap) % 2) throw new Error(`brLead ${gap}: parity`);
+  return tseVotes(f, [["13", (sum + gap) / 2], ["22", (sum - gap) / 2]]);
+}
 /** SYNTHETIC 2022 national final: Ciro Gomes's 3,599,287 votes annulled sub judice (vv and vansj moved with them). */
 const CIRO_SUB_JUDICE: Edits = [
   ['"dvt" : "Válido", "vap" : "3599287"', '"dvt" : "Anulado sub judice", "vap" : "3599287"'],
@@ -314,26 +424,6 @@ const CIRO_SUB_JUDICE: Edits = [
 const ESI_81: Edits = [['"esi" : "156453354"', '"esi" : "152694286"']];
 /** SYNTHETIC: Acre's two leaders brought within 96 votes (0.02 pp of 440,917 valid votes); their sum and every total unchanged. */
 const AC_NEAR_TIE: Edits = [['"vap" : "275582"', '"vap" : "202350"'], ['"vap" : "129022"', '"vap" : "202254"']];
-/** The 3 ridings the PQ won in 2022: Camille-Laurin (370), Îles-de-la-Madeleine (858) and Matane-Matapédia (842). */
-const PQ_RIDINGS_2022 = ["370", "858", "842"];
-/**
- * SYNTHETIC: the file-wide statistics restated as if the named ridings had never been part of the election (riding
- * counts, polling stations, votes and electors), so a file without them is consistent with itself.
- */
-function eqRestated(drop: string[]): Edits {
-  type Riding = Record<"numeroCirconscription" | "nbBureauTotal" | "nbBureauComplete" | "nbVoteValide" | "nbVoteRejete" | "nbVoteExerce" | "nbElecteurInscrit", number>;
-  const d = JSON.parse(officialFixture(EL.eq2022)) as { statistiques: Record<string, number>; circonscriptions: Riding[] };
-  const gone = d.circonscriptions.filter((r) => drop.includes(String(r.numeroCirconscription)));
-  if (gone.length !== drop.length) throw new Error(`eqRestated: ${gone.length} of ${drop.length} ridings found`);
-  const st = d.statistiques;
-  const less = (k: string, by: number): [string, string] => [`"${k}": ${st[k]},`, `"${k}": ${st[k]! - by},`];
-  const sumOf = (k: keyof Riding) => gone.reduce((a, r) => a + r[k], 0);
-  return [
-    less("nbCirconscription", gone.length), less("nbCirconscriptionAvecResultat", gone.length),
-    less("nbBureauVote", sumOf("nbBureauTotal")), less("nbBureauVoteRempli", sumOf("nbBureauComplete")),
-    less("nbVoteValide", sumOf("nbVoteValide")), less("nbVoteRejete", sumOf("nbVoteRejete")), less("nbVoteExerce", sumOf("nbVoteExerce")), less("nbElecteurInscrit", sumOf("nbElecteurInscrit")),
-  ];
-}
 /** SYNTHETIC: Taschereau (730 on the 2022 map) under the 2026 code of the qc_riding_751 event, so the rail's own riding copy is what the leg reads. */
 const TASCH_AS_751: Edits = [['"numeroCirconscription": 730,', '"numeroCirconscription": 751,']];
 /**
@@ -380,6 +470,11 @@ function electionCases(): OfficialCase[] {
   })();
   const L = electionLeg;
   const sim = L("br_pres_r1_winner", "Lula", br, { labels: named });
+  const g95 = qcPartyGap(0.95), g100 = qcPartyGap("1 exactly"), g105 = qcPartyGap(1.05);
+  const pqThird = L("qc_third_place", "Parti québécois", eq, { labels: ["Parti québécois", "Québec solidaire"] });
+  const acFirst = L("br_pres_r1_first_ac", "Jair Bolsonaro", ac, { labels: named });
+  const tasch751 = L("qc_riding_751", taschWinner.name, { eq: eqRegistryOf(EL.eq2022, TASCH_AS_751) });
+  const lastOf842 = EQ2022.ridings.find((r) => r.id === "842")!.candidates.at(-1)!.id;
   const simMarket: Reg = { ...sim, resolver: { ...(sim.resolver as Extract<Reg["resolver"], { kind: "official_release" }>), period: "2026-10-04", release_at: "2026-10-04T20:00:00Z" }, sources: [{ kind: "official_release", ref: "official:br_pres_r1_winner:2026-10-04" }] };
   return [
     // --- election_final: only the authority's own final count decides (red when election_final_count is off) -------
@@ -401,19 +496,37 @@ function electionCases(): OfficialCase[] {
     { id: "EL-M01", group: "election_margin", control: false, title: "SYNTHETIC Acre final count with the leaders 96 votes apart (0.02 pp): Bolsonaro's 1st-place leg abstains (near_tie)", market: L("br_pres_r1_first_ac", "Jair Bolsonaro", ac, { labels: named }), fetched: tseRead(EL.ac2022, AC_NEAR_TIE), expect: PENDING("near_tie") },
     { id: "EL-M02", group: "election_margin", control: false, title: "TSE 2022 national final: Lula's margin 5.2332 pp is 0.017 pp from the 5.25% bucket edge: the 'Lula 5.25%+' leg abstains", market: L("br_pres_r1_margin", "Lula 5.25%+", br), fetched: tseRead(EL.br2022.final), expect: PENDING("near_bucket_edge") },
     { id: "EL-M03", group: "election_margin", control: false, title: "TSE 2022 national final: Lula's 48.4312% of valid votes is 0.019 pp from the 48.45% edge: the '45-48.45%' share leg abstains", market: L("br_pres_r1_share_lula", "45-48.45%", br), fetched: tseRead(EL.br2022.final), expect: PENDING("near_bucket_edge") },
-    { id: "EL-M04", group: "election_margin", control: false, title: "SYNTHETIC Taschereau 2022: Grandmont leads by 346 votes, not more than 1% of the 34,691 cast (346.91): his riding-winner leg stays pending", market: L("qc_riding_751", taschWinner.name, eq, { unit: tasch }), fetched: eqRead(EL.eq2022, TASCH_LEAD_346), expect: PENDING("recount_range") },
+    { id: "EL-M04", group: "election_margin", control: false, title: "SYNTHETIC Taschereau 2022: Grandmont leads by 346 votes, not more than 1% of the 34,691 cast (346.91): his riding-winner leg stays pending", market: L("qc_riding_751", taschWinner.name, eq, { unit: tasch }), fetched: eqRead(EL.eq2022, undefined, TASCH_LEAD_346), expect: PENDING("recount_range") },
     { id: "EL-M05", group: "election_margin", control: false, title: "Élections Québec 2022 final: CAQ holds 88 seats outright and 90 with Beauce-Nord (lead 0.59%) and Fabre (0.88%), both inside the 1% margin: the CAQ '90+' seats leg stays pending", market: L("qc_seats_caq", "90+", eq, { party: "Coalition Avenir Québec" }), fetched: eqRead(EL.eq2022), expect: PENDING("recount_range") },
-    { id: "EL-M06", group: "election_margin", control: false, title: "SYNTHETIC 2022 Québec seat tie: QS and PQ both hold 7 seats and their valid votes are 0.44% apart (under 1%): the PQ 3rd-place leg stays pending", market: L("qc_third_place", "Parti québécois", eq, { labels: ["Parti québécois", "Québec solidaire"] }), fetched: eqRead(EL.eq2022, QC_SEAT_TIE), expect: PENDING("recount_range") },
+    { id: "EL-M06", group: "election_margin", control: false, title: "SYNTHETIC 2022 Québec seat tie: QS and PQ both hold 7 seats and their valid votes are 0.44% apart (under 1%): the PQ 3rd-place leg stays pending", market: L("qc_third_place", "Parti québécois", eq, { labels: ["Parti québécois", "Québec solidaire"] }), fetched: eqRead(EL.eq2022, undefined, QC_SEAT_TIE), expect: PENDING("recount_range") },
     { id: "EL-M07", group: "election_margin", control: false, title: "SYNTHETIC 2022 national final with the voters of installed sections cut: turnout 79.05% of eligible voters but 81.00% of installed-section voters: the 75-80% leg stays pending", market: L("br_pres_r1_turnout", "75-80%", br), fetched: tseRead(EL.br2022.final, ESI_81), expect: PENDING("turnout_definitions_disagree") },
     { id: "EL-M08", group: "election_margin", control: false, title: "SYNTHETIC 2022 national final with Ciro Gomes annulled sub judice: he finishes 4th if his votes are validated and far below 4th if they stay annulled: his 4th-place leg stays pending", market: L("br_pres_r1_fourth", "Ciro Gomes", br, { labels: [...named, "Soraya Thronicke", "Felipe d'Avila"] }), fetched: tseRead(EL.br2022.final, CIRO_SUB_JUDICE), expect: PENDING("sub_judice_votes") },
     { id: "EL-M09", group: "election_margin", control: false, title: "SYNTHETIC 2022 national final with Ciro Gomes annulled sub judice: Lula's share is 49.95% of valid votes while Ciro's votes stay annulled and 48.43% once they are validated: the '49%+' share leg stays pending", market: L("br_pres_r1_share_lula", "49%+", br), fetched: tseRead(EL.br2022.final, CIRO_SUB_JUDICE), expect: PENDING("sub_judice_votes") },
     { id: "EL-M10", group: "election_margin", control: false, title: "Élections Québec 2022 final: Beauce-Nord (PCQ 202 votes, 0.59% of the votes cast, behind the CAQ) is the one riding inside the 1% margin the PCQ could win, so its seats are 0 or 1: the PCQ '1+' seats leg stays pending", market: L("qc_seats_pcq", "1+", eq, { party: "Parti conservateur du Québec" }), fetched: eqRead(EL.eq2022), expect: PENDING("recount_range") },
-    { id: "EL-MC3", group: "election_margin", control: true, title: "SYNTHETIC Taschereau 2022: Grandmont leads by 347 votes, more than 1% of the votes cast: his riding-winner leg is Yes", market: L("qc_riding_751", taschWinner.name, eq, { unit: tasch }), fetched: eqRead(EL.eq2022, TASCH_LEAD_347), expect: EL_YES },
+    { id: "EL-MC3", group: "election_margin", control: true, title: "SYNTHETIC Taschereau 2022: Grandmont leads by 347 votes, more than 1% of the votes cast: his riding-winner leg is Yes", market: L("qc_riding_751", taschWinner.name, eq, { unit: tasch }), fetched: eqRead(EL.eq2022, undefined, TASCH_LEAD_347), expect: EL_YES },
     { id: "EL-MC4", group: "election_margin", control: true, title: "Élections Québec 2022 final: CAQ's 88 to 90 seats are all in '80+': Yes", market: L("qc_seats_caq", "80+", eq, { party: "Coalition Avenir Québec" }), fetched: eqRead(EL.eq2022), expect: EL_YES },
-    { id: "EL-MC5", group: "election_margin", control: true, title: "SYNTHETIC 2022 Québec seat tie (QS and PQ at 7): PLQ's 21 or 22 seats are 2nd outright, Yes", market: L("qc_second_place", "Parti libéral du Québec", eq, { labels: ["Parti libéral du Québec", "Parti québécois"] }), fetched: eqRead(EL.eq2022, QC_SEAT_TIE), expect: EL_YES },
+    { id: "EL-MC5", group: "election_margin", control: true, title: "SYNTHETIC 2022 Québec seat tie (QS and PQ at 7): PLQ's 21 or 22 seats are 2nd outright, Yes", market: L("qc_second_place", "Parti libéral du Québec", eq, { labels: ["Parti libéral du Québec", "Parti québécois"] }), fetched: eqRead(EL.eq2022, undefined, QC_SEAT_TIE), expect: EL_YES },
     { id: "EL-MC6", group: "election_margin", control: true, title: "SYNTHETIC 2022 national final with Ciro Gomes annulled sub judice: Simone Tebet is 3rd whether or not his votes are validated, Yes", market: L("br_pres_r1_third", "Simone Tebet", br, { labels: named }), fetched: tseRead(EL.br2022.final, CIRO_SUB_JUDICE), expect: EL_YES },
     { id: "EL-MC1", group: "election_margin", control: true, title: "TSE 2022 national final: Lula's margin 5.23 pp is in 5-7.5%, far from both edges, Yes", market: L("br_pres_r1_margin", "Lula 5-7.5%", br), fetched: tseRead(EL.br2022.final), expect: EL_YES },
     { id: "EL-MC2", group: "election_margin", control: true, title: "TSE 2022 national final: Lula's share 48.43% is in 45-50%, Yes", market: L("br_pres_r1_share_lula", "45-50%", br), fetched: tseRead(EL.br2022.final), expect: EL_YES },
+    // --- election_margin, each margin at its boundary (SYNTHETIC): just inside, exactly on and just outside, so a margin
+    // halved or shaved by 10%, or a strict comparison made non-strict (or the reverse), turns a case red -----------------
+    { id: "EL-M13", group: "election_margin", control: false, title: `SYNTHETIC 2022 Québec seat tie (QS and PQ at 7 seats) with the PQ ${g95.gap} (${g95.pct}) ahead of QS, inside the 1% tie-break margin (QC_PARTY_VOTES): the PQ 3rd-place leg stays pending`, market: pqThird, fetched: eqRead(EL.eq2022, undefined, g95.ops), expect: { ...PENDING("recount_range"), detail_includes: ["40:7, 8:7"] } },
+    { id: "EL-M14", group: "election_margin", control: false, title: `SYNTHETIC 2022 Québec seat tie (QS and PQ at 7 seats) with the PQ exactly 1% of the valid votes ahead of QS (${g100.gap}): a tie is broken by valid votes only when the parties are MORE than 1% apart, so the PQ 3rd-place leg stays pending`, market: pqThird, fetched: eqRead(EL.eq2022, undefined, g100.ops), expect: { ...PENDING("recount_range"), detail_includes: ["40:7, 8:7"] } },
+    { id: "EL-MC16", group: "election_margin", control: true, title: `SYNTHETIC 2022 Québec seat tie (QS and PQ at 7 seats) with the PQ ${g105.gap} (${g105.pct}) ahead of QS, just outside the 1% margin: the PQ is 3rd, Yes`, market: pqThird, fetched: eqRead(EL.eq2022, undefined, g105.ops), expect: EL_YES },
+    { id: "EL-M15", group: "election_margin", control: false, title: "SYNTHETIC Acre final count (441,000 valid votes) with Bolsonaro 419 votes (0.095 pp) ahead of Lula, inside the 0.1 pp rank gap (BR_RANK_GAP): his 1st-place leg abstains (near_tie)", market: acFirst, fetched: tseRead(EL.ac2022, acGap(419)), expect: PENDING("near_tie") },
+    { id: "EL-M16", group: "election_margin", control: false, title: "SYNTHETIC Acre final count (441,000 valid votes) with Bolsonaro 441 votes ahead of Lula, exactly 0.1 pp: a gap counts only when MORE than 0.1 pp, so his 1st-place leg abstains (near_tie)", market: acFirst, fetched: tseRead(EL.ac2022, acGap(441)), expect: PENDING("near_tie") },
+    { id: "EL-MC17", group: "election_margin", control: true, title: "SYNTHETIC Acre final count (441,000 valid votes) with Bolsonaro 463 votes (0.105 pp) ahead of Lula, just outside the rank gap: Bolsonaro 1st in Acre, Yes", market: acFirst, fetched: tseRead(EL.ac2022, acGap(463)), expect: EL_YES },
+    { id: "EL-M17", group: "election_margin", control: false, title: "SYNTHETIC 2022 national final with Lula 112,319 votes (0.0950 pp of the 118,229,719 valid votes) ahead of Bolsonaro, inside the 0.1 pp rank gap: the margin-of-victory leg 'Lula <2.5%' abstains (near_tie), never Yes", market: L("br_pres_r1_margin", "Lula <2.5%", br), fetched: tseRead(EL.br2022.final, brLead(112_319)), expect: PENDING("near_tie") },
+    { id: "EL-MC18", group: "election_margin", control: true, title: "SYNTHETIC 2022 national final with Lula 124,141 votes (0.1050 pp) ahead of Bolsonaro, just outside the rank gap and far from the 2.5% edge: 'Lula <2.5%' is Yes", market: L("br_pres_r1_margin", "Lula <2.5%", br), fetched: tseRead(EL.br2022.final, brLead(124_141)), expect: EL_YES },
+    { id: "EL-M20", group: "election_margin", control: false, title: "SYNTHETIC Taschereau 2022 with 34,700 votes cast: Grandmont leads by 347, exactly 1% of the votes cast; a lead counts only when MORE than 1% (QC_RIDING_LEAD), so his riding-winner leg stays pending", market: L("qc_riding_751", taschWinner.name, eq, { unit: tasch }), fetched: eqRead(EL.eq2022, undefined, TASCH_LEAD_EXACT), expect: PENDING("recount_range") },
+    { id: "EL-MC19", group: "election_margin", control: true, title: "SYNTHETIC Taschereau 2022 with 34,700 votes cast: Grandmont leads by 348, just over 1% of the votes cast: his riding-winner leg is Yes", market: L("qc_riding_751", taschWinner.name, eq, { unit: tasch }), fetched: eqRead(EL.eq2022, undefined, TASCH_LEAD_348), expect: EL_YES },
+    // --- election_margin, the two readings of a Brazilian rank event (over all candidates and over the named ones): each
+    // is exercised alone, so deciding from one reading, or dropping the rank gap from one reading, turns a case red ------
+    { id: "EL-MC20", group: "election_margin", control: true, title: "TSE 2022 national final, a 4th-place event that names Lula, Bolsonaro, Tebet and Soraya Thronicke but not Ciro Gomes (4th of all): Soraya is 4th of the named candidates and 5th of all, so the readings differ and her leg abstains (unlisted_candidate_in_contention), never Yes", market: L("br_pres_r1_fourth", "Soraya Thronicke", br, { labels: ["Lula", "Jair Bolsonaro", "Simone Tebet", "Soraya Thronicke"] }), fetched: tseRead(EL.br2022.final), expect: PENDING("unlisted_candidate_in_contention") },
+    { id: "EL-MC21", group: "election_margin", control: true, title: "TSE 2022 national final, a 3rd-place event that names only Tebet, Ciro Gomes and Soraya Thronicke: Tebet is 3rd of all candidates (Lula and Bolsonaro, not named, ahead) but 1st of the named ones, so her leg abstains (unlisted_candidate_in_contention), never Yes", market: L("br_pres_r1_third", "Simone Tebet", br, { labels: ["Simone Tebet", "Ciro Gomes", "Soraya Thronicke"] }), fetched: tseRead(EL.br2022.final), expect: PENDING("unlisted_candidate_in_contention") },
+    { id: "EL-M18", group: "election_margin", control: false, title: "SYNTHETIC Acre final count with Lula, whom the event does not name, 96 votes (0.02 pp) behind Bolsonaro: Bolsonaro is clearly 1st of the named candidates but within the rank gap of 1st of all, so his 1st-place leg abstains (near_tie), never Yes", market: L("br_pres_r1_first_ac", "Jair Bolsonaro", ac, { labels: ["Jair Bolsonaro", "Simone Tebet", "Ciro Gomes"] }), fetched: tseRead(EL.ac2022, AC_NEAR_TIE), expect: PENDING("near_tie") },
+    { id: "EL-M19", group: "election_margin", control: false, title: "SYNTHETIC Acre final count with Lula, whom the event does not name, clearly 1st (250,000) and Bolsonaro 50 votes (0.011 pp) behind the named Tebet: of the named candidates Bolsonaro's place is within the rank gap, so his 1st-place leg abstains (near_tie), never No", market: L("br_pres_r1_first_ac", "Jair Bolsonaro", ac, { labels: ["Jair Bolsonaro", "Simone Tebet"] }), fetched: tseRead(EL.ac2022, tseVotes(EL.ac2022, [["13", 250_000], ["22", 87_338], ["15", 87_388]])), expect: PENDING("near_tie") },
     // --- election_margin, the Québec seat-margin, PQ-majority and PVQ-seat events: a leader that is not settled is never
     // answered No (red when election_qc_leader_settled is off, and when the riding-lead margin is) ------------------------
     { id: "EL-M11", group: "election_margin", control: false, title: "SYNTHETIC 2022 Québec near-tie for the most seats (CAQ 55 to 57, PLQ 54 to 55 once Beauce-Nord and Fabre can go either way): 'Another Party Wins' stays pending, never No", market: L("qc_seat_margin", "Another Party Wins", eq, { party: PQ, labels: SEAT_MARGIN_LABELS }), fetched: eqRead(EL.eq2022, undefined, QC_TOP_TIE), expect: { ...PENDING("recount_range"), detail_includes: ["27:55-57, 6:54-55"] } },
@@ -430,7 +543,7 @@ function electionCases(): OfficialCase[] {
     // --- election_complete: a Québec snapshot that is not every riding of the election once decides nothing (red when
     // election_qc_complete_file is off) -----------------------------------------------------------------------------------
     { id: "EL-K01", group: "election_complete", control: false, title: "SYNTHETIC 2022 Québec file without the 3 ridings the PQ won (its statistics still state 125 ridings, all final): the PQ '<3' seats leg stays pending, never Yes from the 122 ridings present", market: L("qc_seats_pq", "<3", eq, { party: PQ }), fetched: eqRead(EL.eq2022, undefined, { drop: PQ_RIDINGS_2022 }), expect: PENDING("totals_inconsistent") },
-    { id: "EL-K02", group: "election_complete", control: false, title: "SYNTHETIC 2022 Québec file without Matane-Matapédia and with its statistics restated to 124 ridings (consistent with itself): the 2022 election had 125, so the PQ '<3' seats leg stays pending, never Yes", market: L("qc_seats_pq", "<3", eq, { party: PQ }), fetched: eqRead(EL.eq2022, eqRestated(["842"]), { drop: ["842"] }), expect: PENDING("totals_inconsistent") },
+    { id: "EL-K02", group: "election_complete", control: false, title: "SYNTHETIC 2022 Québec file without Matane-Matapédia and with its statistics restated to 124 ridings (consistent with itself): the 2022 election had 125, so the PQ '<3' seats leg stays pending, never Yes", market: L("qc_seats_pq", "<3", eq, { party: PQ }), fetched: eqRead(EL.eq2022, undefined, { dropRestated: ["842"] }), expect: PENDING("totals_inconsistent") },
     { id: "EL-K03", group: "election_complete", control: false, title: "SYNTHETIC 2022 Québec file with Matane-Matapédia numbered 370 like Camille-Laurin (125 entries, 124 ridings): the CAQ '80+' seats leg stays pending", market: L("qc_seats_caq", "80+", eq, { party: "Coalition Avenir Québec" }), fetched: eqRead(EL.eq2022, [['"numeroCirconscription": 842,', '"numeroCirconscription": 370,']]), expect: PENDING("totals_inconsistent") },
     { id: "EL-K04", group: "election_complete", control: false, title: `SYNTHETIC stored riding copy holding Taschereau and Matane-Matapédia: a riding copy is one riding, so ${taschWinner.name}'s Taschereau leg stays pending`, market: L("qc_riding_751", taschWinner.name, eq, { unit: tasch }), fetched: eqRead(EL.eq2022, undefined, { copy: [tasch, "842"] }), expect: PENDING("totals_inconsistent") },
     { id: "EL-K05", group: "election_complete", control: false, title: "SYNTHETIC 2022 Québec file without the 3 ridings the PQ won: 'Another Party Wins' stays pending too (nothing is read from a file with ridings missing)", market: L("qc_seat_margin", "Another Party Wins", eq, { party: PQ, labels: SEAT_MARGIN_LABELS }), fetched: eqRead(EL.eq2022, undefined, { drop: PQ_RIDINGS_2022 }), expect: PENDING("totals_inconsistent") },
@@ -439,6 +552,16 @@ function electionCases(): OfficialCase[] {
     { id: "EL-KC1", group: "election_complete", control: true, title: "Élections Québec 2022 final, every one of the 125 ridings: the PQ won 3 seats, so its '<3' seats leg is No", market: L("qc_seats_pq", "<3", eq, { party: PQ }), fetched: eqRead(EL.eq2022), expect: EL_NO },
     { id: "EL-KC2", group: "election_complete", control: true, title: "Élections Québec 2022 final, every one of the 125 ridings: the PQ's 3 seats are in '3-9': Yes", market: L("qc_seats_pq", "3-9", eq, { party: PQ }), fetched: eqRead(EL.eq2022), expect: EL_YES },
     { id: "EL-KC3", group: "election_complete", control: true, title: `SYNTHETIC 2022 Québec file with Taschereau under its 2026 code 751: the rail's own riding copy (that one riding) decides, ${taschWinner.name} wins, Yes`, market: L("qc_riding_751", taschWinner.name, { eq: eqRegistryOf(EL.eq2022, TASCH_AS_751) }), fetched: eqRead(EL.eq2022, TASCH_AS_751), expect: EL_YES },
+    // --- election_complete, the capture's gate on the whole file (red when election_qc_capture_integrity is off): a riding
+    // event keeps a one-riding copy, on which whole-file sums cannot be compared, so a file that does not add up is never
+    // recorded; the resolver still checks the whole file a seat leg keeps --------------------------------------------------
+    { id: "EL-K08", group: "election_complete", control: false, title: `SYNTHETIC 2022 Québec file with Taschereau under 751 whose statistics state 1,000 more valid votes and votes cast than its ridings add up to: the capture records no read of it, so ${taschWinner.name}'s Taschereau leg is never decided from its one-riding copy (release_not_observed)`, market: tasch751, fetched: { ...eqRead(EL.eq2022, [...TASCH_AS_751, eqStat("nbVoteValide", 1000), eqStat("nbVoteExerce", 1000)]), capture: true }, expect: PENDING("release_not_observed") },
+    { id: "EL-K09", group: "election_complete", control: false, title: `SYNTHETIC 2022 Québec file with Taschereau under 751 and Matane-Matapédia's candidate list truncated (its last candidate removed, its valid votes unchanged): the capture records no read of it, so ${taschWinner.name}'s Taschereau leg stays pending (release_not_observed)`, market: tasch751, fetched: { ...eqRead(EL.eq2022, TASCH_AS_751, { unlist: [lastOf842] }), capture: true }, expect: PENDING("release_not_observed") },
+    { id: "EL-K10", group: "election_complete", control: false, title: `SYNTHETIC 2022 Québec file with Taschereau under 751 whose statistics give the PQ 1,000 more votes than its candidates have: the capture records no read of it, so ${taschWinner.name}'s Taschereau leg stays pending (release_not_observed)`, market: tasch751, fetched: { ...eqRead(EL.eq2022, [...TASCH_AS_751, eqPartyTotal(8, 1000)]), capture: true }, expect: PENDING("release_not_observed") },
+    { id: "EL-K11", group: "election_complete", control: false, title: `SYNTHETIC 2022 Québec file with Taschereau under 751 whose statistics count one polling station more (all reported) than its ridings: the capture records no read of it, so ${taschWinner.name}'s Taschereau leg stays pending (release_not_observed)`, market: tasch751, fetched: { ...eqRead(EL.eq2022, [...TASCH_AS_751, eqStat("nbBureauVote", 1), eqStat("nbBureauVoteRempli", 1)]), capture: true }, expect: PENDING("release_not_observed") },
+    { id: "EL-KC4", group: "election_complete", control: true, title: `SYNTHETIC 2022 Québec file with Taschereau under 751, read through the capture's gate: the whole file adds up, so it is recorded and ${taschWinner.name} wins, Yes`, market: tasch751, fetched: { ...eqRead(EL.eq2022, TASCH_AS_751), capture: true }, expect: EL_YES },
+    { id: "EL-KC5", group: "election_complete", control: true, title: "SYNTHETIC 2022 Québec file whose statistics give the PQ 1,000 more votes than its candidates have: a seat leg keeps the whole file, so the PQ '3-9' seats leg stays pending (totals_inconsistent)", market: L("qc_seats_pq", "3-9", eq, { party: PQ }), fetched: eqRead(EL.eq2022, [eqPartyTotal(8, 1000)]), expect: PENDING("totals_inconsistent") },
+    { id: "EL-KC6", group: "election_complete", control: true, title: "SYNTHETIC 2022 Québec file whose statistics count one polling station more (all reported) than its ridings: the PQ '3-9' seats leg stays pending (totals_inconsistent)", market: L("qc_seats_pq", "3-9", eq, { party: PQ }), fetched: eqRead(EL.eq2022, [eqStat("nbBureauVote", 1), eqStat("nbBureauVoteRempli", 1)]), expect: PENDING("totals_inconsistent") },
     // --- election_mapping: a label must map to exactly one authority entry (every case a control) -------------------
     { id: "EL-B01", group: "election_mapping", control: true, title: "'Lula' maps to TSE ballot number 13 in the 2022 registry", build: { event: mapEv("br_pres_r1_winner", named), label: "Lula", registry: { authority: "tse", fixture: EL.br2022.final } }, expect: { subject_id: "13" } },
     { id: "EL-B02", group: "election_mapping", control: true, title: "'Tarcísio de Freitas' (not a 2022 presidential candidate) matches no TSE candidate: refused", build: { event: mapEv("br_pres_r1_third", ["Tarcísio de Freitas", "Lula"]), label: "Tarcísio de Freitas", registry: { authority: "tse", fixture: EL.br2022.final } }, expect: { refused_includes: "matches no" } },
@@ -516,9 +639,9 @@ function bodyOf(read: Pick<Read, "fixture" | "edits" | "eq">): string {
     if (!body.includes(from)) throw new Error(`${read.fixture}: edit "${from.slice(0, 60)}" does not apply`);
     body = body.split(from).join(to);
   }
-  return read.eq?.drop?.length || read.eq?.trade?.length ? eqApply(body, read.eq, read.fixture) : body;
+  return read.eq && eqChangesBody(read.eq) ? eqApply(body, read.eq, read.fixture) : body;
 }
-const bytesOf = (read: Read) => (read.edits?.length || read.eq?.drop?.length || read.eq?.trade?.length ? new TextEncoder().encode(bodyOf(read)) : officialFixtureBytes(read.fixture));
+const bytesOf = (read: Read) => (read.edits?.length || eqChangesBody(read.eq) ? new TextEncoder().encode(bodyOf(read)) : officialFixtureBytes(read.fixture));
 
 /** The parsed document, or { missing } when the production parser says the number is not published (never a value). */
 function parse(read: Read): DocObservation | { missing: string } {
@@ -597,7 +720,11 @@ function electionDoc(r: OfficialResolver, read: Read): OfficialDoc {
   const p = read.parser === "tse_result" ? parseTseResult(body, read.select!) : parseEqResults(body);
   if (!p.ok) throw new Error(`${read.fixture} ${read.parser}: ${p.reason} ${p.detail}`);
   const snap = p.snap as ElectionSnapshot;
-  if (read.eq && snap.authority !== "eq") throw new Error(`${read.fixture}: eq operations apply to an Élections Québec read`);
+  if ((read.eq || read.capture) && snap.authority !== "eq") throw new Error(`${read.fixture}: eq operations and the capture gate apply to an Élections Québec read`);
+  if (read.capture && snap.authority === "eq") {
+    const refused = eqFileRefusal(snap, read.select!);
+    if (refused) return { kind: "official_missing", series: r.series, period: r.period, release_at: new Date(releaseAtOf(r)).toISOString(), source_url: read.url ?? urlOf(read.fixture), detail: `not observed by release_at + 72 h: the capture refused every read of the file (${refused.kind}: ${refused.problems.join("; ")})`.slice(0, 500) };
+  }
   // what the rail stores: its own part of the snapshot, or (SYNTHETIC, EqOps.copy) a copy holding the named ridings
   let contest = snapshotForSeries(r.series as ElectionSeriesId, snap);
   if (read.eq?.copy && snap.authority === "eq") {

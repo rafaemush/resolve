@@ -42,6 +42,9 @@ const M: Mutation[] = [
   { name: "21_qc_complete_file_off", suite: "official", rails: ["election_qc_complete_file"], classes: ["election_complete"] },
   // the Québec seat-margin legs answer No while the party with the most seats is not settled ("q ? YES : pFirst ? NO : NO")
   { name: "22_qc_leader_settled_off", suite: "official", rails: ["election_qc_leader_settled"], classes: ["election_margin"] },
+  // the Québec capture keeps a riding event's one-riding copy of a file whose statistics, party totals, polling stations
+  // or another riding's candidates do not add up (only its completeness is checked)
+  { name: "23_qc_capture_integrity_off", suite: "official", rails: ["election_qc_capture_integrity"], classes: ["election_complete"] },
   { name: "14_registration_policy_off", suite: "registration", rails: ["registration_policy"], classes: ["policy"] },
 ];
 

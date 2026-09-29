@@ -6,14 +6,30 @@
  */
 
 /**
+ * Applied in this order:
  *   drop: ridings (numeroCirconscription) removed from circonscriptions; the file-wide statistics stay as they are, so
  *     the file still states its full riding count;
+ *   dropRestated: ridings removed with the file-wide statistics restated as if they had never been part of the election
+ *     (riding counts, polling stations, votes, electors, and each party's total and candidate count), so the file is
+ *     consistent with itself;
  *   trade: in each named riding ("all": every riding) the two parties' candidates trade parties (number and
- *     abbreviation), so every vote count and every total is unchanged while the riding changes hands; applied in order;
+ *     abbreviation), so every riding's counts are unchanged while the riding changes hands; the two parties' totals in
+ *     the statistics are restated by the votes that changed party; applied in order;
+ *   votes: [numeroCandidat, count] pairs: the candidate's vote count set, with its riding's valid votes and votes cast,
+ *     the file's valid votes and votes cast and its party's total moved by the same amount; applied in order;
+ *   unlist: candidates (numeroCandidat) removed from their riding's list and nothing else: a riding whose candidates no
+ *     longer add up to its valid votes (a truncated candidate list);
  *   copy: the ridings a stored contest keeps, standing for a stored riding copy that is not the rail's own
  *     (snapshotForSeries keeps the event's one riding). Applied by the caller to the parsed snapshot, not to the body.
+ * Every operation but drop and unlist leaves the file consistent with itself (eqIntegrity), so a SYNTHETIC case fails
+ * only where its title says.
  */
-export interface EqOps { drop?: string[]; trade?: Array<{ parties: [string, string]; ridings: string[] | "all" }>; copy?: string[] }
+export interface EqOps {
+  drop?: string[]; dropRestated?: string[]; trade?: Array<{ parties: [string, string]; ridings: string[] | "all" }>;
+  votes?: Array<[string, number]>; unlist?: string[]; copy?: string[];
+}
+/** Does `ops` change the body (every operation but copy, which applies to the parsed snapshot)? */
+export const eqChangesBody = (ops: EqOps | undefined): boolean => !!(ops?.drop?.length || ops?.dropRestated?.length || ops?.trade?.length || ops?.votes?.length || ops?.unlist?.length);
 
 interface Cand { numeroCandidat: number; numeroPartiPolitique: number; abreviationPartiPolitique: string; nbVoteTotal: number }
 interface Riding {
@@ -32,13 +48,29 @@ export interface EqBody {
 export const eqParse = (body: string): EqBody => JSON.parse(body) as EqBody;
 export const eqText = (d: EqBody): string => JSON.stringify(d, null, 2);
 
-/** The body with EqOps.drop and EqOps.trade applied (what: the body's name in an error). */
+/** The body with every EqOps operation but copy applied (what: the body's name in an error). */
 export function eqApply(body: string, ops: EqOps, what = "resultats.json"): string {
   const d = eqParse(body);
-  for (const id of ops.drop ?? []) {
+  const st = d.statistiques;
+  const partyOf = (n: number, why: string): Party => {
+    const p = st.partisPolitiques.filter((x) => x.numeroPartiPolitique === n);
+    if (p.length !== 1) throw new Error(`${what}: ${why}: party ${n} is listed ${p.length} times in the statistics`);
+    return p[0]!;
+  };
+  const take = (id: string, why: string): Riding => {
     const left = d.circonscriptions.filter((r) => String(r.numeroCirconscription) !== id);
-    if (left.length !== d.circonscriptions.length - 1) throw new Error(`${what}: drop ${id}: ${d.circonscriptions.length - left.length} ridings carry that number`);
+    if (left.length !== d.circonscriptions.length - 1) throw new Error(`${what}: ${why} ${id}: ${d.circonscriptions.length - left.length} ridings carry that number`);
+    const gone = d.circonscriptions.find((r) => String(r.numeroCirconscription) === id)!;
     d.circonscriptions = left;
+    return gone;
+  };
+  for (const id of ops.drop ?? []) take(id, "drop");
+  for (const id of ops.dropRestated ?? []) {
+    const r = take(id, "dropRestated");
+    st.nbCirconscription--; st.nbCirconscriptionAvecResultat--;
+    st.nbBureauVote -= r.nbBureauTotal; st.nbBureauVoteRempli -= r.nbBureauComplete;
+    st.nbVoteValide -= r.nbVoteValide; st.nbVoteRejete -= r.nbVoteRejete; st.nbVoteExerce -= r.nbVoteExerce; st.nbElecteurInscrit -= r.nbElecteurInscrit;
+    for (const c of r.candidats) { const p = partyOf(c.numeroPartiPolitique, `dropRestated ${id}`); p.nbVoteTotal -= c.nbVoteTotal; p.nbCandidat--; }
   }
   for (const t of ops.trade ?? []) {
     const ridings = t.ridings === "all" ? d.circonscriptions : t.ridings.map((id) => {
@@ -52,9 +84,27 @@ export function eqApply(body: string, ops: EqOps, what = "resultats.json"): stri
       if (a.length !== 1 || b.length !== 1) throw new Error(`${what}: trade: riding ${r.numeroCirconscription} has ${a.length} and ${b.length} candidates of parties ${t.parties.join(" and ")}`);
       const x = a[0]!, y = b[0]!;
       const was = { n: x.numeroPartiPolitique, abbr: x.abreviationPartiPolitique };
+      // x's votes move from x's old party to y's, y's the other way
+      const px = partyOf(x.numeroPartiPolitique, "trade"), py = partyOf(y.numeroPartiPolitique, "trade");
+      px.nbVoteTotal += y.nbVoteTotal - x.nbVoteTotal; py.nbVoteTotal += x.nbVoteTotal - y.nbVoteTotal;
       x.numeroPartiPolitique = y.numeroPartiPolitique; x.abreviationPartiPolitique = y.abreviationPartiPolitique;
       y.numeroPartiPolitique = was.n; y.abreviationPartiPolitique = was.abbr;
     }
+  }
+  for (const [id, to] of ops.votes ?? []) {
+    if (!Number.isSafeInteger(to) || to < 0) throw new Error(`${what}: votes: candidate ${id} set to ${to}`);
+    const hits = d.circonscriptions.flatMap((r) => r.candidats.filter((c) => String(c.numeroCandidat) === id).map((c) => ({ r, c })));
+    if (hits.length !== 1) throw new Error(`${what}: votes: candidate ${id} is listed ${hits.length} times`);
+    const { r, c } = hits[0]!;
+    const by = to - c.nbVoteTotal;
+    c.nbVoteTotal = to;
+    r.nbVoteValide += by; r.nbVoteExerce += by; st.nbVoteValide += by; st.nbVoteExerce += by;
+    partyOf(c.numeroPartiPolitique, `votes ${id}`).nbVoteTotal += by;
+  }
+  for (const id of ops.unlist ?? []) {
+    const rs = d.circonscriptions.filter((r) => r.candidats.some((c) => String(c.numeroCandidat) === id));
+    if (rs.length !== 1 || rs[0]!.candidats.filter((c) => String(c.numeroCandidat) === id).length !== 1) throw new Error(`${what}: unlist: candidate ${id} is not listed exactly once`);
+    rs[0]!.candidats = rs[0]!.candidats.filter((c) => String(c.numeroCandidat) !== id);
   }
   return eqText(d);
 }
