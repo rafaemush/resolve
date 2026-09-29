@@ -1,7 +1,12 @@
 /**
  * Register the founder-approved entries of a curated candidate file as shadow markets (plan §16.4 P5 step 3-4).
  *
- *   npx tsx scripts/seed-shadow.ts private/shadow-markets/<file>.json [--check | --dry-run (default) | --apply]
+ *   npx tsx scripts/seed-shadow.ts private/shadow-markets/<file>.json [--check | --dry-run (default) | --apply] [--accept-consensus-reading]
+ *
+ * An entry marked "criteria_basis": "consensus_reporting" (scripts/election-legs.ts: the market settles on a consensus of
+ * credible reporting, the authority only if there is ambiguity) is held back in every mode, never registered and never an
+ * error, and --check reports how many were held back; --accept-consensus-reading (the founder's policy call) lets them
+ * through like any other entry. An entry with any other criteria_basis is refused.
  *
  * --check    offline: every entry against the rules of scripts/lib/seed-shadow.ts (MarketRegistration, the meta whitelist,
  *            condition_id on Polymarket, the $50k cap, is_test false, a future deadline, a declarative deadline-free
@@ -29,7 +34,7 @@ import { readFileSync } from "node:fs";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { z } from "zod";
 import { loadEnv, need } from "./lib/env";
-import { checkCandidateFile, parseSeedArgs, UsageError, USAGE, verifyRow, type FileCheck, type SeedArgs, type ShadowRow } from "./lib/seed-shadow";
+import { checkCandidateFile, parseSeedArgs, registrationPlan, UsageError, USAGE, verifyRow, ACCEPT_CONSENSUS_FLAG, type FileCheck, type SeedArgs, type ShadowRow } from "./lib/seed-shadow";
 import { CandidateFile, type CandidateEntry } from "./lib/candidates";
 import { mergeMeta, META_KEYS } from "../src/markets/meta";
 import { MarketRegistration } from "../src/resolve/schema";
@@ -40,14 +45,18 @@ const DEFAULT_WORKER = "https://resolve.rafaemush.workers.dev";
 class Stop extends Error {}
 const say = (line: string) => console.log(line);
 
-function report(check: FileCheck): void {
+function report(check: FileCheck, args: SeedArgs): void {
   for (const f of check.fileErrors) say(`file: ${f}`);
   for (const e of check.entries) {
+    if (e.held) { if (e.approved) say(`held     #${e.index} ${e.platform}:${e.external_id}`); continue; }
     if (!e.errors.length) { if (e.approved) say(`ok       #${e.index} ${e.platform}:${e.external_id}`); continue; }
     say(`${e.approved ? "BLOCKED " : "info    "} #${e.index} ${e.platform}:${e.external_id}${e.approved ? "" : " (not approved)"}`);
     for (const x of e.errors) say(`           - ${x}`);
   }
-  say(`${check.entries.length} entries, ${check.approved} approved, ${check.approvedInvalid} approved with errors`);
+  const held = check.entries.find((e) => e.approved && e.held)?.held;
+  if (check.heldBack) say(`held back: ${check.heldBack} approved entr${check.heldBack === 1 ? "y" : "ies"} (${held}); none of them is registered`);
+  else if (args.acceptConsensusReading) say(`${ACCEPT_CONSENSUS_FLAG}: entries marked criteria_basis consensus_reporting are registered like any other`);
+  say(`${check.entries.length} entries, ${check.approved} approved, ${check.heldBack} held back, ${check.registrable} to register, ${check.approvedInvalid} approved with errors`);
 }
 
 const Registered = z.object({
@@ -106,11 +115,11 @@ async function main(args: SeedArgs): Promise<number> {
   const now = new Date();
   let json: unknown;
   try { json = JSON.parse(readFileSync(args.file, "utf8")); } catch (e) { throw new Stop(`cannot read ${args.file}: ${String(e).slice(0, 200)}`); }
-  const check = checkCandidateFile(json, now);
-  report(check);
+  const check = checkCandidateFile(json, now, { acceptConsensusReading: args.acceptConsensusReading });
+  report(check, args);
   if (check.fileErrors.length || check.approvedInvalid) return 1;
   if (args.mode === "check") return 0;
-  if (!check.approved) { say("nothing approved: nothing to register"); return 0; }
+  if (!registrationPlan(check).length) { say(check.approved ? "every approved entry is held back: nothing to register" : "nothing approved: nothing to register"); return 0; }
 
   loadEnv();
   const worker = (process.env.RESOLVE_PUBLIC_URL || DEFAULT_WORKER).replace(/\/+$/, "");
@@ -122,9 +131,11 @@ async function main(args: SeedArgs): Promise<number> {
 
   const file = CandidateFile.parse(json);
   const platform = file.header.platform;
+  // approved and not held back (criteria_basis without the founder's flag): a held entry is never looked up or registered
+  const plan = new Set(registrationPlan(check));
   let registered = 0, skipped = 0, unsupported = 0, broken = 0;
   for (const [index, entry] of file.entries.entries()) {
-    if (!entry.approved) continue;
+    if (!plan.has(index)) continue;
     const externalId = String(entry.registration.market.external_id);
     // checkCandidateFile already parsed both for every approved entry, so these cannot fail here.
     const meta = mergeMeta(entry.registration.meta);

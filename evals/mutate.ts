@@ -33,6 +33,11 @@ const M: Mutation[] = [
   { name: "13_first_print_off", suite: "official", rails: ["first_print_lock"], classes: ["first_print"] },
   { name: "15_election_final_off", suite: "official", rails: ["election_final_count"], classes: ["election_final"] },
   { name: "16_election_margin_off", suite: "official", rails: ["election_safety_margin"], classes: ["election_margin"] },
+  // one margin of election_safety_margin at a time, each zeroed with every other margin in place
+  { name: "17_qc_riding_lead_zero", suite: "official", rails: ["election_qc_riding_lead"], classes: ["election_margin"] },
+  { name: "18_qc_party_votes_zero", suite: "official", rails: ["election_qc_party_votes"], classes: ["election_margin"] },
+  { name: "19_br_turnout_agree_off", suite: "official", rails: ["election_br_turnout_agree"], classes: ["election_margin"] },
+  { name: "20_br_sub_judice_off", suite: "official", rails: ["election_sub_judice"], classes: ["election_margin"] },
   { name: "14_registration_policy_off", suite: "registration", rails: ["registration_policy"], classes: ["policy"] },
 ];
 

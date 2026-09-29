@@ -163,7 +163,7 @@ export const TseCandidate = z.object({
   name: z.string().min(1).max(200),
   /** The civil name when the file carries both (EA20 nm). */
   full_name: z.string().max(300).nullable(),
-  /** dvt: Válido / Válido (legenda) -> valid; Anulado -> annulled; Anulado sub judice -> sub_judice; anything else -> other. */
+  /** dvt: Válido -> valid; Anulado -> annulled; Anulado sub judice -> sub_judice; anything else, including "Válido (legenda)", -> other, which the resolver refuses (vote_status_unknown). */
   status: z.enum(["valid", "annulled", "sub_judice", "other"]),
   status_text: z.string().max(60),
   votes: Int,
@@ -423,13 +423,13 @@ function decideTse(def: ElectionSeriesDef, s: TseSnapshot, ctx: Ctx, caveats: st
     if (big(s.electorate_installed) === 0n) return unresolvedD("totals_inconsistent", "no installed sections");
     const ta = bucketTri(a, ctx.r.bucket, edge, "turnout over eligible voters"), tb = bucketTri(b, ctx.r.bucket, edge, "turnout over voters of installed sections");
     const detail = `TSE ${s.scope} turnout ${s.turnout} of ${s.electorate} eligible (${show(a)}%), ${s.electorate_installed} in installed sections (${show(b)}%); bucket "${ctx.r.bucket.label}"`;
-    if (ta.v !== "unsure" && tb.v !== "unsure" && ta.v !== tb.v) return unresolvedD("turnout_definitions_disagree", `${detail}: the two denominators fall in different buckets`);
+    if (railEnabled("election_br_turnout_agree") && ta.v !== "unsure" && tb.v !== "unsure" && ta.v !== tb.v) return unresolvedD("turnout_definitions_disagree", `${detail}: the two denominators fall in different buckets`);
     return finish([ta, tb], ctx, detail, caveats);
   }
 
   const sj = s.candidates.filter((c) => c.status === "sub_judice" && big(c.votes) > 0n);
   if (margin && sj.length > MAX_SUB_JUDICE) return unresolvedD("sub_judice_votes", `${sj.length} candidates have annulled sub judice votes`);
-  const scenarios = margin ? subsets(sj) : [[]];
+  const scenarios = margin && railEnabled("election_sub_judice") ? subsets(sj) : [[]];
   const x = subject!;
   const listed = leg.listed ? new Set(leg.listed) : null;
   const results = scenarios.map((S) => {
@@ -473,7 +473,7 @@ function decideTse(def: ElectionSeriesDef, s: TseSnapshot, ctx: Ctx, caveats: st
 function possibleWinners(r: EqRiding, margin: boolean): EqRiding["candidates"] {
   const lead = r.candidates.reduce((m, c) => (big(c.votes) > m ? big(c.votes) : m), 0n);
   const cast = big(r.cast);
-  return r.candidates.filter((c) => { const gap = lead - big(c.votes); return margin ? gap * QC_RIDING_LEAD.den <= cast * QC_RIDING_LEAD.num : gap === 0n; });
+  return r.candidates.filter((c) => { const gap = lead - big(c.votes); return margin && railEnabled("election_qc_riding_lead") ? gap * QC_RIDING_LEAD.den <= cast * QC_RIDING_LEAD.num : gap === 0n; });
 }
 
 interface SeatRanges { min: Map<string, number>; max: Map<string, number>; votes: Map<string, bigint>; parties: string[]; open: number }
@@ -531,7 +531,7 @@ function decideEq(def: ElectionSeriesDef, s: EqSnapshot, ctx: Ctx, caveats: stri
   const p = sub.id;
   const board = R.parties.filter((x) => hi(x) > 0).sort((a, b) => hi(b) - hi(a)).slice(0, 5).map((x) => `${x}:${range(x)}`).join(", ");
   const detail = `${head}; ${R.open} riding(s) inside the recount margin; seats by party number ${board}; leg "${ctx.r.bucket.label}" for party ${p} (${sub.name})`;
-  const votesClearly = (a: string, b: string) => { const d = (R.votes.get(a) ?? 0n) - (R.votes.get(b) ?? 0n); return margin ? d * QC_PARTY_VOTES.den > big(s.valid) * QC_PARTY_VOTES.num : d > 0n; };
+  const votesClearly = (a: string, b: string) => { const d = (R.votes.get(a) ?? 0n) - (R.votes.get(b) ?? 0n); return margin && railEnabled("election_qc_party_votes") ? d * QC_PARTY_VOTES.den > big(s.valid) * QC_PARTY_VOTES.num : d > 0n; };
   const above = (a: string, b: string) => lo(a) > hi(b) || (lo(a) >= hi(b) && votesClearly(a, b));
 
   switch (def.measure) {

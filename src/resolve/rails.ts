@@ -31,6 +31,16 @@ const rails = {
    * could still move, is never decided (off: the exact count as printed decides, and sub judice votes are ignored).
    */
   election_safety_margin: true,
+  // Each margin of election_safety_margin as its own rail, so the mutation harness can remove ONE margin and prove a
+  // frozen case depends on it (evals/mutate.ts 17-20). Off = that margin alone set to zero.
+  /** Québec QC_RIDING_LEAD: a riding whose leader is not ahead by more than 1% of the votes cast is open (off: only an exact tie is open). */
+  election_qc_riding_lead: true,
+  /** Québec QC_PARTY_VOTES: a seat tie is broken by valid votes only when the parties are more than 1% of the valid votes apart (off: any vote lead breaks it). */
+  election_qc_party_votes: true,
+  /** TSE turnout: votes cast over eligible voters and over voters of installed sections must fall in the same bucket (off: not compared). */
+  election_br_turnout_agree: true,
+  /** TSE: every combination of annulled sub judice candidates being validated or not must give the same answer (off: only the count as printed). */
+  election_sub_judice: true,
   // Registration rail (src/markets/policy.ts, src/markets/source-checks.ts, src/ingest/robots.ts). Off = the pre-P1a
   // behaviour; evals/registration.ts proves it.
   /**

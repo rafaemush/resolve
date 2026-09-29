@@ -40,9 +40,11 @@ const MANIFEST = resolve(DIR, "manifest.sha256");
 
 /**
  * Election groups (src/resolve/election.ts): election_final (rail election_final_count), election_margin (rail
- * election_safety_margin), election_mapping (leg building: a label must map to exactly one authority entry; no rail,
- * every case is a control). Election cases read TSE 2022 first-round files (Wayback captures), the TSE 2026 simulation
- * (EA20 layout) and the Élections Québec 2022 archive with the production parsers.
+ * election_safety_margin, and each of its margins alone: election_qc_riding_lead, election_qc_party_votes,
+ * election_br_turnout_agree, election_sub_judice; evals/mutate.ts 16-20), election_mapping (leg building: a label
+ * must map to exactly one authority entry; no rail, every case is a control). Election cases read TSE 2022 first-round
+ * files (Wayback captures), the TSE 2026 simulation (EA20 layout) and the Élections Québec 2022 archive with the
+ * production parsers.
  */
 export type OfficialGroup = "release_gate" | "first_print" | "election_final" | "election_margin" | "election_mapping";
 type Parser = "tse_result" | "eq_result" | "bls_cpi_text" | "bls_ppi_text" | "bls_api_yoy" | "fed_statement" | "ecb_release" | "boe_rss" | "bok_decision_rss" | "bok_gdp_rss" | "ecos_quarter" | "bcb_latest_row" | "bcb_history" | "sgs432_row"
@@ -262,11 +264,49 @@ function electionLeg(series: ElectionSeriesId, label: string, reg: Registries, o
   return b.market;
 }
 const tseRead = (fixture: string, edits?: Edits): Read => ({ fixture, parser: "tse_result", select: TSE_DAY_2022, observed_at: officialFixtureFetchedAt(fixture), ...(edits ? { edits } : {}) });
-const eqRead = (fixture: string): Read => ({ fixture, parser: "eq_result", select: EQ_DAY_2022, observed_at: officialFixtureFetchedAt(fixture) });
+const eqRead = (fixture: string, edits?: Edits): Read => ({ fixture, parser: "eq_result", select: EQ_DAY_2022, observed_at: officialFixtureFetchedAt(fixture), ...(edits ? { edits } : {}) });
+/**
+ * SYNTHETIC Québec edit: candidate `id`'s vote count set to `to`. The edit is the saved text from the candidate's number
+ * to its vote count (unique in the file), so it can only touch that one candidate.
+ */
+function eqVotes(id: string, to: number): [string, string] {
+  const body = officialFixture(EL.eq2022);
+  const start = body.indexOf(`"numeroCandidat": ${id},`);
+  if (start < 0 || body.indexOf(`"numeroCandidat": ${id},`, start + 1) >= 0) throw new Error(`candidate ${id}: not exactly once in ${EL.eq2022}`);
+  const m = /"nbVoteTotal": (\d+)/.exec(body.slice(start));
+  if (!m) throw new Error(`candidate ${id}: no nbVoteTotal`);
+  const from = body.slice(start, start + m.index + m[0].length);
+  return [from, from.replace(/"nbVoteTotal": \d+$/, `"nbVoteTotal": ${to}`)];
+}
+/** SYNTHETIC: two candidates of one riding trade vote counts (every riding and file total unchanged). */
+function eqSwap(a: [string, number], b: [string, number]): Edits { return [eqVotes(a[0], b[1]), eqVotes(b[0], a[1])]; }
 const EL_YES = { status: "RESOLVED", outcome: "OPTION_A", caveats_include: ["first_print", "single_source"] } as const;
 const EL_NO = { status: "RESOLVED", outcome: "OPTION_B", caveats_include: ["first_print", "single_source"] } as const;
 const PENDING = (c: string) => ({ status: "UNRESOLVED", outcome: "NONE", caveats_include: [c] }) as const;
 const NOT_FINAL = PENDING("count_not_final");
+/**
+ * SYNTHETIC Taschereau 2022 (34,691 votes cast; 1% is 346.91): Robin (PQ) brought to 346 votes behind Grandmont (QS),
+ * inside the riding-lead margin, or to 347 behind, just outside it; the votes come from St-Hilaire (CAQ), so the
+ * riding's valid votes are unchanged.
+ */
+const TASCH_LEAD_346: Edits = [eqVotes("2467", 13242), eqVotes("2311", 2052)];
+const TASCH_LEAD_347: Edits = [eqVotes("2467", 13241), eqVotes("2311", 2053)];
+/**
+ * SYNTHETIC 2022 Québec seat tie: in Rosemont, Taschereau, Maurice-Richard and Jean-Lesage the QS and PQ candidates
+ * trade vote counts, so QS and PQ both hold 7 seats (every lead stays above 1% of the votes cast) and PQ's valid votes
+ * (618,745) end 18,091 ahead of QS's (600,654), less than 1% of the 4,112,821 valid votes: 3rd place is not settled.
+ */
+const QC_SEAT_TIE: Edits = [
+  ...eqSwap(["2229", 13311], ["2436", 7527]), ...eqSwap(["2505", 13588], ["2467", 7757]),
+  ...eqSwap(["2378", 10903], ["2793", 4612]), ...eqSwap(["2504", 11390], ["2374", 3337]),
+];
+/** SYNTHETIC 2022 national final: Ciro Gomes's 3,599,287 votes annulled sub judice (vv and vansj moved with them). */
+const CIRO_SUB_JUDICE: Edits = [
+  ['"dvt" : "Válido", "vap" : "3599287"', '"dvt" : "Anulado sub judice", "vap" : "3599287"'],
+  ['"vv" : "118229719"', '"vv" : "114630432"'], ['"vansj" : "0"', '"vansj" : "3599287"'],
+];
+/** SYNTHETIC 2022 national final: voters of installed sections cut to 152,694,286, so turnout over them is 81.00% while turnout over the 156,454,011 eligible stays 79.05%. */
+const ESI_81: Edits = [['"esi" : "156453354"', '"esi" : "152694286"']];
 /** SYNTHETIC: Acre's two leaders brought within 96 votes (0.02 pp of 440,917 valid votes); their sum and every total unchanged. */
 const AC_NEAR_TIE: Edits = [['"vap" : "275582"', '"vap" : "202350"'], ['"vap" : "129022"', '"vap" : "202254"']];
 function eqRidingCode(name: string): string {
@@ -319,6 +359,17 @@ function electionCases(): OfficialCase[] {
     { id: "EL-M01", group: "election_margin", control: false, title: "SYNTHETIC Acre final count with the leaders 96 votes apart (0.02 pp): Bolsonaro's 1st-place leg abstains (near_tie)", market: L("br_pres_r1_first_ac", "Jair Bolsonaro", ac, { labels: named }), fetched: tseRead(EL.ac2022, AC_NEAR_TIE), expect: PENDING("near_tie") },
     { id: "EL-M02", group: "election_margin", control: false, title: "TSE 2022 national final: Lula's margin 5.2332 pp is 0.017 pp from the 5.25% bucket edge: the 'Lula 5.25%+' leg abstains", market: L("br_pres_r1_margin", "Lula 5.25%+", br), fetched: tseRead(EL.br2022.final), expect: PENDING("near_bucket_edge") },
     { id: "EL-M03", group: "election_margin", control: false, title: "TSE 2022 national final: Lula's 48.4312% of valid votes is 0.019 pp from the 48.45% edge: the '45-48.45%' share leg abstains", market: L("br_pres_r1_share_lula", "45-48.45%", br), fetched: tseRead(EL.br2022.final), expect: PENDING("near_bucket_edge") },
+    { id: "EL-M04", group: "election_margin", control: false, title: "SYNTHETIC Taschereau 2022: Grandmont leads by 346 votes, not more than 1% of the 34,691 cast (346.91): his riding-winner leg stays pending", market: L("qc_riding_751", taschWinner.name, eq, { unit: tasch }), fetched: eqRead(EL.eq2022, TASCH_LEAD_346), expect: PENDING("recount_range") },
+    { id: "EL-M05", group: "election_margin", control: false, title: "Élections Québec 2022 final: CAQ holds 88 seats outright and 90 with Beauce-Nord (lead 0.59%) and Fabre (0.88%), both inside the 1% margin: the CAQ '90+' seats leg stays pending", market: L("qc_seats_caq", "90+", eq, { party: "Coalition Avenir Québec" }), fetched: eqRead(EL.eq2022), expect: PENDING("recount_range") },
+    { id: "EL-M06", group: "election_margin", control: false, title: "SYNTHETIC 2022 Québec seat tie: QS and PQ both hold 7 seats and their valid votes are 0.44% apart (under 1%): the PQ 3rd-place leg stays pending", market: L("qc_third_place", "Parti québécois", eq, { labels: ["Parti québécois", "Québec solidaire"] }), fetched: eqRead(EL.eq2022, QC_SEAT_TIE), expect: PENDING("recount_range") },
+    { id: "EL-M07", group: "election_margin", control: false, title: "SYNTHETIC 2022 national final with the voters of installed sections cut: turnout 79.05% of eligible voters but 81.00% of installed-section voters: the 75-80% leg stays pending", market: L("br_pres_r1_turnout", "75-80%", br), fetched: tseRead(EL.br2022.final, ESI_81), expect: PENDING("turnout_definitions_disagree") },
+    { id: "EL-M08", group: "election_margin", control: false, title: "SYNTHETIC 2022 national final with Ciro Gomes annulled sub judice: he finishes 4th if his votes are validated and far below 4th if they stay annulled: his 4th-place leg stays pending", market: L("br_pres_r1_fourth", "Ciro Gomes", br, { labels: [...named, "Soraya Thronicke", "Felipe d'Avila"] }), fetched: tseRead(EL.br2022.final, CIRO_SUB_JUDICE), expect: PENDING("sub_judice_votes") },
+    { id: "EL-M09", group: "election_margin", control: false, title: "SYNTHETIC 2022 national final with Ciro Gomes annulled sub judice: Lula's share is 49.95% of valid votes while Ciro's votes stay annulled and 48.43% once they are validated: the '49%+' share leg stays pending", market: L("br_pres_r1_share_lula", "49%+", br), fetched: tseRead(EL.br2022.final, CIRO_SUB_JUDICE), expect: PENDING("sub_judice_votes") },
+    { id: "EL-M10", group: "election_margin", control: false, title: "Élections Québec 2022 final: Beauce-Nord (PCQ 202 votes, 0.59% of the votes cast, behind the CAQ) is the one riding inside the 1% margin the PCQ could win, so its seats are 0 or 1: the PCQ '1+' seats leg stays pending", market: L("qc_seats_pcq", "1+", eq, { party: "Parti conservateur du Québec" }), fetched: eqRead(EL.eq2022), expect: PENDING("recount_range") },
+    { id: "EL-MC3", group: "election_margin", control: true, title: "SYNTHETIC Taschereau 2022: Grandmont leads by 347 votes, more than 1% of the votes cast: his riding-winner leg is Yes", market: L("qc_riding_751", taschWinner.name, eq, { unit: tasch }), fetched: eqRead(EL.eq2022, TASCH_LEAD_347), expect: EL_YES },
+    { id: "EL-MC4", group: "election_margin", control: true, title: "Élections Québec 2022 final: CAQ's 88 to 90 seats are all in '80+': Yes", market: L("qc_seats_caq", "80+", eq, { party: "Coalition Avenir Québec" }), fetched: eqRead(EL.eq2022), expect: EL_YES },
+    { id: "EL-MC5", group: "election_margin", control: true, title: "SYNTHETIC 2022 Québec seat tie (QS and PQ at 7): PLQ's 21 or 22 seats are 2nd outright, Yes", market: L("qc_second_place", "Parti libéral du Québec", eq, { labels: ["Parti libéral du Québec", "Parti québécois"] }), fetched: eqRead(EL.eq2022, QC_SEAT_TIE), expect: EL_YES },
+    { id: "EL-MC6", group: "election_margin", control: true, title: "SYNTHETIC 2022 national final with Ciro Gomes annulled sub judice: Simone Tebet is 3rd whether or not his votes are validated, Yes", market: L("br_pres_r1_third", "Simone Tebet", br, { labels: named }), fetched: tseRead(EL.br2022.final, CIRO_SUB_JUDICE), expect: EL_YES },
     { id: "EL-MC1", group: "election_margin", control: true, title: "TSE 2022 national final: Lula's margin 5.23 pp is in 5-7.5%, far from both edges, Yes", market: L("br_pres_r1_margin", "Lula 5-7.5%", br), fetched: tseRead(EL.br2022.final), expect: EL_YES },
     { id: "EL-MC2", group: "election_margin", control: true, title: "TSE 2022 national final: Lula's share 48.43% is in 45-50%, Yes", market: L("br_pres_r1_share_lula", "45-50%", br), fetched: tseRead(EL.br2022.final), expect: EL_YES },
     // --- election_mapping: a label must map to exactly one authority entry (every case a control) -------------------

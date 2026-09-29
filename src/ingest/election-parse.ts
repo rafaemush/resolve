@@ -97,6 +97,11 @@ export function parseTseConfig(text: string, day: string): ElectionParse<TseConf
   return { ok: true, snap: hits[0]! };
 }
 
+/** The configuration's environment ("o" official, "s" simulation), or null when it is not a readable configuration. */
+export function tseConfigEnvironment(text: string): string | null {
+  try { const r: unknown = JSON.parse(text); return isObj(r) && typeof r.f === "string" ? r.f.toLowerCase() : null; } catch { return null; }
+}
+
 /** The unified (EA20) result file of one scope, built only from the configuration (never a guessed path). */
 export function tseResultUrl(c: Pick<TseConfig, "cycle" | "electionId">, scope: string): string {
   const uf = scope.toLowerCase();

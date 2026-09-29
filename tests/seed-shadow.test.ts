@@ -7,7 +7,7 @@
  * watches with what was sent.
  */
 import { describe, expect, it } from "vitest";
-import { checkCandidateFile, eventStatementProblem, parseSeedArgs, UsageError, verifyRow } from "../scripts/lib/seed-shadow";
+import { checkCandidateFile, eventStatementProblem, parseSeedArgs, registrationPlan, UsageError, verifyRow } from "../scripts/lib/seed-shadow";
 
 const NOW = new Date("2026-09-24T12:00:00Z");
 const CID = `0x${"cd".repeat(32)}`;
@@ -96,11 +96,41 @@ describe("seed-shadow --check", () => {
   });
 });
 
+describe("seed-shadow criteria_basis (scripts/election-legs.ts)", () => {
+  const consensus = (over: Parameters<typeof entry>[0] & { basis?: unknown; id?: string } = {}) => ({ ...entry({ ...over, market: { external_id: over.id ?? "637022", ...over.market } }), criteria_basis: over.basis ?? "consensus_reporting" });
+
+  it("holds back an approved consensus_reporting entry in --check and in real runs: counted, never registered, never an error", () => {
+    const c = checkCandidateFile(file([entry({ market: { external_id: "1" } }), consensus({ id: "2" }), consensus({ id: "3", approved: false })]), NOW);
+    expect(c).toMatchObject({ fileErrors: [], approved: 2, heldBack: 1, registrable: 1, approvedInvalid: 0 });
+    expect(c.entries[1]).toMatchObject({ errors: [], held: expect.stringContaining("held back unless --accept-consensus-reading is passed") });
+    expect(c.entries[0]!.held).toBeNull();
+    // the list --dry-run and --apply walk: the held entry is not in it
+    expect(registrationPlan(c)).toEqual([0]);
+  });
+
+  it("registers it only with --accept-consensus-reading", () => {
+    const c = checkCandidateFile(file([consensus()]), NOW, { acceptConsensusReading: true });
+    expect(c).toMatchObject({ approved: 1, heldBack: 0, registrable: 1, approvedInvalid: 0 });
+    expect(c.entries[0]!.held).toBeNull();
+    expect(registrationPlan(c)).toEqual([0]);
+  });
+
+  it("refuses any other criteria_basis, with or without the flag", () => {
+    for (const opts of [{}, { acceptConsensusReading: true }]) {
+      const c = checkCandidateFile(file([consensus({ basis: "vibes" })]), NOW, opts);
+      expect(c.entries[0]!.errors).toEqual([expect.stringContaining('criteria_basis "vibes" is not one seed-shadow reads')]);
+      expect(c.approvedInvalid).toBe(1);
+    }
+  });
+});
+
 describe("seed-shadow arguments", () => {
   it("defaults to a dry run and refuses anything ambiguous", () => {
-    expect(parseSeedArgs(["f.json"])).toEqual({ file: "f.json", mode: "dry-run" });
-    expect(parseSeedArgs(["f.json", "--check"])).toEqual({ file: "f.json", mode: "check" });
-    expect(parseSeedArgs(["--apply", "f.json"])).toEqual({ file: "f.json", mode: "apply" });
+    expect(parseSeedArgs(["f.json"])).toEqual({ file: "f.json", mode: "dry-run", acceptConsensusReading: false });
+    expect(parseSeedArgs(["f.json", "--check"])).toEqual({ file: "f.json", mode: "check", acceptConsensusReading: false });
+    expect(parseSeedArgs(["--apply", "f.json"])).toEqual({ file: "f.json", mode: "apply", acceptConsensusReading: false });
+    expect(parseSeedArgs(["f.json", "--accept-consensus-reading", "--apply"])).toEqual({ file: "f.json", mode: "apply", acceptConsensusReading: true });
+    expect(() => parseSeedArgs(["f.json", "--accept-consensus"])).toThrow(UsageError);
     expect(() => parseSeedArgs(["f.json", "--apply", "--dry-run"])).toThrow(UsageError);
     expect(() => parseSeedArgs(["f.json", "--aply"])).toThrow(UsageError);
     expect(() => parseSeedArgs(["a.json", "b.json"])).toThrow(UsageError);

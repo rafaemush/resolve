@@ -41,11 +41,15 @@
  * capture so each contest file is requested at most once per 4 minutes however many legs poll it, the holder's leg
  * polls again in 5 minutes and every other leg every 15, and the count may take 72 h (not 6) before the legs are
  * reported release_not_observed, after which every leg polls hourly. Upstream-failure alerts are per authority (tse,
- * eq), not per series. A capture: TSE configuration (at most once a minute per isolate) + contest file = 2 upstream
- * requests; the Élections Québec file = 1. The holder's waitUntil records its own series and the siblings of its fetch
- * group from the same bytes: request 5 + upstream 2 + R2 1 + record 1 + siblings read 1 + one record per sibling (the
- * TSE national file: 8; the Québec file: 29, no corroboration request exists for elections) = 39 at most, with a lease
- * extension 1 and an alert 3 when a capture fails instead.
+ * eq), not per series. A TSE capture requests the configuration and then the contest file (2 upstream requests); an
+ * isolate that captured another TSE contest in the last 60 s reuses the configuration it read (a per-isolate memo, so
+ * it only saves requests: the bound on the TSE hosts is the fetch lease of each contest, since every isolate and every
+ * contest reads the configuration again). The Élections Québec capture requests the one file, and a final count is
+ * recorded only on a read that confirms an earlier one (EQ_STABLE_MS; the first read is kept in app_config, 1 read and
+ * at most 1 write per capture). The holder's waitUntil records its own series and the siblings of its fetch group from
+ * the same bytes: request 5 + upstream 2 (Québec: 1 + the app_config read 1) + R2 1 + record 1 + siblings read 1 + one
+ * record per sibling (the TSE national file: 8; the Québec file: 29, no corroboration request exists for elections) =
+ * 39 at most, with a lease extension 1 and an alert 3 when a capture fails or waits instead.
  * Workers Free budget (100,000 requests a day), from polls close until the counts are final (72 h at most): every leg
  * polls once per 15 minutes (96 a day) and each contest's holder once per 5 minutes (288 a day), so a day costs
  * 96 x legs + 288 x contests Worker requests; the upstream sees at most 360 requests a day per contest (720 for a TSE
@@ -55,7 +59,7 @@ import type { Env } from "../env";
 import { db, rpc } from "../db/supabase";
 import type { FetchOutcome, MarketRow, WatchRow } from "./types";
 import { MAX_DEFER_S } from "./http";
-import { fetchPrimary, fetchCorroboration, budget, type FetchedObservation, type PrimaryResult } from "./official";
+import { fetchPrimary, fetchCorroboration, budget, type ConfirmRead, type FetchedObservation, type PrimaryResult } from "./official";
 import {
   OFFICIAL_SERIES, OfficialCorroboration, firstPrintFor, officialEvidence, priorLevelProblem, releaseAtOf, fallbackEndMs, fetchSlotOf, missingAfterMs,
   type OfficialObservationDoc, type OfficialMissingDoc, type OfficialResolver, type OfficialSeriesId,
@@ -82,6 +86,48 @@ export const EARLY_WAIT_MS = 5000;
 export const ELECTION_REFETCH_S = 240;
 /** Election cadence while awaiting the final count: the holder's leg, every other leg, and after missingAfterMs. */
 export const ELECTION_POLL_MIN = { holder: 5, other: 15, missing: 60 } as const;
+/**
+ * Élections Québec first print: a final-flagged count is recorded only when the same counts (every riding's candidate
+ * votes and the file-wide totals and flags, never the file's timestamps: ConfirmRead.fingerprint) were first read at
+ * least this long before. The CDN serves copies up to about 2 min old and the counts can still move after the flag is
+ * first seen, so one read never locks the first print. The first read is kept in app_config (confirmKeyOf), so the
+ * confirming read may come from any leg in any isolate; a read with other counts starts the wait again. Changes after
+ * the lock (the recensement) are expected to be far smaller than the 1% riding-lead margin (UNVERIFIED): the resolver's
+ * margins, not this wait, keep such a change from flipping a verdict.
+ */
+export const EQ_STABLE_MS = 10 * 60_000;
+/** The app_config key holding the first read of a count that awaits its confirming read (one per fetch slot and period). */
+export const confirmKeyOf = (slot: string, period: string) => `official_confirm:${slot}:${period}`;
+interface ConfirmState { fingerprint: string; first_read_at: string; as_of: string; raw_sha256: string }
+function confirmState(v: unknown): ConfirmState | null {
+  if (typeof v !== "string") return null;
+  let o: unknown;
+  try { o = JSON.parse(v); } catch { return null; }
+  const x = o as Partial<ConfirmState> | null;
+  if (!x || typeof x.fingerprint !== "string" || typeof x.first_read_at !== "string" || !Number.isFinite(Date.parse(x.first_read_at))) return null;
+  return { fingerprint: x.fingerprint, first_read_at: x.first_read_at, as_of: String(x.as_of ?? ""), raw_sha256: String(x.raw_sha256 ?? "") };
+}
+type Confirmed = { kind: "confirmed"; first_read_at: string } | { kind: "wait"; detail: string } | { kind: "error"; error: string };
+/**
+ * Is this read the confirmation of an earlier read of the same counts at least EQ_STABLE_MS before? Otherwise the read is
+ * kept (when its counts differ from the kept one, or none is kept) and the capture stays pending.
+ */
+async function confirmRead(env: Env, slot: string, period: string, c: ConfirmRead, raw_sha256: string, nowMs: number): Promise<Confirmed> {
+  const key = confirmKeyOf(slot, period);
+  const client = db(env);
+  const { data, error } = await client.from("app_config").select("value").eq("key", key).maybeSingle();
+  if (error) return { kind: "error", error: `app_config read (${key}): ${error.message.slice(0, 160)}` };
+  const kept = confirmState((data as { value?: unknown } | null)?.value);
+  if (kept && kept.fingerprint === c.fingerprint) {
+    const since = Date.parse(kept.first_read_at);
+    if (nowMs - since >= EQ_STABLE_MS) return { kind: "confirmed", first_read_at: kept.first_read_at };
+    return { kind: "wait", detail: `the final count (as of ${c.as_of}) was first read at ${kept.first_read_at}; it is recorded once a read at or after ${iso(since + EQ_STABLE_MS)} shows the same counts` };
+  }
+  const state: ConfirmState = { fingerprint: c.fingerprint, first_read_at: iso(nowMs), as_of: c.as_of, raw_sha256 };
+  const { error: we } = await client.from("app_config").upsert({ key, value: JSON.stringify(state), updated_at: iso(nowMs) }, { onConflict: "key" });
+  if (we) return { kind: "error", error: `app_config write (${key}): ${we.message.slice(0, 160)}` };
+  return { kind: "wait", detail: `first read of this final count (as of ${c.as_of}${kept ? "; the counts differ from the read kept at " + kept.first_read_at : ""}); it is recorded once a read at or after ${iso(nowMs + EQ_STABLE_MS)} shows the same counts` };
+}
 
 export interface OfficialDeps { now(): number; sleep(ms: number): Promise<void>; waitUntil?: (p: Promise<unknown>) => void }
 const REAL: Pick<OfficialDeps, "now" | "sleep"> = { now: () => Date.now(), sleep: (ms) => new Promise((r) => setTimeout(r, ms)) };
@@ -206,7 +252,7 @@ const corroborate = async (obs: FetchedObservation, period: string, deps: Pick<O
  * The other series of the fetch group that the holder's page states for the period: each one not yet stored gets its
  * own corroboration and first print from the same bytes (already in R2). Never throws; returns one note per sibling.
  */
-async function recordSiblings(env: Env, r: OfficialResolver, marketId: string, siblings: FetchedObservation[], upstream: number, deps: Pick<OfficialDeps, "now">, hardStop: number): Promise<string[]> {
+async function recordSiblings(env: Env, r: OfficialResolver, marketId: string, siblings: FetchedObservation[], upstream: number, deps: Pick<OfficialDeps, "now">, hardStop: number, extraMeta: Record<string, unknown> = {}): Promise<string[]> {
   if (!siblings.length) return [];
   const { data, error } = await db(env).from("official_observations").select("series").eq("period", r.period).in("series", siblings.map((s) => s.series));
   if (error) return siblings.map((s) => `${s.series}: not recorded (official_observations read: ${error.message.slice(0, 120)})`);
@@ -216,7 +262,7 @@ async function recordSiblings(env: Env, r: OfficialResolver, marketId: string, s
   const corr = await Promise.all(todo.map((s) => corroborate(s, r.period, deps, hardStop)));
   for (const [i, s] of todo.entries()) {
     try {
-      const row = await recordObservation(env, s, r.period, corr[i]!, { upstream_requests: upstream + 1, captured_by_market: marketId, sibling_of: r.series });
+      const row = await recordObservation(env, s, r.period, corr[i]!, { upstream_requests: upstream + 1, captured_by_market: marketId, sibling_of: r.series, ...extraMeta });
       notes.push(`${s.series}: ${row.inserted ? "recorded" : "already stored"} ${row.value_text}`);
     } catch (e) { notes.push(`${s.series}: record_official_observation: ${String(e).slice(0, 160)}`); }
   }
@@ -259,7 +305,16 @@ export async function captureOfficial(env: Env, r: OfficialResolver, marketId: s
     await deps.sleep(Math.max(0, next - deps.now()));
   }
   const election = isElectionSeries(r.series);
+  // a count that needs a confirming read (Élections Québec) is recorded only on that read, never on the first one
+  let confirmedMeta: Record<string, unknown> = {};
+  if (res.kind === "observed" && res.confirm) {
+    const k = await confirmRead(env, fetchSlotOf(r.series), r.period, res.confirm, res.obs.raw_sha256, deps.now());
+    if (k.kind === "wait") res = { kind: "pending", detail: k.detail };
+    else if (k.kind === "error") res = { kind: "error", error: k.error, retryable: true, drift: false };
+    else confirmedMeta = { first_final_read_at: k.first_read_at, counts_sha256: res.confirm.fingerprint };
+  }
   if (res.kind === "pending") {
+    if (res.alert) await safeAlert(env, res.alert.key, res.alert.text, res.alert.dedupMinutes, meta);
     // An election count that is not final yet: nobody fetches this contest again for ELECTION_REFETCH_S.
     if (election) {
       try { await rpc(db(env), "extend_official_fetch", { p_series: fetchSlotOf(r.series), p_period: r.period, p_seconds: ELECTION_REFETCH_S }); }
@@ -291,11 +346,11 @@ export async function captureOfficial(env: Env, r: OfficialResolver, marketId: s
   try { await env.RAW.put(`raw/${obs.raw_sha256}`, obs.raw, { httpMetadata: { contentType: "application/octet-stream" } }); }
   catch (e) { await safeAlert(env, "r2_put_failed", `R2 put raw/${obs.raw_sha256} (${r.series} ${r.period} upstream body) failed: ${String(e).slice(0, 200)}`, 60, meta); }
   let row: StoredRow;
-  try { row = await recordObservation(env, obs, r.period, corroboration, { upstream_requests: b.used + 1, captured_by_market: marketId }); }
+  try { row = await recordObservation(env, obs, r.period, corroboration, { upstream_requests: b.used + 1, captured_by_market: marketId, ...confirmedMeta }); }
   catch (e) { return { kind: "error", error: `record_official_observation: ${String(e).slice(0, 200)}`, retryable: true, drift: false, requests: b.used }; }
   const stored = docFromRow(row);
   const fetched = docFromFetch(obs, corroboration);
-  const siblings = mode.siblings ? await recordSiblings(env, r, marketId, res.siblings ?? [], b.used, deps, hardStop) : [];
+  const siblings = mode.siblings ? await recordSiblings(env, r, marketId, res.siblings ?? [], b.used, deps, hardStop, confirmedMeta) : [];
   if (mode.siblings) siblings.push(...(res.siblingNotes ?? []));
   return { kind: "recorded", stored, fetched, inserted: row.inserted === true, revision: row.revision_differs === true, ownCapture: row.meta?.captured_by_market === marketId, requests: b.used, siblings };
 }

@@ -13,27 +13,39 @@ import { registrationPolicyIssues, webRenderRefusal } from "../../src/markets/po
 export const SHADOW_VOLUME_CAP_USD = 50_000;
 
 export type SeedMode = "check" | "dry-run" | "apply";
-export interface SeedArgs { file: string; mode: SeedMode }
+/** acceptConsensusReading: --accept-consensus-reading, the founder's call to register entries marked consensus_reporting. */
+export interface SeedArgs { file: string; mode: SeedMode; acceptConsensusReading: boolean }
 
 export class UsageError extends Error {}
-export const USAGE = "usage: npx tsx scripts/seed-shadow.ts <curated file.json> [--check | --dry-run (default) | --apply]";
+export const USAGE = "usage: npx tsx scripts/seed-shadow.ts <curated file.json> [--check | --dry-run (default) | --apply] [--accept-consensus-reading]";
+export const ACCEPT_CONSENSUS_FLAG = "--accept-consensus-reading";
 
-/** Pure. One file and at most one mode flag; anything else is a usage error, so a typo never becomes a write. */
+/** Pure. One file, at most one mode flag and the consensus flag; anything else is a usage error, so a typo never becomes a write. */
 export function parseSeedArgs(argv: string[]): SeedArgs {
   let file: string | null = null;
+  let acceptConsensusReading = false;
   const modes: SeedMode[] = [];
   for (const a of argv) {
     if (a === "--check") modes.push("check");
     else if (a === "--dry-run") modes.push("dry-run");
     else if (a === "--apply") modes.push("apply");
+    else if (a === ACCEPT_CONSENSUS_FLAG) acceptConsensusReading = true;
     else if (a.startsWith("-")) throw new UsageError(`unknown argument "${a}"`);
     else if (file) throw new UsageError(`one file at a time (got "${file}" and "${a}")`);
     else file = a;
   }
   if (!file) throw new UsageError("the curated file is required");
   if (modes.length > 1) throw new UsageError(`${modes.map((m) => `--${m}`).join(" and ")} are exclusive`);
-  return { file, mode: modes[0] ?? "dry-run" };
+  return { file, mode: modes[0] ?? "dry-run", acceptConsensusReading };
 }
+
+/**
+ * criteria_basis values an entry may carry (scripts/election-legs.ts). consensus_reporting: the market settles on "a
+ * consensus of credible reporting" and turns to the authority only if there is ambiguity, while the rail decides from the
+ * authority's count; registering such a market is the founder's policy call, so it is held back (never registered, never
+ * an error) unless --accept-consensus-reading is passed. Any other value is refused: an unknown basis is never registered.
+ */
+export const CRITERIA_BASES = ["consensus_reporting"] as const;
 
 export interface EntryCheck {
   index: number;
@@ -41,6 +53,8 @@ export interface EntryCheck {
   external_id: string;
   approved: boolean;
   errors: string[];
+  /** Why the entry is held back from registration whatever its approval (criteria_basis without the founder's flag), else null. */
+  held: string | null;
 }
 
 export interface FileCheck {
@@ -49,9 +63,14 @@ export interface FileCheck {
   fileErrors: string[];
   entries: EntryCheck[];
   approved: number;
-  /** Approved entries that fail a rule: any one of these blocks --apply. */
+  /** Approved entries held back (criteria_basis consensus_reporting without --accept-consensus-reading): never registered. */
+  heldBack: number;
+  /** Approved entries that would be registered: approved and not held back. */
+  registrable: number;
+  /** Approved entries not held back that fail a rule: any one of these blocks --apply. */
   approvedInvalid: number;
 }
+export interface CheckOptions { acceptConsensusReading?: boolean }
 
 /**
  * Pure. Every entry is checked (so the founder sees what an approval would run into); only approved entries can block.
@@ -64,16 +83,34 @@ export interface FileCheck {
  * catches offline what the Worker would refuse; an approved entry has nothing left under needs_review; no
  * (platform, external_id) appears twice.
  */
-export function checkCandidateFile(json: unknown, now: Date): FileCheck {
+export function checkCandidateFile(json: unknown, now: Date, opts: CheckOptions = {}): FileCheck {
   const parsed = CandidateFile.safeParse(json);
   if (!parsed.success) {
-    return { platform: null, fileErrors: parsed.error.issues.slice(0, 10).map((i) => `${i.path.join(".") || "file"}: ${i.message}`), entries: [], approved: 0, approvedInvalid: 0 };
+    return { platform: null, fileErrors: parsed.error.issues.slice(0, 10).map((i) => `${i.path.join(".") || "file"}: ${i.message}`), entries: [], approved: 0, heldBack: 0, registrable: 0, approvedInvalid: 0 };
   }
   const platform = parsed.data.header.platform;
   const seen = new Map<string, number>();
-  const entries = parsed.data.entries.map((e, index) => checkEntry(e, index, platform, now, seen));
+  const entries = parsed.data.entries.map((e, index) => checkEntry(e, index, platform, now, seen, opts));
   const approved = entries.filter((e) => e.approved);
-  return { platform, fileErrors: [], entries, approved: approved.length, approvedInvalid: approved.filter((e) => e.errors.length).length };
+  const live = approved.filter((e) => !e.held);
+  return { platform, fileErrors: [], entries, approved: approved.length, heldBack: approved.length - live.length, registrable: live.length, approvedInvalid: live.filter((e) => e.errors.length).length };
+}
+
+/**
+ * Pure. The entries --dry-run and --apply may register, by index: approved and not held back. The one list both modes
+ * walk, so an entry held back in --check is never registered in a real run either.
+ */
+export function registrationPlan(check: FileCheck): number[] {
+  return check.entries.filter((e) => e.approved && !e.held).map((e) => e.index);
+}
+
+/** Pure. Why an entry's criteria_basis holds it back (null: it carries none, or the founder accepted it); errors: an unknown basis. */
+export function criteriaBasisHold(entry: unknown, opts: CheckOptions): { held: string | null; error: string | null } {
+  const basis = (entry as { criteria_basis?: unknown } | null)?.criteria_basis;
+  if (basis === undefined) return { held: null, error: null };
+  if (!(CRITERIA_BASES as readonly unknown[]).includes(basis)) return { held: null, error: `criteria_basis ${JSON.stringify(basis)} is not one seed-shadow reads (${CRITERIA_BASES.join(", ")}): never registered` };
+  if (opts.acceptConsensusReading) return { held: null, error: null };
+  return { held: `criteria_basis ${String(basis)}: the market settles on a consensus of credible reporting (the authority only if there is ambiguity); held back unless ${ACCEPT_CONSENSUS_FLAG} is passed`, error: null };
 }
 
 /** Interrogative openers, capitalized as a sentence starts: "WHO declared ..." (the organization) is not "Who ...". */
@@ -125,8 +162,10 @@ export function limitlessMetaProblems(meta: MarketMeta, market: Pick<MarketRegis
   return out;
 }
 
-function checkEntry(e: CandidateEntry, index: number, platform: CandidatePlatform, now: Date, seen: Map<string, number>): EntryCheck {
+function checkEntry(e: CandidateEntry, index: number, platform: CandidatePlatform, now: Date, seen: Map<string, number>, opts: CheckOptions): EntryCheck {
   const errors: string[] = [];
+  const basis = criteriaBasisHold(e, opts);
+  if (basis.error) errors.push(basis.error);
   const m = MarketRegistration.safeParse(e.registration.market);
   const externalId = typeof e.registration.market.external_id === "string" ? e.registration.market.external_id : "?";
   if (!m.success) for (const i of m.error.issues) errors.push(`market.${i.path.join(".")}: ${i.message}`);
@@ -154,7 +193,7 @@ function checkEntry(e: CandidateEntry, index: number, platform: CandidatePlatfor
   const first = seen.get(key);
   if (first !== undefined) errors.push(`duplicate of entry ${first} (${key})`);
   else seen.set(key, index);
-  return { index, platform, external_id: externalId, approved: e.approved, errors };
+  return { index, platform, external_id: externalId, approved: e.approved, errors, held: basis.held };
 }
 
 /** The columns seed-shadow reads back from markets. */

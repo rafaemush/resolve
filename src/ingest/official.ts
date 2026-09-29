@@ -6,8 +6,8 @@
  * A document that is readable but still about an earlier period is "pending", never an observation.
  */
 import { OFFICIAL_SERIES, fetchGroupOf, hostAllowed, sameAtPrecision, reading, thousandsOf, percentTenths, knownRelease, TSE_CONFIG_URL, EQ_RESULTS_URL, type OfficialCorroboration, type OfficialSeriesId } from "../resolve/official";
-import { ELECTION_SERIES, isElectionSeries, snapshotForSeries, tseNotFinal, eqNotFinal, type ElectionSeriesId, type ElectionSnapshot } from "../resolve/election";
-import { parseTseConfig, parseTseResult, parseEqResults, tseResultUrl } from "./election-parse";
+import { ELECTION_SERIES, isElectionSeries, snapshotForSeries, tseNotFinal, eqNotFinal, type ElectionSeriesId, type ElectionSnapshot, type EqSnapshot } from "../resolve/election";
+import { parseTseConfig, parseTseResult, parseEqResults, tseResultUrl, tseConfigEnvironment } from "./election-parse";
 import { sha256Hex } from "../resolve/text";
 import { discardBody, retryAfterSeconds } from "./http";
 import { RESOLVE_BOT_UA } from "../ops/ua";
@@ -146,14 +146,26 @@ export interface FetchedObservation extends DocObservation {
   contest?: ElectionSnapshot;
 }
 
+/**
+ * An observation that is recorded only once a second read confirms it (Élections Québec): fingerprint is the sha256 of
+ * the file's counts (every riding's candidate votes and the file-wide totals and final flag, never its timestamps). The
+ * capture (src/ingest/official-watch.ts) records the first print only when the same fingerprint was first read at least
+ * EQ_STABLE_MS earlier, a state it keeps in the database, so it holds across isolates.
+ */
+export interface ConfirmRead { fingerprint: string; as_of: string }
+export interface PendingAlert { key: string; text: string; dedupMinutes: number }
+
 export type PrimaryResult =
   /**
    * siblings: the other series of the fetch group that the same document states for the same period (recorded by the
    * slot holder from these bytes, so the page is fetched once per release); siblingNotes: why a sibling was not read.
    */
-  | { kind: "observed"; obs: FetchedObservation; siblings?: FetchedObservation[]; siblingNotes?: string[] }
-  /** siblings: as above, when the page is out but does not state this series' number (a "-" cell after a lapse). */
-  | { kind: "pending"; detail: string; siblings?: FetchedObservation[]; siblingNotes?: string[] }
+  | { kind: "observed"; obs: FetchedObservation; siblings?: FetchedObservation[]; siblingNotes?: string[]; confirm?: ConfirmRead }
+  /**
+   * siblings: as above, when the page is out but does not state this series' number (a "-" cell after a lapse).
+   * alert: something the operator must hear about while the legs stay pending (the capture raises it, deduplicated).
+   */
+  | { kind: "pending"; detail: string; siblings?: FetchedObservation[]; siblingNotes?: string[]; alert?: PendingAlert }
   /** siblings: as above, when this series' part of the page no longer parses (drift) but the others' parts do. */
   | { kind: "error"; error: string; httpStatus?: number; deferSeconds?: number; retryable: boolean; drift: boolean; siblings?: FetchedObservation[]; siblingNotes?: string[] };
 
@@ -206,11 +218,26 @@ function siblingsOf(series: OfficialSeriesId, target: string, g: Extract<Got, { 
 export const DGEQ_ATTRIBUTION = "Comprend des données ouvertes octroyées sous la licence d'utilisation des données ouvertes du directeur général des élections disponible à l'adresse Web dgeq.org. L'octroi de la licence n'implique aucune approbation par le directeur général des élections de l'utilisation des données ouvertes qui en est faite.";
 /** A missing TSE file is never retried soon: the TSE FAQ warns that requests answered 404 can get the address blocked. */
 export const ELECTION_DEFER_S = 600;
-/** The TSE configuration is read at most once a minute per isolate (the TSE asks for polls no more often than every 60 s). */
+/**
+ * An isolate reuses the TSE configuration it read for 60 s (the TSE asks for polls no more often than every 60 s). The memo
+ * lives in one isolate only: every other isolate reads the configuration again, so across isolates the rate is bounded by
+ * the contests' fetch leases (one capture per contest per ELECTION_REFETCH_S, src/ingest/official-watch.ts), not by this.
+ */
 export const TSE_CONFIG_TTL_MS = 60_000;
 let tseConfigMemo: { at: number; text: string; url: string } | null = null;
+/**
+ * A configuration from the official environment (f=o) that still lists no President first round this long after polls
+ * close points at drift (the pleito's date or the layout changed): the legs stay pending as before, and the capture
+ * alerts the operator (TSE_CONFIG_ALERT_DEDUP_MIN) instead of leaving it to the 72 h missing alert.
+ */
+export const TSE_CONFIG_MISSING_ALERT_MS = 6 * 3600_000;
+export const TSE_CONFIG_ALERT_DEDUP_MIN = 360;
 /** Tests only: forget the memoised configuration. */
 export function __resetElectionMemo(): void { tseConfigMemo = null; }
+/** The counts of a Québec file, without its timestamps: two reads with the same key report the same result. */
+export function eqCountsKey(s: EqSnapshot): string {
+  return JSON.stringify([s.final, s.registered, s.cast, s.valid, s.rejected, s.parties.map((p) => [p.id, p.votes]), s.ridings.map((r) => [r.id, r.final, r.valid, r.rejected, r.cast, r.candidates.map((c) => [c.id, c.votes])])]);
+}
 
 /** One election file as the observation of `series` (and, from the same bytes, of the other series of its fetch group). */
 function electionObservation(series: ElectionSeriesId, snap: ElectionSnapshot, day: string, deciding: string, g: Extract<Got, { ok: true }>, raw_sha256: string, fetched_at: string): FetchedObservation {
@@ -221,12 +248,12 @@ function electionObservation(series: ElectionSeriesId, snap: ElectionSnapshot, d
   };
 }
 
-async function electionObserved(series: ElectionSeriesId, snap: ElectionSnapshot, day: string, deciding: string, g: Extract<Got, { ok: true }>, b: Budget): Promise<PrimaryResult> {
+async function electionObserved(series: ElectionSeriesId, snap: ElectionSnapshot, day: string, deciding: string, g: Extract<Got, { ok: true }>, b: Budget, confirm?: ConfirmRead): Promise<PrimaryResult> {
   const raw_sha256 = await sha256Hex(g.bytes);
   const fetched_at = new Date(b.now()).toISOString();
   const obs = electionObservation(series, snap, day, deciding, g, raw_sha256, fetched_at);
   const siblings = fetchGroupOf(series).slice(1).filter(isElectionSeries).map((s) => electionObservation(s, snap, day, deciding, g, raw_sha256, fetched_at));
-  return { kind: "observed", obs, siblings };
+  return { kind: "observed", obs, siblings, ...(confirm ? { confirm } : {}) };
 }
 
 /** A failed election GET: a 404 or a refusal (403/429) waits ELECTION_DEFER_S unless the source named its own wait. */
@@ -239,7 +266,8 @@ function electionFailed(g: Extract<Got, { ok: false }>): PrimaryResult {
  * The count an election series reads, recorded only once it is FINAL by the authority's own flags (a partial count is
  * "pending", never an observation). TSE: the configuration first (the election's id is known only from it), then the
  * scope's unified file built from it; Élections Québec: the one results file, accepted only when the authority stamped
- * it at or after polls close (the same URL served the simulation of 2026-09-20).
+ * it at or after polls close (the same URL served the simulation of 2026-09-20), and returned with a ConfirmRead: the
+ * capture records it only when a read at least EQ_STABLE_MS later shows the same counts.
  */
 async function fetchElection(series: ElectionSeriesId, target: string, b: Budget): Promise<PrimaryResult> {
   const def = ELECTION_SERIES[series];
@@ -254,7 +282,16 @@ async function fetchElection(series: ElectionSeriesId, target: string, b: Budget
       tseConfigMemo = { at: now, text: cfgText, url: cfg.url };
     }
     const c = parseTseConfig(cfgText, target);
-    if (!c.ok) return notFound(c);
+    if (!c.ok) {
+      const pending = notFound(c);
+      const known = knownRelease(series, target);
+      // still pending (nothing is guessed from another pleito), but the operator hears that the date never appeared
+      if (pending.kind === "pending" && tseConfigEnvironment(cfgText) === "o" && known && now >= Date.parse(known.release_at) + TSE_CONFIG_MISSING_ALERT_MS) {
+        const hours = Math.round((now - Date.parse(known.release_at)) / 3600_000);
+        return { ...pending, alert: { key: `official_tse_config_${target}`, dedupMinutes: TSE_CONFIG_ALERT_DEDUP_MIN, text: `TSE: the official results configuration (${TSE_CONFIG_URL}, f=o) still lists no President first-round election dated ${target}, ${hours} h after polls closed (${c.detail}). Every TSE leg stays pending; check the pleito date and layout of ele-c.json against src/ingest/election-parse.ts parseTseConfig.` } };
+      }
+      return pending;
+    }
     if (c.snap.environment !== "o") return { kind: "pending", detail: `the TSE configuration is the ${c.snap.environment === "s" ? "simulation" : c.snap.environment} environment` };
     const url = tseResultUrl(c.snap, def.scope);
     const g = await officialGet(series, url, b, "application/json");
@@ -278,7 +315,8 @@ async function fetchElection(series: ElectionSeriesId, target: string, b: Budget
   const nf = eqNotFinal(s);
   if (nf.length) return { kind: "pending", detail: `Élections Québec count not final (as of ${s.as_of}): ${nf.join("; ")}` };
   const deciding = `Élections Québec general election results for election day ${target}: isResultatsFinaux true; ${s.ridings_with_result} of ${s.ridings_total} ridings, ${s.polls_done} of ${s.polls_total} polling stations; updated ${s.as_of}; ${s.valid} valid votes, ${s.cast} votes cast, ${s.registered} registered electors. ${DGEQ_ATTRIBUTION}`;
-  return electionObserved(series, s, target, deciding, g, b);
+  // one final-flagged read never locks the first print: the capture waits for the same counts on a read 10 min later
+  return electionObserved(series, s, target, deciding, g, b, { fingerprint: await sha256Hex(eqCountsKey(s)), as_of: s.as_of });
 }
 
 /** One attempt at the primary source of `series` for the target period. Requests are counted in `b`. */

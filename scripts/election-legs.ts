@@ -16,10 +16,13 @@
  * Outputs: private/shadow-markets/election-legs-2026-09-28.json (every leg, built or refused, with reasons) and
  * private/shadow-markets/seed-election-polymarket-2026-09-28.json (scripts/seed-shadow.ts format: approved only for legs of a
  * decidable event type at or under the $50k cap; the others approved:false with the reason; refused legs listed in the header).
+ * A leg whose text settles on "a consensus of credible reporting" (the authority only if there is ambiguity) carries
+ * "criteria_basis": "consensus_reporting" in both files; scripts/seed-shadow.ts holds those back unless the founder passes
+ * --accept-consensus-reading. Nothing is written when two Polymarket events would share one event key (eventKeyProblems).
  */
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, existsSync } from "node:fs";
 import { dirname, resolve, basename } from "node:path";
-import { buildElectionLeg, eqRegistryFromCandidatures, tseRegistryFromSnapshot, type ElectionEventInput, type Registries, type TseRegistry } from "../src/markets/election-legs";
+import { buildElectionLeg, eqRegistryFromCandidatures, tseRegistryFromSnapshot, eventKeyProblems, criteriaBasis, type ElectionEventInput, type Registries, type TseRegistry } from "../src/markets/election-legs";
 import { ELECTION_SERIES, electionEvent, normName, QC_RIDINGS, BR_UF_NAMES, type ElectionSeriesId } from "../src/resolve/election";
 import { knownRelease } from "../src/resolve/official";
 import { parseTseResult } from "../src/ingest/election-parse";
@@ -162,7 +165,7 @@ async function loadRegistries(): Promise<{ reg: Registries; notes: string[] }> {
 
 type Obj = Record<string, unknown>;
 const iso = (v: unknown) => { const t = typeof v === "string" ? Date.parse(v) : NaN; return Number.isFinite(t) ? new Date(t).toISOString() : undefined; };
-interface Entry { market: MarketRegistration; meta: Obj; volume_usd: number; approved: boolean; reason?: string; event_type: string; event_key: string }
+interface Entry { market: MarketRegistration; meta: Obj; volume_usd: number; approved: boolean; reason?: string; event_type: string; event_key: string; criteria_basis?: "consensus_reporting" }
 interface Refused { event_id: string; event_slug: string; event_type: string; leg_id: string; label: string | null; volume_usd: number; reason: string }
 
 async function main() {
@@ -172,7 +175,7 @@ async function main() {
   const refused: Refused[] = [];
   const types = new Map<string, { type: string; decidable: boolean; reason?: string; events: Set<string>; legs: number; built: number; approved: number }>();
   const typeRow = (type: string, decidable: boolean, reason?: string) => { if (!types.has(type)) types.set(type, { type, decidable, reason, events: new Set(), legs: 0, built: 0, approved: 0 }); return types.get(type)!; };
-  const keysByEvent = new Map<string, Set<string>>();
+  const eventKeys: Array<{ event_id: string; event_key: string }> = [];
 
   for (const { slug, event } of events) {
     const c = classify(slug, event);
@@ -197,35 +200,34 @@ async function main() {
       const refuse = (reason: string) => refused.push({ event_id: eventId, event_slug: slug, event_type: c.type, leg_id: String(m.id), label, volume_usd: volume, reason });
       const open_at = iso(m.startDate ?? m.createdAt ?? event.startDate), deadline = iso(m.endDate ?? event.endDate);
       if (!open_at || !deadline) { refuse("no start or end time on the platform object"); continue; }
-      const b = buildElectionLeg(ev, { external_id: String(m.id), label, open_at, deadline_utc: deadline, criteria: String(m.description ?? event.description ?? "") }, reg);
+      const legCriteria = String(m.description ?? event.description ?? "");
+      const b = buildElectionLeg(ev, { external_id: String(m.id), label, open_at, deadline_utc: deadline, criteria: legCriteria }, reg);
       if (!b.ok) { refuse(b.reason); continue; }
       try { validateRegistration(b.market); } catch (e) { refuse(String(e).slice(0, 400)); continue; }
       const meta: Obj = { condition_id: String(m.conditionId ?? "").toLowerCase(), slug: m.slug ?? null, event_id: eventId, category: "election_result" };
       if (typeof m.questionID === "string" && /^0x[0-9a-fA-F]{64}$/.test(m.questionID)) meta.question_id = m.questionID.toLowerCase();
       if (typeof m.negRisk === "boolean") meta.neg_risk = m.negRisk;
       const key = eventKey({ platform: "polymarket", external_id: String(m.id), resolver: b.market.resolver, meta });
-      (keysByEvent.get(eventId) ?? keysByEvent.set(eventId, new Set()).get(eventId)!).add(key);
+      eventKeys.push({ event_id: eventId, event_key: key });
       const over = volume > SHADOW_VOLUME_CAP_USD;
       row.built++; if (!over) row.approved++;
-      entries.push({ market: b.market, meta, volume_usd: volume, approved: !over, ...(over ? { reason: `volume $${volume.toFixed(2)} is over the $${SHADOW_VOLUME_CAP_USD} shadow cap` } : {}), event_type: c.type, event_key: key });
+      // a text that settles on "a consensus of credible reporting" is marked, never decided here (seed-shadow holds it back)
+      const basis = criteriaBasis(legCriteria);
+      entries.push({ market: b.market, meta, volume_usd: volume, approved: !over, ...(over ? { reason: `volume $${volume.toFixed(2)} is over the $${SHADOW_VOLUME_CAP_USD} shadow cap` } : {}), event_type: c.type, event_key: key, ...(basis ? { criteria_basis: basis } : {}) });
     }
   }
 
-  // every Polymarket event is its own public event key, and no key is shared by two events
-  const owner = new Map<string, string>();
-  for (const [ev, keys] of keysByEvent) {
-    if (keys.size !== 1) throw new Error(`event ${ev} maps to ${keys.size} event keys: ${[...keys].join(", ")}`);
-    const k = [...keys][0]!;
-    if (owner.has(k)) throw new Error(`event key ${k} is shared by events ${owner.get(k)} and ${ev}`);
-    owner.set(k, ev);
-  }
+  // every Polymarket event is its own public event key, and no key is shared by two events: nothing is written otherwise
+  const keyProblems = eventKeyProblems(eventKeys);
+  if (keyProblems.length) throw new Error(`event keys: ${keyProblems.join("; ")}`);
 
   const now = new Date().toISOString();
   const typeRows = [...types.values()].map((t) => ({ type: t.type, decidable: t.decidable, ...(t.reason ? { reason: t.reason } : {}), events: t.events.size, legs: t.legs, legs_built: t.built, legs_approved: t.approved }));
   const counts = {
     events: new Set([...types.values()].flatMap((t) => [...t.events])).size,
-    events_with_built_legs: keysByEvent.size, legs: entries.length + refused.length, legs_built: entries.length,
+    events_with_built_legs: new Set(eventKeys.map((k) => k.event_id)).size, legs: entries.length + refused.length, legs_built: entries.length,
     legs_approved: entries.filter((e) => e.approved).length, legs_over_cap: entries.filter((e) => !e.approved).length, legs_refused: refused.length,
+    legs_consensus_reporting: entries.filter((e) => e.criteria_basis === "consensus_reporting").length,
   };
   const doc = { generated_at: now, private: "Copies Polymarket market texts: keep under the gitignored private/ folder only.", sources, registries: { eq: { source_url: reg.eq!.source_url, fetched_at: reg.eq!.fetched_at, candidates: reg.eq!.candidates.length, parties: reg.eq!.parties.length }, tse: reg.tse ? { source_url: reg.tse.source_url, fetched_at: reg.tse.fetched_at, candidates: reg.tse.candidates.length } : null }, counts, event_types: typeRows, notes, entries, refused };
   mkdirSync(dirname(OUT), { recursive: true });
@@ -235,24 +237,25 @@ async function main() {
     header: {
       platform: "polymarket", generated_at: now, source_url: OUT,
       filters: { resolver: "official_release", category: "election_result", series: [...new Set(entries.map((e) => (e.market.resolver as { series: string }).series))].sort() },
-      counts: { entries: entries.length, approved: counts.legs_approved, over_cap: counts.legs_over_cap, refused_legs: refused.length },
+      counts: { entries: entries.length, approved: counts.legs_approved, over_cap: counts.legs_over_cap, refused_legs: refused.length, consensus_reporting: counts.legs_consensus_reporting },
       needs_founder_approval: false,
       approval_basis: "structured election legs (official_release election series, src/resolve/election.ts): approved only when the event type is decidable from the authority's final count and the leg's volume is at or under the $50k shadow cap",
       requires: [
         "the Worker built from feat/election-rail deployed (the election series, the election_exact rounding and the election resolver field); migrations 016 and 017 applied (no new migration)",
-        "a founder-visible access test before 2026-10-04: one read-only GET from the deployed Worker to https://resultados.tse.jus.br/oficial/comum/config/ele-c.json and to https://donnees.electionsquebec.qc.ca/production/provincial/candidatures/candidatures.json (UNVERIFIED: the TSE hosts answered 403 to this machine; a refused Worker leaves the TSE legs pending, never resolved)",
+        "a founder-visible access test before 2026-10-04: POST /internal/official/probe {\"group\":\"elections\"} on the deployed Worker, which GETs https://resultados.tse.jus.br/oficial/comum/config/ele-c.json and https://donnees.electionsquebec.qc.ca/production/provincial/resultats/resultats.json, the rail's own first requests (UNVERIFIED: the TSE hosts answered 403 to this machine; a refused Worker leaves the TSE legs pending, never resolved)",
         "Élections Québec's licence: its attribution notice must be shown at all times wherever the data is used (the rail puts it in every Quebec observation's deciding text; the channel and public pages are the founder's call)",
+        "a founder policy decision on entries marked criteria_basis consensus_reporting (the market settles on a consensus of credible reporting and turns to the authority only if there is ambiguity, while the rail reads the authority's final count): scripts/seed-shadow.ts holds every such entry back, in --check and in real runs, unless --accept-consensus-reading is passed",
       ],
       refused_legs: refused,
       event_types: typeRows,
     },
-    entries: entries.map((e) => ({ approved: e.approved, needs_review: [], volume_usd: e.volume_usd, ...(e.reason ? { reason: e.reason } : {}), event_type: e.event_type, event_key: e.event_key, registration: { market: e.market, meta: e.meta, is_test: false } })),
+    entries: entries.map((e) => ({ approved: e.approved, needs_review: [], volume_usd: e.volume_usd, ...(e.reason ? { reason: e.reason } : {}), event_type: e.event_type, event_key: e.event_key, ...(e.criteria_basis ? { criteria_basis: e.criteria_basis } : {}), registration: { market: e.market, meta: e.meta, is_test: false } })),
   };
   const check = checkCandidateFile(seed, new Date());
   if (check.fileErrors.length || check.approvedInvalid) throw new Error(`seed file fails seed-shadow --check: ${[...check.fileErrors, ...check.entries.filter((x) => x.approved && x.errors.length).map((x) => `#${x.index} ${x.external_id}: ${x.errors.join("; ")}`)].slice(0, 5).join(" | ")}`);
   writeFileSync(SEED_OUT, JSON.stringify(seed, null, 1) + "\n");
 
-  console.log(`election legs: events=${counts.events} legs=${counts.legs} built=${counts.legs_built} approved=${counts.legs_approved} over_cap=${counts.legs_over_cap} refused=${counts.legs_refused}`);
+  console.log(`election legs: events=${counts.events} legs=${counts.legs} built=${counts.legs_built} approved=${counts.legs_approved} over_cap=${counts.legs_over_cap} refused=${counts.legs_refused} consensus_reporting=${counts.legs_consensus_reporting}`);
   for (const t of typeRows) console.log(`  ${t.decidable ? "decidable" : "REFUSED  "} ${t.type.padEnd(30)} events=${t.events} legs=${t.legs} built=${t.legs_built} approved=${t.legs_approved}${t.reason ? ` :: ${t.reason.slice(0, 90)}` : ""}`);
   const why = new Map<string, number>();
   for (const r of refused) { const k = r.reason.startsWith("no TSE candidate registry") ? "no TSE candidate registry (TSE 403)" : r.reason.startsWith("event type not registered") ? `type not registered: ${r.event_type}` : r.reason.slice(0, 110); why.set(k, (why.get(k) ?? 0) + 1); }

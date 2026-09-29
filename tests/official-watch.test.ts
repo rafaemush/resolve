@@ -14,16 +14,18 @@ const h = vi.hoisted(() => {
   const state = {
     watch: {} as Row, evidence: [] as Row[], resolutions: [] as Row[], loopRuns: [] as Row[],
     obs: new Map<string, Row>(), slots: new Map<string, number>(), extends: [] as number[], hideObsFromSelect: false, nowMs: undefined as number | undefined, rpcCalls: [] as string[], seq: 0, obsReads: [] as string[],
+    appConfig: new Map<string, string>(),
   };
   const now = () => state.nowMs ?? Date.now();
   class Q implements PromiseLike<{ data: unknown; error: unknown; count?: number }> {
-    action: "select" | "insert" | "update" = "select";
+    action: "select" | "insert" | "update" | "upsert" = "select";
     payload: Row | undefined;
     filters: Array<[string, unknown]> = [];
     constructor(private table: string) {}
     select() { return this; }
     insert(p: Row) { this.action = "insert"; this.payload = p; return this; }
     update(p: Row) { this.action = "update"; this.payload = p; return this; }
+    upsert(p: Row) { this.action = "upsert"; this.payload = p; return this; }
     eq(c: string, v: unknown) { this.filters.push([c, v]); return this; }
     in(c: string, v: unknown[]) { this.filters.push([c, v]); return this; }
     gte() { return this; }
@@ -38,6 +40,11 @@ const h = vi.hoisted(() => {
       if (t === "watches" && this.action === "select") return { data: structuredClone(state.watch), error: null };
       if (t === "watches" && this.action === "update") { Object.assign(state.watch, structuredClone(this.payload)); return { data: null, error: null }; }
       if (t === "loop_runs") { state.loopRuns.push(this.payload!); return { data: null, error: null }; }
+      if (t === "app_config" && this.action === "upsert") { state.appConfig.set(String(this.payload!.key), String(this.payload!.value)); return { data: null, error: null }; }
+      if (t === "app_config" && this.action === "select") {
+        const key = String(Object.fromEntries(this.filters).key);
+        return { data: state.appConfig.has(key) ? { value: state.appConfig.get(key) } : null, error: null };
+      }
       if (t === "official_observations") {
         const f = Object.fromEntries(this.filters) as { series: string | string[]; period: string };
         state.obsReads.push(Array.isArray(f.series) ? f.series.join(",") : f.series);
@@ -102,7 +109,10 @@ vi.mock("../src/resolve/runtime", async () => {
 
 import { runWatch } from "../src/ingest/watch";
 import { fetchOfficial, officialIdleNextPoll, inReleaseMinute, BURST_MAX_REQUESTS, BURST_WINDOW_MS } from "../src/ingest/official-watch";
-import { fetchPrimary, officialGet, budget, OFFICIAL_UA } from "../src/ingest/official";
+import { fetchPrimary, officialGet, budget, OFFICIAL_UA, __resetElectionMemo } from "../src/ingest/official";
+import { buildElectionLeg, eqRegistryFromSnapshot, type ElectionEventInput } from "../src/markets/election-legs";
+import { parseEqResults } from "../src/ingest/election-parse";
+import { TSE_CONFIG_URL, EQ_RESULTS_URL } from "../src/resolve/official";
 import { alert } from "../src/ops/alerts";
 import type { MarketRow, WatchRow } from "../src/ingest/types";
 import { buildLegRegistration } from "../src/markets/official-legs";
@@ -162,7 +172,8 @@ function clock(startIso: string) {
 }
 
 beforeEach(() => {
-  Object.assign(h.state, { evidence: [], resolutions: [], loopRuns: [], obs: new Map(), slots: new Map(), extends: [], hideObsFromSelect: false, nowMs: undefined, rpcCalls: [], seq: 0, obsReads: [] });
+  Object.assign(h.state, { evidence: [], resolutions: [], loopRuns: [], obs: new Map(), slots: new Map(), extends: [], hideObsFromSelect: false, nowMs: undefined, rpcCalls: [], seq: 0, obsReads: [], appConfig: new Map() });
+  __resetElectionMemo();
   put = vi.fn(async () => ({}));
   vi.mocked(alert).mockClear();
 });
@@ -773,3 +784,104 @@ describe("a first print first seen after the market's fallback", () => {
   });
 });
 
+
+// ---- election captures -------------------------------------------------------------------------------------------------
+
+function electionMarket(ev: ElectionEventInput, label: string, reg: Parameters<typeof buildElectionLeg>[2] = {}): MarketRow {
+  const b = buildElectionLeg(ev, { external_id: `leg-${ev.series}-${label}`, label, open_at: "2026-09-01T00:00:00Z", deadline_utc: "2027-06-30T23:59:00Z" }, reg);
+  if (!b.ok) throw new Error(b.reason);
+  return { ...b.market, id: MARKET_ID, tenant_id: null, status: "open", official_outcome: null, official_resolved_at: null, official_source_url: null };
+}
+const TIE = "If the reported value falls exactly between two brackets, this market will resolve to the higher bracket.";
+const tseTurnout = () => electionMarket({ series: "br_pres_r1_turnout", period: "2026-10-04", release_at: "2026-10-04T20:00:00Z", title: "Brazil turnout", criteria: TIE, labels: ["75-80%"] }, "75-80%");
+// SYNTHETIC: the Élections Québec 2022 archive (final, every riding) stamped after the 2026 polls closed
+const EQ_2026 = fx("eq_gen2022_resultats.json").replace('"iso8601DateMAJ": "2022-10-06T11:55:41,000-04:00"', '"iso8601DateMAJ": "2026-10-05T23:30:00,000-04:00"');
+/** SYNTHETIC: one vote moved from St-Hilaire (CAQ) to Robin (PQ) in Taschereau: every total unchanged, the counts differ. */
+function eqMoved(body: string): string {
+  const edit = (id: number, from: number, to: number) => (b: string) => {
+    const at = b.indexOf(`"numeroCandidat": ${id},`);
+    const end = b.indexOf(`"nbVoteTotal": ${from}`, at);
+    if (at < 0 || end < 0) throw new Error(`candidate ${id}`);
+    return b.slice(0, end) + `"nbVoteTotal": ${to}` + b.slice(end + `"nbVoteTotal": ${from}`.length);
+  };
+  return edit(2311, 7537, 7536)(edit(2467, 7757, 7758)(body));
+}
+function eqSeatsCaq(): MarketRow {
+  const p = parseEqResults(EQ_2026);
+  if (!p.ok) throw new Error(p.detail);
+  const eq = eqRegistryFromSnapshot(p.snap, EQ_RESULTS_URL, "2026-09-27T22:51:18Z");
+  return electionMarket({ series: "qc_seats_caq", period: "2026-10-05", release_at: "2026-10-06T00:00:00Z", title: "CAQ seats", criteria: "Seats won by the CAQ.", labels: ["80+"], party: "Coalition Avenir Québec" }, "80+", { eq });
+}
+const CONFIRM_KEY = "official_confirm:eq_general:2026-10-05";
+
+describe("election captures", () => {
+  it("TSE: an official configuration that still lists no President first round 6 h after polls close keeps the legs pending and alerts the operator", async () => {
+    const m = tseTurnout();
+    setWatch(m);
+    serve((url) => (url === TSE_CONFIG_URL ? ok(fx("tse_2022_config_ele-c_20221004T163421Z.json"), "application/json") : new Response("", { status: 404 })));
+    // 5 h after polls close (20:00Z): pending, nothing alerted yet
+    const early = await fetchOfficial(env(), watchRow(), m, clock("2026-10-05T01:00:00Z").deps);
+    expect(early).toMatchObject({ notModified: true });
+    expect(early.note).toContain("lists no President first-round election dated 04/10/2026");
+    expect(alertKeys()).toEqual([]);
+    // 6 h 5 min after: still pending (never a guess from the 2022 pleito), and the operator hears it once per 6 h
+    __resetElectionMemo();
+    const late = await fetchOfficial(env(), watchRow(), m, clock("2026-10-05T02:05:00Z").deps);
+    expect(late).toMatchObject({ notModified: true });
+    expect(late.evidence).toBeUndefined();
+    expect(alertKeys()).toEqual([["official_tse_config_2026-10-04", 360]]);
+    expect(String(vi.mocked(alert).mock.calls[0]![2])).toContain("still lists no President first-round election dated 2026-10-04, 6 h after polls closed");
+    expect(calls.map((x) => x.url)).toEqual([TSE_CONFIG_URL, TSE_CONFIG_URL]); // the configuration only: no result URL is guessed
+    expect(h.state.obs.size).toBe(0);
+  });
+
+  it("TSE: the simulation configuration (f=s) without the election day never raises that alert", async () => {
+    const m = tseTurnout();
+    setWatch(m);
+    serve((url) => (url === TSE_CONFIG_URL ? ok(fx("tse_sim2026_config_ele-c.json"), "application/json") : new Response("", { status: 404 })));
+    const out = await fetchOfficial(env(), watchRow(), m, clock("2026-10-05T03:00:00Z").deps);
+    expect(out).toMatchObject({ notModified: true });
+    expect(alertKeys()).toEqual([]);
+  });
+
+  it("Élections Québec: a final count is recorded only when a read at least 10 min after the first shows the same counts; the first read is kept in the database, not the isolate", async () => {
+    const m = eqSeatsCaq();
+    setWatch(m);
+    serve((url) => (url === EQ_RESULTS_URL ? ok(EQ_2026, "application/json") : new Response("", { status: 404 })));
+    const first = await fetchOfficial(env(), watchRow(), m, clock("2026-10-06T03:40:00Z").deps);
+    expect(first).toMatchObject({ notModified: true });
+    expect(first.note).toContain("first read of this final count");
+    expect(h.state.obs.size).toBe(0);
+    expect(JSON.parse(h.state.appConfig.get(CONFIRM_KEY)!)).toMatchObject({ first_read_at: "2026-10-06T03:40:00.000Z", as_of: "2026-10-05T23:30:00.000-04:00" });
+    // 5 min later, another isolate (module state reset): the same counts, but not yet 10 min after the first read
+    __resetElectionMemo();
+    const second = await fetchOfficial(env(), watchRow(), m, clock("2026-10-06T03:45:00Z").deps);
+    expect(second.note).toContain("was first read at 2026-10-06T03:40:00.000Z");
+    expect(h.state.obs.size).toBe(0);
+    // 10 min after the first read: the same counts again, so the first print is recorded, naming the first read
+    __resetElectionMemo();
+    const third = await fetchOfficial(env(), watchRow(), m, clock("2026-10-06T03:50:00Z").deps);
+    expect(third.evidence!.structured).toMatchObject({ kind: "official_observation", series: "qc_seats_caq", period: "2026-10-05" });
+    expect(h.state.obs.get("qc_seats_caq|2026-10-05")!.meta).toMatchObject({ first_final_read_at: "2026-10-06T03:40:00.000Z", counts_sha256: expect.stringMatching(/^[0-9a-f]{64}$/) });
+    expect(calls.filter((x) => x.url === EQ_RESULTS_URL)).toHaveLength(3);
+  });
+
+  it("Élections Québec: counts that change between two final reads start the 10 min again", async () => {
+    const m = eqSeatsCaq();
+    setWatch(m);
+    let body = EQ_2026;
+    serve((url) => (url === EQ_RESULTS_URL ? ok(body, "application/json") : new Response("", { status: 404 })));
+    await fetchOfficial(env(), watchRow(), m, clock("2026-10-06T03:40:00Z").deps);
+    body = eqMoved(EQ_2026);
+    const moved = await fetchOfficial(env(), watchRow(), m, clock("2026-10-06T03:45:00Z").deps);
+    expect(moved.note).toContain("the counts differ from the read kept at 2026-10-06T03:40:00.000Z");
+    expect(JSON.parse(h.state.appConfig.get(CONFIRM_KEY)!).first_read_at).toBe("2026-10-06T03:45:00.000Z");
+    // 11 min after the first read but 6 after the change: still pending
+    const early = await fetchOfficial(env(), watchRow(), m, clock("2026-10-06T03:51:00Z").deps);
+    expect(early.note).toContain("was first read at 2026-10-06T03:45:00.000Z");
+    expect(h.state.obs.size).toBe(0);
+    const done = await fetchOfficial(env(), watchRow(), m, clock("2026-10-06T03:55:00Z").deps);
+    expect(done.evidence).toBeDefined();
+    expect(h.state.obs.get("qc_seats_caq|2026-10-05")!.meta).toMatchObject({ first_final_read_at: "2026-10-06T03:45:00.000Z" });
+  });
+});

@@ -1,7 +1,8 @@
 /**
  * Election series of the official_release rail: TSE and Élections Québec parsers on the saved files
  * (evals/fixtures/official/), result URLs built only from the configuration, the finality and integrity checks, the
- * event keys (one per platform event), and the registration rules. The resolve paths are covered by the frozen cases
+ * event keys (one per platform event: two events on one key are refused), the TSE label mapper (exact names or a
+ * curated table, never a word subset), the criteria basis mark, and the registration rules. The resolve paths are covered by the frozen cases
  * in evals/official.ts (groups election_final, election_margin, election_mapping).
  */
 import { describe, expect, it } from "vitest";
@@ -10,6 +11,8 @@ import { parseTseConfig, parseTseResult, parseEqResults, tseResultUrl, eqIso, vo
 import { ELECTION_SERIES, tseNotFinal, tseIntegrity, eqNotFinal, eqIntegrity, electionRegistrationIssues, normName, namesAgree } from "../src/resolve/election";
 import { KNOWN_RELEASES, OFFICIAL_SERIES, fetchGroupOf } from "../src/resolve/official";
 import { ElectionSeries } from "../src/resolve/schema";
+import { buildElectionLeg, criteriaBasis, eqRegistryFromSnapshot, eventKeyProblems, mapTseCandidate, tseRegistryFromSnapshot, TSE_LABEL_NUMBERS, type TseRegistry } from "../src/markets/election-legs";
+import { eventKey } from "../src/markets/event-key";
 
 describe("TSE configuration and URLs", () => {
   it("finds the President first round of the 2026 simulation (its pleito is dated 26/04/2026) and builds the unified file URL from it", () => {
@@ -80,18 +83,33 @@ describe("Élections Québec results", () => {
 });
 
 describe("registry and event keys", () => {
-  it("every election series is registered with a known release at polls close and its own event key", () => {
-    const keys = new Set<string>();
+  it("every election series is registered with a known release at polls close", () => {
     for (const s of ElectionSeries.options) {
       const d = ELECTION_SERIES[s];
       expect(d).toBeDefined();
       const day = d.authority === "tse" ? "2026-10-04" : "2026-10-05";
       expect(KNOWN_RELEASES[`${s}:${day}`]?.release_at).toBe(d.authority === "tse" ? "2026-10-04T20:00:00Z" : "2026-10-06T00:00:00Z");
       expect(OFFICIAL_SERIES[s].decides).toBe("election");
-      keys.add(`official:${s}:${day}`);
     }
-    expect(keys.size).toBe(ElectionSeries.options.length);
-    expect(ELECTION_SERIES.qc_pq_majority.id).not.toBe(ELECTION_SERIES.qc_seats_pq.id);
+  });
+  it("two distinct Polymarket events read as the same series and day collide on one event key, and the leg file refuses it", () => {
+    // legs built by the production builder, keys by the production eventKey (the leg file's own path)
+    const p = parseEqResults(fx("eq_gen2022_resultats.json"));
+    if (!p.ok) throw new Error(p.detail);
+    const reg = { eq: eqRegistryFromSnapshot(p.snap, "https://donnees.electionsquebec.qc.ca/production/provincial/resultats/resultats.json", "2026-09-27T22:51:18Z") };
+    const row = (series: "qc_seats_caq" | "qc_seats_plq", party: string, eventId: string, legId: string) => {
+      const b = buildElectionLeg({ series, period: "2026-10-05", release_at: "2026-10-06T00:00:00Z", title: `Seats (${eventId})`, criteria: "Seats won.", labels: ["20+"], party }, { external_id: legId, label: "20+", open_at: "2026-09-01T00:00:00Z", deadline_utc: "2027-01-31T23:59:00Z" }, reg);
+      if (!b.ok) throw new Error(b.reason);
+      return { event_id: eventId, event_key: eventKey({ platform: "polymarket", external_id: legId, resolver: b.market.resolver, meta: { event_id: eventId } }) };
+    };
+    const caq = row("qc_seats_caq", "Coalition Avenir Québec", "101", "1001");
+    const relisted = row("qc_seats_caq", "Coalition Avenir Québec", "202", "2002"); // a relisted copy of the same event
+    const plq = row("qc_seats_plq", "Parti libéral du Québec", "303", "3003");
+    expect(caq.event_key).toBe(relisted.event_key); // the real collision
+    expect(eventKeyProblems([caq, relisted, plq])).toEqual(["event key official:qc_seats_caq:2026-10-05 is shared by events 101 and 202"]);
+    expect(eventKeyProblems([caq, plq, { ...caq, event_id: "101" }])).toEqual([]);
+    // and one event whose legs land on two keys is refused too
+    expect(eventKeyProblems([caq, { ...plq, event_id: "101" }])).toEqual(["event 101 maps to 2 event keys: official:qc_seats_caq:2026-10-05, official:qc_seats_plq:2026-10-05"]);
   });
   it("one fetch serves every series of the national TSE file and of the Québec file", () => {
     expect(fetchGroupOf("br_pres_r1_winner")).toContain("br_pres_r1_turnout");
@@ -108,5 +126,74 @@ describe("registry and event keys", () => {
     const issues = electionRegistrationIssues({ ...base, bucket: { label: "x", lo: 2, hi: 2, lo_inclusive: true, hi_inclusive: true }, election: { subject: { id: "13", name: "LULA" } } });
     expect(issues.join(" ")).toContain("election.listed");
     expect(issues.join(" ")).toContain("place 3");
+  });
+});
+
+describe("TSE label mapping: exact ballot or civil name, or the curated table; never a word subset", () => {
+  const reg2022 = (() => {
+    const p = parseTseResult(fx("tse_2022_br_c0001_e000544_r_20221004T163422Z.json"), "2022-10-02");
+    if (!p.ok) throw new Error(p.detail);
+    return tseRegistryFromSnapshot(p.snap, "https://resultados.tse.jus.br/oficial/ele2022/544/dados-simplificados/br/br-c0001-e000544-r.json", "2022-10-04T16:34:22Z");
+  })();
+  // SYNTHETIC registry: names shaped like the 2026 events' labels, ballot numbers invented (no 2026 TSE list was observed)
+  const synth: TseRegistry = {
+    source_url: "https://resultados.tse.jus.br/oficial/ele2026/0/dados/br/br-c0001-e000000-u.json", fetched_at: "2026-10-04T21:00:00Z", election_day: "2026-10-04",
+    candidates: [
+      { id: "901", name: "FLÁVIO BOLSONARO", full_name: "FLÁVIO NANTES BOLSONARO" },
+      { id: "902", name: "ESCRITOR AUGUSTO CURY", full_name: "AUGUSTO JORGE CURY" },
+      { id: "903", name: "JOSÉ SILVA", full_name: null },
+      { id: "904", name: "JOSE SILVA", full_name: null },
+    ],
+  };
+  const id = (r: ReturnType<typeof mapTseCandidate>) => (r.ok ? r.subject.id : `refused: ${r.reason}`);
+
+  it("maps exact ballot names and civil names, case and accents ignored", () => {
+    expect(id(mapTseCandidate("Lula", reg2022))).toBe("13");
+    expect(id(mapTseCandidate("ciro GOMES", reg2022))).toBe("12");
+    expect(id(mapTseCandidate("Flavio Bolsonaro", synth))).toBe("901");
+    expect(id(mapTseCandidate("Flávio Nantes Bolsonaro", synth))).toBe("901");
+  });
+  it("refuses a label that only shares words with a candidate (a surname, or part of a ballot name)", () => {
+    const bolsonaro = mapTseCandidate("Bolsonaro", reg2022);
+    expect(bolsonaro).toMatchObject({ ok: false, partial: true });
+    if (!bolsonaro.ok) expect(bolsonaro.reason).toContain("its words are within 22 JAIR BOLSONARO; a word-subset match is never accepted");
+    expect(mapTseCandidate("Bolsonaro", synth)).toMatchObject({ ok: false, partial: true });
+    expect(mapTseCandidate("Augusto Cury", synth)).toMatchObject({ ok: false, partial: true });
+  });
+  it("refuses an unmatched label (an off-ballot person who shares a surname is no match at all)", () => {
+    for (const l of ["Jair Bolsonaro", "Michelle Bolsonaro", "Tarcísio de Freitas"]) {
+      const r = mapTseCandidate(l, synth);
+      expect(r.ok).toBe(false);
+      if (!r.ok) { expect(r.reason).toContain("matches no TSE candidate"); expect(r.partial).toBeUndefined(); expect(r.unmatched).toBe(true); }
+    }
+  });
+  it("refuses an ambiguous label (two candidates with the same normalized name)", () => {
+    const r = mapTseCandidate("Jose Silva", synth);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toContain("ambiguous: it matches 903 JOSÉ SILVA and 904 JOSE SILVA");
+  });
+  it("maps a curated label to its ballot number only when the registry lists that number and no exact name contradicts it", () => {
+    expect(TSE_LABEL_NUMBERS["2026-10-04"]).toEqual({}); // no 2026 ballot number has been observed from the TSE
+    expect(id(mapTseCandidate("Augusto Cury", synth, { "augusto cury": "902" }))).toBe("902");
+    expect(id(mapTseCandidate("Augusto Cury", synth, { "augusto cury": "999" }))).toContain("curated as ballot number 999, which the TSE candidate of 2026-10-04");
+    expect(id(mapTseCandidate("Flavio Bolsonaro", synth, { "flavio bolsonaro": "902" }))).toContain("ambiguous: curated as ballot number 902 but it is the exact name of 901");
+  });
+  it("a rank event that names a candidate by some words only is refused as a whole (its named set is unknown)", () => {
+    const ev = { series: "br_pres_r1_winner" as const, period: "2026-10-04", release_at: "2026-10-04T20:00:00Z", title: "Winner", criteria: "Paraphrased rules.", labels: ["Flavio Bolsonaro", "Bolsonaro"] };
+    const b = buildElectionLeg(ev, { external_id: "1", label: "Flavio Bolsonaro", open_at: "2026-09-01T00:00:00Z", deadline_utc: "2027-06-30T23:59:00Z" }, { tse: synth });
+    expect(b.ok).toBe(false);
+    if (!b.ok) expect(b.reason).toContain("so the candidates it names are not known exactly");
+    const ok = buildElectionLeg({ ...ev, labels: ["Flavio Bolsonaro", "Jair Bolsonaro"] }, { external_id: "1", label: "Flavio Bolsonaro", open_at: "2026-09-01T00:00:00Z", deadline_utc: "2027-06-30T23:59:00Z" }, { tse: synth });
+    expect(ok.ok && (ok.market.resolver as { election?: { listed?: string[] } }).election?.listed).toEqual(["901"]);
+    // a curated entry the registry contradicts is a refusal of the event, never a silently shorter named set
+    const bad = mapTseCandidate("Augusto Cury", synth, { "augusto cury": "999" });
+    expect(bad.ok === false && bad.unmatched).toBeFalsy();
+  });
+});
+
+describe("criteria basis", () => {
+  it("marks a text that settles on a consensus of credible reporting (paraphrased), and nothing else", () => {
+    expect(criteriaBasis("<p>Resolves on a consensus of credible\nreporting; the official results decide only if there is ambiguity.</p>")).toBe("consensus_reporting");
+    expect(criteriaBasis("Resolves on the official turnout published by the electoral authority.")).toBeNull();
   });
 });

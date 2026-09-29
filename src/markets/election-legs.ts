@@ -1,9 +1,14 @@
 /**
  * Building election leg registrations (scripts/election-legs.ts). Pure. Every leg's subject is pinned to the
  * authority's own identifier at registration: a label is mapped against the authority's candidate or party list and a
- * label that does not map to exactly one entry is refused, never guessed. A label maps when its normalized text equals
- * an entry's name, or when every word of it is a word of the entry's name (ballot name or civil name; "Augusto Cury"
- * within "ESCRITOR AUGUSTO CURY", "Lula da Silva" within "LUIZ INÁCIO LULA DA SILVA"); both ways are pooled and more
+ * label that does not map to exactly one entry is refused, never guessed. A TSE candidate label maps only when its
+ * normalized text (case and accents ignored) equals the ballot name or the civil name, or through an entry of the
+ * curated table TSE_LABEL_NUMBERS (label -> ballot number, written by hand from the TSE's own list); a word-subset match
+ * is refused: the 2026 events list off-ballot people who share a surname with a candidate ("Jair Bolsonaro", "Michelle
+ * Bolsonaro" beside Flávio Bolsonaro), so "Bolsonaro" could pin a leg to the wrong person. A Québec candidate label
+ * (within one riding) maps on the exact name or when every word of a label of at least two words is a word of the name;
+ * a one-word label must match exactly. A party label
+ * maps on the exact name or abbreviation, or as words of either ("CAQ" within "ÉCF-CAQ"). Matches are pooled and more
  * than one entry is ambiguous ("PCQ" is both the Parti communiste du Québec's abbreviation and a word of the Parti
  * canadien du Québec's "PCQ/CPQ", while the Polymarket events mean the Parti conservateur, "PCOQ").
  *
@@ -57,7 +62,11 @@ export function eqRegistryFromSnapshot(s: EqSnapshot, source_url: string, fetche
 
 // ---- label mapping -------------------------------------------------------------------------------------------------
 
-export type MapResult = { ok: true; subject: ElectionSubject } | { ok: false; reason: string };
+/**
+ * A refusal. unmatched: the label names nobody on the list (an off-ballot person a rank event may list); partial: it
+ * matches some words of a name only. A rank event whose labels include any refusal but unmatched is refused as a whole.
+ */
+export type MapResult = { ok: true; subject: ElectionSubject } | { ok: false; reason: string; partial?: true; unmatched?: true };
 
 const within = (label: string, name: string | null | undefined): boolean => {
   if (!name) return false;
@@ -65,32 +74,104 @@ const within = (label: string, name: string | null | undefined): boolean => {
   const want = nameTokens(label);
   return want.length > 0 && want.every((t) => have.has(t));
 };
-function pick<T extends { id: string }>(label: string, pool: T[], names: (x: T) => Array<string | null | undefined>, what: string, show: (x: T) => string): { ok: true; hit: T } | { ok: false; reason: string } {
+/** subset: "multiword" (a label of two or more words may be a word subset of a name), "any" (any label may). */
+type Subset = "multiword" | "any";
+function pick<T extends { id: string }>(label: string, pool: T[], names: (x: T) => Array<string | null | undefined>, what: string, show: (x: T) => string, subset: Subset): { ok: true; hit: T } | { ok: false; reason: string } {
   const n = normName(label);
   if (!n) return { ok: false, reason: `empty label` };
+  const allowSubset = subset === "any" || (subset === "multiword" && nameTokens(label).length >= 2);
   const hits = new Map<string, T>();
-  for (const x of pool) if (names(x).some((m) => m && (normName(m) === n || within(label, m)))) hits.set(x.id, x);
+  for (const x of pool) if (names(x).some((m) => m && (normName(m) === n || (allowSubset && within(label, m))))) hits.set(x.id, x);
   if (hits.size === 1) return { ok: true, hit: [...hits.values()][0]! };
   if (!hits.size) return { ok: false, reason: `"${label}" matches no ${what}` };
   return { ok: false, reason: `"${label}" is ambiguous: it matches ${[...hits.values()].map(show).join(" and ")}` };
 }
 
-export function mapTseCandidate(label: string, reg: TseRegistry): MapResult {
-  const p = pick(label, reg.candidates, (c) => [c.name, c.full_name], `TSE candidate of ${reg.election_day} (${reg.source_url})`, (c) => `${c.id} ${c.name}`);
-  return p.ok ? { ok: true, subject: { id: p.hit.id, name: p.hit.name, ...(p.hit.full_name ? { full_name: p.hit.full_name } : {}) } } : p;
+/**
+ * Curated TSE labels, per election day: a platform label (normalized with normName) whose text is neither a candidate's
+ * ballot name nor civil name, mapped to the ballot number by hand after reading the TSE's own candidate list for that
+ * election (never a press report). The number must still be in the registry the leg is built against, and an entry
+ * that disagrees with an exact name match refuses the label. Empty for 2026-10-04: every TSE host answered 403 from the
+ * founder's machine (2026-09-27), so no 2026 ballot number was observed; add entries only with the TSE list in hand.
+ */
+export const TSE_LABEL_NUMBERS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
+  "2026-10-04": {},
+};
+
+const tseSubject = (c: TseRegistry["candidates"][number]): ElectionSubject => ({ id: c.id, name: c.name, ...(c.full_name ? { full_name: c.full_name } : {}) });
+
+/**
+ * A TSE candidate label: the exact (normalized) ballot or civil name of one candidate, or a curated entry for the
+ * registry's election day. Refused: no match, more than one, a curated number the registry does not list, a curated
+ * number that disagrees with an exact match, and a match on some of the words of a name only.
+ */
+export function mapTseCandidate(label: string, reg: TseRegistry, curated: Readonly<Record<string, string>> = TSE_LABEL_NUMBERS[reg.election_day] ?? {}): MapResult {
+  const what = `TSE candidate of ${reg.election_day} (${reg.source_url})`;
+  const n = normName(label);
+  if (!n) return { ok: false, reason: "empty label" };
+  const exact = reg.candidates.filter((c) => [c.name, c.full_name].some((m) => m && normName(m) === n));
+  const show = (xs: TseRegistry["candidates"]) => xs.map((c) => `${c.id} ${c.name}`).join(" and ");
+  if (exact.length > 1) return { ok: false, reason: `"${label}" is ambiguous: it matches ${show(exact)}` };
+  const number = Object.prototype.hasOwnProperty.call(curated, n) ? curated[n]! : null;
+  if (number !== null) {
+    const listed = reg.candidates.filter((c) => c.id === number);
+    if (listed.length !== 1) return { ok: false, reason: `"${label}" is curated as ballot number ${number}, which the ${what} lists ${listed.length ? "more than once" : "nowhere"}` };
+    if (exact.length && exact[0]!.id !== number) return { ok: false, reason: `"${label}" is ambiguous: curated as ballot number ${number} but it is the exact name of ${show(exact)}` };
+    return { ok: true, subject: tseSubject(listed[0]!) };
+  }
+  if (exact.length === 1) return { ok: true, subject: tseSubject(exact[0]!) };
+  const partial = reg.candidates.filter((c) => within(label, c.name) || within(label, c.full_name));
+  if (!partial.length) return { ok: false, unmatched: true, reason: `"${label}" matches no ${what} exactly` };
+  return { ok: false, partial: true, reason: `"${label}" matches no ${what} exactly (its words are within ${show(partial)}; a word-subset match is never accepted for TSE legs: add a curated entry to TSE_LABEL_NUMBERS from the TSE's list)` };
 }
 
 export function mapEqCandidate(label: string, riding: string, reg: EqRegistry): MapResult {
   const pool = reg.candidates.filter((c) => c.riding === riding);
   if (!pool.length) return { ok: false, reason: `riding ${riding} has no accepted candidacy in ${reg.source_url}` };
-  const p = pick(label, pool, (c) => [c.name], `accepted candidate of riding ${riding}`, (c) => `${c.id} ${c.name}`);
+  const p = pick(label, pool, (c) => [c.name], `accepted candidate of riding ${riding}`, (c) => `${c.id} ${c.name}`, "multiword");
   return p.ok ? { ok: true, subject: { id: p.hit.id, name: p.hit.name } } : p;
 }
 
 /** A party by abbreviation ("CAQ" within "ÉCF-CAQ") or by name ("Coalition Avenir Québec"). */
 export function mapEqParty(label: string, reg: EqRegistry): MapResult {
-  const p = pick(label, reg.parties, (x) => [x.abbr, x.name], "Élections Québec party", (x) => `${x.id} ${x.abbr} (${x.name})`);
+  const p = pick(label, reg.parties, (x) => [x.abbr, x.name], "Élections Québec party", (x) => `${x.id} ${x.abbr} (${x.name})`, "any");
   return p.ok ? { ok: true, subject: { id: p.hit.id, name: p.hit.name } } : p;
+}
+
+// ---- criteria basis ---------------------------------------------------------------------------------------------------
+
+/**
+ * What a leg's text says settles it, when that is not the authority alone. "consensus_reporting": the market resolves on
+ * "a consensus of credible reporting" and turns to the authority's official results only "if there is ambiguity" (the
+ * Polymarket Quebec events, and the Brazilian ones except turnout, as saved 2026-09-27). The rail reads the authority's
+ * final count either way; whether that reading may stand for such a market is a policy call, so the leg file marks
+ * these legs (criteria_basis) and scripts/seed-shadow.ts holds them back unless --accept-consensus-reading is given.
+ */
+export type CriteriaBasis = "consensus_reporting";
+export function criteriaBasis(text: string): CriteriaBasis | null {
+  return /\bconsensus\s+of\s+credible\s+reporting\b/i.test(strip(text)) ? "consensus_reporting" : null;
+}
+
+// ---- event keys -------------------------------------------------------------------------------------------------------
+
+/**
+ * markets.event_key counts and posts one platform event once (src/markets/event-key.ts). An election leg's key is
+ * official:<series>:<day>, so two distinct platform events read as the same series and day (a relisted copy such as
+ * "...-margin-of-victory" and "...-margin-of-victory-2") would share one key: one fact counted once while two events
+ * settle. Every event must have exactly one key and every key exactly one event. [] = consistent.
+ */
+export function eventKeyProblems(rows: Iterable<{ event_id: string; event_key: string }>): string[] {
+  const keysOf = new Map<string, Set<string>>(), eventsOf = new Map<string, Set<string>>();
+  for (const { event_id, event_key } of rows) {
+    if (!keysOf.has(event_id)) keysOf.set(event_id, new Set());
+    keysOf.get(event_id)!.add(event_key);
+    if (!eventsOf.has(event_key)) eventsOf.set(event_key, new Set());
+    eventsOf.get(event_key)!.add(event_id);
+  }
+  const out: string[] = [];
+  for (const [ev, keys] of keysOf) if (keys.size !== 1) out.push(`event ${ev} maps to ${keys.size} event keys: ${[...keys].sort().join(", ")}`);
+  for (const [key, evs] of eventsOf) if (evs.size !== 1) out.push(`event key ${key} is shared by events ${[...evs].sort().join(" and ")}`);
+  return out;
 }
 
 // ---- buckets ---------------------------------------------------------------------------------------------------------
@@ -174,7 +255,9 @@ export function buildElectionLeg(ev: ElectionEventInput, leg: ElectionLegSpec, r
         if (!l) continue;
         const m = mapTseCandidate(l, t);
         if (m.ok) { if (!listed.includes(m.subject.id)) listed.push(m.subject.id); }
-        else if (m.reason.includes("ambiguous")) return { ok: false, reason: `the event's label ${m.reason}, so the candidates it names are not known exactly` };
+        // only a label that names nobody on the TSE's list is left out; an ambiguous one, one that names a candidate by some
+        // words only, or a curated entry the registry contradicts leaves the named set unknown
+        else if (!m.unmatched) return { ok: false, reason: `the event's label ${m.reason}, so the candidates it names are not known exactly` };
       }
       bucket = { label, lo: def.rank!, hi: def.rank!, lo_inclusive: true, hi_inclusive: true };
       election = { subject: s.subject, listed };
