@@ -311,6 +311,12 @@ describe("Élections Québec completeness: every riding of the election, each on
     expect(d).toMatchObject(pending("totals_inconsistent"));
     expect(d.detail).toContain("the file states 125 ridings; the election has 127");
   });
+  it("a leg of an election day the rail has no riding count for never decides: the file's own count is not a substitute", () => {
+    const d = decide("qc_seats_caq", "80+", eqSnap(), { party: "Coalition Avenir Québec", period: "2018-10-01" });
+    expect(d).toMatchObject(pending("totals_inconsistent"));
+    expect(d.detail).toContain("no riding count for this election day");
+    expect(decide("qc_seats_caq", "80+", eqSnap(), { party: "Coalition Avenir Québec" })).toMatchObject(YES); // the same file for 2022
+  });
 });
 
 describe("Québec seat-margin, PQ-majority and PVQ-seat legs", () => {
@@ -405,5 +411,11 @@ describe("the registered condition of an election leg", () => {
     }
     const first = legs[0]!;
     expect(first.ok && first.market.condition.startsWith('Leg "<3" of "Test: qc_seats_pq" (Quebec general election 2026, seats won by the PQ (Élections Québec)): resolves Yes iff')).toBe(true);
+    // the TSE legs are worded by the same line (turnout needs no candidate registry)
+    const tie = "A value exactly between two brackets resolves to the higher bracket.";
+    const turnout = buildElectionLeg({ series: "br_pres_r1_turnout", period: "2026-10-04", release_at: "2026-10-04T20:00:00Z", title: "Turnout", criteria: tie, labels: ["75-80%"] }, { external_id: "t", label: "75-80%", open_at: "2026-09-01T00:00:00Z", deadline_utc: "2027-06-30T23:59:00Z" }, {});
+    if (!turnout.ok) throw new Error(turnout.reason);
+    expect(turnout.market.condition).toContain(`stays unresolved. ${tie}`);
+    expect(turnout.market.condition).not.toMatch(/otherwise no/i);
   });
 });

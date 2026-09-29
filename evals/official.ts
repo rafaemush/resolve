@@ -262,8 +262,8 @@ function mapEv(series: ElectionSeriesId, labels: string[], extra: Partial<Electi
   return { series, period: tse ? TSE_DAY_2022 : EQ_DAY_2022, release_at: tse ? TSE_CLOSE_2022 : EQ_CLOSE_2022, title: `Eval: ${series} (2022 count)`, criteria: `Paraphrased eval rules. ${TIE_TEXT}`, labels, ...extra };
 }
 /** An election leg built by the production leg builder (src/markets/election-legs.ts) against the authority's own registry. */
-function electionLeg(series: ElectionSeriesId, label: string, reg: Registries, opts: { labels?: string[]; party?: string; unit?: string } = {}): Reg {
-  const ev = mapEv(series, opts.labels ?? [label], { ...(opts.party ? { party: opts.party } : {}), ...(opts.unit ? { unit: opts.unit } : {}) });
+function electionLeg(series: ElectionSeriesId, label: string, reg: Registries, opts: { labels?: string[]; party?: string; unit?: string; day?: { period: string; release_at: string } } = {}): Reg {
+  const ev = mapEv(series, opts.labels ?? [label], { ...(opts.party ? { party: opts.party } : {}), ...(opts.unit ? { unit: opts.unit } : {}), ...(opts.day ?? {}) });
   const b = buildElectionLeg(ev, { external_id: `eval-${series}-${label}`.replace(/[^A-Za-z0-9-]+/g, "-").slice(0, 80), label, open_at: "2022-09-01T00:00:00Z", deadline_utc: "2027-06-30T23:59:00Z" }, reg);
   if (!b.ok) throw new Error(`electionLeg ${series} "${label}": ${b.reason}`);
   return b.market;
@@ -346,6 +346,8 @@ const QC_TOP_TIE: EqOps = { trade: [{ parties: ["27", "6"], ridings: QC_TOP_TIE_
 const QC_PQ_LEADS: EqOps = { trade: [{ parties: ["27", "8"], ridings: "all" }] };
 /** SYNTHETIC: both of the above: the PQ (55 to 57 seats) and the PLQ (54 to 55) are not settled for the most seats. */
 const QC_PQ_TOP_TIE: EqOps = { trade: [{ parties: ["27", "8"], ridings: "all" }, { parties: ["8", "6"], ridings: QC_TOP_TIE_RIDINGS }] };
+/** SYNTHETIC attribution: the Quebec general election of 2018-10-01, a day the rail's registry has no riding count for (polls closed 20:00 EDT). */
+const EQ_2018 = { period: "2018-10-01", release_at: "2018-10-02T00:00:00Z" };
 /** The Québec seat-margin event's legs, with the party named as the 2022 registry names it. */
 const PQ = "Parti québécois";
 const SEAT_MARGIN_LABELS = [`${PQ} <10`, `${PQ} 10-19`, `${PQ} 20-29`, `${PQ} 30-39`, `${PQ} 40+`, "Another Party Wins"];
@@ -432,6 +434,8 @@ function electionCases(): OfficialCase[] {
     { id: "EL-K03", group: "election_complete", control: false, title: "SYNTHETIC 2022 Québec file with Matane-Matapédia numbered 370 like Camille-Laurin (125 entries, 124 ridings): the CAQ '80+' seats leg stays pending", market: L("qc_seats_caq", "80+", eq, { party: "Coalition Avenir Québec" }), fetched: eqRead(EL.eq2022, [['"numeroCirconscription": 842,', '"numeroCirconscription": 370,']]), expect: PENDING("totals_inconsistent") },
     { id: "EL-K04", group: "election_complete", control: false, title: `SYNTHETIC stored riding copy holding Taschereau and Matane-Matapédia: a riding copy is one riding, so ${taschWinner.name}'s Taschereau leg stays pending`, market: L("qc_riding_751", taschWinner.name, eq, { unit: tasch }), fetched: eqRead(EL.eq2022, undefined, { copy: [tasch, "842"] }), expect: PENDING("totals_inconsistent") },
     { id: "EL-K05", group: "election_complete", control: false, title: "SYNTHETIC 2022 Québec file without the 3 ridings the PQ won: 'Another Party Wins' stays pending too (nothing is read from a file with ridings missing)", market: L("qc_seat_margin", "Another Party Wins", eq, { party: PQ, labels: SEAT_MARGIN_LABELS }), fetched: eqRead(EL.eq2022, undefined, { drop: PQ_RIDINGS_2022 }), expect: PENDING("totals_inconsistent") },
+    { id: "EL-K06", group: "election_complete", control: false, title: `SYNTHETIC stored riding copy holding Matane-Matapédia alone: not the leg's riding, so ${taschWinner.name}'s Taschereau leg stays pending`, market: L("qc_riding_751", taschWinner.name, eq, { unit: tasch }), fetched: eqRead(EL.eq2022, undefined, { copy: ["842"] }), expect: PENDING("totals_inconsistent") },
+    { id: "EL-K07", group: "election_complete", control: false, title: "SYNTHETIC attribution of the 2022 archive to the election of 2018-10-01, a day the rail has no riding count for: the file cannot be checked for missing ridings, so the CAQ '80+' seats leg stays pending", market: L("qc_seats_caq", "80+", eq, { party: "Coalition Avenir Québec", day: EQ_2018 }), fetched: { ...eqRead(EL.eq2022), select: EQ_2018.period }, expect: PENDING("totals_inconsistent") },
     { id: "EL-KC1", group: "election_complete", control: true, title: "Élections Québec 2022 final, every one of the 125 ridings: the PQ won 3 seats, so its '<3' seats leg is No", market: L("qc_seats_pq", "<3", eq, { party: PQ }), fetched: eqRead(EL.eq2022), expect: EL_NO },
     { id: "EL-KC2", group: "election_complete", control: true, title: "Élections Québec 2022 final, every one of the 125 ridings: the PQ's 3 seats are in '3-9': Yes", market: L("qc_seats_pq", "3-9", eq, { party: PQ }), fetched: eqRead(EL.eq2022), expect: EL_YES },
     { id: "EL-KC3", group: "election_complete", control: true, title: `SYNTHETIC 2022 Québec file with Taschereau under its 2026 code 751: the rail's own riding copy (that one riding) decides, ${taschWinner.name} wins, Yes`, market: L("qc_riding_751", taschWinner.name, { eq: eqRegistryOf(EL.eq2022, TASCH_AS_751) }), fetched: eqRead(EL.eq2022, TASCH_AS_751), expect: EL_YES },
