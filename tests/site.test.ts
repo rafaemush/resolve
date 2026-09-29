@@ -105,6 +105,21 @@ describe("pages", () => {
     expect(Object.keys(KNOWN_RELEASES)).toContain("us_unemployment_rate:2026-09");
   });
 
+  it("upcomingReleases: an election's contests are one row with their markets summed, and never crowd out the releases after it", () => {
+    const rows = upcomingReleases(NOW, [
+      { platform: "polymarket", event_key: "official:qc_seats_caq:2026-10-05" }, { platform: "polymarket", event_key: "official:qc_riding_751:2026-10-05" },
+      { platform: "polymarket", event_key: "official:br_pres_r1_turnout:2026-10-04" },
+    ]);
+    const qc = rows.filter((r) => r.event_key.startsWith("election:eq:"));
+    expect(qc).toHaveLength(1);
+    expect(qc[0]).toMatchObject({ event_key: "election:eq:2026-10-05", period: "2026-10-05", release_at: "2026-10-06T00:00:00Z", markets: { polymarket: 2 } });
+    expect(qc[0]!.event_keys).toHaveLength(30);
+    expect(qc[0]!.label).toContain("30 contests");
+    expect(rows.filter((r) => r.event_key.startsWith("election:tse:"))).toEqual([expect.objectContaining({ markets: { polymarket: 1 }, release_at: "2026-10-04T20:00:00Z" })]);
+    expect(rows.map((r) => r.event_key)).toContain("official:us_cpi_u_nsa_yoy:2026-09");
+    expect(rows.every((r) => r.event_key.startsWith("election:") || r.event_keys.length === 1)).toBe(true);
+  });
+
   it("/record with zero rows says the record is too young and shows upcoming releases", async () => {
     h.db = fakeDb({});
     const html = await (await app.request("/record", {}, env, ctx)).text();

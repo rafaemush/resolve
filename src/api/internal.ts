@@ -20,8 +20,8 @@ import { drainWebhooks, publishEvent } from "../webhooks/deliver";
 import { alert } from "../ops/alerts";
 import { Budget, INVOCATION_SUBREQUESTS } from "../ops/budget";
 import { OfficialSeries } from "../resolve/schema";
-import { CorroborationStatus, OFFICIAL_SERIES, hostAllowed, type OfficialCorroboration } from "../resolve/official";
-import { PROBE_GROUPS, probePlan, probeRefusal, runOfficialProbe } from "../ingest/official-probe";
+import { CorroborationStatus, hostAllowed, type OfficialCorroboration } from "../resolve/official";
+import { PROBE_GROUPS, PROBE_SERIES, probePlan, probeRefusal, runOfficialProbe } from "../ingest/official-probe";
 import { MatchBody, MatchRow, matchRefusal } from "../billing/match";
 import { paymentCreditedPayload } from "../billing/events";
 import { formatUsdc, parseUsdc } from "../billing/tiers";
@@ -216,9 +216,10 @@ internal.post("/official/recheck", async (c) => {
 
 const ProbeBody = z.strictObject({
   group: z.enum(PROBE_GROUPS).optional(),
-  series: z.array(OfficialSeries).min(1).max(Object.keys(OFFICIAL_SERIES).length).optional(),
+  series: z.array(OfficialSeries).min(1).max(PROBE_SERIES.length).optional(),
   corroboration: z.boolean().optional(),
 }).refine((b) => !(b.group && b.series), "give group or series, not both")
+  .refine((b) => !b.series || b.series.every((s) => PROBE_SERIES.includes(s)), "election series are not probed one by one: give group elections (the TSE and Élections Québec hosts)")
   .refine((b) => b.group !== undefined || b.series !== undefined, `give group (${PROBE_GROUPS.join(" | ")}) or series: one group per call stays under the 10 ms CPU limit`);
 
 /**

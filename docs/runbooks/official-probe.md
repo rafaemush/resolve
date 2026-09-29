@@ -1,6 +1,6 @@
 # Official source probe (from the Worker)
 
-Code: `src/ingest/official-probe.ts`, route `POST /internal/official/probe` (`src/api/internal.ts`). Tests: `tests/official-probe.test.ts`. Last updated 2026-09-28.
+Code: `src/ingest/official-probe.ts`, route `POST /internal/official/probe` (`src/api/internal.ts`). Tests: `tests/official-probe.test.ts`. Last updated 2026-09-29.
 
 ## Why it exists
 
@@ -8,9 +8,9 @@ Public Base RPC endpoints answered a laptop but refused Cloudflare Worker egress
 
 ## What one call does
 
-- **Every official series** (or the ones asked for): the rail's own requests for the **latest published** period. It uses the same URLs through `officialGet`, so the series allowlist, the ResolveBot UA, the 8 s timeouts and redirects checked by hand all apply. Then the rail's parser runs on the answer. The latest period comes from the document itself: a BLS page states its month, and a feed or index lists its decisions (the newest one the parser accepts is taken). One BLS page is fetched once for all the series it states, as the slot holder does.
+- **Every official series except the election contests** (or the ones asked for): the rail's own requests for the **latest published** period. It uses the same URLs through `officialGet`, so the series allowlist, the ResolveBot UA, the 8 s timeouts and redirects checked by hand all apply. Then the rail's parser runs on the answer. The latest period comes from the document itself: a BLS page states its month, and a feed or index lists its decisions (the newest one the parser accepts is taken). One BLS page is fetched once for all the series it states, as the slot holder does.
 - **Corroboration.** When the primary gave a value, the call runs the rail's `fetchCorroboration` for it and reports `agree`, `disagree`, `unavailable`, `inconclusive` or `single_source`. When the primary gave no value (the host refused it, for example), the corroboration URL is still requested once and its latest row is reported as `reachability_only`.
-- **Election hosts:** fixed constants only (`ELECTION_PROBES`): `https://resultados.tse.jus.br/`, `https://resultados.tse.jus.br/oficial/comum/config/ele-c.json` and `https://www.electionsquebec.qc.ca/`. The TSE config path is the one the public results app used in 2022 and 2024 and is unverified for 2026; a 404 from it still shows that the host answers. A redirect is followed only to a host on that list. Bodies are counted, not parsed.
+- **Election hosts:** fixed constants only (`ELECTION_PROBES`): `https://resultados.tse.jus.br/`, `https://resultados.tse.jus.br/oficial/comum/config/ele-c.json`, `https://www.electionsquebec.qc.ca/` and `https://donnees.electionsquebec.qc.ca/production/provincial/resultats/resultats.json`. The TSE config and the Élections Québec results file are the election rail's own first requests, so this group is its access test before polls close (2026-10-04 20:00Z and 2026-10-06 00:00Z). The TSE config path is the one the public results app used in 2022 and 2024 and is unverified for 2026; a 404 from it still shows that the host answers. The Québec results file answers `{}` until polls close. A redirect is followed only to a host on that list. Bodies are counted, not parsed. The election series themselves (`br_pres_r1_*`, `qc_*`) have no latest period to read and are refused in `series`.
 - **Writes nothing.** There is no database call, no R2 write, no alert and no Telegram message. The JSON answer (and one `console.log` summary line for `wrangler tail`) is the only output. One failing host never stops the others.
 
 ## Usage
@@ -28,7 +28,7 @@ curl -sS -X POST -H "Authorization: Bearer <ADMIN_API_KEY>" -H "content-type: ap
 |---|---|---|
 | `group` | `bls` | The 7 series read from www.bls.gov: CPI (4 series, one page), Employment Situation (2 series, one page), PPI. 3 page requests + 7 BLS API v1 requests = 10 (3 on a BLS release day, see below) |
 | | `central_banks` | fomc_upper_bound, ecb_dfr, boe_bank_rate, bok_base_rate, kr_gdp_advance_yoy, bcb_selic_target: 8 primary + 5 corroboration = 13. `planned` says 14: from 1 January until the ECB's first meeting of the year, the current year's index names no decision, so the previous year's index is read as well |
-| | `elections` | the 3 election URLs above = 3 |
+| | `elections` | the 4 election URLs above = 4 |
 | `series` | array of series ids | only these series (not together with `group`), e.g. `{"series":["us_unemployment_rate"]}` = 2 requests |
 | `corroboration` | `false` | skip the corroborating requests |
 | (neither `group` nor `series`) | | refused with a 400 |

@@ -19,7 +19,7 @@ import { db, rpc } from "../src/db/supabase";
 import { alert } from "../src/ops/alerts";
 import { OFFICIAL_UA, blsApiUrl, BLS_API, URLS } from "../src/ingest/official";
 import {
-  ELECTION_PROBES, PROBE_GROUPS, PROBE_MAX_SUBREQUESTS, blsApiHoldOn, clean, etDay, plannedRequests, probePlan, probeRefusal, runOfficialProbe,
+  ELECTION_PROBES, PROBE_GROUPS, PROBE_MAX_SUBREQUESTS, PROBE_SERIES, blsApiHoldOn, clean, etDay, plannedRequests, probePlan, probeRefusal, runOfficialProbe,
   seriesOfGroup, type ProbeReport,
 } from "../src/ingest/official-probe";
 import { latestOrdinaryCopomMeeting } from "../src/ingest/official-parse";
@@ -108,6 +108,10 @@ describe("POST /internal/official/probe", () => {
       const res = await post(bad);
       expect(res.status, JSON.stringify(bad)).toBe(400);
     }
+    // an election contest has no latest period to read: its hosts are the elections group, never a series of the probe
+    const election = await post({ series: ["us_unemployment_rate", "br_pres_r1_winner"] });
+    expect(election.status).toBe(400);
+    expect(((await election.json()) as { error: { message: string } }).error.message).toContain("election series are not probed one by one: give group elections");
     // an empty body (or one without group or series) is refused: all groups in one call are over the CPU limit
     for (const empty of [undefined, {}, { corroboration: false }]) {
       const res = await post(empty);
@@ -124,11 +128,13 @@ describe("POST /internal/official/probe", () => {
     serve();
     const rs = await everyGroup();
     expect(rs.map((r) => r.groups)).toEqual([["bls"], ["central_banks"], ["elections"]]);
-    expect(rs.flatMap((r) => r.series)).toEqual(Object.keys(OFFICIAL_SERIES));
+    // every series but the election contests (PROBE_SERIES), whose hosts the elections group requests instead
+    expect(rs.flatMap((r) => r.series)).toEqual(Object.keys(OFFICIAL_SERIES).filter((s) => !OFFICIAL_SERIES[s as OfficialSeriesId].hosts.some((h) => h.endsWith("tse.jus.br") || h.endsWith("electionsquebec.qc.ca"))));
+    expect(rs.flatMap((r) => r.series)).toEqual([...PROBE_SERIES]);
     // central_banks plans one request more than it makes: the ECB's previous-year index, needed only in January
-    expect(rs.map((r) => r.subrequests)).toEqual([{ cap: PROBE_MAX_SUBREQUESTS, planned: 10, used: 10 }, { cap: PROBE_MAX_SUBREQUESTS, planned: 14, used: 13 }, { cap: PROBE_MAX_SUBREQUESTS, planned: 3, used: 3 }]);
+    expect(rs.map((r) => r.subrequests)).toEqual([{ cap: PROBE_MAX_SUBREQUESTS, planned: 10, used: 10 }, { cap: PROBE_MAX_SUBREQUESTS, planned: 14, used: 13 }, { cap: PROBE_MAX_SUBREQUESTS, planned: 4, used: 4 }]);
     expect(rs.every((r) => r.bls_api_hold === null)).toBe(true);
-    expect(calls).toHaveLength(26);
+    expect(calls).toHaveLength(27);
     expect(calls.every((c) => c.ua === OFFICIAL_UA && c.redirect === "manual")).toBe(true);
     const r = merged(rs);
     // every primary parsed a value from the saved documents
@@ -150,9 +156,9 @@ describe("POST /internal/official/probe", () => {
     expect(cpi[0]!.parsed!.map((p) => [p.series, p.ok])).toEqual([["us_cpi_u_nsa_yoy", true], ["us_cpi_u_sa_mom", true], ["us_core_cpi_nsa_yoy", true], ["us_core_cpi_sa_mom", true]]);
     // a request's query string is shown as "?…"
     expect(r.requests.find((q) => q.host === "fred.stlouisfed.org")!.path).toBe("/graph/fredgraph.csv?…");
-    expect(Object.keys(r.hosts).sort()).toEqual(["api.bls.gov", "data-api.ecb.europa.eu", "ecos.bok.or.kr", "fred.stlouisfed.org", "resultados.tse.jus.br", "www.bankofengland.co.uk", "www.bcb.gov.br", "www.bls.gov", "www.bok.or.kr", "www.ecb.europa.eu", "www.electionsquebec.qc.ca", "www.federalreserve.gov"]);
+    expect(Object.keys(r.hosts).sort()).toEqual(["api.bls.gov", "data-api.ecb.europa.eu", "donnees.electionsquebec.qc.ca", "ecos.bok.or.kr", "fred.stlouisfed.org", "resultados.tse.jus.br", "www.bankofengland.co.uk", "www.bcb.gov.br", "www.bls.gov", "www.bok.or.kr", "www.ecb.europa.eu", "www.electionsquebec.qc.ca", "www.federalreserve.gov"]);
     expect(Object.values(r.hosts).every((h) => h.answered_200)).toBe(true);
-    expect(r.requests.filter((q) => q.role === "election").map((q) => [q.host, q.status])).toEqual([["resultados.tse.jus.br", 200], ["resultados.tse.jus.br", 200], ["www.electionsquebec.qc.ca", 200]]);
+    expect(r.requests.filter((q) => q.role === "election").map((q) => [q.host, q.status])).toEqual([["resultados.tse.jus.br", 200], ["resultados.tse.jus.br", 200], ["www.electionsquebec.qc.ca", 200], ["donnees.electionsquebec.qc.ca", 200]]);
     // no database, no alert
     expect(vi.mocked(db)).not.toHaveBeenCalled();
     expect(vi.mocked(rpc)).not.toHaveBeenCalled();
@@ -372,7 +378,7 @@ describe("subrequest cap", () => {
     expect(calls).toHaveLength(5);
     expect(r.subrequests).toMatchObject({ cap: 5, used: 5 });
     expect(r.requests.filter((q) => q.error === "request budget exhausted").length).toBeGreaterThan(0);
-    expect(r.series_results).toHaveLength(Object.keys(OFFICIAL_SERIES).length);
+    expect(r.series_results).toHaveLength(PROBE_SERIES.length);
   });
 
   it("a plan that could need more than the cap is refused before anything is requested", () => {
@@ -380,7 +386,7 @@ describe("subrequest cap", () => {
     expect(probeRefusal(probePlan({ group: "bls" }))).toBeNull();
     expect(probeRefusal(probePlan({ group: "bls" }), 9)).toBe("this probe needs up to 10 requests before redirects (cap 9): narrow it with group (bls | central_banks | elections) or fewer series");
     expect(probeRefusal(probePlan({ group: "bls", corroboration: false }), 9)).toBeNull();
-    expect(probeRefusal(probePlan({}), 26)).toContain("needs up to 27 requests");
+    expect(probeRefusal(probePlan({}), 27)).toContain("needs up to 28 requests");
   });
 
   it("redirect hops count: an upstream that redirects every request never takes the call past the cap", async () => {

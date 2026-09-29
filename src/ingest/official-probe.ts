@@ -19,6 +19,7 @@
  * On the ET day of a scheduled BLS release (KNOWN_RELEASES) the BLS API v1 is not requested at all (blsApiHoldOn).
  */
 import { KNOWN_RELEASES, OFFICIAL_SERIES, type CorroborationStatus, type OfficialSeriesId } from "../resolve/official";
+import { isElectionSeries } from "../resolve/election";
 import type { z } from "zod";
 import {
   officialGet, fetchCorroboration, parseBlsSeries, budget, blsApiUrl, contentLength, BLS_API, URLS, OFFICIAL_UA, MAX_REDIRECTS,
@@ -44,18 +45,26 @@ const CONCURRENCY = 3;
 const ELECTION_BODY_CAP = 2 * 1024 * 1024;
 
 /**
- * The election hosts the next rails would read. Constants only (SSRF-safe): the caller can choose the group, never a URL.
- * The TSE config path is the one the public results app requested in 2022 and 2024 (unverified for 2026: a 404 from
- * it still shows that the host answers the Worker).
+ * The election hosts the election rail reads (src/ingest/official.ts: TSE_CONFIG_URL and EQ_RESULTS_URL are two of
+ * these, so the probe is the access test before polls close). Constants only (SSRF-safe): the caller can choose the
+ * group, never a URL. The TSE config path is the one the public results app requested in 2022 and 2024 (unverified for
+ * 2026: a 404 from it still shows that the host answers the Worker); the Élections Québec results file answers "{}"
+ * until polls close.
  */
 export const ELECTION_PROBES: ReadonlyArray<{ label: string; url: string }> = [
   { label: "TSE results site root", url: "https://resultados.tse.jus.br/" },
   { label: "TSE results app election config", url: "https://resultados.tse.jus.br/oficial/comum/config/ele-c.json" },
   { label: "Elections Quebec site root", url: "https://www.electionsquebec.qc.ca/" },
+  { label: "Elections Quebec results file (the rail's source)", url: "https://donnees.electionsquebec.qc.ca/production/provincial/resultats/resultats.json" },
 ];
 const ELECTION_HOSTS: ReadonlySet<string> = new Set(ELECTION_PROBES.map((p) => new URL(p.url).hostname));
 
-const ALL_SERIES = Object.keys(OFFICIAL_SERIES) as OfficialSeriesId[];
+/**
+ * The series the probe reads one by one: every official_release series except the election contests, which publish no
+ * latest period before their election day; the elections group requests their hosts (ELECTION_PROBES) instead.
+ */
+export const PROBE_SERIES: readonly OfficialSeriesId[] = (Object.keys(OFFICIAL_SERIES) as OfficialSeriesId[]).filter((s) => !isElectionSeries(s));
+const ALL_SERIES: OfficialSeriesId[] = [...PROBE_SERIES];
 const isBls = (s: OfficialSeriesId) => OFFICIAL_SERIES[s].hosts.includes("www.bls.gov");
 
 /** The series a group covers: bls = every series read from www.bls.gov; central_banks = the rest; elections = none. */

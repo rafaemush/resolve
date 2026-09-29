@@ -17,6 +17,7 @@ import { db } from "../db/supabase";
 import { ok, err } from "./envelope";
 import { trackRecordRows } from "./public";
 import { KNOWN_RELEASES, OFFICIAL_SERIES, knownRelease, type OfficialSeriesId } from "../resolve/official";
+import { ELECTION_SERIES, isElectionSeries } from "../resolve/election";
 import { effectiveTiers, packQuotes, type PaygCredit } from "../billing/tiers";
 import { followCap, type Plan } from "../shadow/follows";
 import { perKeyRpm } from "./auth";
@@ -141,9 +142,21 @@ const platformName = (p: string) => PLATFORM_NAME[p] ?? p;
 
 // ---- upcoming releases ---------------------------------------------------------------------------------------------
 
-export interface UpcomingRelease { event_key: string; series: OfficialSeriesId; period: string; label: string; release_at: string; markets: Record<string, number> }
+/**
+ * One row of the table: one scheduled release (event_keys: its one event key), or one election, whose contests are
+ * each their own series and event key (one per platform event) and share one release time, polls close.
+ */
+export interface UpcomingRelease { event_key: string; event_keys: string[]; series: OfficialSeriesId; period: string; label: string; release_at: string; markets: Record<string, number> }
 
-/** Pure. KNOWN_RELEASES scheduled after `now`, soonest first, with the public markets per platform of each event. */
+const ELECTION_ROW_LABEL: Record<string, string> = {
+  tse: "Brazil presidential election, first round: the TSE's final count (polls close)",
+  eq: "Quebec general election: Élections Québec's final count (polls close)",
+};
+
+/**
+ * Pure. KNOWN_RELEASES scheduled after `now`, soonest first, with the public markets per platform of each event; the
+ * contests of one election are one row (their markets summed), so an election day never crowds the releases out.
+ */
 export function upcomingReleases(now: number, markets: ReadonlyArray<{ platform: string; event_key: string | null }>, limit = 20): UpcomingRelease[] {
   const counts = new Map<string, Record<string, number>>();
   for (const m of markets) {
@@ -152,22 +165,32 @@ export function upcomingReleases(now: number, markets: ReadonlyArray<{ platform:
     c[m.platform] = (c[m.platform] ?? 0) + 1;
     counts.set(m.event_key, c);
   }
-  return Object.entries(KNOWN_RELEASES)
-    .filter(([, r]) => Date.parse(r.release_at) > now)
-    .map(([k, r]) => {
-      const i = k.indexOf(":");
-      const series = k.slice(0, i) as OfficialSeriesId;
-      const period = k.slice(i + 1);
-      const event_key = `official:${k}`;
-      return { event_key, series, period, label: OFFICIAL_SERIES[series]?.label ?? series, release_at: r.release_at, markets: counts.get(event_key) ?? {} };
-    })
+  const rows = new Map<string, UpcomingRelease>();
+  for (const [k, r] of Object.entries(KNOWN_RELEASES)) {
+    if (Date.parse(r.release_at) <= now) continue;
+    const i = k.indexOf(":");
+    const series = k.slice(0, i) as OfficialSeriesId;
+    const period = k.slice(i + 1);
+    const event_key = `official:${k}`;
+    const authority = isElectionSeries(series) ? ELECTION_SERIES[series].authority : null;
+    const id = authority ? `election:${authority}:${period}` : event_key;
+    let row = rows.get(id);
+    if (!row) {
+      row = { event_key: id, event_keys: [], series, period, label: authority ? ELECTION_ROW_LABEL[authority] ?? authority : OFFICIAL_SERIES[series]?.label ?? series, release_at: r.release_at, markets: {} };
+      rows.set(id, row);
+    }
+    row.event_keys.push(event_key);
+    for (const [p, n] of Object.entries(counts.get(event_key) ?? {})) row.markets[p] = (row.markets[p] ?? 0) + n;
+  }
+  for (const row of rows.values()) if (row.event_keys.length > 1) row.label = `${row.label}, ${row.event_keys.length} contests`;
+  return [...rows.values()]
     .sort((a, b) => a.release_at.localeCompare(b.release_at) || a.series.localeCompare(b.series))
     .slice(0, limit);
 }
 
 /** One read: public, non-test, undeleted markets of the upcoming events (event_key and platform only). */
 async function upcomingWithCounts(env: Env, now: number): Promise<{ rows: UpcomingRelease[]; countsOk: boolean }> {
-  const keys = upcomingReleases(now, []).map((u) => u.event_key);
+  const keys = upcomingReleases(now, []).flatMap((u) => u.event_keys);
   if (!keys.length) return { rows: [], countsOk: true };
   try {
     const { data, error } = await db(env).from("markets").select("platform, event_key").is("tenant_id", null).eq("is_test", false).is("deleted_at", null).in("event_key", keys);
@@ -186,7 +209,7 @@ function upcomingTable(rows: UpcomingRelease[], countsOk: boolean): string {
     return parts.length ? parts.join("<br>") : `<span class="muted">none registered yet</span>`;
   };
   return `<div class="table"><table>
-<caption class="muted" style="text-align:left;caption-side:bottom;padding-top:.4rem">Scheduled release times as published by each agency or central bank. Markets: public markets Resolve shadows for that release, per venue.</caption>
+<caption class="muted" style="text-align:left;caption-side:bottom;padding-top:.4rem">Scheduled release times as published by each agency or central bank; for an election, the time polls close (the final count comes hours or days later). Markets: public markets Resolve shadows for that release, per venue.</caption>
 <thead><tr><th scope="col">Release (UTC)</th><th scope="col">Series</th><th scope="col">Period</th><th scope="col">Markets covered</th></tr></thead>
 <tbody>${rows.map((r) => `<tr><td class="n">${esc(utc(r.release_at))}</td><td>${esc(r.label)}</td><td class="n">${esc(r.period)}</td><td>${cov(r.markets)}</td></tr>`).join("\n")}</tbody>
 </table></div>`;
