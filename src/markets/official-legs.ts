@@ -3,9 +3,12 @@
  * label parser turns an option title ("≤2.9%", "2.0–2.4%", "25 bps cut", "50+ bps increase", "No change", "50k to
  * 100k", "<-50k", "200k+") into the bucket the leg represents, in the series' decided unit. Anything it does not
  * recognise is null, never a guess: the leg is then left out of the suggestions with its label listed for the founder.
+ * derivePriorLevel / priorForGroup: a rate ladder's prior_level from the rail's own stored first print of the meeting
+ * before it (release calendar order), never from memory.
  */
 import type { MarketRegistration, OfficialBucket } from "../resolve/schema";
-import { OFFICIAL_SERIES, type OfficialSeriesId, type SeriesDef } from "../resolve/official";
+import { OFFICIAL_SERIES, knownRelease, levelBps, reading, type OfficialSeriesId, type SeriesDef } from "../resolve/official";
+import { previousInCalendar } from "../resolve/release-calendar";
 
 const NUM = String.raw`[-−]?\d+(?:\.\d+)?`;
 const norm = (s: string) => s.replace(/[−–—]/g, (c) => (c === "−" ? "-" : "–")).replace(/\s+/g, " ").trim();
@@ -141,4 +144,58 @@ export function buildLegRegistration(i: LegInput): { ok: true; market: MarketReg
     negative_rule: "explicit_negative", allow_prerelease: false,
   };
   return { ok: true, market };
+}
+
+// ---- prior_level of rate ladders ----------------------------------------------------------------------------------
+
+/** A first print as official_observations stores it: one row per (series, period), first print wins (migration 016). */
+export interface StoredFirstPrint { value: number | string; value_text: string; observed_at: string; doc_period?: string | null }
+export type FirstPrintLookup = (series: OfficialSeriesId, period: string) => StoredFirstPrint | undefined;
+
+/**
+ * ok: the previous meeting's period and the level its stored first print set. Otherwise the reason; pending: the
+ * previous meeting is known and not yet released at `nowMs`, so any prior level for this meeting would be a forecast.
+ */
+export type DerivedPrior =
+  | { ok: true; prior_period: string; prior_level: number; value_text: string; observed_at: string }
+  | { ok: false; prior_period: string | null; pending: boolean; reason: string };
+
+/**
+ * Pure. The prior_level of a rate-change leg from the rail's own record: the level the stored first print of the
+ * previous scheduled meeting (release calendar order) set. The reason instead when the series decides no rate change,
+ * the calendar does not list the previous meeting, or that meeting has no readable stored first print about itself.
+ */
+export function derivePriorLevel(series: OfficialSeriesId, period: string, lookup: FirstPrintLookup, nowMs: number): DerivedPrior {
+  const def = OFFICIAL_SERIES[series];
+  if (def.decides !== "rate_change_bps") return { ok: false, prior_period: null, pending: false, reason: `${series} decides ${def.decides}: it takes no prior_level` };
+  const prev = previousInCalendar(series, period);
+  if ("reason" in prev) return { ok: false, prior_period: null, pending: false, reason: `previous meeting unknown: ${prev.reason}` };
+  const row = lookup(series, prev.period);
+  if (!row) {
+    const at = knownRelease(series, prev.period)?.release_at ?? prev.row.release_at;
+    const pending = at === null || Date.parse(at) > nowMs;
+    return { ok: false, prior_period: prev.period, pending, reason: `no stored first print of ${series}:${prev.period}, the meeting before ${period}${pending ? ` (not released yet: ${at ?? "time unknown"})` : ""}` };
+  }
+  if (row.doc_period && row.doc_period !== prev.period) return { ok: false, prior_period: prev.period, pending: false, reason: `the stored first print of ${series}:${prev.period} is about ${row.doc_period}` };
+  const bps = levelBps(reading({ value: Number(row.value), value_text: row.value_text }));
+  if (bps === undefined) return { ok: false, prior_period: prev.period, pending: false, reason: `the stored first print of ${series}:${prev.period} (${row.value_text}) is not a readable level` };
+  return { ok: true, prior_period: prev.period, prior_level: bps / 100, value_text: row.value_text, observed_at: row.observed_at };
+}
+
+/**
+ * Pure. The prior_level a rate-change group is suggested with, and a note for its basis. A hand-written prior must
+ * equal the stored first print when one exists (else this throws with both values: the group is wrong, not the
+ * record) and is refused while the meeting before it has not been released (it would be a forecast). A group without
+ * one takes the derived level, or is skipped with the reason: never suggested with a guess.
+ */
+export function priorForGroup(g: Pick<LegGroup, "series" | "period" | "prior_level">, d: DerivedPrior): { prior_level: number; note: string } | { skip: string } {
+  if (g.prior_level !== undefined) {
+    if (d.ok && levelBps(g.prior_level) !== levelBps(d.prior_level)) {
+      throw new Error(`${g.series}:${g.period}: the hand-written prior_level ${g.prior_level} disagrees with the stored first print of ${g.series}:${d.prior_period}, ${d.value_text} (level ${d.prior_level}, observed ${d.observed_at}); correct the group before suggesting it`);
+    }
+    if (!d.ok && d.pending) return { skip: `${g.series}:${g.period}: the hand-written prior_level ${g.prior_level} is a forecast: ${d.reason}` };
+    return { prior_level: g.prior_level, note: d.ok ? `prior ${g.prior_level} (hand-written) equals the stored first print of ${d.prior_period}, ${d.value_text}` : `prior ${g.prior_level} (hand-written; not checked against a stored first print: ${d.reason})` };
+  }
+  if (d.ok) return { prior_level: d.prior_level, note: `prior ${d.prior_level} from the stored first print of ${g.series}:${d.prior_period}, ${d.value_text} (observed ${d.observed_at})` };
+  return { skip: `${g.series}:${g.period}: no prior_level (${d.reason}); the group is not suggested rather than suggested with a guess` };
 }

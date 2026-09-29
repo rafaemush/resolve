@@ -1,18 +1,26 @@
 /**
  * Suggested registrations for every leg of the official_release ladders: the eight Limitless manual negRisk groups
  * and their Polymarket mirrors, and the Polymarket-only BLS ladders (CPI 1-month and core, unemployment rate,
- * payrolls). Nothing is registered: every entry is approved:false for the founder.
+ * payrolls), or one ladder named on the command line. Nothing is registered: every entry is approved:false for the founder.
  *   npx tsx scripts/official-legs.ts [--only <series>[,<series>...]] [--out private/shadow-markets/official-release-2026-09-24.json]
  *   npx tsx scripts/official-legs.ts --only us_cpi_u_sa_mom,us_core_cpi_nsa_yoy,us_core_cpi_sa_mom,us_unemployment_rate,us_nonfarm_payrolls_change --out private/shadow-markets/official-release-bls-2026-09-27.json
+ *   npx tsx scripts/official-legs.ts --pm-slug <polymarket event slug> --series us_unemployment_rate --period 2026-10 --title "October Unemployment Rate"
+ *     (or --lm-slug <limitless group slug>; default --out private/shadow-markets/official-release-<series>-<period>.json)
  * Read-only public GETs at most one per second: api.limitless.exchange/markets/<group slug> (X-API-Key only when
  * LIMITLESS_API_KEY is set; never printed) and gamma-api.polymarket.com/events?slug=<the group's externalSlug, or the
- * Polymarket-only group's event slug>. The resolver fields (period, release_at, prior_level) come from the event
- * registry (official schedules, src/resolve/official.ts KNOWN_RELEASES); the bucket comes from each option's own
- * title; rounding from the series. The output copies platform market texts: it belongs under private/ only.
+ * Polymarket-only group's event slug>. The resolver fields (period, release_at) come from the event registry (official
+ * schedules, src/resolve/official.ts KNOWN_RELEASES, extended from src/resolve/release-calendar.ts); the bucket comes
+ * from each option's own title; rounding from the series. prior_level (rate ladders) is the hand-written one, checked
+ * against the rail's stored first print of the meeting before it, or derived from that print; without either the
+ * group is skipped with the reason. That check is one read-only select of official_observations with the service role
+ * (SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY from .env, never printed), made only when a group's previous meeting is in
+ * the release calendar. The output copies platform market texts: it is written under private/ only.
  */
 import { writeFileSync, mkdirSync } from "node:fs";
-import { dirname, resolve } from "node:path";
-import { loadEnv } from "./lib/env";
+import { dirname, relative, resolve } from "node:path";
+import { createClient } from "@supabase/supabase-js";
+import { loadEnv, need } from "./lib/env";
+import { USAGE, UsageError, outPathRefusal, parseLegArgs, readFirstPrints, withPriors, type LegArgs, type ObservationsClient } from "./lib/official-legs";
 import { buildLegRegistration, type LegGroup } from "../src/markets/official-legs";
 import { limitlessLabels, limitlessOutcomeIndex } from "../src/markets/outcomes";
 import { validateRegistration } from "../src/markets/register";
@@ -60,11 +68,19 @@ GROUPS.push(
 );
 const REFUSED = [{ slug: "bank-of-japan-decision-in-october-1789388114859", series: "boj_policy_rate", title: "Bank of Japan Decision in October?" }];
 
-const arg = (name: string) => { const i = process.argv.indexOf(name); return i >= 0 ? process.argv[i + 1] : undefined; };
-const out = arg("--out") ?? "private/shadow-markets/official-release-2026-09-24.json";
-const only = arg("--only")?.split(",").map((s) => s.trim()).filter(Boolean) ?? null;
+let args: LegArgs;
+try { args = parseLegArgs(process.argv.slice(2)); }
+catch (e) { if (e instanceof UsageError) { console.error(`${e.message}\n${USAGE}`); process.exit(2); } throw e; }
+const { only, adhoc } = args;
+const root = resolve(import.meta.dirname, "..");
+const out = resolve(root, args.out);
+const refusedOut = outPathRefusal(root, out);
+if (refusedOut) { console.error(`${refusedOut}\n${USAGE}`); process.exit(2); }
 for (const s of only ?? []) if (!GROUPS.some((g) => g.series === s)) throw new Error(`--only ${s}: no ladder group for that series`);
-const selected = GROUPS.filter((g) => !only || only.includes(g.series));
+/** An ad-hoc group takes its release_at and basis from the registry (parseLegArgs refused anything outside it). */
+const selected: Group[] = adhoc
+  ? [{ ...(adhoc.pmSlug ? { pmSlug: adhoc.pmSlug } : { slug: adhoc.slug! }), series: adhoc.series, period: adhoc.period, release_at: scheduled(adhoc.series, adhoc.period), title: adhoc.title, basis: knownRelease(adhoc.series, adhoc.period)!.basis }]
+  : GROUPS.filter((g) => !only || only.includes(g.series));
 loadEnv();
 const key = process.env.LIMITLESS_API_KEY;
 
@@ -122,8 +138,20 @@ async function addPolymarketEvent(g: Group, slug: string, provider: string): Pro
   }
 }
 
+/** The stored first prints of the meetings before the rate groups: one read-only select, only when some are needed. */
+async function readStored(keys: Parameters<typeof readFirstPrints>[1]) {
+  const client = createClient(need("SUPABASE_URL"), need("SUPABASE_SERVICE_ROLE_KEY"), { auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false } });
+  // the Supabase builder is the ObservationsClient shape (from/select/in, awaitable); its generics are too deep to check here
+  return readFirstPrints(client as unknown as ObservationsClient, keys);
+}
+
 async function main() {
-  for (const g of selected) {
+  // prior_level of every rate group before any platform request: a hand-written prior that disagrees with a stored
+  // first print stops the run (withPriors throws with both values); a group without a prior is skipped with the reason
+  const priced = await withPriors(selected, readStored, Date.now());
+  const skippedGroups = priced.skipped.map((s) => ({ group: groupName(s.group), series: s.group.series, period: s.group.period, reason: s.reason }));
+  notes.push(...skippedGroups.map((s) => `${s.group}: skipped, ${s.reason}`));
+  for (const g of priced.groups) {
     if (!g.slug) { await addPolymarketEvent(g, g.pmSlug!, "none: Polymarket-only ladder"); continue; }
     const lm = (await getJson(`https://api.limitless.exchange/markets/${g.slug}`, key ? { "X-API-Key": key } : {})) as Obj | null;
     if (!lm) { notes.push(`${g.slug}: Limitless GET failed; no legs from it`); continue; }
@@ -146,7 +174,7 @@ async function main() {
     await addPolymarketEvent(g, ext, String(meta.externalProvider ?? lm.externalProvider ?? "null"));
   }
   notes.push(...deadlineNotes);
-  if (!only) for (const r of REFUSED) notes.push(`${r.slug} (${r.title}): refused, ${UNSUPPORTED_OFFICIAL_SERIES[r.series]}; the market also allows "a consensus of credible reporting"`);
+  if (!only && !adhoc) for (const r of REFUSED) notes.push(`${r.slug} (${r.title}): refused, ${UNSUPPORTED_OFFICIAL_SERIES[r.series]}; the market also allows "a consensus of credible reporting"`);
 
   const lim = entries.filter((e) => e.market.platform === "limitless").length;
   const poly = entries.filter((e) => e.market.platform === "polymarket").length;
@@ -154,18 +182,20 @@ async function main() {
   const doc = {
     generated_at: new Date().toISOString(),
     sources,
-    counts: { groups: selected.length, limitless_legs: lim, polymarket_legs: poly, distinct_events: events.size },
+    counts: { groups: selected.length, groups_skipped: skippedGroups.length, limitless_legs: lim, polymarket_legs: poly, distinct_events: events.size },
     ...(only ? { only } : {}),
+    ...(adhoc ? { adhoc } : {}),
     needs_founder_approval: true,
     how_to_approve: "set approved:true on the entries to register, then POST each market to /internal/markets (after migration 016 is applied and the Worker with the official_release rail is deployed)",
-    refused: only ? [] : REFUSED.map((r) => ({ slug: r.slug, series: r.series, reason: UNSUPPORTED_OFFICIAL_SERIES[r.series] })),
+    refused: only || adhoc ? [] : REFUSED.map((r) => ({ slug: r.slug, series: r.series, reason: UNSUPPORTED_OFFICIAL_SERIES[r.series] })),
+    skipped_groups: skippedGroups,
     skipped,
     notes,
     entries,
   };
-  mkdirSync(dirname(resolve(out)), { recursive: true });
+  mkdirSync(dirname(out), { recursive: true });
   writeFileSync(out, JSON.stringify(doc, null, 1) + "\n");
-  console.log(`official legs: groups=${selected.length} limitless_legs=${lim} polymarket_legs=${poly} distinct_events=${events.size} skipped=${skipped.length} -> ${out}`);
+  console.log(`official legs: groups=${selected.length} groups_skipped=${skippedGroups.length} limitless_legs=${lim} polymarket_legs=${poly} distinct_events=${events.size} skipped=${skipped.length} -> ${relative(root, out)}`);
   for (const n of notes) console.log(`note: ${n}`);
   for (const s of skipped) console.log(`skipped ${s.platform} ${s.label} (${s.external_id}): ${s.reason}`);
 }
