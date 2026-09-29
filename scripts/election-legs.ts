@@ -18,11 +18,12 @@
  * decidable event type at or under the $50k cap; the others approved:false with the reason; refused legs listed in the header).
  * A leg whose text settles on "a consensus of credible reporting" (the authority only if there is ambiguity) carries
  * "criteria_basis": "consensus_reporting" in both files; scripts/seed-shadow.ts holds those back unless the founder passes
- * --accept-consensus-reading. Nothing is written when two Polymarket events would share one event key (eventKeyProblems).
+ * --accept-consensus-reading. Nothing is written when two Polymarket events would share one event key, or one event would
+ * map to two (legsWithOneKeyPerEvent, src/markets/election-legs.ts).
  */
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, existsSync } from "node:fs";
 import { dirname, resolve, basename } from "node:path";
-import { buildElectionLeg, eqRegistryFromCandidatures, tseRegistryFromSnapshot, eventKeyProblems, criteriaBasis, type ElectionEventInput, type Registries, type TseRegistry } from "../src/markets/election-legs";
+import { buildElectionLeg, eqRegistryFromCandidatures, tseRegistryFromSnapshot, legsWithOneKeyPerEvent, criteriaBasis, type ElectionEventInput, type Registries, type TseRegistry } from "../src/markets/election-legs";
 import { ELECTION_SERIES, electionEvent, normName, QC_RIDINGS, BR_UF_NAMES, type ElectionSeriesId } from "../src/resolve/election";
 import { knownRelease } from "../src/resolve/official";
 import { parseTseResult } from "../src/ingest/election-parse";
@@ -165,17 +166,16 @@ async function loadRegistries(): Promise<{ reg: Registries; notes: string[] }> {
 
 type Obj = Record<string, unknown>;
 const iso = (v: unknown) => { const t = typeof v === "string" ? Date.parse(v) : NaN; return Number.isFinite(t) ? new Date(t).toISOString() : undefined; };
-interface Entry { market: MarketRegistration; meta: Obj; volume_usd: number; approved: boolean; reason?: string; event_type: string; event_key: string; criteria_basis?: "consensus_reporting" }
+interface Entry { market: MarketRegistration; meta: Obj; volume_usd: number; approved: boolean; reason?: string; event_type: string; event_id: string; event_key: string; criteria_basis?: "consensus_reporting" }
 interface Refused { event_id: string; event_slug: string; event_type: string; leg_id: string; label: string | null; volume_usd: number; reason: string }
 
 async function main() {
   const events = await loadEvents();
   const { reg, notes } = await loadRegistries();
-  const entries: Entry[] = [];
+  const built: Entry[] = [];
   const refused: Refused[] = [];
   const types = new Map<string, { type: string; decidable: boolean; reason?: string; events: Set<string>; legs: number; built: number; approved: number }>();
   const typeRow = (type: string, decidable: boolean, reason?: string) => { if (!types.has(type)) types.set(type, { type, decidable, reason, events: new Set(), legs: 0, built: 0, approved: 0 }); return types.get(type)!; };
-  const eventKeys: Array<{ event_id: string; event_key: string }> = [];
 
   for (const { slug, event } of events) {
     const c = classify(slug, event);
@@ -208,24 +208,23 @@ async function main() {
       if (typeof m.questionID === "string" && /^0x[0-9a-fA-F]{64}$/.test(m.questionID)) meta.question_id = m.questionID.toLowerCase();
       if (typeof m.negRisk === "boolean") meta.neg_risk = m.negRisk;
       const key = eventKey({ platform: "polymarket", external_id: String(m.id), resolver: b.market.resolver, meta });
-      eventKeys.push({ event_id: eventId, event_key: key });
       const over = volume > SHADOW_VOLUME_CAP_USD;
       row.built++; if (!over) row.approved++;
       // a text that settles on "a consensus of credible reporting" is marked, never decided here (seed-shadow holds it back)
       const basis = criteriaBasis(legCriteria);
-      entries.push({ market: b.market, meta, volume_usd: volume, approved: !over, ...(over ? { reason: `volume $${volume.toFixed(2)} is over the $${SHADOW_VOLUME_CAP_USD} shadow cap` } : {}), event_type: c.type, event_key: key, ...(basis ? { criteria_basis: basis } : {}) });
+      built.push({ market: b.market, meta, volume_usd: volume, approved: !over, ...(over ? { reason: `volume $${volume.toFixed(2)} is over the $${SHADOW_VOLUME_CAP_USD} shadow cap` } : {}), event_type: c.type, event_id: eventId, event_key: key, ...(basis ? { criteria_basis: basis } : {}) });
     }
   }
 
-  // every Polymarket event is its own public event key, and no key is shared by two events: nothing is written otherwise
-  const keyProblems = eventKeyProblems(eventKeys);
-  if (keyProblems.length) throw new Error(`event keys: ${keyProblems.join("; ")}`);
+  // every Polymarket event is its own public event key, and no key is shared by two events: it throws otherwise, and
+  // nothing below (neither file) is written
+  const entries = legsWithOneKeyPerEvent(built);
 
   const now = new Date().toISOString();
   const typeRows = [...types.values()].map((t) => ({ type: t.type, decidable: t.decidable, ...(t.reason ? { reason: t.reason } : {}), events: t.events.size, legs: t.legs, legs_built: t.built, legs_approved: t.approved }));
   const counts = {
     events: new Set([...types.values()].flatMap((t) => [...t.events])).size,
-    events_with_built_legs: new Set(eventKeys.map((k) => k.event_id)).size, legs: entries.length + refused.length, legs_built: entries.length,
+    events_with_built_legs: new Set(entries.map((e) => e.event_id)).size, legs: entries.length + refused.length, legs_built: entries.length,
     legs_approved: entries.filter((e) => e.approved).length, legs_over_cap: entries.filter((e) => !e.approved).length, legs_refused: refused.length,
     legs_consensus_reporting: entries.filter((e) => e.criteria_basis === "consensus_reporting").length,
   };

@@ -182,6 +182,17 @@ export function eventKeyProblems(rows: Iterable<{ event_id: string; event_key: s
   return out;
 }
 
+/**
+ * Pure. The legs a leg file is written with (scripts/election-legs.ts): all of them, as given, when every event has
+ * exactly one key and every key exactly one event (eventKeyProblems); otherwise it throws, so no leg of any event is
+ * returned and the caller writes nothing.
+ */
+export function legsWithOneKeyPerEvent<T extends { event_id: string; event_key: string }>(legs: readonly T[]): T[] {
+  const problems = eventKeyProblems(legs);
+  if (problems.length) throw new Error(`event keys: ${problems.join("; ")}`);
+  return [...legs];
+}
+
 // ---- buckets ---------------------------------------------------------------------------------------------------------
 
 const N = String.raw`(\d+(?:\.\d+)?)`;

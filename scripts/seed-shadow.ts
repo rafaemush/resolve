@@ -34,8 +34,8 @@ import { readFileSync } from "node:fs";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { z } from "zod";
 import { loadEnv, need } from "./lib/env";
-import { checkCandidateFile, parseSeedArgs, registrationPlan, UsageError, USAGE, verifyRow, ACCEPT_CONSENSUS_FLAG, type FileCheck, type SeedArgs, type ShadowRow } from "./lib/seed-shadow";
-import { CandidateFile, type CandidateEntry } from "./lib/candidates";
+import { selectForRegistration, parseSeedArgs, UsageError, USAGE, verifyRow, ACCEPT_CONSENSUS_FLAG, type FileCheck, type SeedArgs, type ShadowRow } from "./lib/seed-shadow";
+import type { CandidateEntry } from "./lib/candidates";
 import { mergeMeta, META_KEYS } from "../src/markets/meta";
 import { MarketRegistration } from "../src/resolve/schema";
 import { redact } from "../src/ops/redact";
@@ -115,11 +115,12 @@ async function main(args: SeedArgs): Promise<number> {
   const now = new Date();
   let json: unknown;
   try { json = JSON.parse(readFileSync(args.file, "utf8")); } catch (e) { throw new Stop(`cannot read ${args.file}: ${String(e).slice(0, 200)}`); }
-  const check = checkCandidateFile(json, now, { acceptConsensusReading: args.acceptConsensusReading });
+  // the one selection every mode makes (scripts/lib/seed-shadow.ts): the check with this run's flags, and the entries to POST
+  const { check, platform, register: toRegister } = selectForRegistration(json, args, now);
   report(check, args);
-  if (check.fileErrors.length || check.approvedInvalid) return 1;
+  if (check.fileErrors.length || check.approvedInvalid || !platform) return 1;
   if (args.mode === "check") return 0;
-  if (!registrationPlan(check).length) { say(check.approved ? "every approved entry is held back: nothing to register" : "nothing approved: nothing to register"); return 0; }
+  if (!toRegister.length) { say(check.approved ? "every approved entry is held back: nothing to register" : "nothing approved: nothing to register"); return 0; }
 
   loadEnv();
   const worker = (process.env.RESOLVE_PUBLIC_URL || DEFAULT_WORKER).replace(/\/+$/, "");
@@ -129,13 +130,9 @@ async function main(args: SeedArgs): Promise<number> {
   await preflight(worker, adminKey);
   say("worker: registration contract and meta whitelist match");
 
-  const file = CandidateFile.parse(json);
-  const platform = file.header.platform;
   // approved and not held back (criteria_basis without the founder's flag): a held entry is never looked up or registered
-  const plan = new Set(registrationPlan(check));
   let registered = 0, skipped = 0, unsupported = 0, broken = 0;
-  for (const [index, entry] of file.entries.entries()) {
-    if (!plan.has(index)) continue;
+  for (const { index, entry } of toRegister) {
     const externalId = String(entry.registration.market.external_id);
     // checkCandidateFile already parsed both for every approved entry, so these cannot fail here.
     const meta = mergeMeta(entry.registration.meta);

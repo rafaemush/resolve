@@ -7,7 +7,7 @@
  * watches with what was sent.
  */
 import { describe, expect, it } from "vitest";
-import { checkCandidateFile, eventStatementProblem, parseSeedArgs, registrationPlan, UsageError, verifyRow } from "../scripts/lib/seed-shadow";
+import { checkCandidateFile, eventStatementProblem, parseSeedArgs, registrationPlan, selectForRegistration, UsageError, verifyRow } from "../scripts/lib/seed-shadow";
 
 const NOW = new Date("2026-09-24T12:00:00Z");
 const CID = `0x${"cd".repeat(32)}`;
@@ -113,6 +113,22 @@ describe("seed-shadow criteria_basis (scripts/election-legs.ts)", () => {
     expect(c).toMatchObject({ approved: 1, heldBack: 0, registrable: 1, approvedInvalid: 0 });
     expect(c.entries[0]!.held).toBeNull();
     expect(registrationPlan(c)).toEqual([0]);
+  });
+
+  it("the entries a run POSTs (selectForRegistration, the script's one selection): a held entry only with --accept-consensus-reading", () => {
+    const f = file([entry({ market: { external_id: "1" } }), consensus({ id: "2" }), consensus({ id: "3", approved: false })]);
+    const posted = (argv: string[]) => selectForRegistration(f, parseSeedArgs(["f.json", ...argv]), NOW).register.map((x) => [x.index, x.entry.registration.market.external_id]);
+    for (const mode of ["--check", "--dry-run", "--apply"]) {
+      expect(posted([mode]), mode).toEqual([[0, "1"]]);
+      expect(posted([mode, "--accept-consensus-reading"]), mode).toEqual([[0, "1"], [1, "2"]]);
+    }
+    const held = selectForRegistration(f, parseSeedArgs(["f.json", "--apply"]), NOW);
+    expect(held.check).toMatchObject({ approved: 2, heldBack: 1, registrable: 1 });
+    expect(held.platform).toBe("polymarket");
+    // a file that fails the check selects nothing, flag or not
+    const dup = file([entry({ market: { external_id: "1" } }), entry({ market: { external_id: "1" } })]);
+    expect(selectForRegistration(dup, parseSeedArgs(["f.json", "--apply", "--accept-consensus-reading"]), NOW).register).toEqual([]);
+    expect(selectForRegistration({ entries: [] }, parseSeedArgs(["f.json", "--apply"]), NOW)).toMatchObject({ platform: null, register: [] });
   });
 
   it("refuses any other criteria_basis, with or without the flag", () => {

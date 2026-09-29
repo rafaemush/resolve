@@ -17,7 +17,7 @@ import {
 import { KNOWN_RELEASES, OFFICIAL_SERIES, fetchGroupOf } from "../src/resolve/official";
 import { ElectionSeries } from "../src/resolve/schema";
 import { __setRailsForMutationTesting } from "../src/resolve/rails";
-import { buildElectionLeg, criteriaBasis, eqRegistryFromSnapshot, eventKeyProblems, mapTseCandidate, seatMarginForeignLabels, tseRegistryFromSnapshot, TSE_LABEL_NUMBERS, type TseRegistry } from "../src/markets/election-legs";
+import { buildElectionLeg, criteriaBasis, eqRegistryFromSnapshot, eventKeyProblems, legsWithOneKeyPerEvent, mapTseCandidate, seatMarginForeignLabels, tseRegistryFromSnapshot, TSE_LABEL_NUMBERS, type TseRegistry } from "../src/markets/election-legs";
 import { eventKey } from "../src/markets/event-key";
 
 afterEach(() => __setRailsForMutationTesting([]));
@@ -118,6 +118,11 @@ describe("registry and event keys", () => {
     expect(eventKeyProblems([caq, plq, { ...caq, event_id: "101" }])).toEqual([]);
     // and one event whose legs land on two keys is refused too
     expect(eventKeyProblems([caq, { ...plq, event_id: "101" }])).toEqual(["event 101 maps to 2 event keys: official:qc_seats_caq:2026-10-05, official:qc_seats_plq:2026-10-05"]);
+    // what scripts/election-legs.ts writes: every leg when the keys are one per event, no leg at all otherwise
+    const written = (legs: Array<typeof caq>): Array<typeof caq> | string => { try { return legsWithOneKeyPerEvent(legs); } catch (e) { return String(e); } };
+    expect(written([caq, plq])).toEqual([caq, plq]);
+    expect(written([caq, relisted, plq])).toBe("Error: event keys: event key official:qc_seats_caq:2026-10-05 is shared by events 101 and 202");
+    expect(written([caq, { ...plq, event_id: "101" }])).toBe("Error: event keys: event 101 maps to 2 event keys: official:qc_seats_caq:2026-10-05, official:qc_seats_plq:2026-10-05");
   });
   it("one fetch serves every series of the national TSE file and of the Québec file", () => {
     expect(fetchGroupOf("br_pres_r1_winner")).toContain("br_pres_r1_turnout");

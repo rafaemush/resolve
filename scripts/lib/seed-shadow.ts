@@ -104,6 +104,23 @@ export function registrationPlan(check: FileCheck): number[] {
   return check.entries.filter((e) => e.approved && !e.held).map((e) => e.index);
 }
 
+/** One run's selection: the file's check (made with the run's flags) and the entries it POSTs, in file order, by index. */
+export interface SeedSelection { check: FileCheck; platform: CandidatePlatform | null; register: Array<{ index: number; entry: CandidateEntry }> }
+
+/**
+ * Pure. The one selection scripts/seed-shadow.ts makes, in every mode: the parsed file checked with the run's own flags
+ * (args.acceptConsensusReading, so a held entry is held in --check and in real runs alike), and the entries --dry-run
+ * and --apply walk, approved and not held back (registrationPlan). A file that fails the check (a file error, or an
+ * approved entry with errors) selects nothing.
+ */
+export function selectForRegistration(json: unknown, args: SeedArgs, now: Date): SeedSelection {
+  const check = checkCandidateFile(json, now, { acceptConsensusReading: args.acceptConsensusReading });
+  if (check.fileErrors.length || check.approvedInvalid) return { check, platform: check.platform, register: [] };
+  const file = CandidateFile.parse(json);
+  const plan = new Set(registrationPlan(check));
+  return { check, platform: file.header.platform, register: file.entries.flatMap((entry, index) => (plan.has(index) ? [{ index, entry }] : [])) };
+}
+
 /** Pure. Why an entry's criteria_basis holds it back (null: it carries none, or the founder accepted it); errors: an unknown basis. */
 export function criteriaBasisHold(entry: unknown, opts: CheckOptions): { held: string | null; error: string | null } {
   const basis = (entry as { criteria_basis?: unknown } | null)?.criteria_basis;
