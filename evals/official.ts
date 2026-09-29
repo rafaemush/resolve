@@ -32,6 +32,7 @@ import { parseTseConfig, parseTseResult, parseEqResults } from "../src/ingest/el
 import { snapshotForSeries, type ElectionSeriesId, type ElectionSnapshot } from "../src/resolve/election";
 import { buildElectionLeg, tseRegistryFromSnapshot, eqRegistryFromSnapshot, type ElectionEventInput, type Registries } from "../src/markets/election-legs";
 import { officialFixture, officialFixtureBytes, officialFixtureFetchedAt, OFFICIAL_FIXTURE_DIR } from "./lib/official-fixtures";
+import { eqApply, QC_TOP_TIE_RIDINGS, type EqOps } from "./lib/eq-synthetic";
 
 const sha = (s: string | Uint8Array) => createHash("sha256").update(s).digest("hex");
 const DIR = resolve(process.cwd(), "evals/official-cases");
@@ -41,12 +42,14 @@ const MANIFEST = resolve(DIR, "manifest.sha256");
 /**
  * Election groups (src/resolve/election.ts): election_final (rail election_final_count), election_margin (rail
  * election_safety_margin, and each of its margins alone: election_qc_riding_lead, election_qc_party_votes,
- * election_br_turnout_agree, election_sub_judice; evals/mutate.ts 16-20), election_mapping (leg building: a label
- * must map to exactly one authority entry; no rail, every case is a control). Election cases read TSE 2022 first-round
- * files (Wayback captures), the TSE 2026 simulation (EA20 layout) and the Élections Québec 2022 archive with the
- * production parsers.
+ * election_br_turnout_agree, election_sub_judice; evals/mutate.ts 16-20; and rail election_qc_leader_settled, 22: the
+ * Québec seat-margin legs abstain while the party with the most seats is not settled), election_complete (rail
+ * election_qc_complete_file, 21: a Québec snapshot that is not every riding of the election once decides nothing),
+ * election_mapping (leg building: a label must map to exactly one authority entry; no rail, every case is a control).
+ * Election cases read TSE 2022 first-round files (Wayback captures), the TSE 2026 simulation (EA20 layout) and the
+ * Élections Québec 2022 archive with the production parsers.
  */
-export type OfficialGroup = "release_gate" | "first_print" | "election_final" | "election_margin" | "election_mapping";
+export type OfficialGroup = "release_gate" | "first_print" | "election_final" | "election_margin" | "election_complete" | "election_mapping";
 type Parser = "tse_result" | "eq_result" | "bls_cpi_text" | "bls_ppi_text" | "bls_api_yoy" | "fed_statement" | "ecb_release" | "boe_rss" | "bok_decision_rss" | "bok_gdp_rss" | "ecos_quarter" | "bcb_latest_row" | "bcb_history" | "sgs432_row"
   | "bls_cpi_table" | "bls_empsit_text" | "bls_api_mom" | "bls_api_level" | "bls_api_change";
 /** bls_api_yoy and bls_api run the production corroboration (src/ingest/official.ts blsCorroboration) on the saved body. */
@@ -59,8 +62,10 @@ type Edits = Array<[string, string]>;
  */
 /** tse_result: select is the election day looked up in the saved configuration `config`; eq_result: select is the election day. */
 /** url (election reads only): the URL the saved body is attributed to, when not its provenance URL (a SYNTHETIC relocation). */
-interface Read { fixture: string; parser: Parser; url?: string; select?: string; observed_at: string; own_capture?: boolean; edits?: Edits; config?: string; config_edits?: Edits; corroboration?: { fixture?: string; parser: CorrParser; select?: string; edits?: Edits } }
-interface Expect { status: "RESOLVED" | "UNRESOLVED" | "ERROR"; outcome: "OPTION_A" | "OPTION_B" | "NONE"; caveats_include?: readonly string[]; error_reason?: string }
+/** eq (eq_result reads only): SYNTHETIC operations on the body's JSON, applied after `edits` (evals/lib/eq-synthetic.ts); each must apply. */
+interface Read { fixture: string; parser: Parser; url?: string; select?: string; observed_at: string; own_capture?: boolean; edits?: Edits; eq?: EqOps; config?: string; config_edits?: Edits; corroboration?: { fixture?: string; parser: CorrParser; select?: string; edits?: Edits } }
+/** detail_includes: text the structured resolver's own account of the decision must contain (the seat ranges a SYNTHETIC case claims; never on a control, whose ranges close when a margin rail is off). */
+interface Expect { status: "RESOLVED" | "UNRESOLVED" | "ERROR"; outcome: "OPTION_A" | "OPTION_B" | "NONE"; caveats_include?: readonly string[]; error_reason?: string; detail_includes?: readonly string[] }
 export interface ResolveCase { id: string; group: OfficialGroup; control: boolean; title: string; market: Reg; stored?: Read; fetched: Read; expect: Expect }
 /** A leg built at run time from an authority registry saved as a fixture: refused (reason substring) or mapped (subject id). */
 interface BuildSpec { event: ElectionEventInput; label: string; registry: { authority: "tse" | "eq"; fixture: string; config?: string } | null }
@@ -246,8 +251,8 @@ function tseRegistryOf(fixture: string, day: string): Registries["tse"] {
   if (!p.ok) throw new Error(`${fixture}: ${p.detail}`);
   return tseRegistryFromSnapshot(p.snap, urlOf(fixture), officialFixtureFetchedAt(fixture));
 }
-function eqRegistryOf(fixture: string): Registries["eq"] {
-  const p = parseEqResults(officialFixture(fixture));
+function eqRegistryOf(fixture: string, edits?: Edits): Registries["eq"] {
+  const p = parseEqResults(bodyOf({ fixture, edits }));
   if (!p.ok) throw new Error(`${fixture}: ${p.detail}`);
   return eqRegistryFromSnapshot(p.snap, urlOf(fixture), officialFixtureFetchedAt(fixture));
 }
@@ -264,7 +269,7 @@ function electionLeg(series: ElectionSeriesId, label: string, reg: Registries, o
   return b.market;
 }
 const tseRead = (fixture: string, edits?: Edits): Read => ({ fixture, parser: "tse_result", select: TSE_DAY_2022, observed_at: officialFixtureFetchedAt(fixture), ...(edits ? { edits } : {}) });
-const eqRead = (fixture: string, edits?: Edits): Read => ({ fixture, parser: "eq_result", select: EQ_DAY_2022, observed_at: officialFixtureFetchedAt(fixture), ...(edits ? { edits } : {}) });
+const eqRead = (fixture: string, edits?: Edits, eq?: EqOps): Read => ({ fixture, parser: "eq_result", select: EQ_DAY_2022, observed_at: officialFixtureFetchedAt(fixture), ...(edits ? { edits } : {}), ...(eq ? { eq } : {}) });
 /**
  * SYNTHETIC Québec edit: candidate `id`'s vote count set to `to`. The edit is the saved text from the candidate's number
  * to its vote count (unique in the file), so it can only touch that one candidate.
@@ -309,6 +314,41 @@ const CIRO_SUB_JUDICE: Edits = [
 const ESI_81: Edits = [['"esi" : "156453354"', '"esi" : "152694286"']];
 /** SYNTHETIC: Acre's two leaders brought within 96 votes (0.02 pp of 440,917 valid votes); their sum and every total unchanged. */
 const AC_NEAR_TIE: Edits = [['"vap" : "275582"', '"vap" : "202350"'], ['"vap" : "129022"', '"vap" : "202254"']];
+/** The 3 ridings the PQ won in 2022: Camille-Laurin (370), Îles-de-la-Madeleine (858) and Matane-Matapédia (842). */
+const PQ_RIDINGS_2022 = ["370", "858", "842"];
+/**
+ * SYNTHETIC: the file-wide statistics restated as if the named ridings had never been part of the election (riding
+ * counts, polling stations, votes and electors), so a file without them is consistent with itself.
+ */
+function eqRestated(drop: string[]): Edits {
+  type Riding = Record<"numeroCirconscription" | "nbBureauTotal" | "nbBureauComplete" | "nbVoteValide" | "nbVoteRejete" | "nbVoteExerce" | "nbElecteurInscrit", number>;
+  const d = JSON.parse(officialFixture(EL.eq2022)) as { statistiques: Record<string, number>; circonscriptions: Riding[] };
+  const gone = d.circonscriptions.filter((r) => drop.includes(String(r.numeroCirconscription)));
+  if (gone.length !== drop.length) throw new Error(`eqRestated: ${gone.length} of ${drop.length} ridings found`);
+  const st = d.statistiques;
+  const less = (k: string, by: number): [string, string] => [`"${k}": ${st[k]},`, `"${k}": ${st[k]! - by},`];
+  const sumOf = (k: keyof Riding) => gone.reduce((a, r) => a + r[k], 0);
+  return [
+    less("nbCirconscription", gone.length), less("nbCirconscriptionAvecResultat", gone.length),
+    less("nbBureauVote", sumOf("nbBureauTotal")), less("nbBureauVoteRempli", sumOf("nbBureauComplete")),
+    less("nbVoteValide", sumOf("nbVoteValide")), less("nbVoteRejete", sumOf("nbVoteRejete")), less("nbVoteExerce", sumOf("nbVoteExerce")), less("nbElecteurInscrit", sumOf("nbElecteurInscrit")),
+  ];
+}
+/** SYNTHETIC: Taschereau (730 on the 2022 map) under the 2026 code of the qc_riding_751 event, so the rail's own riding copy is what the leg reads. */
+const TASCH_AS_751: Edits = [['"numeroCirconscription": 730,', '"numeroCirconscription": 751,']];
+/**
+ * SYNTHETIC 2022 Québec near-tie for the most seats: in 33 ridings the CAQ won by more than 1% of the votes cast, the
+ * CAQ's and the PLQ's candidates trade parties. The CAQ then holds 55 seats outright and 57 with Beauce-Nord and Fabre
+ * (both inside the 1% margin), the PLQ 54 and 55 with Fabre: which of the two has the most seats is not settled.
+ */
+const QC_TOP_TIE: EqOps = { trade: [{ parties: ["27", "6"], ridings: QC_TOP_TIE_RIDINGS }] };
+/** SYNTHETIC 2022 Québec: the CAQ's and the PQ's candidates trade parties in every riding, so the PQ holds the CAQ's 88 to 90 seats and the CAQ the PQ's 3. */
+const QC_PQ_LEADS: EqOps = { trade: [{ parties: ["27", "8"], ridings: "all" }] };
+/** SYNTHETIC: both of the above: the PQ (55 to 57 seats) and the PLQ (54 to 55) are not settled for the most seats. */
+const QC_PQ_TOP_TIE: EqOps = { trade: [{ parties: ["27", "8"], ridings: "all" }, { parties: ["8", "6"], ridings: QC_TOP_TIE_RIDINGS }] };
+/** The Québec seat-margin event's legs, with the party named as the 2022 registry names it. */
+const PQ = "Parti québécois";
+const SEAT_MARGIN_LABELS = [`${PQ} <10`, `${PQ} 10-19`, `${PQ} 20-29`, `${PQ} 30-39`, `${PQ} 40+`, "Another Party Wins"];
 function eqRidingCode(name: string): string {
   const p = parseEqResults(officialFixture(EL.eq2022));
   if (!p.ok) throw new Error(p.detail);
@@ -372,12 +412,38 @@ function electionCases(): OfficialCase[] {
     { id: "EL-MC6", group: "election_margin", control: true, title: "SYNTHETIC 2022 national final with Ciro Gomes annulled sub judice: Simone Tebet is 3rd whether or not his votes are validated, Yes", market: L("br_pres_r1_third", "Simone Tebet", br, { labels: named }), fetched: tseRead(EL.br2022.final, CIRO_SUB_JUDICE), expect: EL_YES },
     { id: "EL-MC1", group: "election_margin", control: true, title: "TSE 2022 national final: Lula's margin 5.23 pp is in 5-7.5%, far from both edges, Yes", market: L("br_pres_r1_margin", "Lula 5-7.5%", br), fetched: tseRead(EL.br2022.final), expect: EL_YES },
     { id: "EL-MC2", group: "election_margin", control: true, title: "TSE 2022 national final: Lula's share 48.43% is in 45-50%, Yes", market: L("br_pres_r1_share_lula", "45-50%", br), fetched: tseRead(EL.br2022.final), expect: EL_YES },
+    // --- election_margin, the Québec seat-margin, PQ-majority and PVQ-seat events: a leader that is not settled is never
+    // answered No (red when election_qc_leader_settled is off, and when the riding-lead margin is) ------------------------
+    { id: "EL-M11", group: "election_margin", control: false, title: "SYNTHETIC 2022 Québec near-tie for the most seats (CAQ 55 to 57, PLQ 54 to 55 once Beauce-Nord and Fabre can go either way): 'Another Party Wins' stays pending, never No", market: L("qc_seat_margin", "Another Party Wins", eq, { party: PQ, labels: SEAT_MARGIN_LABELS }), fetched: eqRead(EL.eq2022, undefined, QC_TOP_TIE), expect: { ...PENDING("recount_range"), detail_includes: ["27:55-57, 6:54-55"] } },
+    { id: "EL-M12", group: "election_margin", control: false, title: "SYNTHETIC 2022 Québec with the PQ in the CAQ's place and the same near-tie (PQ 55 to 57, PLQ 54 to 55): the PQ is not settled as the party with the most seats, so its '<10' margin leg stays pending, never No", market: L("qc_seat_margin", `${PQ} <10`, eq, { party: PQ, labels: SEAT_MARGIN_LABELS }), fetched: eqRead(EL.eq2022, undefined, QC_PQ_TOP_TIE), expect: { ...PENDING("recount_range"), detail_includes: ["8:55-57, 6:54-55"] } },
+    { id: "EL-MC7", group: "election_margin", control: true, title: "Élections Québec 2022 final: the CAQ's 88 to 90 seats are the most outright (PLQ 21 to 22, PQ 3): 'Another Party Wins' is Yes", market: L("qc_seat_margin", "Another Party Wins", eq, { party: PQ, labels: SEAT_MARGIN_LABELS }), fetched: eqRead(EL.eq2022), expect: EL_YES },
+    { id: "EL-MC8", group: "election_margin", control: true, title: "Élections Québec 2022 final: the PQ's 3 seats are never the most: its '<10' seat-margin leg is No", market: L("qc_seat_margin", `${PQ} <10`, eq, { party: PQ, labels: SEAT_MARGIN_LABELS }), fetched: eqRead(EL.eq2022), expect: EL_NO },
+    { id: "EL-MC9", group: "election_margin", control: true, title: "Élections Québec 2022 final: the PQ's 3 seats are not a majority (the event's bucket is fixed at 64 seats or more): No", market: L("qc_pq_majority", "", eq, { party: PQ }), fetched: eqRead(EL.eq2022), expect: EL_NO },
+    { id: "EL-MC10", group: "election_margin", control: true, title: "Élections Québec 2022 final: the PVQ led in no riding and is within 1% of the leader in none: 'wins at least one seat' is No", market: L("qc_pvq_seat", "", eq, { party: "Parti vert du Québec" }), fetched: eqRead(EL.eq2022), expect: EL_NO },
+    { id: "EL-MC11", group: "election_margin", control: true, title: "SYNTHETIC 2022 Québec near-tie between the CAQ and the PLQ: the PQ's 3 seats are still never the most, so its '<10' seat-margin leg is No", market: L("qc_seat_margin", `${PQ} <10`, eq, { party: PQ, labels: SEAT_MARGIN_LABELS }), fetched: eqRead(EL.eq2022, undefined, QC_TOP_TIE), expect: EL_NO },
+    { id: "EL-MC12", group: "election_margin", control: true, title: "SYNTHETIC 2022 Québec with the PQ in the CAQ's place (88 to 90 seats, PLQ 21 to 22): its margin is 66 to 69 seats, all in '40+': Yes", market: L("qc_seat_margin", `${PQ} 40+`, eq, { party: PQ, labels: SEAT_MARGIN_LABELS }), fetched: eqRead(EL.eq2022, undefined, QC_PQ_LEADS), expect: EL_YES },
+    { id: "EL-MC13", group: "election_margin", control: true, title: "SYNTHETIC 2022 Québec with the PQ in the CAQ's place: its '30-39' seat-margin leg is No", market: L("qc_seat_margin", `${PQ} 30-39`, eq, { party: PQ, labels: SEAT_MARGIN_LABELS }), fetched: eqRead(EL.eq2022, undefined, QC_PQ_LEADS), expect: EL_NO },
+    { id: "EL-MC14", group: "election_margin", control: true, title: "SYNTHETIC 2022 Québec with the PQ in the CAQ's place: the PQ has the most seats outright, so 'Another Party Wins' is No", market: L("qc_seat_margin", "Another Party Wins", eq, { party: PQ, labels: SEAT_MARGIN_LABELS }), fetched: eqRead(EL.eq2022, undefined, QC_PQ_LEADS), expect: EL_NO },
+    { id: "EL-MC15", group: "election_margin", control: true, title: "SYNTHETIC 2022 Québec with the PQ in the CAQ's place: 88 to 90 seats are all 64 or more: the PQ-majority leg is Yes", market: L("qc_pq_majority", "", eq, { party: PQ }), fetched: eqRead(EL.eq2022, undefined, QC_PQ_LEADS), expect: EL_YES },
+    // --- election_complete: a Québec snapshot that is not every riding of the election once decides nothing (red when
+    // election_qc_complete_file is off) -----------------------------------------------------------------------------------
+    { id: "EL-K01", group: "election_complete", control: false, title: "SYNTHETIC 2022 Québec file without the 3 ridings the PQ won (its statistics still state 125 ridings, all final): the PQ '<3' seats leg stays pending, never Yes from the 122 ridings present", market: L("qc_seats_pq", "<3", eq, { party: PQ }), fetched: eqRead(EL.eq2022, undefined, { drop: PQ_RIDINGS_2022 }), expect: PENDING("totals_inconsistent") },
+    { id: "EL-K02", group: "election_complete", control: false, title: "SYNTHETIC 2022 Québec file without Matane-Matapédia and with its statistics restated to 124 ridings (consistent with itself): the 2022 election had 125, so the PQ '<3' seats leg stays pending, never Yes", market: L("qc_seats_pq", "<3", eq, { party: PQ }), fetched: eqRead(EL.eq2022, eqRestated(["842"]), { drop: ["842"] }), expect: PENDING("totals_inconsistent") },
+    { id: "EL-K03", group: "election_complete", control: false, title: "SYNTHETIC 2022 Québec file with Matane-Matapédia numbered 370 like Camille-Laurin (125 entries, 124 ridings): the CAQ '80+' seats leg stays pending", market: L("qc_seats_caq", "80+", eq, { party: "Coalition Avenir Québec" }), fetched: eqRead(EL.eq2022, [['"numeroCirconscription": 842,', '"numeroCirconscription": 370,']]), expect: PENDING("totals_inconsistent") },
+    { id: "EL-K04", group: "election_complete", control: false, title: `SYNTHETIC stored riding copy holding Taschereau and Matane-Matapédia: a riding copy is one riding, so ${taschWinner.name}'s Taschereau leg stays pending`, market: L("qc_riding_751", taschWinner.name, eq, { unit: tasch }), fetched: eqRead(EL.eq2022, undefined, { copy: [tasch, "842"] }), expect: PENDING("totals_inconsistent") },
+    { id: "EL-K05", group: "election_complete", control: false, title: "SYNTHETIC 2022 Québec file without the 3 ridings the PQ won: 'Another Party Wins' stays pending too (nothing is read from a file with ridings missing)", market: L("qc_seat_margin", "Another Party Wins", eq, { party: PQ, labels: SEAT_MARGIN_LABELS }), fetched: eqRead(EL.eq2022, undefined, { drop: PQ_RIDINGS_2022 }), expect: PENDING("totals_inconsistent") },
+    { id: "EL-KC1", group: "election_complete", control: true, title: "Élections Québec 2022 final, every one of the 125 ridings: the PQ won 3 seats, so its '<3' seats leg is No", market: L("qc_seats_pq", "<3", eq, { party: PQ }), fetched: eqRead(EL.eq2022), expect: EL_NO },
+    { id: "EL-KC2", group: "election_complete", control: true, title: "Élections Québec 2022 final, every one of the 125 ridings: the PQ's 3 seats are in '3-9': Yes", market: L("qc_seats_pq", "3-9", eq, { party: PQ }), fetched: eqRead(EL.eq2022), expect: EL_YES },
+    { id: "EL-KC3", group: "election_complete", control: true, title: `SYNTHETIC 2022 Québec file with Taschereau under its 2026 code 751: the rail's own riding copy (that one riding) decides, ${taschWinner.name} wins, Yes`, market: L("qc_riding_751", taschWinner.name, { eq: eqRegistryOf(EL.eq2022, TASCH_AS_751) }), fetched: eqRead(EL.eq2022, TASCH_AS_751), expect: EL_YES },
     // --- election_mapping: a label must map to exactly one authority entry (every case a control) -------------------
     { id: "EL-B01", group: "election_mapping", control: true, title: "'Lula' maps to TSE ballot number 13 in the 2022 registry", build: { event: mapEv("br_pres_r1_winner", named), label: "Lula", registry: { authority: "tse", fixture: EL.br2022.final } }, expect: { subject_id: "13" } },
     { id: "EL-B02", group: "election_mapping", control: true, title: "'Tarcísio de Freitas' (not a 2022 presidential candidate) matches no TSE candidate: refused", build: { event: mapEv("br_pres_r1_third", ["Tarcísio de Freitas", "Lula"]), label: "Tarcísio de Freitas", registry: { authority: "tse", fixture: EL.br2022.final } }, expect: { refused_includes: "matches no" } },
     { id: "EL-B03", group: "election_mapping", control: true, title: "No TSE registry (every TSE host answered 403): a candidate leg is refused, never registered by label", build: { event: mapEv("br_pres_r1_winner", named), label: "Lula", registry: null }, expect: { refused_includes: "no TSE candidate registry" } },
     { id: "EL-B04", group: "election_mapping", control: true, title: "Quebec riding leg naming a person who is not a candidate in that riding: refused", build: { event: mapEv("qc_riding_751", ["Vincent Marissal"], { unit: tasch }), label: "Vincent Marissal", registry: { authority: "eq", fixture: EL.eq2022 } }, expect: { refused_includes: "matches no" } },
     { id: "EL-B05", group: "election_mapping", control: true, title: "'Parti' matches more than one Élections Québec party: ambiguous, refused", build: { event: mapEv("qc_second_place", ["Parti"]), label: "Parti", registry: { authority: "eq", fixture: EL.eq2022 } }, expect: { refused_includes: "ambiguous" } },
+    { id: "EL-B06", group: "election_mapping", control: true, title: "A seat-margin event that also lists a bucket for the CAQ: 'Another Party Wins' would mean neither the PQ nor the CAQ, which the rail does not read: refused", build: { event: mapEv("qc_seat_margin", [...SEAT_MARGIN_LABELS, "Coalition Avenir Québec 10-19"], { party: PQ }), label: "Another Party Wins", registry: { authority: "eq", fixture: EL.eq2022 } }, expect: { refused_includes: "means a party the event does not list" } },
+    { id: "EL-B07", group: "election_mapping", control: true, title: "The same event: the PQ's own '<10' bucket is refused with it (the event, not only one leg)", build: { event: mapEv("qc_seat_margin", [...SEAT_MARGIN_LABELS, "Coalition Avenir Québec 10-19"], { party: PQ }), label: `${PQ} <10`, registry: { authority: "eq", fixture: EL.eq2022 } }, expect: { refused_includes: "the event is refused" } },
+    { id: "EL-B08", group: "election_mapping", control: true, title: "A seat-margin event listing only the PQ's buckets and 'Another Party Wins': the leg maps to party 8", build: { event: mapEv("qc_seat_margin", SEAT_MARGIN_LABELS, { party: PQ }), label: "Another Party Wins", registry: { authority: "eq", fixture: EL.eq2022 } }, expect: { subject_id: "8" } },
   ];
 }
 
@@ -439,20 +505,20 @@ const API_IDS: Record<string, string> = {
 const apiId = (fixture: string) => { const id = API_IDS[fixture]; if (!id) throw new Error(`no BLS API series id for ${fixture}`); return id; };
 const monthLabel = (period: string) => `${MONTHS[Number(period.slice(5, 7)) - 1]} ${period.slice(0, 4)}`;
 
-/** A saved body with its SYNTHETIC edits applied (an edit that does not apply is a harness error, never a silent no-op). */
-function bodyOf(fixture: string, edits: Edits = []): string {
-  let body = officialFixture(fixture);
-  for (const [from, to] of edits) {
-    if (!body.includes(from)) throw new Error(`${fixture}: edit "${from.slice(0, 60)}" does not apply`);
+/** A saved body with its SYNTHETIC edits and operations applied (one that does not apply is a harness error, never a silent no-op). */
+function bodyOf(read: Pick<Read, "fixture" | "edits" | "eq">): string {
+  let body = officialFixture(read.fixture);
+  for (const [from, to] of read.edits ?? []) {
+    if (!body.includes(from)) throw new Error(`${read.fixture}: edit "${from.slice(0, 60)}" does not apply`);
     body = body.split(from).join(to);
   }
-  return body;
+  return read.eq?.drop?.length || read.eq?.trade?.length ? eqApply(body, read.eq, read.fixture) : body;
 }
-const bytesOf = (read: Read) => (read.edits?.length ? new TextEncoder().encode(bodyOf(read.fixture, read.edits)) : officialFixtureBytes(read.fixture));
+const bytesOf = (read: Read) => (read.edits?.length || read.eq?.drop?.length || read.eq?.trade?.length ? new TextEncoder().encode(bodyOf(read)) : officialFixtureBytes(read.fixture));
 
 /** The parsed document, or { missing } when the production parser says the number is not published (never a value). */
 function parse(read: Read): DocObservation | { missing: string } {
-  const body = bodyOf(read.fixture, read.edits);
+  const body = bodyOf(read);
   const need = (p: { ok: true; obs: DocObservation } | { ok: false; reason: string; detail: string }) => { if (!p.ok) throw new Error(`${read.fixture} ${read.parser}: ${p.reason} ${p.detail}`); return p.obs; };
   const orMissing = (p: DocParse) => (!p.ok && p.reason === "not_published" ? { missing: p.detail } : need(p));
   switch (read.parser) {
@@ -523,10 +589,17 @@ function parse(read: Read): DocObservation | { missing: string } {
 
 /** An election read as the rail stores it: the production parser's snapshot, the part the series keeps, and a deciding text naming the day. */
 function electionDoc(r: OfficialResolver, read: Read): OfficialDoc {
-  const body = bodyOf(read.fixture, read.edits);
+  const body = bodyOf(read);
   const p = read.parser === "tse_result" ? parseTseResult(body, read.select!) : parseEqResults(body);
   if (!p.ok) throw new Error(`${read.fixture} ${read.parser}: ${p.reason} ${p.detail}`);
   const snap = p.snap as ElectionSnapshot;
+  if (read.eq && snap.authority !== "eq") throw new Error(`${read.fixture}: eq operations apply to an Élections Québec read`);
+  // what the rail stores: its own part of the snapshot, or (SYNTHETIC, EqOps.copy) a copy holding the named ridings
+  let contest = snapshotForSeries(r.series as ElectionSeriesId, snap);
+  if (read.eq?.copy && snap.authority === "eq") {
+    const kept = read.eq.copy.map((id) => { const x = snap.ridings.filter((y) => y.id === id); if (x.length !== 1) throw new Error(`${read.fixture}: copy: riding ${id} is listed ${x.length} times`); return x[0]!; });
+    contest = { ...snap, ridings: kept };
+  }
   const valid = snap.authority === "tse" ? snap.votes.valid : snap.valid;
   const deciding = snap.authority === "tse"
     ? `TSE President first-round count for ${snap.scope}, election day ${snap.election_day} (election ${snap.election_id}, environment ${snap.environment}): tf=${snap.flags.tf} dv=${snap.flags.dv}; ${snap.sections.totalized} of ${snap.sections.total} sections totalized; ${snap.votes.valid} valid votes.`
@@ -536,14 +609,14 @@ function electionDoc(r: OfficialResolver, read: Read): OfficialDoc {
     kind: "official_observation", series: r.series, period: read.select!, value: Number(valid), value_text: valid, deciding_text: deciding,
     source_url: read.url ?? urlOf(read.fixture), raw_sha256: sha(bytesOf(read)), observed_at: at, direction: null,
     corroboration: { status: "single_source", source_url: null, value: null, value_text: null, detail: "no second source publishes the count on election night", checked_at: at },
-    stated_prior: null, stated_step_bps: null, contest: snapshotForSeries(r.series as ElectionSeriesId, snap),
+    stated_prior: null, stated_step_bps: null, contest,
   };
 }
 
 function corroborate(series: OfficialSeriesId, obs: DocObservation, spec: Read["corroboration"], at: string): OfficialCorroboration | null {
   if (!spec) return null;
   if (spec.parser === "single_source") return { status: "single_source", source_url: null, value: null, value_text: null, detail: "SGS 432 forward-fills; the Copom history row is the only source", checked_at: at };
-  const body = bodyOf(spec.fixture!, spec.edits);
+  const body = bodyOf({ fixture: spec.fixture!, edits: spec.edits });
   let v: string | undefined;
   switch (spec.parser) {
     case "bls_api_yoy": case "bls_api": {
@@ -645,6 +718,8 @@ async function runCase(k: OfficialCase): Promise<{ failures: string[]; falseReso
   if (v.winning_outcome !== k.expect.outcome) f.push(`outcome ${v.winning_outcome} != ${k.expect.outcome}`);
   for (const c of k.expect.caveats_include ?? []) if (!v.caveats.includes(c)) f.push(`caveat ${c} missing (have ${v.caveats.join(",") || "none"})`);
   if (k.expect.error_reason !== undefined && v.error_reason !== k.expect.error_reason) f.push(`error_reason ${v.error_reason} != ${k.expect.error_reason}`);
+  const detail = v.checks.find((c) => c.name === "structured_resolver")?.detail ?? "";
+  for (const d of k.expect.detail_includes ?? []) if (!detail.includes(d)) f.push(`detail lacks "${d}" (${detail.slice(0, 300)})`);
   if (jevCalls !== 0) f.push(`jev_calls ${jevCalls} != 0`);
   const falseResolved = v.resolution_status === "RESOLVED" && (k.expect.status !== "RESOLVED" || v.winning_outcome !== k.expect.outcome);
   return { failures: f, falseResolved };

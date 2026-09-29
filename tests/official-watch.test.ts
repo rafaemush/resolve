@@ -112,6 +112,7 @@ import { fetchOfficial, officialIdleNextPoll, inReleaseMinute, BURST_MAX_REQUEST
 import { fetchPrimary, officialGet, budget, OFFICIAL_UA, __resetElectionMemo } from "../src/ingest/official";
 import { buildElectionLeg, eqRegistryFromSnapshot, type ElectionEventInput } from "../src/markets/election-legs";
 import { parseEqResults } from "../src/ingest/election-parse";
+import { eqAs2026, eqText, type EqBody } from "../evals/lib/eq-synthetic";
 import { TSE_CONFIG_URL, EQ_RESULTS_URL } from "../src/resolve/official";
 import { alert } from "../src/ops/alerts";
 import type { MarketRow, WatchRow } from "../src/ingest/types";
@@ -794,8 +795,12 @@ function electionMarket(ev: ElectionEventInput, label: string, reg: Parameters<t
 }
 const TIE = "If the reported value falls exactly between two brackets, this market will resolve to the higher bracket.";
 const tseTurnout = () => electionMarket({ series: "br_pres_r1_turnout", period: "2026-10-04", release_at: "2026-10-04T20:00:00Z", title: "Brazil turnout", criteria: TIE, labels: ["75-80%"] }, "75-80%");
-// SYNTHETIC: the Élections Québec 2022 archive (final, every riding) stamped after the 2026 polls closed
-const EQ_2026 = fx("eq_gen2022_resultats.json").replace('"iso8601DateMAJ": "2022-10-06T11:55:41,000-04:00"', '"iso8601DateMAJ": "2026-10-05T23:30:00,000-04:00"');
+// SYNTHETIC: the Élections Québec 2022 archive (final, every riding) as a file of the 2026 election: stamped after the
+// 2026 polls closed and brought to the 127 ridings of the 2026 map by two invented ridings (evals/lib/eq-synthetic.ts)
+const eq2026 = (): EqBody => eqAs2026(fx("eq_gen2022_resultats.json"));
+const EQ_2026 = eqText(eq2026());
+/** SYNTHETIC: the same file without the 3 ridings the PQ won in 2022; its statistics still state 127 ridings, all final. */
+const EQ_2026_CUT = (() => { const d = eq2026(); d.circonscriptions = d.circonscriptions.filter((r) => ![370, 858, 842].includes(r.numeroCirconscription)); return eqText(d); })();
 /** SYNTHETIC: one vote moved from St-Hilaire (CAQ) to Robin (PQ) in Taschereau: every total unchanged, the counts differ. */
 function eqMoved(body: string): string {
   const edit = (id: number, from: number, to: number) => (b: string) => {
@@ -813,6 +818,7 @@ function eqSeatsCaq(): MarketRow {
   return electionMarket({ series: "qc_seats_caq", period: "2026-10-05", release_at: "2026-10-06T00:00:00Z", title: "CAQ seats", criteria: "Seats won by the CAQ.", labels: ["80+"], party: "Coalition Avenir Québec" }, "80+", { eq });
 }
 const CONFIRM_KEY = "official_confirm:eq_general:2026-10-05";
+const EQ_INCOMPLETE_ALERT = ["official_eq_incomplete_2026-10-05", 60];
 
 describe("election captures", () => {
   it("TSE: an official configuration that still lists no President first round 6 h after polls close keeps the legs pending and alerts the operator", async () => {
@@ -883,5 +889,66 @@ describe("election captures", () => {
     const done = await fetchOfficial(env(), watchRow(), m, clock("2026-10-06T03:55:00Z").deps);
     expect(done.evidence).toBeDefined();
     expect(h.state.obs.get("qc_seats_caq|2026-10-05")!.meta).toMatchObject({ first_final_read_at: "2026-10-06T03:45:00.000Z" });
+  });
+
+  it("Élections Québec: a final-flagged file that is not every riding of the election once is pending with an alert, never an observation awaiting its confirming read", async () => {
+    const read = async (body: string) => {
+      serve((url) => (url === EQ_RESULTS_URL ? ok(body, "application/json") : new Response("", { status: 404 })));
+      return fetchPrimary("qc_seats_pq", "2026-10-05", budget(() => Date.parse("2026-10-06T03:40:00Z"), 10_000, 2));
+    };
+    // control: the whole file is observed and carries the counts a second read must confirm
+    const whole = await read(EQ_2026);
+    expect(whole).toMatchObject({ kind: "observed", confirm: { as_of: "2026-10-05T23:30:00.000-04:00", fingerprint: expect.stringMatching(/^[0-9a-f]{64}$/) } });
+    // the 3 ridings the PQ won are missing: the finality flags and the statistics (127 ridings, all with results) say nothing of it
+    const cut = await read(EQ_2026_CUT);
+    expect(cut).toMatchObject({ kind: "pending", alert: { key: EQ_INCOMPLETE_ALERT[0], dedupMinutes: EQ_INCOMPLETE_ALERT[1] } });
+    expect(cut).not.toHaveProperty("confirm");
+    expect(cut).not.toHaveProperty("obs");
+    expect((cut as { detail: string }).detail).toContain("the file lists 124 of its 127 ridings");
+    // a riding number carried by two ridings (127 entries, 126 ridings)
+    const twice = eq2026();
+    twice.circonscriptions.find((r) => r.numeroCirconscription === 842)!.numeroCirconscription = 370;
+    const dup = await read(eqText(twice));
+    expect(dup).toMatchObject({ kind: "pending", alert: { key: EQ_INCOMPLETE_ALERT[0] } });
+    expect((dup as { detail: string }).detail).toContain("riding 370 is listed more than once");
+    // a file consistent with itself that states 125 ridings (the 2022 archive stamped after the 2026 polls closed): the
+    // riding count is the rail's own for the election (127), never the file's
+    const other = await read(eqText(eqAs2026(fx("eq_gen2022_resultats.json"), 125)));
+    expect(other).toMatchObject({ kind: "pending", alert: { key: EQ_INCOMPLETE_ALERT[0] } });
+    expect((other as { detail: string }).detail).toContain("the file states 125 ridings; the election has 127");
+  });
+
+  it("Élections Québec: two identical truncated reads 10 min apart never lock a first print, and a truncated read neither starts nor confirms one", async () => {
+    const m = eqSeatsCaq();
+    setWatch(m);
+    let body = EQ_2026_CUT;
+    serve((url) => (url === EQ_RESULTS_URL ? ok(body, "application/json") : new Response("", { status: 404 })));
+    const first = await fetchOfficial(env(), watchRow(), m, clock("2026-10-06T03:40:00Z").deps);
+    expect(first).toMatchObject({ notModified: true });
+    expect(first.note).toContain("flagged final but is not every riding of the 2026-10-05 election once");
+    expect(h.state.appConfig.has(CONFIRM_KEY)).toBe(false); // never the first candidate
+    expect(alertKeys()).toEqual([EQ_INCOMPLETE_ALERT]);
+    const again = await fetchOfficial(env(), watchRow(), m, clock("2026-10-06T03:50:00Z").deps);
+    expect(again).toMatchObject({ notModified: true });
+    expect(again.evidence).toBeUndefined();
+    expect(h.state.appConfig.has(CONFIRM_KEY)).toBe(false);
+    expect(h.state.obs.size).toBe(0);
+    // the whole file arrives: its first read starts the wait
+    body = EQ_2026;
+    const whole = await fetchOfficial(env(), watchRow(), m, clock("2026-10-06T03:55:00Z").deps);
+    expect(whole.note).toContain("first read of this final count");
+    expect(JSON.parse(h.state.appConfig.get(CONFIRM_KEY)!).first_read_at).toBe("2026-10-06T03:55:00.000Z");
+    // 11 min later a truncated read: it confirms nothing and leaves the kept read alone
+    body = EQ_2026_CUT;
+    const cut = await fetchOfficial(env(), watchRow(), m, clock("2026-10-06T04:06:00Z").deps);
+    expect(cut.evidence).toBeUndefined();
+    expect(h.state.obs.size).toBe(0);
+    expect(JSON.parse(h.state.appConfig.get(CONFIRM_KEY)!).first_read_at).toBe("2026-10-06T03:55:00.000Z");
+    // the whole file again, the same counts as the kept read: recorded
+    body = EQ_2026;
+    const done = await fetchOfficial(env(), watchRow(), m, clock("2026-10-06T04:11:00Z").deps);
+    expect(done.evidence!.structured).toMatchObject({ kind: "official_observation", series: "qc_seats_caq", period: "2026-10-05" });
+    expect(h.state.obs.get("qc_seats_caq|2026-10-05")!.meta).toMatchObject({ first_final_read_at: "2026-10-06T03:55:00.000Z" });
+    expect(decideOfficial(m, done.evidence!)).toMatchObject({ status: "RESOLVED", outcome: "OPTION_A" });
   });
 });

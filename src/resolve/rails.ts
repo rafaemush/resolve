@@ -41,6 +41,17 @@ const rails = {
   election_br_turnout_agree: true,
   /** TSE: every combination of annulled sub judice candidates being validated or not must give the same answer (off: only the count as printed). */
   election_sub_judice: true,
+  /**
+   * Élections Québec: only a snapshot that lists every riding of the election exactly once decides, and a riding event's
+   * copy only when it holds its one riding (off: whatever ridings the snapshot holds are counted as the whole election,
+   * so a file that lost the ridings a party won reads as that party winning none).
+   */
+  election_qc_complete_file: true,
+  /**
+   * Québec seat-margin event: a leg is decided only when the party with the most seats is settled in every case (off: a
+   * leader that is not settled is answered No, "Another Party Wins" included, where the rail must abstain).
+   */
+  election_qc_leader_settled: true,
   // Registration rail (src/markets/policy.ts, src/markets/source-checks.ts, src/ingest/robots.ts). Off = the pre-P1a
   // behaviour; evals/registration.ts proves it.
   /**

@@ -15,6 +15,14 @@
  * Buckets: percent labels ("<5%", "5-10%", "15%+") are [lo, hi) because every one of these texts settles a value exactly
  * between two brackets in the higher one (checked on the leg's text, else refused); seat labels ("<5", "5-9", "30+") are
  * whole seats, both ends inclusive.
+ *
+ * The Québec seat-margin event lists one party's margin buckets and "Another Party Wins", which means a party the event
+ * does not list. The rail reads that leg as "a party other than the subject has the most seats", which is the same thing
+ * only while the subject is the one party listed: an event with a bucket for a second party, or with a label that is
+ * neither, is refused as a whole (seatMarginForeignLabels).
+ *
+ * The registered condition says what the rail does: Yes and No only from the authority's final count, and unresolved
+ * while the count is not final or the value is inside the rail's safety margins (never "otherwise No").
  */
 import type { ElectionLeg, ElectionSubject, MarketRegistration, OfficialBucket } from "../resolve/schema";
 import { ELECTION_SERIES, electionEvent, normName, nameTokens, type ElectionSeriesId, type TseSnapshot, type EqSnapshot } from "../resolve/election";
@@ -198,6 +206,25 @@ export function seatsLegBucket(label: string, floor = 0): OfficialBucket | null 
 /** The texts that settle a value exactly between two brackets in the higher one. */
 export const TIE_TO_HIGHER = /\bhigher (?:range )?bracket\b/i;
 
+export const ANOTHER_PARTY_WINS = /^another party wins$/i;
+/**
+ * The active labels of a Québec seat-margin event that are neither "Another Party Wins" nor a margin bucket of the
+ * subject party ("PQ 10-19": the party, then whole seats from 1 up). [] = the subject is the one party the event lists,
+ * so "Another Party Wins" is "a party other than the subject"; anything else (a bucket for a second party, an unnamed
+ * leg, an unreadable bucket) leaves that reading unproven and the event is refused.
+ */
+export function seatMarginForeignLabels(labels: Array<string | null>, subjectId: string, reg: EqRegistry): string[] {
+  const out: string[] = [];
+  for (const raw of labels) {
+    const l = raw?.trim() ?? "";
+    if (ANOTHER_PARTY_WINS.test(l)) continue;
+    const m = /^(.*\S)\s+(\S+)$/.exec(l);
+    const party = m ? mapEqParty(m[1]!, reg) : null;
+    if (!m || !party?.ok || party.subject.id !== subjectId || !seatsLegBucket(m[2]!, 1)) out.push(l || "(a leg without a label)");
+  }
+  return out;
+}
+
 // ---- legs -------------------------------------------------------------------------------------------------------------
 
 export interface ElectionEventInput {
@@ -311,11 +338,16 @@ export function buildElectionLeg(ev: ElectionEventInput, leg: ElectionLegSpec, r
       if (!reg.eq) return { ok: false, reason: "no Élections Québec party registry" };
       let partyLabel: string;
       if (def.measure === "rank_seats") partyLabel = label;
-      else if (def.measure === "seat_margin") partyLabel = /^another party wins$/i.test(label) ? (ev.party ?? "") : (/^(.*\S)\s+\S+$/.exec(label)?.[1] ?? "");
+      else if (def.measure === "seat_margin") partyLabel = ANOTHER_PARTY_WINS.test(label) ? (ev.party ?? "") : (/^(.*\S)\s+\S+$/.exec(label)?.[1] ?? "");
       else partyLabel = ev.party ?? "";
       const s = mapEqParty(partyLabel, reg.eq);
       if (!s.ok) return { ok: false, reason: s.reason };
       if (def.subjectId && s.subject.id !== def.subjectId) return { ok: false, reason: `"${partyLabel}" maps to party ${s.subject.id} (${s.subject.name}); ${ev.series} is about party ${def.subjectId}` };
+      if (def.measure === "seat_margin") {
+        // the event, not only its "Another Party Wins" leg: every leg of an event the rail cannot read as one party's is refused
+        const foreign = seatMarginForeignLabels(ev.labels, s.subject.id, reg.eq);
+        if (foreign.length) return { ok: false, reason: `the event lists ${foreign.slice(0, 3).map((l) => `"${l}"`).join(", ")}, not a seat-margin bucket of party ${s.subject.id} (${s.subject.name}): "Another Party Wins" means a party the event does not list, which the rail can read only when ${s.subject.name} is the one party listed; the event is refused` };
+      }
       election = { subject: s.subject };
       if (def.measure === "rank_seats") {
         bucket = { label, lo: def.rank!, hi: def.rank!, lo_inclusive: true, hi_inclusive: true };
@@ -324,7 +356,7 @@ export function buildElectionLeg(ev: ElectionEventInput, leg: ElectionLegSpec, r
         bucket = def.fixedBucket ?? seatsLegBucket(label);
         if (!bucket) return { ok: false, reason: `unrecognised seat bucket "${label}"` };
         fact = `Party ${s.subject.name} (Élections Québec party ${s.subject.id}) won a number of seats in the bucket "${bucket.label}" in the Quebec general election of ${ev.period}`;
-      } else if (/^another party wins$/i.test(label)) {
+      } else if (ANOTHER_PARTY_WINS.test(label)) {
         bucket = { label, lo: 1, lo_inclusive: true, hi_inclusive: true };
         election = { subject: s.subject, other_leader: true };
         fact = `A party other than ${s.subject.name} (Élections Québec party ${s.subject.id}) won the most seats outright in the Quebec general election of ${ev.period}`;
@@ -338,7 +370,7 @@ export function buildElectionLeg(ev: ElectionEventInput, leg: ElectionLegSpec, r
     }
     default: { const never: never = def.measure; return { ok: false, reason: `unhandled measure ${String(never)}` }; }
   }
-  const head = `Leg "${label || bucket.label}" of "${ev.title}": resolves Yes iff ${OFFICIAL_SERIES[ev.series].label} gives this leg, from the authority's final count and outside the rail's safety margins; otherwise No. `;
+  const head = `Leg "${label || bucket.label}" of "${ev.title}" (${OFFICIAL_SERIES[ev.series].label}): resolves Yes iff the authority's final count puts this leg's value in the bucket, No iff it puts it in another bucket; a value inside the rail's safety margins, or a count that is not final, stays unresolved. `;
   const market: MarketRegistration = {
     platform: "polymarket", external_id: leg.external_id,
     condition: (head + criteria).slice(0, 4000),

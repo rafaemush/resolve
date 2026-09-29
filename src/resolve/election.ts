@@ -9,6 +9,11 @@
  *   - finality (rail election_final_count): TSE f=o, tf=s, and=f (EA20), dv=s, esae=n and every section totalized;
  *     Élections Québec isResultatsFinaux on the file and on every riding, every polling station reported.
  *   - integrity: the file's own totals add up (valid votes = the sum of the valid candidates, and so on).
+ *   - completeness (rail election_qc_complete_file): an Élections Québec snapshot lists every riding of the election
+ *     exactly once, and the election's riding count comes from the rail's registry (QC_RIDING_COUNT), never from the
+ *     file alone; a riding event's stored copy holds exactly its one riding. A file that lost ridings would otherwise
+ *     count seats from the ridings present. The capture applies the same check before a read can become the first
+ *     print or confirm one (src/ingest/official.ts).
  *   - the subject: the leg names an authority id pinned at registration; it must appear exactly once, under the name
  *     it was registered with, or the leg is an ERROR (SUBJECT_MISMATCH), never a guess.
  *   - robustness (rail election_safety_margin): ranks, shares, margins and seat counts are computed exactly from the
@@ -131,9 +136,17 @@ export function isElectionSeries(s: string): s is ElectionSeriesId { return Obje
  * own timestamp precedes it (a simulation, the previous election) never decides.
  */
 export interface ElectionEvent { authority: ElectionAuthority; day: string; polls_close: string; basis: string; ridings?: number }
+/**
+ * Ridings of each Quebec general election the rail reads, by election day: the number of circonscriptions a results file
+ * of that election must list, each once. 2026-10-05: 127 (liste_circonscriptions2026.csv and candidatures.json, OBSERVED
+ * 2026-09-27; the Polymarket texts say "all 127 seats of the National Assembly"). 2022-10-03: 125 (the Élections Québec
+ * archive of that election, read by the frozen cases). An election day that is not here decides nothing.
+ */
+export const QC_RIDING_COUNT: Readonly<Record<string, number>> = { "2022-10-03": 125, "2026-10-05": 127 };
+export function eqExpectedRidings(day: string): number | undefined { return Object.prototype.hasOwnProperty.call(QC_RIDING_COUNT, day) ? QC_RIDING_COUNT[day] : undefined; }
 export const ELECTION_EVENTS: ElectionEvent[] = [
   { authority: "tse", day: "2026-10-04", polls_close: "2026-10-04T20:00:00Z", basis: "Brazil general election, first round, Sunday 2026-10-04; polls close 17:00 Brasília time (UTC-3) in every time zone (national hours since 2022; UNVERIFIED for 2026: every TSE host answered 403 from here, 2026-09-27T22:48Z..23:34Z); the TSE publishes no President totals before (dv flag)" },
-  { authority: "eq", day: "2026-10-05", polls_close: "2026-10-06T00:00:00Z", ridings: 127, basis: "Quebec general election Monday 2026-10-05; results published from 20:00 EDT (OBSERVED https://www.dgeq.org/ 2026-09-27T22:46Z: files update after 20:00 every 2-5 minutes); 127 ridings (liste_circonscriptions2026.csv, candidatures.json)" },
+  { authority: "eq", day: "2026-10-05", polls_close: "2026-10-06T00:00:00Z", ridings: QC_RIDING_COUNT["2026-10-05"]!, basis: "Quebec general election Monday 2026-10-05; results published from 20:00 EDT (OBSERVED https://www.dgeq.org/ 2026-09-27T22:46Z: files update after 20:00 every 2-5 minutes); 127 ridings (liste_circonscriptions2026.csv, candidatures.json)" },
 ];
 export function electionEvent(authority: ElectionAuthority, day: string): ElectionEvent | undefined { return ELECTION_EVENTS.find((e) => e.authority === authority && e.day === day); }
 
@@ -365,12 +378,41 @@ export function eqIntegrity(s: EqSnapshot): string[] {
     if (big(r.valid) + big(r.rejected) !== big(r.cast)) p.push(`${r.name}: valid + rejected != cast`);
     if (new Set(r.candidates.map((c) => c.id)).size !== r.candidates.length) p.push(`${r.name}: a candidate number appears twice`);
   }
-  // a riding-event copy keeps one riding; the whole-file totals are checked when every riding is there
+  // a riding-event copy keeps one riding; the whole-file totals are checked when every riding is there (eqCompleteness
+  // refuses every snapshot that is neither)
   if (full) {
     if (sum(s.ridings.map((r) => big(r.cast))) !== big(s.cast)) p.push("the ridings' votes cast do not add up to the file's");
     if (sum(s.ridings.map((r) => big(r.valid))) !== big(s.valid)) p.push("the ridings' valid votes do not add up to the file's");
   }
   return p.slice(0, 5);
+}
+
+/**
+ * Does the snapshot hold every riding of the election, each once ([] = complete)? expected: the election's riding count
+ * from the rail's registry (eqExpectedRidings), so a file that dropped ridings and restated its own nbCirconscription
+ * is still refused. copyOf: the riding of a riding event, whose stored copy (snapshotForSeries) is exactly that one
+ * riding beside the file-wide statistics; every other snapshot, and a riding event's that is not such a copy, must be
+ * the whole file. The finality and integrity checks cannot see a missing riding: the first reads the file-wide
+ * statistics and the ridings present, the second adds up the ridings present.
+ */
+export function eqCompleteness(s: EqSnapshot, expected: number | undefined, copyOf?: string): string[] {
+  const p: string[] = [];
+  if (expected === undefined) p.push("the rail has no riding count for this election day, so a missing riding could not be told");
+  else if (Number(s.ridings_total) !== expected) p.push(`the file states ${s.ridings_total} ridings; the election has ${expected} (another election's file, or a partial one)`);
+  if (copyOf !== undefined && s.ridings.length === 1) {
+    const r = s.ridings[0]!;
+    if (r.id !== copyOf) p.push(`the riding copy holds riding ${r.id} (${r.name}), not riding ${copyOf}`);
+    return p;
+  }
+  if (BigInt(s.ridings.length) !== big(s.ridings_total)) {
+    p.push(copyOf !== undefined
+      ? `the snapshot holds ${s.ridings.length} ridings: neither riding ${copyOf} alone nor all ${s.ridings_total}`
+      : `the file lists ${s.ridings.length} of its ${s.ridings_total} ridings`);
+  }
+  const seen = new Set<string>(), twice = new Set<string>();
+  for (const r of s.ridings) { if (seen.has(r.id)) twice.add(r.id); seen.add(r.id); }
+  if (twice.size) p.push(`riding ${[...twice].slice(0, 3).join(", ")} is listed more than once`);
+  return p;
 }
 
 interface Ctx { r: LegResolver; positive: Option; margin: boolean }
@@ -492,13 +534,16 @@ function seatRanges(s: EqSnapshot, margin: boolean): SeatRanges {
   return { min, max, votes, parties, open };
 }
 
-function decideEq(def: ElectionSeriesDef, s: EqSnapshot, ctx: Ctx, caveats: string[], expectedRidings: number | undefined): StructuredDecision {
+function decideEq(def: ElectionSeriesDef, s: EqSnapshot, ctx: Ctx, caveats: string[]): StructuredDecision {
   const leg = ctx.r.election ?? {};
   if (railEnabled("election_final_count")) {
     const nf = eqNotFinal(s);
     if (nf.length) return unresolvedD("count_not_final", `Élections Québec count not final: ${nf.join("; ")}`);
   }
-  if (expectedRidings !== undefined && Number(s.ridings_total) !== expectedRidings) return unresolvedD("awaiting_release", `the file has ${s.ridings_total} ridings; the ${ctx.r.period} election has ${expectedRidings} (another election's file)`);
+  if (railEnabled("election_qc_complete_file")) {
+    const gaps = eqCompleteness(s, eqExpectedRidings(ctx.r.period), def.measure === "riding_winner" ? (leg.unit ?? def.riding?.code) : undefined);
+    if (gaps.length) return unresolvedD("totals_inconsistent", `Élections Québec snapshot for the ${ctx.r.period} election is not every riding once: ${gaps.join("; ")}`);
+  }
   const bad = eqIntegrity(s);
   if (bad.length) return unresolvedD("totals_inconsistent", `Élections Québec file: ${bad.join("; ")}`);
   const margin = ctx.margin;
@@ -549,13 +594,16 @@ function decideEq(def: ElectionSeriesDef, s: EqSnapshot, ctx: Ctx, caveats: stri
       const maxOther = Math.max(0, ...others.map(hi)), minOtherTop = Math.max(0, ...others.map(lo));
       const pFirst = lo(p) > maxOther;
       const pNotFirst = others.some((x) => lo(x) >= hi(p));
+      // a leader that is not settled in every case (a tie, or ridings inside the recount margin that could change it) is
+      // never read as "not this leg": the rail abstains (off: answered No)
+      const open = (why: string): Tri => (railEnabled("election_qc_leader_settled") ? unsure("recount_range", why) : NO);
       let t: Tri;
       if (leg.other_leader) {
         // "Another Party Wins": a party other than p has strictly the most seats in every case
         const q = others.find((x) => R.parties.every((y) => y === x || hi(y) < lo(x)));
-        t = q ? YES : pFirst ? NO : unsure("recount_range", "which party has the most seats outright is not settled");
+        t = q ? YES : pFirst ? NO : open("which party has the most seats outright is not settled");
       } else if (pNotFirst) t = NO;
-      else if (!pFirst) t = unsure("recount_range", `party ${p} is not settled as the outright leader (${range(p)} seats vs up to ${maxOther})`);
+      else if (!pFirst) t = open(`party ${p} is not settled as the outright leader (${range(p)} seats vs up to ${maxOther})`);
       else t = rangeTri(lo(p) - maxOther, hi(p) - minOtherTop, ctx.r.bucket, `party ${p}'s seat margin over the second party`);
       return finish([t], ctx, detail, caveats);
     }
@@ -575,7 +623,7 @@ export function decideElection(market: Pick<MarketRegistration, "positive_option
   if (s.authority !== def.authority) return mismatch(`the stored count is from ${s.authority}; ${def.id} reads ${def.authority}`);
   const ctx: Ctx = { r, positive: market.positive_option, margin: railEnabled("election_safety_margin") };
   if (s.authority === "tse") return decideTse(def, s, ctx, caveats);
-  return decideEq(def, s, ctx, caveats, electionEvent("eq", r.period)?.ridings);
+  return decideEq(def, s, ctx, caveats);
 }
 
 // ---- registration -----------------------------------------------------------------------------------------------
