@@ -154,8 +154,10 @@ const ELECTION_ROW_LABEL: Record<string, string> = {
 };
 
 /**
- * Pure. KNOWN_RELEASES scheduled after `now`, soonest first, with the public markets per platform of each event; the
- * contests of one election are one row (their markets summed), so an election day never crowds the releases out.
+ * Pure. The next release of each series in KNOWN_RELEASES scheduled after `now`, soonest first, with the public markets
+ * per platform of each event. A later period of a series appears once the earlier one is out, so a registry that holds
+ * months ahead never crowds the table (nor the one markets read, which asks only for these event keys); the contests of
+ * one election are one row (their markets summed), so an election day never crowds the releases out either.
  */
 export function upcomingReleases(now: number, markets: ReadonlyArray<{ platform: string; event_key: string | null }>, limit = 20): UpcomingRelease[] {
   const counts = new Map<string, Record<string, number>>();
@@ -165,9 +167,16 @@ export function upcomingReleases(now: number, markets: ReadonlyArray<{ platform:
     c[m.platform] = (c[m.platform] ?? 0) + 1;
     counts.set(m.event_key, c);
   }
-  const rows = new Map<string, UpcomingRelease>();
+  // the soonest future event of each series
+  const next = new Map<string, [string, (typeof KNOWN_RELEASES)[string]]>();
   for (const [k, r] of Object.entries(KNOWN_RELEASES)) {
     if (Date.parse(r.release_at) <= now) continue;
+    const series = k.slice(0, k.indexOf(":"));
+    const cur = next.get(series);
+    if (!cur || Date.parse(r.release_at) < Date.parse(cur[1].release_at)) next.set(series, [k, r]);
+  }
+  const rows = new Map<string, UpcomingRelease>();
+  for (const [k, r] of next.values()) {
     const i = k.indexOf(":");
     const series = k.slice(0, i) as OfficialSeriesId;
     const period = k.slice(i + 1);

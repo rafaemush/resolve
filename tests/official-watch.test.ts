@@ -469,7 +469,7 @@ describe("runWatch with an official_release source", () => {
   afterEach(() => { vi.useRealTimers(); });
 
   it("before release: a no_op that schedules the release minute and fetches nothing", async () => {
-    const release = "2026-11-10T13:30:00.000Z"; // the October CPI: not in the registry, so the market's own release_at
+    const release = "2026-11-10T13:30:00.000Z"; // the October CPI, as the registry schedules it (release calendar)
     const m = market({ series: "us_cpi_u_nsa_yoy", period: "2026-10", release_at: release, title: "CPI Oct" }, "3.4%", "2026-11-11T03:59:00Z");
     setWatch(m);
     serve(cpiRouter(1));

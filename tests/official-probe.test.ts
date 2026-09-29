@@ -286,6 +286,10 @@ describe("BLS release day", () => {
     expect(blsApiHoldOn(Date.parse("2026-10-14T20:00:00Z"))).toContain("us_cpi_u_nsa_yoy:2026-09");
     expect(blsApiHoldOn(Date.parse("2026-10-15T13:00:00Z"))).toContain("us_ppi_fd_nsa_yoy:2026-09");
     expect(blsApiHoldOn(Date.parse("2026-10-28T19:00:00Z"))).toBeNull(); // the FOMC day
+    // the November releases of the October data are registry events too (release calendar)
+    expect(blsApiHoldOn(Date.parse("2026-11-06T05:30:00Z"))).toContain("us_nonfarm_payrolls_change:2026-10"); // Nov 6, 00:30 EST
+    expect(blsApiHoldOn(Date.parse("2026-11-10T20:00:00Z"))).toContain("us_core_cpi_sa_mom:2026-10");
+    expect(blsApiHoldOn(Date.parse("2026-11-13T13:00:00Z"))).toContain("us_ppi_fd_nsa_yoy:2026-10");
   });
 
   it("on that day the probe never requests the BLS API, even for reachability, and plans without it", async () => {

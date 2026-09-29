@@ -13,6 +13,7 @@ import { OfficialSeries, type OfficialBucket, type EvidenceInput, type MarketReg
 import type { StructuredDecision } from "./structured";
 import { railEnabled } from "./rails";
 import { ELECTION_SERIES, ELECTION_EVENTS, ElectionSnapshot, canonicalSnapshot, decideElection, electionRegistrationIssues, isElectionSeries, type ElectionSeriesId } from "./election";
+import { calendarReleases } from "./release-calendar";
 
 export type OfficialSeriesId = z.infer<typeof OfficialSeries>;
 export type OfficialRoundingRule = Extract<Resolver, { kind: "official_release" }>["rounding"];
@@ -123,13 +124,14 @@ export function fetchGroupOf(series: OfficialSeriesId): OfficialSeriesId[] {
 }
 
 /**
- * The scheduled publication of each event the rail is registered for (research 2026-09-24). release_at belongs to the
- * (series, period), never to a registration: every leg of every market reads the same first print, so a market
- * registered with an earlier release_at could otherwise record a first print that a market with a later one would
- * refuse forever. Registration refuses a differing release_at for these events. fallback_until: the market texts'
- * fallback when the source does not publish (the next scheduled release or meeting), when the text names one. From
- * that moment the texts settle on an earlier period, which the rail never decides from, so gate 1 refuses a first
- * print first observed at or after it (released_after_fallback): a late print never resolves these legs.
+ * The scheduled publication of each event the rail is registered for (research 2026-09-24, then the release calendar in
+ * src/resolve/release-calendar.ts, read 2026-09-29). release_at belongs to the (series, period), never to a
+ * registration: every leg of every market reads the same first print, so a market registered with an earlier
+ * release_at could otherwise record a first print that a market with a later one would refuse forever. Registration
+ * refuses a differing release_at for these events. fallback_until: the market texts' fallback when the source does
+ * not publish (the next scheduled release or meeting), when the text names one. From that moment the texts settle on
+ * an earlier period, which the rail never decides from, so gate 1 refuses a first print first observed at or after it
+ * (released_after_fallback): a late print never resolves these legs.
  */
 export interface KnownRelease { release_at: string; fallback_until: string | null; basis: string }
 /** The September 2026 CPI release: one document, four series (headline YoY in the text, the rest in Table A). */
@@ -144,7 +146,8 @@ const CPI_2026_09_SIBLING: KnownRelease = { ...CPI_2026_09, basis: `${CPI_2026_0
  * BLS dates, which is a registry update here, never a new reading of the market text.
  */
 const EMPSIT_2026_09: KnownRelease = { release_at: "2026-10-02T12:30:00Z", fallback_until: "2026-11-06T05:00:00Z", basis: "BLS Employment Situation schedule: September 2026 -> Oct. 02, 2026 08:30 ET; next release (October 2026 data) Nov. 06, 2026 08:30 ET (observed 2026-09-27T18:46Z); the texts fall back 'by the date' of that release, read conservatively as 00:00 ET Nov. 06" };
-export const KNOWN_RELEASES: Record<string, KnownRelease> = {
+/** The hand-written entries and the election days, exactly as written (the calendar never overrides one). */
+export const HAND_WRITTEN_RELEASES: Record<string, KnownRelease> = {
   "us_cpi_u_nsa_yoy:2026-09": CPI_2026_09,
   "us_cpi_u_sa_mom:2026-09": CPI_2026_09_SIBLING,
   "us_core_cpi_nsa_yoy:2026-09": CPI_2026_09_SIBLING,
@@ -161,6 +164,16 @@ export const KNOWN_RELEASES: Record<string, KnownRelease> = {
   // Election days: release_at is polls close. The texts wait until 2027 ("Other" or the lowest bracket after that), so
   // no fallback is named and the 45-day cap ends the polling.
   ...Object.fromEntries(Object.values(ELECTION_SERIES).flatMap((d) => ELECTION_EVENTS.filter((e) => e.authority === d.authority).map((e): [string, KnownRelease] => [`${d.id}:${e.day}`, { release_at: e.polls_close, fallback_until: null, basis: e.basis }]))),
+};
+/**
+ * The registry: the hand-written entries unchanged, plus every event of the release calendar they lack, each with its
+ * family's fallback convention (an event whose fallback needs a next date the calendar lacks is left out). The
+ * calendar reproduces the release_at and fallback_until of every hand-written entry it covers
+ * (tests/release-calendar.test.ts), so the two can never disagree.
+ */
+export const KNOWN_RELEASES: Record<string, KnownRelease> = {
+  ...HAND_WRITTEN_RELEASES,
+  ...Object.fromEntries(Object.entries(calendarReleases().releases).filter(([k]) => !(k in HAND_WRITTEN_RELEASES))),
 };
 /** No official number is awaited longer than this after its release_at (the markets' fallbacks are shorter). */
 export const FALLBACK_MAX_MS = 45 * 86_400_000;

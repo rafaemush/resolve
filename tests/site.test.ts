@@ -101,8 +101,33 @@ describe("pages", () => {
     const rows = upcomingReleases(Date.parse("2026-10-03T00:00:00Z"), []);
     expect(rows.every((r) => Date.parse(r.release_at) > Date.parse("2026-10-03T00:00:00Z"))).toBe(true);
     expect(rows.map((r) => r.release_at)).toEqual([...rows.map((r) => r.release_at)].sort());
-    expect(rows.find((r) => r.series === "us_unemployment_rate")).toBeUndefined();
+    // the September print is out: the series shows its October data (Nov 6), never the past event
+    expect(rows.filter((r) => r.series === "us_unemployment_rate")).toEqual([expect.objectContaining({ period: "2026-10", release_at: "2026-11-06T13:30:00Z" })]);
     expect(Object.keys(KNOWN_RELEASES)).toContain("us_unemployment_rate:2026-09");
+  });
+
+  it("upcomingReleases: one row per series, its next release, however far ahead the registry reaches", () => {
+    const series = (k: string) => k.slice(0, k.indexOf(":"));
+    expect(new Set(Object.keys(KNOWN_RELEASES).filter((k) => series(k) === "fomc_upper_bound")).size).toBeGreaterThan(3); // the calendar holds 2027
+    for (const at of ["2026-09-28T00:00:00Z", "2026-10-15T13:00:00Z", "2026-11-11T00:00:00Z", "2027-02-01T00:00:00Z"]) {
+      const now = Date.parse(at);
+      const rows = upcomingReleases(now, [], 1000).filter((r) => !r.event_key.startsWith("election:"));
+      expect(new Set(rows.map((r) => r.series)).size, at).toBe(rows.length);
+      for (const r of rows) {
+        const soonest = Object.entries(KNOWN_RELEASES).filter(([k, v]) => series(k) === r.series && Date.parse(v.release_at) > now).map(([, v]) => v.release_at).sort()[0];
+        expect(r.release_at, `${at} ${r.series}`).toBe(soonest);
+      }
+      expect(upcomingReleases(now, []).length).toBeLessThanOrEqual(20);
+    }
+    // before the September CPI is out its October successor is not a row, and its markets are not asked for
+    const rows = upcomingReleases(NOW, [{ platform: "polymarket", event_key: "official:us_cpi_u_nsa_yoy:2026-10" }]);
+    expect(rows.flatMap((r) => r.event_keys)).not.toContain("official:us_cpi_u_nsa_yoy:2026-10");
+    expect(rows.find((r) => r.series === "us_cpi_u_nsa_yoy")).toMatchObject({ period: "2026-09", markets: {} });
+    // once it is out, the October CPI is the row, with its markets
+    expect(upcomingReleases(Date.parse("2026-10-14T12:31:00Z"), [{ platform: "polymarket", event_key: "official:us_cpi_u_nsa_yoy:2026-10" }]).find((r) => r.series === "us_cpi_u_nsa_yoy"))
+      .toMatchObject({ period: "2026-10", release_at: "2026-11-10T13:30:00Z", markets: { polymarket: 1 } });
+    // every series of the registry still has a row on the landing date (15 rows: 13 series, 2 elections)
+    expect(upcomingReleases(NOW, [])).toHaveLength(15);
   });
 
   it("upcomingReleases: an election's contests are one row with their markets summed, and never crowd out the releases after it", () => {
