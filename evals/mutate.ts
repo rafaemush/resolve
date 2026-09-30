@@ -45,6 +45,10 @@ const M: Mutation[] = [
   // the Québec capture keeps a riding event's one-riding copy of a file whose statistics, party totals, polling stations
   // or another riding's candidates do not add up (only its completeness is checked)
   { name: "23_qc_capture_integrity_off", suite: "official", rails: ["election_qc_capture_integrity"], classes: ["election_complete"] },
+  // the TSE capture records a final-flagged file no leg can decide from (its own simulation flag, a stamp before polls
+  // close, totals that do not add up, an unknown vote destination) as the immutable first print; the correct file read
+  // after it is never the first print
+  { name: "24_tse_capture_refusal_off", suite: "official", rails: ["election_tse_capture_refusal"], classes: ["election_final"] },
   { name: "14_registration_policy_off", suite: "registration", rails: ["registration_policy"], classes: ["policy"] },
 ];
 

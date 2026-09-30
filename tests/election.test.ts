@@ -11,7 +11,7 @@ import { officialFixture as fx } from "../evals/lib/official-fixtures";
 import { eqApply, QC_TOP_TIE_RIDINGS, type EqOps } from "../evals/lib/eq-synthetic";
 import { parseTseConfig, parseTseResult, parseEqResults, tseResultUrl, eqIso, voteStatus } from "../src/ingest/election-parse";
 import {
-  ELECTION_EVENTS, ELECTION_SERIES, QC_RIDING_COUNT, decideElection, eqCompleteness, eqExpectedRidings, eqFileRefusal, tseNotFinal, tseIntegrity, eqNotFinal, eqIntegrity,
+  ELECTION_EVENTS, ELECTION_SERIES, QC_RIDING_COUNT, TSE_POLLS_CLOSE, decideElection, eqCompleteness, eqExpectedRidings, eqFileRefusal, tseFileRefusal, tseNotFinal, tseIntegrity, eqNotFinal, eqIntegrity,
   electionRegistrationIssues, normName, namesAgree, snapshotForSeries, type ElectionSeriesId, type EqSnapshot, type LegResolver,
 } from "../src/resolve/election";
 import { KNOWN_RELEASES, OFFICIAL_SERIES, fetchGroupOf } from "../src/resolve/official";
@@ -68,6 +68,61 @@ describe("TSE result files", () => {
     const p = parseTseResult(body, "2022-10-02");
     if (!p.ok) throw new Error(p.detail);
     expect(tseIntegrity(p.snap).join(" ")).toContain("valid candidates add up");
+  });
+});
+
+const pendingTse = (caveat: string) => ({ status: "UNRESOLVED", outcome: "NONE", caveats: [caveat] });
+describe("TSE capture gate: a final file no leg can decide from is never recorded (tseFileRefusal)", () => {
+  const FINAL = fx("tse_2022_br_c0001_e000544_r_20221004T163422Z.json");
+  const DAY = "2022-10-02";
+  /** SYNTHETIC: the 2022 national final count with replacements, each applying exactly once. */
+  const edited = (...edits: Array<[string, string]>) => {
+    let body = FINAL;
+    for (const [from, to] of edits) { if (body.split(from).length !== 2) throw new Error(`"${from}" is not exactly once`); body = body.replace(from, to); }
+    const p = parseTseResult(body, DAY);
+    if (!p.ok) throw new Error(p.detail);
+    return p.snap;
+  };
+  /** SYNTHETIC: the final count stamped (dt/ht) on election day at `hms` Brasília time. */
+  const stamped = (hms: string) => edited(['"dt" : "04/10/2022", "ht" : "10:27:34"', `"dt" : "02/10/2022", "ht" : "${hms}"`]);
+  /** SYNTHETIC: Constituinte Eymael's 16,604 votes under a destination the rail does not read, the totals restated so the file adds up. */
+  const unknownDestination = () => edited(
+    ['"dvt" : "Válido", "vap" : "16604"', '"dvt" : "Válido (legenda)", "vap" : "16604"'], ['"vv" : "118229719"', '"vv" : "118213115"'],
+    ['"vvc" : "118229719"', '"vvc" : "118213115"'], ['"tv" : "123682372"', '"tv" : "123665768"'], ['"c" : "123682372"', '"c" : "123665768"'],
+  );
+  const turnoutLeg = () => {
+    const b = buildElectionLeg({ series: "br_pres_r1_turnout", period: DAY, release_at: "2022-10-02T20:00:00Z", title: "Test: turnout", criteria: "Paraphrased test rules. A value exactly between two brackets resolves to the higher bracket.", labels: ["75-80%"] }, { external_id: "t-turnout", label: "75-80%", open_at: "2022-09-01T00:00:00Z", deadline_utc: "2027-06-30T23:59:00Z" }, {});
+    if (!b.ok) throw new Error(b.reason);
+    return (snap: ReturnType<typeof edited>) => decideElection(b.market, b.market.resolver as LegResolver, snap, ["first_print", "single_source"]);
+  };
+
+  it("the 2022 national final count may be recorded, also stamped exactly at polls close; a second before, or a day the rail has no polls-close time for, is refused", () => {
+    expect(tseFileRefusal(edited(), DAY)).toBeNull();
+    expect(tseFileRefusal(stamped("17:00:00"), DAY)).toBeNull();
+    expect(tseFileRefusal(stamped("16:59:59"), DAY)).toEqual({ kind: "before_polls_close", detail: "the file is stamped 2022-10-02T16:59:59-03:00, before polls closed at 2022-10-02T20:00:00Z (a simulation or another election)" });
+    expect(tseFileRefusal(edited(), "2018-10-07")).toMatchObject({ kind: "before_polls_close", detail: expect.stringContaining("no polls-close time for a TSE election on 2018-10-07") });
+    // the 2026 time is the event's release_at, which gate 1 of the resolver holds the stamp to
+    expect(TSE_POLLS_CLOSE["2026-10-04"]).toBe(ELECTION_EVENTS.find((e) => e.authority === "tse" && e.day === "2026-10-04")!.polls_close);
+    expect(TSE_POLLS_CLOSE["2026-10-04"]).toBe(KNOWN_RELEASES["br_pres_r1_winner:2026-10-04"]!.release_at);
+  });
+  it("refuses the file's own simulation flag, totals that do not add up and a vote destination the rail does not read, each the way every leg refuses it", () => {
+    const decide = turnoutLeg();
+    expect(decide(edited())).toMatchObject({ status: "RESOLVED", outcome: "OPTION_A" }); // control: 79.05% is in 75-80%
+    const simulation = edited(['"f" : "o"', '"f" : "s"']);
+    expect(tseFileRefusal(simulation, DAY)).toEqual({ kind: "environment", detail: "the TSE file is from the simulation environment, never a result" });
+    expect(decide(simulation)).toMatchObject(pendingTse("awaiting_release"));
+    const offByOne = edited(['"vv" : "118229719"', '"vv" : "118229720"']);
+    expect(tseFileRefusal(offByOne, DAY)).toEqual({ kind: "inconsistent", detail: "TSE BR file: the valid candidates add up to 118229719, the file's valid votes are 118229720; vvc 118229719 != vv + van + vansj" });
+    expect(decide(offByOne)).toMatchObject(pendingTse("totals_inconsistent"));
+    const unknown = unknownDestination();
+    expect(tseIntegrity(unknown)).toEqual([]); // the file adds up: only the destination refuses it
+    expect(tseFileRefusal(unknown, DAY)).toEqual({ kind: "vote_status_unknown", detail: 'vote destination "Válido (legenda)" (27) is not one the rail reads' });
+    expect(decide(unknown)).toMatchObject(pendingTse("vote_status_unknown"));
+  });
+  it("off (rail election_tse_capture_refusal): the capture records any final file", () => {
+    __setRailsForMutationTesting(["election_tse_capture_refusal"]);
+    for (const s of [edited(['"f" : "o"', '"f" : "s"']), stamped("16:59:59"), edited(['"vv" : "118229719"', '"vv" : "118229720"']), unknownDestination()]) expect(tseFileRefusal(s, DAY)).toBeNull();
+    expect(tseFileRefusal(edited(), "2018-10-07")).toBeNull();
   });
 });
 

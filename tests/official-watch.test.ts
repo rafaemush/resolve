@@ -111,7 +111,9 @@ import { runWatch } from "../src/ingest/watch";
 import { fetchOfficial, officialIdleNextPoll, inReleaseMinute, BURST_MAX_REQUESTS, BURST_WINDOW_MS } from "../src/ingest/official-watch";
 import { fetchPrimary, officialGet, budget, OFFICIAL_UA, __resetElectionMemo } from "../src/ingest/official";
 import { buildElectionLeg, eqRegistryFromSnapshot, type ElectionEventInput } from "../src/markets/election-legs";
-import { parseEqResults } from "../src/ingest/election-parse";
+import { parseEqResults, parseTseResult } from "../src/ingest/election-parse";
+import { fetchGroupOf } from "../src/resolve/official";
+import { tseIntegrity } from "../src/resolve/election";
 import { eqApply, eqAs2026, eqText, type EqBody } from "../evals/lib/eq-synthetic";
 import { TSE_CONFIG_URL, EQ_RESULTS_URL } from "../src/resolve/official";
 import { alert } from "../src/ops/alerts";
@@ -836,7 +838,107 @@ function eqRidingTasch(): MarketRow {
   return electionMarket({ series: "qc_riding_751", period: "2026-10-05", release_at: "2026-10-06T00:00:00Z", title: "Taschereau winner", criteria: "The candidate who wins the riding.", labels: [winner] }, winner, { eq });
 }
 
+/** One replacement that must apply exactly once. */
+const once = (body: string, from: string, to: string): string => { if (body.split(from).length !== 2) throw new Error(`"${from}" is not exactly once in the body`); return body.replace(from, to); };
+const TSE_BR_URL = "https://resultados.tse.jus.br/oficial/ele2026/21270/dados/br/br-c0001-e021270-u.json";
+/** SYNTHETIC: the 2026 simulation configuration as the official one (f=o) with its federal pleito dated 04/10/2026. */
+const TSE_CFG_O = once(once(fx("tse_sim2026_config_ele-c.json"), '"f" : "s"', '"f" : "o"'), '"dt" : "26/04/2026"', '"dt" : "04/10/2026"');
+/** SYNTHETIC: the simulation's national President file (final flags) as the official file, stamped 22:00 BRT on election day (01:00Z Oct 5, after polls closed at 20:00Z). */
+const TSE_FINAL = ([
+  ['"f" : "s"', '"f" : "o"'], ['"dg" : "24/09/2026", "hg" : "16:12:52"', '"dg" : "04/10/2026", "hg" : "22:00:10"'], ['"dt" : "24/09/2026", "ht" : "16:12:34"', '"dt" : "04/10/2026", "ht" : "22:00:00"'],
+] as const).reduce((b, [f, t]) => once(b, f, t), fx("tse_sim2026_br_c0001_e021270_u.json"));
+/** SYNTHETIC TSE_FINAL with every candidate numbered n removed from its party (the file's totals not restated). */
+const tseWithout = (n: string): string => {
+  const d = JSON.parse(TSE_FINAL) as { carg: Array<{ agr: Array<{ par: Array<{ cand: Array<{ n: string }> }> }> }> };
+  let cut = 0;
+  for (const c of d.carg) for (const a of c.agr) for (const p of a.par) { const k = p.cand.length; p.cand = p.cand.filter((x) => x.n !== n); cut += k - p.cand.length; }
+  if (cut !== 1) throw new Error(`candidate ${n} is listed ${cut} times`);
+  return JSON.stringify(d);
+};
+/** SYNTHETIC TSE_FINAL with a candidate of no votes whose vote destination (dvt) is "Concorrendo": the file still adds up. */
+const tseWithUnknownDestination = (): string => {
+  const d = JSON.parse(TSE_FINAL) as { carg: Array<{ agr: Array<{ par: Array<{ cand: Array<Record<string, unknown>> }> }> }> };
+  const par = d.carg[0]!.agr[1]!.par[0]!;
+  par.cand.push({ ...par.cand[0]!, n: "99", sqcand: "1", nm: "CANDIDATO X", nmu: "CANDIDATO X", dvt: "Concorrendo", vap: "0" });
+  return JSON.stringify(d);
+};
+/**
+ * SYNTHETIC final-flagged official TSE files that no leg can decide from (the verifier's reproductions), each with what
+ * the capture says of it: the file's own environment flag is the simulation's; stamped 16:59 BRT, before polls closed; the
+ * valid votes one more than the valid candidates add up to; a valid candidate relabelled "Válido (legenda)"; a candidate
+ * of no votes with the destination "Concorrendo" (the totals add up); a valid candidate missing, the totals not restated.
+ */
+const TSE_REFUSED: Array<[string, () => string, string]> = [
+  ["simulation environment", () => once(TSE_FINAL, '"f" : "o"', '"f" : "s"'), "the TSE file is from the simulation environment, never a result"],
+  ["stamped before polls close", () => once(once(TSE_FINAL, '"dt" : "04/10/2026", "ht" : "22:00:00"', '"dt" : "04/10/2026", "ht" : "16:59:00"'), '"dg" : "04/10/2026", "hg" : "22:00:10"', '"dg" : "04/10/2026", "hg" : "16:59:10"'), "before polls closed at 2026-10-04T20:00:00Z"],
+  ["valid votes off by one", () => once(TSE_FINAL, '"vv" : "100982116"', '"vv" : "100982117"'), "the valid candidates add up to 100982116, the file's valid votes are 100982117"],
+  ["a valid candidate relabelled", () => once(TSE_FINAL, '"dvt" : "Válido", "seq" : "13"', '"dvt" : "Válido (legenda)", "seq" : "13"'), "the valid candidates add up to"],
+  ["an unknown vote destination", tseWithUnknownDestination, 'vote destination "Concorrendo" (99) is not one the rail reads'],
+  ["a valid candidate missing", () => tseWithout("68"), "the valid candidates add up to"],
+];
+const TSE_REFUSED_ALERT = "official_tse_refused_2026-10-04";
+const serveTse = (body: () => string) => serve((url) => (url === TSE_CONFIG_URL ? ok(TSE_CFG_O, "application/json") : url === TSE_BR_URL ? ok(body(), "application/json") : new Response("", { status: 404 })));
+const tseTurnout8590 = () => electionMarket({ series: "br_pres_r1_turnout", period: "2026-10-04", release_at: "2026-10-04T20:00:00Z", title: "Brazil turnout", criteria: TIE, labels: ["85-90%"] }, "85-90%");
+
 describe("election captures", () => {
+  it("TSE: a final-flagged file that no leg can decide from is pending with an alert, never an observation of its fetch group", async () => {
+    const read = async (body: string) => {
+      __resetElectionMemo();
+      serveTse(() => body);
+      return fetchPrimary("br_pres_r1_turnout", "2026-10-04", budget(() => Date.parse("2026-10-05T01:10:00Z"), 10_000, 2));
+    };
+    // control: the final official file is observed, with every other series of the national file from the same bytes
+    const whole = await read(TSE_FINAL);
+    expect(whole).toMatchObject({ kind: "observed", obs: { series: "br_pres_r1_turnout", period: "2026-10-04" } });
+    expect(whole.kind === "observed" && whole.siblings?.map((x) => x.series)).toEqual(fetchGroupOf("br_pres_r1_turnout").slice(1));
+    // the unknown destination exercises its own check: the file adds up
+    const unknown = parseTseResult(tseWithUnknownDestination(), "2026-10-04");
+    expect(unknown.ok && tseIntegrity(unknown.snap)).toEqual([]);
+    for (const [name, body, why] of TSE_REFUSED) {
+      const r = await read(body());
+      expect(r, name).toMatchObject({ kind: "pending", alert: { key: TSE_REFUSED_ALERT, dedupMinutes: 60 } });
+      expect(r, name).not.toHaveProperty("obs");
+      expect(r, name).not.toHaveProperty("siblings");
+      expect((r as { detail: string }).detail, name).toContain("the TSE BR file");
+      expect((r as { detail: string }).detail, name).toContain("is flagged final but no leg can decide from it");
+      expect((r as { detail: string }).detail, name).toContain(why);
+    }
+    // what the gate exists for: without it each of those files is observed, and would be the first print of all 9 series
+    __setRailsForMutationTesting(["election_tse_capture_refusal"]);
+    for (const [name, body] of TSE_REFUSED) expect(await read(body()), name).toMatchObject({ kind: "observed" });
+  });
+
+  it("TSE: a refused final-flagged file locks nothing (waitUntil, as in production); the correct file read after it is recorded for the whole fetch group and the leg resolves", async () => {
+    for (const [name, bad] of TSE_REFUSED) {
+      Object.assign(h.state, { obs: new Map(), slots: new Map(), appConfig: new Map() });
+      __resetElectionMemo();
+      vi.mocked(alert).mockClear();
+      const m = tseTurnout8590();
+      setWatch(m);
+      let body = bad();
+      serveTse(() => body);
+      const poll = async (at: string) => {
+        const tasks: Array<Promise<unknown>> = [];
+        const out = await fetchOfficial(env(), watchRow(), m, { ...clock(at).deps, waitUntil: (p) => { tasks.push(p); } });
+        await Promise.all(tasks);
+        return out;
+      };
+      const first = await poll("2026-10-05T01:10:00Z");
+      expect(first.evidence, name).toBeUndefined();
+      expect(h.state.obs.size, name).toBe(0); // no series of the national file is locked
+      expect(alertKeys(), name).toEqual([[TSE_REFUSED_ALERT, 60]]);
+      // the correct file 30 min later: the whole fetch group is recorded from it
+      body = TSE_FINAL;
+      __resetElectionMemo();
+      await poll("2026-10-05T01:40:00Z");
+      expect([...h.state.obs.keys()].sort(), name).toEqual(fetchGroupOf("br_pres_r1_turnout").map((x) => `${x}|2026-10-04`).sort());
+      // the next poll reads the stored first print and the leg resolves from it
+      const next = await poll("2026-10-05T01:45:00Z");
+      expect(next.evidence!.structured, name).toMatchObject({ kind: "official_observation", series: "br_pres_r1_turnout", period: "2026-10-04" });
+      expect(decideOfficial(m, next.evidence!), name).toMatchObject({ status: "RESOLVED", outcome: "OPTION_A" });
+    }
+  });
+
   it("TSE: an official configuration that still lists no President first round 6 h after polls close keeps the legs pending and alerts the operator", async () => {
     const m = tseTurnout();
     setWatch(m);

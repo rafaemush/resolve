@@ -44,7 +44,10 @@
  * eq), not per series. A TSE capture requests the configuration and then the contest file (2 upstream requests); an
  * isolate that captured another TSE contest in the last 60 s reuses the configuration it read (a per-isolate memo, so
  * it only saves requests: the bound on the TSE hosts is the fetch lease of each contest, since every isolate and every
- * contest reads the configuration again). The Élections Québec capture requests the one file, and a final count is
+ * contest reads the configuration again). A final-flagged TSE file that no leg can decide from (its own environment
+ * flag, a stamp before polls close, totals that do not add up, a vote destination the rail does not read) is pending
+ * with an alert and never recorded, since the first print of every series of its fetch group would be locked to it
+ * (src/ingest/official.ts). The Élections Québec capture requests the one file, and a final count is
  * recorded only on a read that confirms an earlier one (EQ_STABLE_MS; the first read is kept in app_config, 1 read and
  * at most 1 write per capture). A final-flagged file that is not every riding of the election once (a read that lost
  * ridings), or whose statistics, party totals or polling stations do not add up to its ridings, is pending with an

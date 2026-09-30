@@ -10,7 +10,10 @@
  *     Élections Québec isResultatsFinaux on the file and on every riding, every polling station reported.
  *   - integrity: the file's own totals add up (valid votes = the sum of the valid candidates, and so on; an Élections
  *     Québec file's statistics, party totals and polling stations against its ridings). The capture checks a whole
- *     Québec file before a riding event keeps its one-riding copy (eqFileRefusal), since the copy cannot show them.
+ *     Québec file before a riding event keeps its one-riding copy (eqFileRefusal), since the copy cannot show them, and
+ *     records no final TSE file that every leg would refuse (tseFileRefusal: its own environment flag, a stamp before
+ *     polls close, totals that do not add up, a vote destination the rail does not read), since the first print is
+ *     immutable and a correct file published after it would never be read.
  *   - completeness (rail election_qc_complete_file): an Élections Québec snapshot lists every riding of the election
  *     exactly once, and the election's riding count comes from the rail's registry (QC_RIDING_COUNT), never from the
  *     file alone; a riding event's stored copy holds exactly its one riding. A file that lost ridings would otherwise
@@ -146,8 +149,17 @@ export interface ElectionEvent { authority: ElectionAuthority; day: string; poll
  */
 export const QC_RIDING_COUNT: Readonly<Record<string, number>> = { "2022-10-03": 125, "2026-10-05": 127 };
 export function eqExpectedRidings(day: string): number | undefined { return Object.prototype.hasOwnProperty.call(QC_RIDING_COUNT, day) ? QC_RIDING_COUNT[day] : undefined; }
+/**
+ * When polls closed at each Brazilian presidential first round the rail reads, by election day: a TSE file stamped
+ * (dt/ht) before it is a simulation or another election, never the count (tseFileRefusal; gate 1 of
+ * src/resolve/official.ts applies the same time as the event's release_at). 2026-10-04: 17:00 Brasília time (UTC-3)
+ * nationwide (ELECTION_EVENTS); 2022-10-02: 17:00 Brasília time, the first election with national hours (the election
+ * the frozen cases read). A final file of an election day that is not here is never recorded.
+ */
+export const TSE_POLLS_CLOSE: Readonly<Record<string, string>> = { "2022-10-02": "2022-10-02T20:00:00Z", "2026-10-04": "2026-10-04T20:00:00Z" };
+export function tsePollsClose(day: string): string | undefined { return Object.prototype.hasOwnProperty.call(TSE_POLLS_CLOSE, day) ? TSE_POLLS_CLOSE[day] : undefined; }
 export const ELECTION_EVENTS: ElectionEvent[] = [
-  { authority: "tse", day: "2026-10-04", polls_close: "2026-10-04T20:00:00Z", basis: "Brazil general election, first round, Sunday 2026-10-04; polls close 17:00 Brasília time (UTC-3) in every time zone (national hours since 2022; UNVERIFIED for 2026: every TSE host answered 403 from here, 2026-09-27T22:48Z..23:34Z); the TSE publishes no President totals before (dv flag)" },
+  { authority: "tse", day: "2026-10-04", polls_close: TSE_POLLS_CLOSE["2026-10-04"]!, basis: "Brazil general election, first round, Sunday 2026-10-04; polls close 17:00 Brasília time (UTC-3) in every time zone (national hours since 2022; UNVERIFIED for 2026: every TSE host answered 403 from here, 2026-09-27T22:48Z..23:34Z); the TSE publishes no President totals before (dv flag)" },
   { authority: "eq", day: "2026-10-05", polls_close: "2026-10-06T00:00:00Z", ridings: QC_RIDING_COUNT["2026-10-05"]!, basis: "Quebec general election Monday 2026-10-05; results published from 20:00 EDT (OBSERVED https://www.dgeq.org/ 2026-09-27T22:46Z: files update after 20:00 every 2-5 minutes); 127 ridings (liste_circonscriptions2026.csv, candidatures.json)" },
 ];
 export function electionEvent(authority: ElectionAuthority, day: string): ElectionEvent | undefined { return ELECTION_EVENTS.find((e) => e.authority === authority && e.day === day); }
@@ -359,6 +371,42 @@ export function tseIntegrity(s: TseSnapshot): string[] {
   return p;
 }
 
+/** Why no TSE file with this environment flag is ever a result (only o, the official results, is), or null. */
+function tseEnvironmentProblem(s: TseSnapshot): string | null {
+  return s.environment.toLowerCase() === "o" ? null : `the TSE file is from the ${s.environment === "s" ? "simulation" : `"${s.environment}"`} environment, never a result`;
+}
+
+/** Why no leg can decide from a TSE file's numbers, or null: they do not add up (tseIntegrity), or a vote destination is one the rail does not read. */
+function tseContentProblem(s: TseSnapshot): { caveat: "totals_inconsistent" | "vote_status_unknown"; detail: string } | null {
+  const bad = tseIntegrity(s);
+  if (bad.length) return { caveat: "totals_inconsistent", detail: `TSE ${s.scope} file: ${bad.join("; ")}` };
+  const unknown = s.candidates.filter((c) => c.status === "other");
+  if (unknown.length) return { caveat: "vote_status_unknown", detail: `vote destination ${unknown.map((c) => `"${c.status_text}" (${c.id})`).join(", ")} is not one the rail reads` };
+  return null;
+}
+
+export type TseRefusalKind = "environment" | "before_polls_close" | "inconsistent" | "vote_status_unknown";
+/**
+ * The capture's gate on a final-flagged TSE file (src/ingest/official.ts, after tseNotFinal), before any series of its
+ * fetch group is recorded from it: the file's own environment flag is o, it is stamped (dt/ht) at or after polls closed
+ * on `day` (TSE_POLLS_CLOSE; a day the rail has no time for is refused), its totals add up (tseIntegrity) and every vote
+ * destination is one the rail reads. Every leg refuses such a file (decideTse with the same checks, gate 1 of
+ * src/resolve/official.ts for the stamp), and the first print is immutable (migration 016): recorded, it would lock a
+ * count no leg can ever decide from, and the correct file published after it would never be read. null: the file may
+ * be recorded.
+ */
+export function tseFileRefusal(s: TseSnapshot, day: string): { kind: TseRefusalKind; detail: string } | null {
+  if (!railEnabled("election_tse_capture_refusal")) return null;
+  const env = tseEnvironmentProblem(s);
+  if (env) return { kind: "environment", detail: env };
+  const close = tsePollsClose(day);
+  if (close === undefined) return { kind: "before_polls_close", detail: `the rail has no polls-close time for a TSE election on ${day}, so the file's stamp ${s.as_of} cannot be checked` };
+  if (!(Date.parse(s.as_of) >= Date.parse(close))) return { kind: "before_polls_close", detail: `the file is stamped ${s.as_of}, before polls closed at ${close} (a simulation or another election)` };
+  const bad = tseContentProblem(s);
+  if (bad) return { kind: bad.caveat === "totals_inconsistent" ? "inconsistent" : "vote_status_unknown", detail: bad.detail };
+  return null;
+}
+
 export function eqNotFinal(s: EqSnapshot): string[] {
   const p: string[] = [];
   if (!s.final) p.push("isResultatsFinaux is false");
@@ -468,15 +516,15 @@ function decideTse(def: ElectionSeriesDef, s: TseSnapshot, ctx: Ctx, caveats: st
   const leg = ctx.r.election ?? {};
   if (s.scope !== def.scope) return mismatch(`the file is the ${s.scope} count; ${def.id} reads ${def.scope}`);
   if (s.office !== "1" || s.round !== "1") return mismatch(`the file is office ${s.office} round ${s.round}; ${def.id} is the President, first round`);
-  if (s.environment.toLowerCase() !== "o") return unresolvedD("awaiting_release", `the TSE file is from the ${s.environment === "s" ? "simulation" : `"${s.environment}"`} environment, never a result`);
+  // the checks the capture applies before it records a final file (tseFileRefusal), in the resolver's order
+  const env = tseEnvironmentProblem(s);
+  if (env) return unresolvedD("awaiting_release", env);
   if (railEnabled("election_final_count")) {
     const nf = tseNotFinal(s);
     if (nf.length) return unresolvedD("count_not_final", `TSE ${s.scope} count not final: ${nf.join("; ")}`);
   }
-  const bad = tseIntegrity(s);
-  if (bad.length) return unresolvedD("totals_inconsistent", `TSE ${s.scope} file: ${bad.join("; ")}`);
-  const unknown = s.candidates.filter((c) => c.status === "other");
-  if (unknown.length) return unresolvedD("vote_status_unknown", `vote destination ${unknown.map((c) => `"${c.status_text}" (${c.id})`).join(", ")} is not one the rail reads`);
+  const bad = tseContentProblem(s);
+  if (bad) return unresolvedD(bad.caveat, bad.detail);
 
   let subject: TseCandidate | null = null;
   if (def.measure !== "turnout") {

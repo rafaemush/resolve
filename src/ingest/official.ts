@@ -6,7 +6,7 @@
  * A document that is readable but still about an earlier period is "pending", never an observation.
  */
 import { OFFICIAL_SERIES, fetchGroupOf, hostAllowed, sameAtPrecision, reading, thousandsOf, percentTenths, knownRelease, TSE_CONFIG_URL, EQ_RESULTS_URL, type OfficialCorroboration, type OfficialSeriesId } from "../resolve/official";
-import { ELECTION_SERIES, isElectionSeries, snapshotForSeries, tseNotFinal, eqNotFinal, eqFileRefusal, type ElectionSeriesId, type ElectionSnapshot, type EqSnapshot } from "../resolve/election";
+import { ELECTION_SERIES, isElectionSeries, snapshotForSeries, tseNotFinal, tseFileRefusal, eqNotFinal, eqFileRefusal, type ElectionSeriesId, type ElectionSnapshot, type EqSnapshot } from "../resolve/election";
 import { parseTseConfig, parseTseResult, parseEqResults, tseResultUrl, tseConfigEnvironment } from "./election-parse";
 import { sha256Hex } from "../resolve/text";
 import { discardBody, retryAfterSeconds } from "./http";
@@ -234,6 +234,8 @@ export const TSE_CONFIG_MISSING_ALERT_MS = 6 * 3600_000;
 export const TSE_CONFIG_ALERT_DEDUP_MIN = 360;
 /** A final-flagged Élections Québec file that is not every riding once, or does not add up: the operator hears each at most this often. */
 export const EQ_INCOMPLETE_ALERT_DEDUP_MIN = 60;
+/** A final-flagged TSE file that no leg can decide from (tseFileRefusal): one alert per election day at most this often, whichever file. */
+export const TSE_REFUSED_ALERT_DEDUP_MIN = 60;
 /** Tests only: forget the memoised configuration. */
 export function __resetElectionMemo(): void { tseConfigMemo = null; }
 /** The counts of a Québec file, without its timestamps: two reads with the same key report the same result. */
@@ -267,13 +269,17 @@ function electionFailed(g: Extract<Got, { ok: false }>): PrimaryResult {
 /**
  * The count an election series reads, recorded only once it is FINAL by the authority's own flags (a partial count is
  * "pending", never an observation). TSE: the configuration first (the election's id is known only from it), then the
- * scope's unified file built from it; Élections Québec: the one results file, accepted only when the authority stamped
- * it at or after polls close (the same URL served the simulation of 2026-09-20), it lists every riding of the election
- * exactly once (against the rail's own riding count) and the whole file adds up (its statistics, party totals and polling
- * stations against its ridings: eqFileRefusal), and returned with a ConfirmRead: the capture records it only when a read
- * at least EQ_STABLE_MS later shows the same counts. A final-flagged file that lost ridings or does not add up is
- * "pending" with an alert, so it is never the first candidate of a first print nor the read that confirms one: a riding
- * event stores a one-riding copy, on which the resolver can no longer compare the whole file's sums.
+ * scope's unified file built from it, recorded only when some leg can decide from it (tseFileRefusal: the file's own
+ * environment flag, its stamp at or after polls close, its totals, every vote destination one the rail reads); a
+ * final-flagged file refused there is "pending" with an alert, because the first print is immutable and would hold every
+ * series of the fetch group to a count no leg decides from, the correct file published after it never read.
+ * Élections Québec: the one results file, accepted only when the authority stamped it at or after polls close (the same
+ * URL served the simulation of 2026-09-20), it lists every riding of the election exactly once (against the rail's own
+ * riding count) and the whole file adds up (its statistics, party totals and polling stations against its ridings:
+ * eqFileRefusal), and returned with a ConfirmRead: the capture records it only when a read at least EQ_STABLE_MS later
+ * shows the same counts. A final-flagged file that lost ridings or does not add up is "pending" with an alert, so it is
+ * never the first candidate of a first print nor the read that confirms one: a riding event stores a one-riding copy, on
+ * which the resolver can no longer compare the whole file's sums.
  */
 async function fetchElection(series: ElectionSeriesId, target: string, b: Budget): Promise<PrimaryResult> {
   const def = ELECTION_SERIES[series];
@@ -308,6 +314,12 @@ async function fetchElection(series: ElectionSeriesId, target: string, b: Budget
     if (s.scope !== def.scope || s.election_id !== c.snap.electionId || s.office !== "1" || s.round !== "1") return { kind: "error", error: `schema drift: ${url} is the ${s.scope} office ${s.office} round ${s.round} file of election ${s.election_id}`, retryable: false, drift: true };
     const nf = tseNotFinal(s);
     if (nf.length) return { kind: "pending", detail: `TSE ${s.scope} count not final (${s.sections.totalized} of ${s.sections.total} sections, as of ${s.as_of}): ${nf.join("; ")}` };
+    // a final file no leg can decide from is never the first print (it is immutable, and would lock the whole fetch group)
+    const refused = tseFileRefusal(s, target);
+    if (refused) {
+      const detail = `the TSE ${s.scope} file (as of ${s.as_of}) is flagged final but no leg can decide from it: ${refused.detail}`;
+      return { kind: "pending", detail, alert: { key: `official_tse_refused_${target}`, dedupMinutes: TSE_REFUSED_ALERT_DEDUP_MIN, text: `TSE: ${detail}. Nothing was recorded and the legs read from ${url} stay pending; the next poll reads the file again. Other TSE files refused within ${TSE_REFUSED_ALERT_DEDUP_MIN} min are not alerted again (tseFileRefusal in src/resolve/election.ts).` } };
+    }
     const deciding = `TSE President first-round count for ${s.scope === "BR" ? "Brazil" : s.scope}, election day ${s.election_day} (${c.snap.cycle}, election ${s.election_id}, environment ${s.environment}): tf=${s.flags.tf}${s.flags.and !== null ? ` and=${s.flags.and}` : ""} dv=${s.flags.dv} esae=${s.flags.esae}; ${s.sections.totalized} of ${s.sections.total} sections totalized; last totalization ${s.as_of}; ${s.votes.valid} valid votes, ${s.turnout} voters of ${s.electorate} eligible.`;
     return electionObserved(series, s, s.election_day, deciding, g, b);
   }

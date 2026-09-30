@@ -29,7 +29,7 @@ import {
 import { BLS_API, blsCorroboration } from "../src/ingest/official";
 import { buildLegRegistration, type LegGroup } from "../src/markets/official-legs";
 import { parseTseConfig, parseTseResult, parseEqResults } from "../src/ingest/election-parse";
-import { eqFileRefusal, snapshotForSeries, type ElectionSeriesId, type ElectionSnapshot } from "../src/resolve/election";
+import { eqFileRefusal, tseFileRefusal, snapshotForSeries, type ElectionSeriesId, type ElectionSnapshot } from "../src/resolve/election";
 import { buildElectionLeg, tseRegistryFromSnapshot, eqRegistryFromSnapshot, type ElectionEventInput, type Registries } from "../src/markets/election-legs";
 import { officialFixture, officialFixtureBytes, officialFixtureFetchedAt, OFFICIAL_FIXTURE_DIR } from "./lib/official-fixtures";
 import { eqApply, eqChangesBody, eqParse, QC_TOP_TIE_RIDINGS, type EqOps } from "./lib/eq-synthetic";
@@ -40,7 +40,9 @@ const CASES_FILE = resolve(DIR, "cases.jsonl");
 const MANIFEST = resolve(DIR, "manifest.sha256");
 
 /**
- * Election groups (src/resolve/election.ts): election_final (rail election_final_count), election_margin (rail
+ * Election groups (src/resolve/election.ts): election_final (rail election_final_count; and rail
+ * election_tse_capture_refusal, 24: the capture records no final TSE file that no leg can decide from, so the correct file
+ * read after it is the first print, Read.capture with a stored read), election_margin (rail
  * election_safety_margin, and each of its margins alone: election_qc_riding_lead, election_qc_party_votes,
  * election_br_turnout_agree, election_sub_judice; evals/mutate.ts 16-20; and rail election_qc_leader_settled, 22: the
  * Québec seat-margin legs abstain while the party with the most seats is not settled), election_complete (rail
@@ -65,9 +67,11 @@ type Edits = Array<[string, string]>;
 /** url (election reads only): the URL the saved body is attributed to, when not its provenance URL (a SYNTHETIC relocation). */
 /** eq (eq_result reads only): SYNTHETIC operations on the body's JSON, applied after `edits` (evals/lib/eq-synthetic.ts); each must apply. */
 /**
- * capture (eq_result reads only): the read first goes through the capture's gate on the whole file (eqFileRefusal, as
- * src/ingest/official.ts applies it before any series keeps its part); a read it refuses is never stored, so the leg's
- * document is the release_not_observed one the watch records once polls closed 72 h ago.
+ * capture (election reads): the read first goes through the capture's gate on the whole file (eqFileRefusal for an
+ * Élections Québec read, tseFileRefusal for a TSE read, as src/ingest/official.ts applies them before any series keeps
+ * its part); a read it refuses is never stored. A refused fetched read leaves the leg with the release_not_observed
+ * document the watch records once polls closed 72 h ago; a refused stored read (the first read of the night) leaves the
+ * fetched read as the first print.
  */
 interface Read { fixture: string; parser: Parser; url?: string; select?: string; observed_at: string; own_capture?: boolean; edits?: Edits; eq?: EqOps; capture?: true; config?: string; config_edits?: Edits; corroboration?: { fixture?: string; parser: CorrParser; select?: string; edits?: Edits } }
 /** detail_includes: text the structured resolver's own account of the decision must contain (the seat ranges a SYNTHETIC case claims; never on a control, whose ranges close when a margin rail is off). */
@@ -424,6 +428,23 @@ const CIRO_SUB_JUDICE: Edits = [
 const ESI_81: Edits = [['"esi" : "156453354"', '"esi" : "152694286"']];
 /** SYNTHETIC: Acre's two leaders brought within 96 votes (0.02 pp of 440,917 valid votes); their sum and every total unchanged. */
 const AC_NEAR_TIE: Edits = [['"vap" : "275582"', '"vap" : "202350"'], ['"vap" : "129022"', '"vap" : "202254"']];
+/**
+ * SYNTHETIC final-flagged 2022 national files that no leg can decide from (the capture refuses each: tseFileRefusal): its
+ * own environment flag the simulation's; stamped 16:59 BRT on election day, before polls closed; valid votes one more
+ * than its valid candidates add up to; Constituinte Eymael's 16,604 votes under the destination "Válido (legenda)",
+ * every total restated so the file adds up.
+ */
+const TSE_2022_REFUSED: Record<"simulation" | "early" | "vv_plus_one" | "destination", Edits> = {
+  simulation: [['"f" : "o"', '"f" : "s"']],
+  early: [['"dg" : "04/10/2022", "hg" : "12:07:13", "dt" : "04/10/2022", "ht" : "10:27:34"', '"dg" : "02/10/2022", "hg" : "16:59:10", "dt" : "02/10/2022", "ht" : "16:59:00"']],
+  vv_plus_one: [['"vv" : "118229719"', '"vv" : "118229720"']],
+  destination: [
+    ['"dvt" : "Válido", "vap" : "16604"', '"dvt" : "Válido (legenda)", "vap" : "16604"'], ['"vv" : "118229719"', '"vv" : "118213115"'],
+    ['"vvc" : "118229719"', '"vvc" : "118213115"'], ['"tv" : "123682372"', '"tv" : "123665768"'], ['"c" : "123682372"', '"c" : "123665768"'],
+  ],
+};
+/** The first read of the night, 34 min before the saved final file was fetched, through the capture's gate. */
+const tseFirstRead = (edits: Edits): Read => ({ ...tseRead(EL.br2022.final, edits), observed_at: "2022-10-04T16:00:00Z", capture: true });
 /** SYNTHETIC: Taschereau (730 on the 2022 map) under the 2026 code of the qc_riding_751 event, so the rail's own riding copy is what the leg reads. */
 const TASCH_AS_751: Edits = [['"numeroCirconscription": 730,', '"numeroCirconscription": 751,']];
 /**
@@ -491,6 +512,14 @@ function electionCases(): OfficialCase[] {
     { id: "EL-FC7", group: "election_final", control: true, title: "TSE 2022 national final count: turnout 79.05% (over eligible voters and over installed sections alike) is in 75-80%, Yes", market: L("br_pres_r1_turnout", "75-80%", br), fetched: tseRead(EL.br2022.final), expect: EL_YES },
     { id: "EL-FC8", group: "election_final", control: true, title: "TSE 2026 SIMULATION file from resultados-sim.tse.jus.br: not the series' host, never evidence", market: simMarket, fetched: { fixture: EL.sim2026, parser: "tse_result", select: "2026-10-04", observed_at: officialFixtureFetchedAt(EL.sim2026) }, expect: { status: "ERROR", outcome: "NONE", error_reason: "SOURCE_REF_MISMATCH" } },
     { id: "EL-FC10", group: "election_final", control: true, title: "SYNTHETIC: the 2026 simulation bytes (f=s, final flags, stamped 24/09/2026) served at the official host and read after polls close: never a result", market: simMarket, fetched: { fixture: EL.sim2026, parser: "tse_result", select: "2026-10-04", observed_at: "2026-10-05T12:00:00Z", url: "https://resultados.tse.jus.br/oficial/ele2026/21270/dados/br/br-c0001-e021270-u.json" }, expect: AWAIT },
+    // --- election_final, the TSE capture's gate (red when election_tse_capture_refusal is off): a final-flagged file no
+    // leg can decide from is read first; it is never stored, so the real final count read after it is the first print.
+    // Off, it is the immutable first print and the leg abstains for good -----------------------------------------------
+    { id: "EL-F05", group: "election_final", control: false, title: "SYNTHETIC: a final-flagged 2022 national file whose own environment flag is the simulation's (f=s) is read first; the capture records nothing, so the real final count read after it is the first print: Lula 1st, Yes", market: L("br_pres_r1_winner", "Lula", br, { labels: named }), stored: tseFirstRead(TSE_2022_REFUSED.simulation), fetched: { ...tseRead(EL.br2022.final), capture: true }, expect: EL_YES },
+    { id: "EL-F06", group: "election_final", control: false, title: "SYNTHETIC: a final-flagged 2022 national file stamped 16:59 BRT on election day, before polls closed, is read first; the capture records nothing, so the real final count read after it is the first print: Lula 1st, Yes", market: L("br_pres_r1_winner", "Lula", br, { labels: named }), stored: tseFirstRead(TSE_2022_REFUSED.early), fetched: { ...tseRead(EL.br2022.final), capture: true }, expect: EL_YES },
+    { id: "EL-F07", group: "election_final", control: false, title: "SYNTHETIC: a final-flagged 2022 national file whose valid votes are one more than its valid candidates add up to is read first; the capture records nothing, so the real final count read after it is the first print: Lula 1st, Yes", market: L("br_pres_r1_winner", "Lula", br, { labels: named }), stored: tseFirstRead(TSE_2022_REFUSED.vv_plus_one), fetched: { ...tseRead(EL.br2022.final), capture: true }, expect: EL_YES },
+    { id: "EL-F08", group: "election_final", control: false, title: "SYNTHETIC: a final-flagged 2022 national file with Constituinte Eymael's votes under the destination 'Válido (legenda)' (its totals restated, so it adds up) is read first; the capture records nothing, so the real final count read after it is the first print: turnout 79.05% is in 75-80%, Yes", market: L("br_pres_r1_turnout", "75-80%", br), stored: tseFirstRead(TSE_2022_REFUSED.destination), fetched: { ...tseRead(EL.br2022.final), capture: true }, expect: EL_YES },
+    { id: "EL-FC11", group: "election_final", control: true, title: "TSE 2022 national final count read through the capture's gate (tseFileRefusal): recorded, Lula 1st nationally, Yes", market: L("br_pres_r1_winner", "Lula", br, { labels: named }), fetched: { ...tseRead(EL.br2022.final), capture: true }, expect: EL_YES },
     { id: "EL-FC9", group: "election_final", control: true, title: `Élections Québec 2022 final file (every riding final): ${taschWinner.name} wins Taschereau, Yes`, market: L("qc_riding_751", taschWinner.name, eq, { unit: tasch }), fetched: eqRead(EL.eq2022), expect: EL_YES },
     // --- election_margin: a decisive number inside the safety margin stays pending (red when election_safety_margin is off)
     { id: "EL-M01", group: "election_margin", control: false, title: "SYNTHETIC Acre final count with the leaders 96 votes apart (0.02 pp): Bolsonaro's 1st-place leg abstains (near_tie)", market: L("br_pres_r1_first_ac", "Jair Bolsonaro", ac, { labels: named }), fetched: tseRead(EL.ac2022, AC_NEAR_TIE), expect: PENDING("near_tie") },
@@ -720,10 +749,11 @@ function electionDoc(r: OfficialResolver, read: Read): OfficialDoc {
   const p = read.parser === "tse_result" ? parseTseResult(body, read.select!) : parseEqResults(body);
   if (!p.ok) throw new Error(`${read.fixture} ${read.parser}: ${p.reason} ${p.detail}`);
   const snap = p.snap as ElectionSnapshot;
-  if ((read.eq || read.capture) && snap.authority !== "eq") throw new Error(`${read.fixture}: eq operations and the capture gate apply to an Élections Québec read`);
-  if (read.capture && snap.authority === "eq") {
-    const refused = eqFileRefusal(snap, read.select!);
-    if (refused) return { kind: "official_missing", series: r.series, period: r.period, release_at: new Date(releaseAtOf(r)).toISOString(), source_url: read.url ?? urlOf(read.fixture), detail: `not observed by release_at + 72 h: the capture refused every read of the file (${refused.kind}: ${refused.problems.join("; ")})`.slice(0, 500) };
+  if (read.eq && snap.authority !== "eq") throw new Error(`${read.fixture}: eq operations apply to an Élections Québec read`);
+  if (read.capture) {
+    const refused = snap.authority === "eq" ? eqFileRefusal(snap, read.select!) : tseFileRefusal(snap, read.select!);
+    const why = refused && ("problems" in refused ? refused.problems.join("; ") : refused.detail);
+    if (refused) return { kind: "official_missing", series: r.series, period: r.period, release_at: new Date(releaseAtOf(r)).toISOString(), source_url: read.url ?? urlOf(read.fixture), detail: `not observed by release_at + 72 h: the capture refused every read of the file (${refused.kind}: ${why})`.slice(0, 500) };
   }
   // what the rail stores: its own part of the snapshot, or (SYNTHETIC, EqOps.copy) a copy holding the named ridings
   let contest = snapshotForSeries(r.series as ElectionSeriesId, snap);
@@ -837,8 +867,12 @@ async function runCase(k: OfficialCase): Promise<{ failures: string[]; falseReso
   let doc: OfficialDoc = fetched;
   if (k.stored) {
     const stored = docOf(r, k.stored);
-    if (stored.kind !== "official_observation" || fetched.kind !== "official_observation") throw new Error("a first_print case needs two observations");
-    doc = firstPrintFor(stored, fetched);
+    // a first read the capture refused was never stored: the fetched read is the first print
+    if (k.stored.capture && stored.kind === "official_missing") doc = fetched;
+    else {
+      if (stored.kind !== "official_observation" || fetched.kind !== "official_observation") throw new Error("a first_print case needs two observations");
+      doc = firstPrintFor(stored, fetched);
+    }
   }
   const { evidence } = officialEvidence(doc, new Date(k.fetched.observed_at).toISOString(), { ownCapture: k.fetched.own_capture ?? true });
   let jevCalls = 0;

@@ -55,6 +55,13 @@ const rails = {
    */
   election_qc_capture_integrity: true,
   /**
+   * TSE capture: a final-flagged file that no leg can decide from (its own environment flag not o, stamped before polls
+   * closed, totals that do not add up, a vote destination the rail does not read: tseFileRefusal) is pending with an
+   * alert, never recorded (off: it becomes the immutable first print of every series of its fetch group, so the correct
+   * file published after it is never read and every leg stays unresolved for good).
+   */
+  election_tse_capture_refusal: true,
+  /**
    * Québec seat-margin event: a leg is decided only when the party with the most seats is settled in every case (off: a
    * leader that is not settled is answered No, "Another Party Wins" included, where the rail must abstain).
    */
