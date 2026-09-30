@@ -1,5 +1,5 @@
 /**
- * Customer-facing text (plan §17.5, MCA §2.3(a)): the pilot pack, the invoice / pilot-letter / W-8BEN templates, the
+ * Customer-facing text (plan §17.5, MCA §2.3(a)): the pilot pack, the invoice / pilot-letter / W-9 templates, the
  * pricing page and the /bot page never name the model, never say "DCM-grade" or quote "24–72 h", never state an
  * accuracy figure, describe credits as a non-refundable prepayment for API services, and carry placeholders instead of
  * personal data.
@@ -12,7 +12,7 @@ import { RESOLVE_BOT_UA } from "../src/ops/ua";
 
 const ROOT = resolve(import.meta.dirname, "..");
 const read = (p: string) => readFileSync(resolve(ROOT, p), "utf8");
-const DOCS = ["docs/pilot-pack.md", "docs/templates/invoice.md", "docs/templates/pilot-letter.md", "docs/templates/w8ben-notes.md", "docs/pricing.md"];
+const DOCS = ["docs/pilot-pack.md", "docs/templates/invoice.md", "docs/templates/pilot-letter.md", "docs/templates/w9-notes.md", "docs/pricing.md"];
 
 describe("customer-facing documents", () => {
   const texts = Object.fromEntries([...DOCS.map((p) => [p, read(p)]), ["/bot", botPageHtml(RESOLVE_BOT_UA)]]) as Record<string, string>;
@@ -38,15 +38,16 @@ describe("customer-facing documents", () => {
     expect(t).toMatch(/not an oracle of record/);
   });
   it("templates carry <placeholders>, no personal data: no email address, no filled wallet address", () => {
-    for (const p of ["docs/templates/invoice.md", "docs/templates/pilot-letter.md", "docs/templates/w8ben-notes.md"]) {
+    for (const p of ["docs/templates/invoice.md", "docs/templates/pilot-letter.md", "docs/templates/w9-notes.md"]) {
       const t = texts[p]!;
       expect(t, p).toMatch(/<[^<>\n]+>/);
       expect(t, p).not.toMatch(/[\w.+-]+@[\w-]+\.[a-z]{2,}/i);
       // the only 0x address allowed is the public USDC contract on Base
       for (const a of t.match(/0x[0-9a-fA-F]{40}\b/g) ?? []) expect(a).toBe("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
     }
-    expect(texts["docs/templates/w8ben-notes.md"]).toMatch(/Not tax or legal advice/);
-    expect(texts["docs/templates/w8ben-notes.md"]).toMatch(/Treaty claim: confirm with counsel/);
+    expect(texts["docs/templates/w9-notes.md"]).toMatch(/Not tax or legal advice/);
+    expect(texts["docs/templates/w9-notes.md"]).toMatch(/Never sign a W-8BEN/);
+    for (const [p, t] of Object.entries(texts)) expect(t, p).not.toMatch(/with a W-8BEN|the W-8BEN (and|are)|W-8BEN is provided/);
   });
   it("the accuracy and lead-time gate is 100 distinct events, never a count of markets", () => {
     for (const [p, t] of Object.entries(texts)) expect(t, p).not.toMatch(/100\s+(reconciled\s+)?markets|100 of your markets/i);

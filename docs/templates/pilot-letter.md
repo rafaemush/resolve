@@ -16,7 +16,7 @@
 6. **Ending.** Either party may end the pilot early by written notice. Credits already issued stay on the account.
 7. **After the pilot.** Continuing is `<Design Partner at $750 a month | a Platform agreement once Resolve's operating entity exists>`, on your written decision.
 
-Resolve is operated by its founder as an individual until its operating entity exists; this letter, the invoice and the W-8BEN are issued on that basis.
+Resolve is operated by its founder as an individual until its operating entity exists; this letter, the invoice and the W-9 are issued on that basis.
 
 | For Resolve | For `<Customer legal name>` |
 |---|---|

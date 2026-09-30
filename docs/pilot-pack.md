@@ -18,9 +18,9 @@ Resolve checks whether the stated condition of a prediction market has happened,
 - Webhooks in your platform's own identifiers (below).
 - The weekly reconciliation report for your markets.
 - A named contact for the pilot.
-- Paid once in USDC against an invoice, with a W-8BEN and a one-page pilot letter. The payment is credited to your account as the $1,000 pack: 120,000 credits for API calls.
+- Paid once in USDC against an invoice, with a W-9 and a one-page pilot letter. The payment is credited to your account as the $1,000 pack: 120,000 credits for API calls.
 
-Resolve is operated by its founder as an individual until its operating entity exists; the invoice, the W-8BEN and the pilot letter are issued on that basis.
+Resolve is operated by its founder as an individual until its operating entity exists; the invoice, the W-9 and the pilot letter are issued on that basis.
 
 ## What you receive
 

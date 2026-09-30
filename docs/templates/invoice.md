@@ -42,4 +42,4 @@ Taxes: `<none charged, or the tax and rate that applies: confirm with counsel>`.
 
 - The payment is credited to account `<Resolve tenant id>` as `<120,000 credits (the $1,000 pack) | the month's Design Partner prepayment>`. Credits are a non-refundable prepayment for API services. They are not a balance, wallet, deposit or stored value: they cannot be withdrawn, transferred to another account, or exchanged for money or crypto, and Resolve holds no funds on the customer's behalf.
 - Resolve publishes an informational signal: not financial advice, and not an oracle of record. No service level is part of this invoice.
-- Resolve is operated by its founder as an individual until its operating entity exists; this invoice is issued on that basis. A W-8BEN is provided on request.
+- Resolve is operated by its founder as an individual until its operating entity exists; this invoice is issued on that basis. A W-9 is provided on request.
