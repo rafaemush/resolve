@@ -12,6 +12,11 @@ export const FREE_EVALUATION_CREDITS = 300;
 export const EVALUATION_KEY_DAYS = 30;
 /** tenants.watch_limit of an evaluation tenant, as POST /internal/tenants and scripts/issue-test-key.ts create it. */
 export const EVALUATION_WATCH_LIMIT = 5;
+/**
+ * tenants.watch_limit of a pay-as-you-go tenant (docs/pricing.md: Pay as you go, 5 watches). A free tenant's first card
+ * purchase moves it to payg with at least this many (src/billing/whop-events.ts); a higher limit is never lowered.
+ */
+export const PAYG_WATCH_LIMIT = 5;
 
 /**
  * The ledger request_id that makes the evaluation grant once per tenant (credit_ledger UNIQUE(reason, request_id)).

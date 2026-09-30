@@ -9,6 +9,7 @@ import { v1 } from "./api/v1";
 import { webhooks } from "./api/webhooks";
 import { pub } from "./api/public";
 import { site } from "./api/site";
+import { whopWebhook, billingV1, noStore } from "./api/billing";
 import { engineVersion } from "./api/public-names";
 import openapi from "./generated/openapi.json";
 
@@ -62,8 +63,11 @@ app.post("/internal/tick", async (c) => {
 app.get("/openapi.json", (c) => c.json(openapi));
 app.route("/", site);           // public HTML: /, /record, /pricing, /docs, /terms, and POST /v1/request-key (before the authenticated /v1 router)
 app.route("/", pub);            // public: /v1/track-record, /v1/track-record/verify, /bot, /echo (registered before the authenticated /v1 router)
+app.route("/", whopWebhook);    // public: POST /webhooks/whop, Whop's signed payment, refund and dispute events (src/api/billing.ts)
 app.route("/internal", internal);
 v1.route("/webhooks", webhooks);
+v1.route("/billing", billingV1);
+app.use("/v1/billing/*", noStore); // every answer of the checkout route is no-store, the key middleware's refusals included
 app.route("/v1", v1);
 
 app.notFound((c) => err(c, "not_found", `no route ${c.req.method} ${c.req.path}`, 404));

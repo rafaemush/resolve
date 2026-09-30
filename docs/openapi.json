@@ -2135,6 +2135,241 @@
         }
       }
     },
+    "/v1/billing/checkout": {
+      "post": {
+        "summary": "Open a card checkout (Whop, the merchant of record) for a credit pack for this key's account: \"50\": $50 for 5,000 credits, \"250\": $250 for 27,500 credits. Whop receives this account's id, never the key. The credits are added when Whop confirms the payment (usually within a minute; GET /v1/account shows the balance); a free test key's account moves to pay as you go and its key stops expiring. Credits are a non-refundable prepayment for API services and do not expire while the account is open; a card refund or chargeback removes them. Never cached",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": []
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "pack"
+                ],
+                "properties": {
+                  "pack": {
+                    "type": "string",
+                    "enum": [
+                      "50",
+                      "250"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "checkout_url (Whop's hosted checkout), checkout_id, pack, price, currency, credits, merchant_of_record, note",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "validation_error: pack is not one of the packs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "auth_required | invalid_key | key_expired",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "rate_limited | daily_cap_reached",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "UPSTREAM_UNAVAILABLE: card checkout not yet available, not configured, or Whop did not open the checkout; nothing was charged",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/billing/checkout": {
+      "post": {
+        "summary": "The pricing page's card form (public HTML; no-store): the key and the pack in the form body, answered with a 303 to the Whop checkout opened for that key's account (the key is never passed on, echoed or kept). Refusals answer an HTML page with the reason",
+        "requestBody": {
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "key",
+                  "pack"
+                ],
+                "properties": {
+                  "key": {
+                    "type": "string"
+                  },
+                  "pack": {
+                    "type": "string",
+                    "enum": [
+                      "50",
+                      "250"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "303": {
+            "description": "Location: the Whop checkout"
+          },
+          "400": {
+            "description": "the form was not complete",
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "the key was not accepted",
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "too many requests for this key",
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "card checkout not yet available, or the checkout could not be opened; nothing was charged",
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/billing/done": {
+      "get": {
+        "summary": "Where Whop sends the buyer after paying (public HTML). It reads nothing: credits come only from Whop's signed confirmation",
+        "responses": {
+          "200": {
+            "description": "text/html",
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/webhooks/whop": {
+      "post": {
+        "summary": "Whop's signed payment, refund and dispute events (Standard Webhooks: webhook-id, webhook-timestamp within 300 s, webhook-signature v1 HMAC-SHA256 of the raw body). Called by Whop only; an unverified request answers 401 and nothing is stored",
+        "responses": {
+          "200": {
+            "description": "received, type, result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "invalid_signature",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "conflict: another event of the same payment is being processed; Whop retries",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "validation_error: body too large",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "UPSTREAM_UNAVAILABLE: not configured or the database is unavailable; Whop retries",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/request-key": {
       "post": {
         "summary": "Request a test key (public, no auth). Issues an evaluation key on the spot and returns it once (data.key): rsl_test_, 300 credits, valid 30 days, structured verdicts only, up to 5 watches. One key per email address every 30 days, 3 keys a day per network (IPv4 address or IPv6 /64) and a daily cap on keys issued this way (25 by default); past any of these, or when the service is unsure, no key is issued (key_issued=false) and a person answers by email. At most 5 requests per hour per IP address",

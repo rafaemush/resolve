@@ -27,6 +27,11 @@ export interface Env {
   RESOLVE_BOT_UA: string;
   LIMITLESS_WS_ENABLED?: string;      // "0" switches the Limitless lifecycle listener off (src/jobs/limitless-ws.ts)
   REQUEST_KEY_DAILY_CAP?: string;     // evaluation keys POST /v1/request-key issues per UTC day (default 25, "0" = none; src/api/evaluation-key.ts)
+  // card checkout through Whop (src/billing/whop.ts): only "1" opens checkouts; the webhook verifies and records either way
+  WHOP_CHECKOUT_ENABLED?: string;
+  WHOP_PLAN_ID_50?: string;           // the Whop plan (plan_...) of the $50 pack: 5,000 credits
+  WHOP_PLAN_ID_250?: string;          // the Whop plan (plan_...) of the $250 pack: 27,500 credits
+  WHOP_SANDBOX?: string;              // "1" = Whop's sandbox (sandbox-api.whop.com, sandbox.whop.com); anything else = production
   // secrets
   TYPESAFE_API_KEY?: string;
   SPOTLIGHT_SECRET: string;
@@ -45,6 +50,8 @@ export interface Env {
   USDC_RECEIVING_ADDRESS?: string;
   RESOLVE_PUBLIC_URL?: string;
   PUBLIC_CHANNEL_URL?: string;        // the public Telegram channel link shown on the site (omitted when unset)
+  WHOP_API_KEY?: string;              // Whop account API key (checkout_configuration:create): creates card checkouts
+  WHOP_WEBHOOK_SECRET?: string;       // the Whop webhook's signing secret, exactly as Whop shows it
   GIT_SHA?: string;
 }
 

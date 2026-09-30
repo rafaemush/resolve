@@ -64,3 +64,13 @@ LIMITLESS_WS_ENABLED = "1"
 # Evaluation keys the request form issues on the spot per UTC day (src/api/evaluation-key.ts). Past it, and when it is
 # "0", the form stores the request and alerts the operator, who answers by email. Not a whole number from 0 to 1000 = 0.
 REQUEST_KEY_DAILY_CAP = "25"
+# Card checkout through Whop (src/billing/whop.ts). Only "1" opens checkouts and shows the /pricing form; while it is
+# "0", POST /v1/billing/checkout answers 503 and the webhook (POST /webhooks/whop) still verifies and records, so a test
+# event from the Whop dashboard is answered. The plan ids are the Whop plans (plan_...) of the $50 pack (5,000 credits)
+# and the $250 pack (27,500 credits): empty = checkout refuses, and a payment on an unknown plan answers 503 for Whop to
+# retry once they are set. WHOP_SANDBOX "1" points every Whop call at the sandbox. WHOP_API_KEY and WHOP_WEBHOOK_SECRET
+# are secrets (wrangler secret put), never here.
+WHOP_CHECKOUT_ENABLED = "0"
+WHOP_PLAN_ID_50 = ""
+WHOP_PLAN_ID_250 = ""
+WHOP_SANDBOX = "0"

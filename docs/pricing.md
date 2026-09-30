@@ -1,6 +1,6 @@
 # Resolve pricing
 
-Prices are in US dollars and paid in USDC on Base. Last updated 2026-09-30.
+Resolve is a developer data API: credits pay for its calls. Prices are in US dollars, paid by card through Whop (the merchant of record) or in USDC on Base. Last updated 2026-09-30.
 
 ## Credits
 
@@ -17,14 +17,14 @@ A verdict that cannot be produced because an upstream is unavailable (`error_cod
 
 Web-evidence verdicts are not generally available yet. Until they are, paid plans are quoted on structured verdicts only, and a request routed to web evidence answers `UPSTREAM_UNAVAILABLE` and is refunded. The public shadow track record runs web-evidence verdicts today, as best effort.
 
-**Credits are a non-refundable prepayment for API services.** They are not a balance, wallet, deposit or stored value: they cannot be withdrawn, transferred to another account, or exchanged for money or crypto, and Resolve holds no funds on your behalf. A refund of a failed verdict returns credits, never money.
+**Credits are a non-refundable prepayment for API services.** They are not a balance, wallet, deposit or stored value: they cannot be withdrawn, transferred to another account, or exchanged for money or crypto, and Resolve holds no funds on your behalf. A refund of a failed verdict returns credits, never money. Credits do not expire while the account is open. If a card payment is refunded or charged back, the credits it bought are removed from the account (as far as the balance allows).
 
 ## Plans
 
 | Plan | Price | Included | Watches | Follows (private early reveals) | Requests per minute per key |
 |---|---|---|---|---|---|
 | Free | $0 | 300 credits with an evaluation key, valid 30 days from issue | 5 | not included (see below) | 60 |
-| Pay as you go | packs from $50 | credits never expire | 5 | up to 50 | 60 |
+| Pay as you go | packs from $50 | credits do not expire while the account is open | 5 | up to 50 | 60 |
 | Builder | $99 / month | 12,000 credits a month | 50 | up to 50 | 60 |
 | Growth | $399 / month | 60,000 credits a month | 500 | up to 500 | 300 |
 | Platform | $1,500 to $3,000 / month, invoiced | by agreement | by agreement | unlimited | 600 |
@@ -39,7 +39,9 @@ Web-evidence verdicts are not generally available yet. Until they are, paid plan
 | $250 (the standard pack) | 27,500 | 10 % |
 | $1,000 | 120,000 | 20 % |
 
-Register the wallet you pay from: `GET /v1/account/wallet/challenge?address=<your address>` returns a message; sign it with that wallet (`personal_sign`) and send the signature with `POST /v1/account/wallet` within 10 minutes. Then send USDC on Base from that wallet to the address `GET /v1/payments/address` returns. The deposit is credited once Base marks its block safe (typically 5 to 10 minutes), at the rate of the tier its amount reaches: 100 credits per USDC, 110 from $250, 120 from $1,000 (amount x rate, rounded down), so each pack above arrives as one ledger entry. A deposit from an unregistered wallet is held until it is matched to your account. A `payment.credited` webhook reports each credit, and `credits.low` warns once when a charge leaves your balance below 500 credits (again after your next purchase).
+**Pay by card.** The $50 and $250 packs can be paid by card through Whop, which processes the payment as the merchant of record and handles card disputes. Buying needs a Resolve key (the free test key from the form works): the "Pay by card" form on `/pricing`, or `POST /v1/billing/checkout` with `{"pack": "50"}` or `{"pack": "250"}` and the key in the `Authorization` header, which answers `checkout_url`, Whop's hosted checkout for that key's account. Whop receives the account id, never the key. The credits are added once Whop confirms the payment, usually within a minute, as one ledger entry per payment; a free test key's account then moves to pay as you go and the key stops expiring. A card refund or chargeback removes the credits that payment bought (a partial refund its share); if they were already used, the account keeps a balance of zero, never below. The route answers 503 until card checkout is switched on.
+
+**Pay in USDC.** Register the wallet you pay from: `GET /v1/account/wallet/challenge?address=<your address>` returns a message; sign it with that wallet (`personal_sign`) and send the signature with `POST /v1/account/wallet` within 10 minutes. Then send USDC on Base from that wallet to the address `GET /v1/payments/address` returns. The deposit is credited once Base marks its block safe (typically 5 to 10 minutes), at the rate of the tier its amount reaches: 100 credits per USDC, 110 from $250, 120 from $1,000 (amount x rate, rounded down), so each pack above arrives as one ledger entry. A deposit from an unregistered wallet is held until it is matched to your account. A `payment.credited` webhook reports each credit, and `credits.low` warns once when a charge leaves your balance below 500 credits (again after your next purchase).
 
 **Pilot pack ($1,000, 30 days, for a venue).** Private early reveals for every market you name that Resolve shadows (the pilot account has no follow limit), webhooks in your platform's payload shape, a weekly reconciliation report for your markets (commit time, official time, lead time, agreement, share of web-evidence verdicts), and a named contact. Paid in USDC against an invoice, with a W-9 and a one-page pilot letter (details: [pilot-pack.md](pilot-pack.md)). Resolve is operated by its founder as an individual until its operating entity exists; the invoice, the W-9 and the letter are issued on that basis.
 
@@ -68,6 +70,10 @@ Early reveals are labeled "private early reveal — excluded from the public rec
 - No accuracy percentage appears in any offer, message or invoice before 100 distinct events on that platform have been reconciled against the platform of record (the legs of one multi-outcome event count once). Before that, we quote only your own markets' reconciled rows and measured lead times. The public track record (`GET /v1/track-record`) shows percentages only after 100 reconciled events per platform, counted the same way.
 - No lead-time claim before lead time has been measured on at least 30 distinct events.
 - Resolve is an informational signal: not financial advice and not an oracle of record.
+
+## Status (2026-09-30)
+
+Card checkout through Whop is built and switched off until the Whop account and its two plans are set up; until then `POST /v1/billing/checkout` answers 503 and `/pricing` shows no card form.
 
 ## Status (2026-09-25)
 

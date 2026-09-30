@@ -51,7 +51,14 @@ export async function invalidateKeyCache(hash: string): Promise<void> {
 export type AuthResult = { ok: true; auth: AuthContext } | { ok: false; response: Response };
 
 export async function authenticate<E extends { Bindings: Env }>(c: Context<E>): Promise<AuthResult> {
-  const raw = extractApiKey(c);
+  return authenticateKey(c, extractApiKey(c));
+}
+
+/**
+ * The same checks for a key that did not come in a header: the card checkout form (POST /billing/checkout) posts it in
+ * its body, since a page without script cannot set a header. No answer repeats the key.
+ */
+export async function authenticateKey<E extends { Bindings: Env }>(c: Context<E>, raw: string | null): Promise<AuthResult> {
   if (!raw) return { ok: false, response: err(c, "auth_required", "Provide an API key via `Authorization: Bearer rsl_live_...` or `X-Api-Key`.", 401) };
   if (!KEY_PREFIX.test(raw)) return { ok: false, response: err(c, "invalid_key", "Invalid API key format.", 401) };
   const hash = await sha256Hex(raw);

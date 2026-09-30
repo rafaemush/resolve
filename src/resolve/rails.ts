@@ -74,6 +74,13 @@ const rails = {
    * not read as a disallow for now: refused as unverified, nothing stored.
    */
   registration_policy: true,
+  // Card checkout rail (src/billing/whop.ts). Off = the failure it exists for; evals/whop.ts proves it.
+  /**
+   * POST /webhooks/whop acts only on a request whose webhook-signature is the HMAC-SHA256 of
+   * "<webhook-id>.<webhook-timestamp>.<raw body>" under WHOP_WEBHOOK_SECRET, with a timestamp within 5 minutes (off:
+   * any request that claims to be from Whop is believed, so anyone could grant credits with a forged payment).
+   */
+  whop_signature: true,
 };
 export type Rail = keyof typeof rails;
 export function railEnabled(r: Rail): boolean { return rails[r]; }

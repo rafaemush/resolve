@@ -5,12 +5,15 @@
  * rows whose hashes GET /v1/track-record/verify checks), GET /pricing, GET /docs, GET /terms, and POST /v1/request-key
  * (a test-key request: stored as a lead with an inbound touch; an evaluation key is issued on the spot and shown once
  * when src/api/evaluation-key.ts allows it, otherwise a person answers by email; the operator is alerted either way,
- * never with the key).
+ * never with the key), and the card checkout's pages: the "Pay by card" form on /pricing (only when card checkout is
+ * switched on and configured), POST /billing/checkout (the form: the key in its body, a 303 to Whop) and GET
+ * /billing/done (where Whop sends the buyer back; it reads nothing).
  *
  * Rules every page keeps (tests/site.test.ts): every dynamic value is HTML-escaped; no page names the model or its
  * vendor; no accuracy percentage appears before the view marks a platform reportable (100 reconciled markets); no number
  * is printed that is not read from the database or from code; each page makes at most 3 database reads, in parallel;
- * a strict Content-Security-Policy (no script at all) and a 60 s public cache (the POST answers: no-store).
+ * a strict Content-Security-Policy (no script at all; /pricing's form may also post to Whop's checkout host, where the
+ * form's answer redirects) and a 60 s public cache (the POST answers: no-store).
  */
 import { Hono, type Context } from "hono";
 import { z } from "zod";
@@ -22,10 +25,13 @@ import { KNOWN_RELEASES, OFFICIAL_SERIES, knownRelease, type OfficialSeriesId } 
 import { ELECTION_SERIES, isElectionSeries } from "../resolve/election";
 import { effectiveTiers, packQuotes, type PaygCredit } from "../billing/tiers";
 import { followCap, type Plan } from "../shadow/follows";
-import { perKeyRpm } from "./auth";
+import { authenticateKey, perKeyRpm, rateLimit } from "./auth";
 import { alert } from "../ops/alerts";
+import { maskEmail } from "../ops/redact";
 import { EVALUATION_KEY_DAYS, EVALUATION_WATCH_LIMIT, FREE_EVALUATION_CREDITS } from "./keys";
 import { issueEvaluationKey, type AutoKeyOutcome } from "./evaluation-key";
+import { CARD_PACKS, PACK_IDS, cardCheckoutOffered, isPackId, usd, whopConfig, type WhopConfig } from "../billing/whop";
+import { checkoutRefusal, startCheckout } from "./billing";
 
 type Vars = { requestId: string; schemaVersion: string };
 export const site = new Hono<{ Bindings: Env; Variables: Vars }>();
@@ -36,6 +42,12 @@ export const esc = (v: unknown): string =>
   String(v ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 
 export const SITE_CSP = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
+/**
+ * The policy of a page that carries the card form: the form posts to this site, whose answer is a 303 to Whop's hosted
+ * checkout, and browsers apply form-action to that redirect (and to any redirect Whop's page makes within its own
+ * domain). Nothing else is loosened; the checkout URL itself must be on the configured host (checkoutUrlAllowed).
+ */
+export const cardFormCsp = (cfg: Pick<WhopConfig, "checkoutOrigin">): string => SITE_CSP.replace("form-action 'self'", `form-action 'self' ${cfg.checkoutOrigin} https://*.whop.com`);
 export const PAGE_MAX_AGE = 60;
 const DISCLAIMER = "Informational signal, not financial advice, not an oracle of record.";
 
@@ -89,7 +101,7 @@ td.n{font-variant-numeric:tabular-nums;white-space:nowrap}
 form{display:grid;gap:.8rem;max-width:34rem}
 label{display:grid;gap:.25rem;font-weight:600;font-size:.95rem}
 label small{font-weight:400;color:var(--muted)}
-input,textarea{font:inherit;color:var(--fg);background:var(--bg);border:1px solid var(--muted);border-radius:4px;padding:.5rem .6rem;width:100%}
+input,textarea,select{font:inherit;color:var(--fg);background:var(--bg);border:1px solid var(--muted);border-radius:4px;padding:.5rem .6rem;width:100%}
 textarea{min-height:6rem}
 button{font:inherit;font-weight:600;color:#fff;background:var(--accent);border:0;border-radius:4px;padding:.6rem 1.1rem;justify-self:start;cursor:pointer}
 @media (prefers-color-scheme:dark){button{color:#10201a}}
@@ -113,9 +125,9 @@ ${o.body}
 }
 
 /** The security and cache headers of every page. */
-function page(c: Context<{ Bindings: Env; Variables: Vars }>, html: string, status: 200 | 400 | 429 | 503 = 200, cache = status === 200): Response {
+function page(c: Context<{ Bindings: Env; Variables: Vars }>, html: string, status: 200 | 400 | 401 | 429 | 503 = 200, cache = status === 200, csp = SITE_CSP): Response {
   const res = c.html(html, status);
-  res.headers.set("Content-Security-Policy", SITE_CSP);
+  res.headers.set("Content-Security-Policy", csp);
   res.headers.set("X-Content-Type-Options", "nosniff");
   res.headers.set("Referrer-Policy", "strict-origin-when-cross-origin");
   res.headers.set("X-Frame-Options", "DENY");
@@ -390,7 +402,35 @@ export const PUBLIC_PLANS: ReadonlyArray<{ plan: Plan | null; name: string; pric
   { plan: null, name: "Pilot pack", price: "$1,000 for 30 days", contents: "A shorter start for a venue: private early reveals for the markets you name, webhooks in your payload shape and a weekly reconciliation report." },
 ];
 
-export function pricingHtml(o: { packs: PaygCredit[] | null; channel: string | null }): string {
+const dollars = (cents: number) => usd(cents).replace(/\.00$/, "");
+
+/**
+ * The "Pay by card" section of /pricing (and of a refused form answer): what a card pack is, the form that opens a Whop
+ * checkout, and the same from code. Shown only when card checkout is offered (src/billing/whop.ts cardCheckoutOffered).
+ * The key field is never filled in: no answer repeats a key.
+ */
+export function payByCardHtml(o: { base: string }): string {
+  const options = PACK_IDS.map((p) => `<option value="${p}">${esc(dollars(CARD_PACKS[p].priceCents))}: ${esc(int(CARD_PACKS[p].credits))} credits</option>`).join("");
+  return `<h2 id="pay-by-card">Pay by card</h2>
+<p>Buy a credit pack for the Resolve developer data API by card. Whop processes the payment as the merchant of record. The credits are added to the account of the key you enter once Whop confirms the payment, usually within a minute.</p>
+<ul>
+<li>Credits pay for calls to Resolve's own API and nothing else: they are not money, cannot be withdrawn, and cannot be moved to another account.</li>
+<li>Credits are a non-refundable prepayment for API services. They do not expire while the account is open.</li>
+<li>If a card payment is refunded or charged back, the credits it bought are removed from the account.</li>
+<li>A free test key's account becomes pay as you go with its first pack, and the key stops expiring.</li>
+</ul>
+<form method="post" action="/billing/checkout" autocomplete="off">
+<label>API key <small>(sent to Resolve only, to find your account; it is never passed to Whop or shown again)</small> <input name="key" type="password" required maxlength="64" autocomplete="off" spellcheck="false" pattern="rsl_(live|test)_[a-z0-9]{32}"></label>
+<label>Pack <select name="pack" required>${options}</select></label>
+<button type="submit">Continue to checkout</button>
+</form>
+<p>From code, the answer carries <code>checkout_url</code>:</p>
+<pre>curl -X POST ${esc(o.base)}/v1/billing/checkout \\
+  -H "Authorization: Bearer $RESOLVE_KEY" -H 'content-type: application/json' \\
+  -d '{"pack":"50"}'</pre>`;
+}
+
+export function pricingHtml(o: { packs: PaygCredit[] | null; channel: string | null; card?: { base: string } | null }): string {
   const limits = (p: Plan | null) => {
     if (!p) return `<td class="muted">no follow limit</td><td class="muted">by agreement</td>`;
     const cap = followCap(p);
@@ -400,7 +440,7 @@ export function pricingHtml(o: { packs: PaygCredit[] | null; channel: string | n
     ? `<div class="table"><table><thead><tr><th scope="col">Pack</th><th scope="col">Credits</th></tr></thead><tbody>${o.packs.map((p) => `<tr><td class="n">$${esc(int(Number(p.usdc)))}</td><td class="n">${esc(int(p.credits))}</td></tr>`).join("")}</tbody></table></div>`
     : `<p class="muted">Pack credit amounts are unavailable right now; ask us for a quote.</p>`;
   const body = `<h1>Pricing</h1>
-<p class="lede">Prices are in US dollars. The smallest pack gives 100 credits per dollar; larger packs give more (see the table below).</p>
+<p class="lede">Resolve is a developer data API; credits pay for its calls. Prices are in US dollars. The smallest pack gives 100 credits per dollar; larger packs give more (see the table below).</p>
 <h2>Credits per call</h2>
 <ul>
 <li>A structured verdict (machine-readable sources such as official releases, GitHub objects, on-chain logs): <strong>1 credit</strong>.</li>
@@ -416,8 +456,8 @@ export function pricingHtml(o: { packs: PaygCredit[] | null; channel: string | n
 <p class="muted">Monthly plans and venue offers are set up by agreement; the figures above are what the plan includes.</p>
 <h2>Pay-as-you-go packs</h2>
 ${packs}
-<h2>Payment</h2>
-<p>Invoiced in USD; ask us for payment options. For the Design Partner offer or the pilot pack, name the markets and a start date and we send an invoice to review before anything is paid.</p>
+${o.card ? payByCardHtml({ base: o.card.base }) + "\n" : ""}<h2>Payment</h2>
+<p>Invoiced in USD; ask us for payment options.${o.card ? ` The ${PACK_IDS.map((k) => esc(dollars(CARD_PACKS[k].priceCents))).join(" and ")} packs can also be paid by card (above).` : ""} For the Design Partner offer or the pilot pack, name the markets and a start date and we send an invoice to review before anything is paid.</p>
 <p><strong>Credits are a non-refundable prepayment for API services.</strong> They cannot be withdrawn, transferred, or exchanged for money or crypto.</p>
 <h2>What we do not claim</h2>
 <ul>
@@ -430,6 +470,8 @@ ${packs}
 }
 
 site.get("/pricing", (c) => cached(c, "/pricing?site=1", async () => {
+  const cfg = whopConfig(c.env);
+  const card = cardCheckoutOffered(cfg);
   let packs: PaygCredit[] | null = null;
   try {
     const { data, error } = await db(c.env).from("app_config").select("value").eq("key", "payg_tiers").maybeSingle();
@@ -440,7 +482,7 @@ site.get("/pricing", (c) => cached(c, "/pricing?site=1", async () => {
       if ("tiers" in eff) packs = packQuotes(eff.tiers);
     }
   } catch { packs = null; }
-  return page(c, pricingHtml({ packs, channel: channelUrl(c.env) }), 200, packs !== null);
+  return page(c, pricingHtml({ packs, channel: channelUrl(c.env), card: card ? { base: baseUrl(c) } : null }), 200, packs !== null, card ? cardFormCsp(cfg) : SITE_CSP);
 }));
 
 // ---- GET /docs -----------------------------------------------------------------------------------------------------
@@ -456,7 +498,7 @@ export const DOCS_MARKET_EXAMPLE = {
   open_at: "2026-10-01T00:00:00Z", deadline_utc: "2026-12-01T00:00:00Z",
 } as const;
 
-export function docsHtml(o: { base: string; channel: string | null }): string {
+export function docsHtml(o: { base: string; channel: string | null; card?: boolean }): string {
   const b = esc(o.base);
   const market = esc(JSON.stringify(DOCS_MARKET_EXAMPLE, null, 2));
   const body = `<h1>Quickstart</h1>
@@ -499,13 +541,21 @@ function verify(rawBody, header, secret, toleranceSeconds = 300) {
 <pre>curl '${b}/v1/track-record/verify?hash=&lt;commitment sha256&gt;'</pre>
 <p>After the reveal the answer includes <code>preimage</code>. Recompute the hash and compare:</p>
 <pre>printf '%s' "$PREIMAGE" | shasum -a 256</pre>
-<p>The output must equal <code>commitment_sha256</code>. The whole record is at <a href="/record">/record</a>.</p>`;
+<p>The output must equal <code>commitment_sha256</code>. The whole record is at <a href="/record">/record</a>.</p>
+<h2 id="pay-by-card">6. Pay by card</h2>
+<p>Resolve is a developer data API, paid for in credits. The ${PACK_IDS.map((k) => `${esc(dollars(CARD_PACKS[k].priceCents))} (${esc(int(CARD_PACKS[k].credits))} credits)`).join(" and ")} packs can be paid by card through Whop, which processes the payment as the merchant of record. Open a checkout for the account of your key:</p>
+<pre>curl -X POST ${b}/v1/billing/checkout \\
+  -H "Authorization: Bearer $RESOLVE_KEY" -H 'content-type: application/json' \\
+  -d '{"pack":"50"}'</pre>
+<p>Send the buyer to <code>data.checkout_url</code> (the <a href="/pricing#pay-by-card">pricing page</a> has the same as a form). Whop tells Resolve when the payment is confirmed, and the credits are added to the account then, usually within a minute: <code>GET /v1/account</code> shows the balance. Your key is never sent to Whop. A free test key's account becomes pay as you go with its first pack, and the key stops expiring.</p>
+<p>Credits are a non-refundable prepayment for API services. They pay for this API only: they cannot be withdrawn or moved to another account, and they do not expire while the account is open. If a card payment is refunded or charged back, the credits it bought are removed from the account.</p>
+${o.card ? "" : `<p class="note">Card checkout is not open yet: until it is, <code>POST /v1/billing/checkout</code> answers 503.</p>\n`}`;
   return layout({ title: "Docs · Resolve", path: "/docs", description: "Resolve quickstart: request a key, register a market, resolve it, receive webhooks and verify a commitment.", body, channel: o.channel });
 }
 
 const baseUrl = (c: Context<{ Bindings: Env; Variables: Vars }>) => (c.env.RESOLVE_PUBLIC_URL?.replace(/\/+$/, "") || new URL(c.req.url).origin);
 
-site.get("/docs", (c) => page(c, docsHtml({ base: baseUrl(c), channel: channelUrl(c.env) })));
+site.get("/docs", (c) => page(c, docsHtml({ base: baseUrl(c), channel: channelUrl(c.env), card: cardCheckoutOffered(whopConfig(c.env)) })));
 
 // ---- GET /terms ----------------------------------------------------------------------------------------------------
 
@@ -515,7 +565,8 @@ export function termsHtml(o: { channel: string | null }): string {
 <h2>What Resolve is</h2>
 <p>Resolve provides an informational signal: its reading of whether a market's stated condition happened, from the sources registered for that market. It is not financial advice and not an oracle of record. The venue's own resolution process decides every market; your decisions stay yours.</p>
 <h2>Credits</h2>
-<p>Credits are a non-refundable prepayment for API services. They are not a balance, deposit or stored value, and cannot be withdrawn, transferred to another account, or exchanged for money or crypto. A verdict that fails because an upstream is unavailable is refunded in credits, never in money.</p>
+<p>Credits are a non-refundable prepayment for API services. They are not a balance, deposit or stored value, and cannot be withdrawn, transferred to another account, or exchanged for money or crypto. A verdict that fails because an upstream is unavailable is refunded in credits, never in money. Credits do not expire while the account is open.</p>
+<p>When you pay by card, Whop processes the payment as the merchant of record and handles any card dispute. If a card payment is refunded or charged back, the credits it bought are removed from the account (as far as the balance allows).</p>
 <h2>No guarantee</h2>
 <p>There is no service-level agreement and no lead-time promise. The service is provided as is.</p>
 <h2>Acceptable use</h2>
@@ -551,11 +602,7 @@ export type KeyRequest = z.infer<typeof KeyRequest>;
 export const REQUEST_KEY_LIMIT = { perIpPerHour: 5, allPerHour: 60 } as const;
 
 /** a***@example.com: the alert names the domain, never the full address (the lead row keeps it). */
-export function maskEmail(email: string): string {
-  const at = email.lastIndexOf("@");
-  if (at < 1) return "***";
-  return `${email[0]}***${email.slice(at)}`;
-}
+export { maskEmail };
 
 const VENUES = new Set(["polymarket", "limitless"]);
 
@@ -700,3 +747,58 @@ site.post("/v1/request-key", async (c) => {
   }
   return page(c, keyIssuedHtml({ key: issued.key, expiresAt: issued.expiresAt, base: baseUrl(c), channel }), 200, false);
 });
+
+// ---- POST /billing/checkout, GET /billing/done ---------------------------------------------------------------------
+
+/** The form's body: two short fields. */
+const CHECKOUT_FORM_MAX = 4096;
+
+/**
+ * The /pricing card form: the key in the form body (a page without script cannot set a header), authenticated and rate
+ * limited like any API call, then a 303 to the Whop checkout opened for that key's tenant. Whop receives the tenant id
+ * only. No answer repeats the key, every answer is no-store, and the page that carries the form again after a refusal
+ * never fills the key in. The flag, the configuration and the pack are checked before the key is read.
+ */
+site.post("/billing/checkout", async (c) => {
+  c.header("Cache-Control", "no-store");
+  c.header("Referrer-Policy", "no-referrer");
+  const cfg = whopConfig(c.env);
+  const channel = channelUrl(c.env);
+  const answer = (status: 400 | 401 | 429 | 503, title: string, text: string) => {
+    const form = cardCheckoutOffered(cfg);
+    const body = `<h1>${esc(title)}</h1><p>${esc(text)}</p>${form ? payByCardHtml({ base: baseUrl(c) }) : `<p><a href="/pricing">Back to pricing</a></p>`}`;
+    return page(c, layout({ title: `${title} · Resolve`, path: "/billing/checkout", description: title, channel, body }), status, false, form ? cardFormCsp(cfg) : SITE_CSP);
+  };
+  const refused = await checkoutRefusal(c.env, cfg, "POST /billing/checkout");
+  if (refused) return answer(503, "Card checkout unavailable", refused.message);
+  if (!(c.req.header("content-type") ?? "").toLowerCase().includes("application/x-www-form-urlencoded")) return answer(400, "Unsupported request", "Send the form on the pricing page, or use POST /v1/billing/checkout with your key in the Authorization header.");
+  if (Number(c.req.header("content-length") ?? 0) > CHECKOUT_FORM_MAX) return answer(400, "Request too large", "The request body is too large.");
+  const text = await c.req.text();
+  if (text.length > CHECKOUT_FORM_MAX) return answer(400, "Request too large", "The request body is too large.");
+  const f = new URLSearchParams(text);
+  const pack = f.get("pack");
+  if (!isPackId(pack)) return answer(400, "Please choose a pack", `Choose one of the packs: ${PACK_IDS.map((k) => dollars(CARD_PACKS[k].priceCents)).join(" or ")}.`);
+  const a = await authenticateKey(c, f.get("key")?.trim() || null);
+  if (!a.ok) {
+    // The refusal's own message (auth.ts): it names the problem, never the key.
+    const e = (await a.response.clone().json().catch(() => null)) as { error?: { message?: unknown } } | null;
+    const msg = typeof e?.error?.message === "string" ? e.error.message : "The key was not accepted.";
+    return a.response.status === 429 ? answer(429, "Too many requests", msg) : answer(401, "Key not accepted", msg);
+  }
+  const rl = await rateLimit(c, a.auth, { jev: false, jevRpmLimit: 1 });
+  if (!rl.allowed) return answer(429, "Too many requests", "Too many requests for this key in the last minute. Please try again shortly.");
+  const r = await startCheckout(c, cfg, a.auth, pack);
+  if (!r.ok) return answer(503, "Checkout unavailable", "The checkout could not be opened right now. Nothing was charged; please try again in a few minutes.");
+  return c.redirect(r.url, 303);
+});
+
+/** Where Whop sends the buyer back. It reads nothing and trusts no query parameter: the credits come only from Whop's webhook. */
+export function billingDoneHtml(o: { channel: string | null }): string {
+  const body = `<h1>Thank you</h1>
+<p>If the payment went through, Whop confirms it to Resolve directly and the credits are added to your account, usually within a minute. <code>GET /v1/account</code> shows the balance.</p>
+<p>If it did not go through, nothing was charged: you can try again from the <a href="/pricing#pay-by-card">pricing page</a>.</p>
+<p class="muted">This page does not look at the payment; only Whop's confirmation adds credits.</p>`;
+  return layout({ title: "Payment · Resolve", path: "/billing/done", description: "After a card payment for Resolve credits.", body, channel: o.channel });
+}
+
+site.get("/billing/done", (c) => page(c, billingDoneHtml({ channel: channelUrl(c.env) })));

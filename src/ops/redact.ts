@@ -17,3 +17,13 @@ export function redact(text: string): string {
   for (const [re, rep] of PATTERNS) out = out.replace(re, rep);
   return out;
 }
+
+/**
+ * a***@example.com: an operator alert names the domain of a buyer's or requester's address, never the full address (the
+ * lead row keeps a requester's; Whop keeps a card buyer's).
+ */
+export function maskEmail(email: string): string {
+  const at = email.lastIndexOf("@");
+  if (at < 1) return "***";
+  return `${email[0]}***${email.slice(at)}`;
+}
