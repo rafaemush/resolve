@@ -1779,7 +1779,17 @@
             }
           },
           "404": {
-            "description": "not_found: an unknown series, a period not in the series' format, or no first print recorded and none scheduled; nothing charged",
+            "description": "not_found: an unknown series, a period not in the series' format, no first print recorded and none scheduled, or a stored observation made before its scheduled release (not a first print); nothing charged",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "405": {
+            "description": "method_not_allowed: HEAD is refused (Allow: GET) before anything is read or charged: an answer to HEAD carries no print",
             "content": {
               "application/json": {
                 "schema": {

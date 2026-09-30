@@ -45,7 +45,7 @@ vi.mock("../src/resolve/runtime", async () => {
   };
 });
 
-import { creditsLowPayload, noteCharge, paymentCreditedPayload, queuePaymentsCredited } from "../src/billing/events";
+import { creditsLowPayload, creditsLowTopUp, noteCharge, paymentCreditedPayload, queuePaymentsCredited } from "../src/billing/events";
 import { alert } from "../src/ops/alerts";
 import { v1 } from "../src/api/v1";
 import { MarketRegistration } from "../src/resolve/schema";
@@ -74,7 +74,14 @@ describe("payload builders", () => {
       .toEqual({ tx_hash: "0xabc", log_index: 2, amount_usdc: "250.5", credits: 27_555, balance_after: 30_000 });
   });
   it("credits.low: the balance, the threshold it fell below, the charge that crossed it, where to top up", () => {
-    expect(creditsLowPayload({ balance: 499, threshold: 500, request_id: "r1" })).toEqual({ balance: 499, threshold: 500, request_id: "r1", top_up: "GET /v1/payments/address" });
+    expect(creditsLowPayload({ balance: 499, threshold: 500, request_id: "r1", top_up: "/pricing" })).toEqual({ balance: 499, threshold: 500, request_id: "r1", top_up: "/pricing" });
+  });
+  it("credits.low tops up by card while card checkout is offered, else at /pricing; never at the USDC address, even with one configured", () => {
+    const usdc = { USDC_RECEIVING_ADDRESS: `0x${"1".repeat(40)}` };
+    const card = { WHOP_CHECKOUT_ENABLED: "1", WHOP_API_KEY: "whop_test_key", WHOP_PLAN_ID_50: "plan_a", WHOP_PLAN_ID_250: "plan_b" };
+    expect(creditsLowTopUp({ ...env, ...usdc } as Env)).toBe("/pricing");
+    expect(creditsLowTopUp({ ...env, ...usdc, ...card } as unknown as Env)).toBe("POST /v1/billing/checkout");
+    expect(creditsLowTopUp({ ...env, ...usdc, ...card, WHOP_CHECKOUT_ENABLED: "0" } as unknown as Env)).toBe("/pricing");
   });
 });
 
@@ -85,7 +92,7 @@ describe("noteCharge: credits.low once per crossing", () => {
     expect(await noteCharge(env, "t1", "r-a")).toEqual({ crossed: false, queued: 0 });
     charge(10); // 495: crossed
     expect(await noteCharge(env, "t1", "r-b")).toEqual({ crossed: true, queued: 1 });
-    expect(lowEvents().map((d) => d.payload)).toEqual([{ balance: 495, threshold: 500, request_id: "r-b", top_up: "GET /v1/payments/address" }]);
+    expect(lowEvents().map((d) => d.payload)).toEqual([{ balance: 495, threshold: 500, request_id: "r-b", top_up: "/pricing" }]);
     charge(5);
     expect(await noteCharge(env, "t1", "r-c")).toEqual({ crossed: false, queued: 0 }); // still low: once per crossing
     const t = h.db.tables.tenants![0]!;
@@ -179,7 +186,7 @@ describe("POST /v1/resolve: credits.low on the charge that crosses the threshold
     expect((await post()).status).toBe(200); // 502: above the threshold
     expect(lowEvents()).toHaveLength(0);
     expect((await post()).status).toBe(200); // 497: crossed
-    expect(lowEvents().map((d) => d.payload)).toEqual([{ balance: 497, threshold: 500, request_id: "req1", top_up: "GET /v1/payments/address" }]);
+    expect(lowEvents().map((d) => d.payload)).toEqual([{ balance: 497, threshold: 500, request_id: "req1", top_up: "/pricing" }]);
     expect((await post()).status).toBe(200); // 492: already notified
     expect(lowEvents()).toHaveLength(1);
   });

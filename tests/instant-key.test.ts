@@ -204,6 +204,8 @@ describe("a stranger gets a working evaluation key from the form", () => {
     expect(data).toMatchObject({ received: true, key_issued: true, environment: "test", plan: "free", credits: 300, watch_limit: 5, expires_at: new Date(NOW + 30 * DAY).toISOString(), docs: "https://resolve.example.com/docs" });
     expect(data.key).toMatch(/^rsl_test_[a-z0-9]{32}$/);
     expect(data.key_id).toBe(rows("api_keys")[0]!.id);
+    // the next call, as on the key page: the free list of first prints
+    expect(data.next).toBe("GET /v1/prints (free): every official series, its latest first print and its next scheduled release");
 
     expect(rows("credit_ledger")).toHaveLength(1);
     expect(rows("credit_ledger")[0]).toMatchObject({ tenant_id: tenantId, delta: 300, reason: "grant", request_id: grantRequestId(tenantId), balance_after: 300 });

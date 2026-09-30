@@ -29,7 +29,7 @@ vi.mock("../src/db/supabase", () => ({
 vi.mock("../src/ops/alerts", () => ({ alert: vi.fn(async () => ({ sent: true, deduped: false })), alertMany: vi.fn(async () => ({ sent: [], deduped: [] })) }));
 
 import { recorderCheckDue, recorderStaleAlert, runTick, tickAlerts, DISPATCH_LOOKBACK_MINUTES, RECORDER_STALE_MINUTES, type DispatchState } from "../src/jobs/tick";
-import { checkDispatchFailures, dbSizeAlert, dispatchCheckAlert, DB_SIZE_ALERT_MB, DISPATCH_WINDOW_MINUTES, MB } from "../src/jobs/dispatch";
+import { checkDispatchFailures, dbSizeAlert, dispatchCheckAlert, purgeAlert, DB_SIZE_ALERT_MB, DB_SIZE_UNREADABLE_DEDUP_MINUTES, DISPATCH_WINDOW_MINUTES, MB, PURGE_STALE_HOURS } from "../src/jobs/dispatch";
 import { alert, alertMany } from "../src/ops/alerts";
 
 const put = vi.fn(async () => undefined);
@@ -184,9 +184,9 @@ describe("dispatch_failures check", () => {
   });
 
   const SMALL = 40 * MB;
-  const withRpc = (answer: { data: unknown; error: unknown }, size: { data: unknown; error: unknown } = { data: SMALL, error: null }) => {
+  const withRpc = (answer: { data: unknown; error: unknown }, bytes = SMALL) => {
     const seen: unknown[] = [];
-    h.db = fakeDb({}, {}, { rpc: { dispatch_failures: async (_db, args) => { seen.push(args); return answer; }, database_size_bytes: async () => size } });
+    h.db = fakeDb({}, {}, { rpc: { dispatch_failures: async (_db, args) => { seen.push(args); return answer; }, storage_status: async () => ({ data: storage(bytes), error: null }) } });
     return seen;
   };
   const sent = () => vi.mocked(alertMany).mock.calls.flatMap((c) => c[1].map((i) => [i.key, i.dedupMinutes]));
@@ -194,16 +194,16 @@ describe("dispatch_failures check", () => {
     const seen = withRpc({ data: 4, error: null });
     const r = await checkDispatchFailures(env);
     expect(seen).toEqual([{ p_minutes: DISPATCH_WINDOW_MINUTES }]);
-    expect(r).toMatchObject({ ok: false, failures: 4, alert: "dispatch_http_failures", db_size: { bytes: SMALL, alert: null } });
+    expect(r).toMatchObject({ ok: false, failures: 4, alert: "dispatch_http_failures", db_size: { bytes: SMALL, alert: null }, retention: { alert: null } });
     expect(sent()).toEqual([["dispatch_http_failures", 60]]);
     expect(vi.mocked(alertMany)).toHaveBeenCalledTimes(1);
     expect(vi.mocked(alert)).not.toHaveBeenCalled();
   });
-  it("zero failures and a small database: two RPCs, no alert", async () => {
+  it("zero failures, a small database and a purge that ran last night: two RPCs, no alert", async () => {
     withRpc({ data: 0, error: null });
-    expect(await checkDispatchFailures(env)).toMatchObject({ ok: true, failures: 0, alert: null, db_size: { bytes: SMALL, error: null, alert: null } });
+    expect(await checkDispatchFailures(env)).toMatchObject({ ok: true, failures: 0, alert: null, db_size: { bytes: SMALL, error: null, alert: null }, retention: { scheduled: true, alert: null } });
     expect(vi.mocked(alertMany)).not.toHaveBeenCalled();
-    expect(h.db.calls).toEqual([{ table: "rpc:dispatch_failures", action: "rpc" }, { table: "rpc:database_size_bytes", action: "rpc" }]);
+    expect(h.db.calls).toEqual([{ table: "rpc:dispatch_failures", action: "rpc" }, { table: "rpc:storage_status", action: "rpc" }]);
   });
   it("an RPC error or a non-count answer is dispatch_check_failed, never zero", async () => {
     withRpc({ data: null, error: { code: "PGRST202", message: "Could not find the function public.dispatch_failures" } });
@@ -213,7 +213,14 @@ describe("dispatch_failures check", () => {
   });
 });
 
-describe("database size check (migration 022's database_size_bytes)", () => {
+/** An hour before the clock the check reads. */
+const anHourAgo = () => new Date(Date.now() - 3_600_000).toISOString();
+/** storage_status()'s answer: the size, the purge's cron job in place, its last run an hour ago and successful. */
+function storage(bytes: number, o: { scheduled?: boolean | null; last?: { started_at: string; outcome: string; error: string | null } | null } = {}): Record<string, unknown> {
+  return { database_bytes: bytes, purge_scheduled: o.scheduled === undefined ? true : o.scheduled, last_purge: o.last === undefined ? { started_at: anHourAgo(), outcome: "success", error: null } : o.last };
+}
+
+describe("storage check (migration 022's storage_status): the database size", () => {
   beforeEach(() => { vi.mocked(alert).mockClear(); vi.mocked(alertMany).mockClear(); });
   it("pure: quiet up to 300 MB, db_size_300mb past it, db_size_400mb past 400 MB (its own key, so it is never deduplicated by the first)", () => {
     expect(DB_SIZE_ALERT_MB).toEqual([300, 400]);
@@ -230,31 +237,76 @@ describe("database size check (migration 022's database_size_bytes)", () => {
     expect(b.text).toContain("The database is 400.0 MB");
     expect(b.meta).toEqual({ bytes: 400 * MB + 1, level_mb: 400 });
   });
-  it("pure: could-not-read is its own alert, never small", () => {
-    expect(dbSizeAlert(null, "rpc database_size_bytes: PGRST202")!.key).toBe("db_size_check_failed");
+  it("pure: could-not-read is its own alert, never small, repeated every 6 hours while it lasts (not every 10-minute run)", () => {
+    const u = dbSizeAlert(null, "rpc storage_status: PGRST202")!;
+    expect([u.key, u.dedupMinutes]).toEqual(["db_size_check_failed", 360]);
+    expect(DB_SIZE_UNREADABLE_DEDUP_MINUTES).toBe(360);
+    expect(u.text).toContain("storage_status()");
     expect(dbSizeAlert(5, "late error")!.key).toBe("db_size_check_failed");
   });
 
-  const withSize = (size: { data: unknown; error: unknown }, failures = 0) => {
-    h.db = fakeDb({}, {}, { rpc: { dispatch_failures: async () => ({ data: failures, error: null }), database_size_bytes: async () => size } });
+  const withStorage = (answer: { data: unknown; error: unknown }, failures = 0) => {
+    h.db = fakeDb({}, {}, { rpc: { dispatch_failures: async () => ({ data: failures, error: null }), storage_status: async () => answer } });
   };
-  const sent = () => vi.mocked(alertMany).mock.calls.flatMap((c) => c[1].map((i) => i.key));
+  const sentKeys = () => vi.mocked(alertMany).mock.calls.flatMap((c) => c[1].map((i) => i.key));
   it("alerts past 300 MB and again past 400 MB, through the same alertMany as a dispatch failure", async () => {
-    withSize({ data: 350 * MB, error: null });
+    withStorage({ data: storage(350 * MB), error: null });
     expect(await checkDispatchFailures(env)).toMatchObject({ ok: false, alert: null, db_size: { bytes: 350 * MB, alert: "db_size_300mb" } });
-    expect(sent()).toEqual(["db_size_300mb"]);
+    expect(sentKeys()).toEqual(["db_size_300mb"]);
     vi.mocked(alertMany).mockClear();
-    withSize({ data: String(420 * MB), error: null }, 2);
+    withStorage({ data: storage(420 * MB), error: null }, 2);
     expect(await checkDispatchFailures(env)).toMatchObject({ ok: false, alert: "dispatch_http_failures", db_size: { bytes: 420 * MB, alert: "db_size_400mb" } });
     expect(vi.mocked(alertMany)).toHaveBeenCalledTimes(1);
-    expect(sent()).toEqual(["dispatch_http_failures", "db_size_400mb"]);
+    expect(sentKeys()).toEqual(["dispatch_http_failures", "db_size_400mb"]);
   });
-  it("an RPC error or a non-size answer is db_size_check_failed, never quiet", async () => {
-    withSize({ data: null, error: { code: "PGRST202", message: "Could not find the function public.database_size_bytes" } });
-    expect(await checkDispatchFailures(env)).toMatchObject({ ok: false, db_size: { bytes: null, alert: "db_size_check_failed" } });
-    withSize({ data: "lots", error: null });
-    expect(await checkDispatchFailures(env)).toMatchObject({ ok: false, db_size: { bytes: null, alert: "db_size_check_failed" } });
-    withSize({ data: -1, error: null });
-    expect(await checkDispatchFailures(env)).toMatchObject({ ok: false, db_size: { bytes: null, alert: "db_size_check_failed" } });
+  it("an RPC error or an answer of another shape is db_size_check_failed (dedup 6 h), never quiet", async () => {
+    withStorage({ data: null, error: { code: "PGRST202", message: "Could not find the function public.storage_status" } });
+    expect(await checkDispatchFailures(env)).toMatchObject({ ok: false, db_size: { bytes: null, alert: "db_size_check_failed" }, retention: { alert: null } });
+    expect(vi.mocked(alertMany).mock.calls.at(-1)![1].map((i) => [i.key, i.dedupMinutes])).toEqual([["db_size_check_failed", 360]]);
+    for (const data of [String(40 * MB), 40 * MB, { ...storage(40 * MB), database_bytes: -1 }, { ...storage(40 * MB), database_bytes: "lots" }, { database_bytes: 40 * MB }]) {
+      withStorage({ data, error: null });
+      expect(await checkDispatchFailures(env), JSON.stringify(data)).toMatchObject({ ok: false, db_size: { bytes: null, alert: "db_size_check_failed" } });
+    }
+  });
+});
+
+describe("storage check: the daily retention purge (a purge that stopped is heard of before 300 MB)", () => {
+  beforeEach(() => { vi.mocked(alert).mockClear(); vi.mocked(alertMany).mockClear(); });
+  const NOW = Date.parse("2026-10-05T10:00:00Z");
+  const run = (hoursAgo: number, outcome = "success", error: string | null = null) => ({ started_at: new Date(NOW - hoursAgo * 3_600_000).toISOString(), outcome, error });
+  it("pure: quiet after a recent success or no_op, and before the first run while the job is scheduled (or where pg_cron is absent)", () => {
+    expect(purgeAlert({ purge_scheduled: true, last_purge: run(7) }, NOW)).toBeNull();
+    expect(purgeAlert({ purge_scheduled: true, last_purge: run(PURGE_STALE_HOURS, "no_op") }, NOW)).toBeNull();
+    expect(purgeAlert({ purge_scheduled: true, last_purge: null }, NOW)).toBeNull();
+    expect(purgeAlert({ purge_scheduled: null, last_purge: null }, NOW)).toBeNull();
+  });
+  it("pure: a failed run, a run older than 26 h, or a missing cron job each alert, daily", () => {
+    expect(PURGE_STALE_HOURS).toBe(26);
+    const failed = purgeAlert({ purge_scheduled: true, last_purge: run(7, "failure", "canceling statement due to lock timeout") }, NOW)!;
+    expect([failed.key, failed.dedupMinutes]).toEqual(["retention_purge_failed", 1440]);
+    expect(failed.text).toContain("canceling statement due to lock timeout");
+    expect(failed.text).toContain("nothing was purged");
+    const stale = purgeAlert({ purge_scheduled: true, last_purge: run(PURGE_STALE_HOURS + 0.1) }, NOW)!;
+    expect([stale.key, stale.dedupMinutes]).toEqual(["retention_purge_stale", 1440]);
+    expect(stale.text).toContain("more than 26 h ago");
+    // an old failure is a purge that stopped: stale, whatever its last outcome
+    expect(purgeAlert({ purge_scheduled: true, last_purge: run(50, "failure", "x") }, NOW)!.key).toBe("retention_purge_stale");
+    // a time it cannot read is never fresh
+    expect(purgeAlert({ purge_scheduled: true, last_purge: { started_at: "yesterday", outcome: "success", error: null } }, NOW)!.key).toBe("retention_purge_stale");
+    const gone = purgeAlert({ purge_scheduled: false, last_purge: run(1) }, NOW)!;
+    expect([gone.key, gone.dedupMinutes]).toEqual(["retention_purge_unscheduled", 1440]);
+    expect(gone.text).toContain("select cron.schedule('purge_retention', '23 3 * * *', 'select public.purge_retention()');");
+    expect(purgeAlert({ purge_scheduled: false, last_purge: null }, NOW)!.key).toBe("retention_purge_unscheduled");
+  });
+  it("goes out in the same alertMany as the size and a dispatch failure, from the one storage_status read", async () => {
+    const withStorage = (data: unknown, failures = 0) => { h.db = fakeDb({}, {}, { rpc: { dispatch_failures: async () => ({ data: failures, error: null }), storage_status: async () => ({ data, error: null }) } }); };
+    withStorage(storage(350 * MB, { last: { started_at: anHourAgo(), outcome: "failure", error: "deadlock detected" } }), 1);
+    expect(await checkDispatchFailures(env)).toMatchObject({ ok: false, alert: "dispatch_http_failures", db_size: { alert: "db_size_300mb" }, retention: { scheduled: true, last_purge: { outcome: "failure", error: "deadlock detected" }, alert: "retention_purge_failed" } });
+    expect(vi.mocked(alertMany)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(alertMany).mock.calls[0]![1].map((i) => [i.key, i.dedupMinutes])).toEqual([["dispatch_http_failures", 60], ["db_size_300mb", 7 * 1440], ["retention_purge_failed", 1440]]);
+    vi.mocked(alertMany).mockClear();
+    withStorage(storage(40 * MB, { scheduled: false }));
+    expect(await checkDispatchFailures(env)).toMatchObject({ ok: false, retention: { scheduled: false, alert: "retention_purge_unscheduled" } });
+    expect(h.db.calls.filter((c) => c.table.startsWith("rpc:")).map((c) => c.table)).toEqual(["rpc:dispatch_failures", "rpc:storage_status"]);
   });
 });

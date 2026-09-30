@@ -1,18 +1,20 @@
 /**
- * Migration 022 (charge_read, purge_retention, database_size_bytes), rollback-only: everything runs inside one DO block
+ * Migration 022 (charge_read, purge_retention, storage_status), rollback-only: everything runs inside one DO block
  * that always raises at the end, so nothing persists. It asserts:
  *   - charge_read(): the first call charges once (one credit_ledger 'charge' row, note read, the new balance back); the
  *     same request id again is a replay (charged 0, no second row), also at a zero balance; a short balance is refused
  *     with nothing written; another tenant cannot replay the id (RS003); a deleted tenant is refused; an amount below 1,
  *     a bare-hex id, and begin_resolution's own charge id are refused (22023), so a read never replays a verdict's charge;
- *     refund_credits() gives a read's charge back;
+ *     refund_credits() gives a read's charge back. A concurrent duplicate (the same id while the first call runs) needs a
+ *     second session and a committed tenant: scripts/selftest-db.ts --concurrency-probe races it on staging;
  *   - purge_retention(): with rows older than 30 days written in every protected table (official_observations,
  *     bot_posts, credit_ledger, reconciliations, resolutions), a fingerprint of each whole table is the same after the
  *     purge and the old rows are all there; a loop_runs row older than 30 days is deleted and a recent one kept; the
  *     excerpt of 30-day-old evidence is cleared for a settled and for a deleted market, and kept for an open market and
  *     for recent evidence of a settled one, with the hashes, R2 key and URL kept; the run writes its loop_runs row with
  *     the database size;
- *   - database_size_bytes() is pg_database_size() of this database;
+ *   - storage_status(): database_bytes is pg_database_size() of this database, last_purge is the run the purge just
+ *     wrote, purge_scheduled is the cron job (null without pg_cron);
  *   - least privilege: anon and authenticated cannot execute any of the three, PUBLIC holds no EXECUTE, service_role
  *     can; each is SECURITY DEFINER with a pinned search_path and commented, as is evidence.excerpt; the daily cron job.
  * Refused unless SUPABASE_PROJECT_REF equals STAGING_SUPABASE_PROJECT_REF or RESOLVE_SELFTEST_NON_PRODUCTION=1 (with
@@ -27,7 +29,7 @@ const TAG = "SELFTEST_PRINTS";
 const A = "print:us_unemployment_rate:2026-09:__selftest_prints_a__";
 const B = "print:us_unemployment_rate:2026-09:__selftest_prints_b__";
 const C = "print:us_unemployment_rate:2026-09:__selftest_prints_c__";
-const FNS = "'public.charge_read(uuid,integer,text)'::regprocedure, 'public.purge_retention()'::regprocedure, 'public.database_size_bytes()'::regprocedure";
+const FNS = "'public.charge_read(uuid,integer,text)'::regprocedure, 'public.purge_retention()'::regprocedure, 'public.storage_status()'::regprocedure";
 /** The record: purge_retention never deletes or changes a row of these. */
 export const PROTECTED_TABLES = ["official_observations", "bot_posts", "credit_ledger", "reconciliations", "resolutions"] as const;
 const ORDER: Record<(typeof PROTECTED_TABLES)[number], string> = { official_observations: "x.series, x.period", bot_posts: "x.id", credit_ledger: "x.id", reconciliations: "x.id", resolutions: "x.id" };
@@ -40,7 +42,7 @@ declare
   v_old constant timestamptz := now() - interval '45 days';
   t1 uuid; t2 uuid; tdel uuid; r record; r2 record;
   mo uuid; mc uuid; md uuid; e1 uuid; e2 uuid; e3 uuid; e4 uuid;
-  purge jsonb; fp_before jsonb; fp_after jsonb; v_bool boolean;
+  purge jsonb; fp_before jsonb; fp_after jsonb; v_bool boolean; st jsonb;
 begin
   -- 1. charge_read ------------------------------------------------------------------------------------------------------
   insert into tenants (display_name, credits_balance) values ('__selftest_prints_t1__', 2) returning id into t1;
@@ -73,7 +75,10 @@ begin
   select * into r2 from begin_resolution(t2, null, '__selftest_prints_idem__', 1, null, 'eval');
   begin perform charge_read(t2, 1, r2.request_id); out := out || '{"verdict_charge_id":"allowed"}';
   exception when others then out := out || jsonb_build_object('verdict_charge_id', sqlstate); end;
-  out := out || jsonb_build_object('refund', refund_credits('${B}'), 'refund_balance', (select credits_balance from tenants where id = t1));
+  -- the balance in a statement of its own: read in the refund's statement it would see that statement's snapshot, from
+  -- before the refund
+  out := out || jsonb_build_object('refund', refund_credits('${B}'));
+  out := out || jsonb_build_object('refund_balance', (select credits_balance from tenants where id = t1));
 
   -- 2. purge_retention: rows older than 30 days in every protected table and in the two it purges ------------------------
   insert into markets (platform, external_id, condition, event_statement, option_a, option_b, positive_option, open_at, deadline_utc)
@@ -126,8 +131,15 @@ begin
     'old_deleted_excerpt', (select excerpt from evidence where id = e4),
     'purge_counted', (purge->>'loop_runs_deleted')::int >= 1 and (purge->>'evidence_excerpts_cleared')::int >= 2,
     'purge_run_row', (select jsonb_build_array(l.outcome, l.meta ? 'database_bytes', (l.meta->>'retention_days')::int) from loop_runs l
-                       where l.loop_name = 'retention_purge' order by l.id desc limit 1),
-    'size_is_pg_database_size', database_size_bytes() = pg_database_size(current_database()) and database_size_bytes() > 0);
+                       where l.loop_name = 'retention_purge' order by l.id desc limit 1));
+  st := storage_status();
+  out := out || jsonb_build_object(
+    'storage_size_is_pg_database_size', (st->>'database_bytes')::bigint = pg_database_size(current_database()) and (st->>'database_bytes')::bigint > 0,
+    'storage_last_purge', (select (st->'last_purge'->>'started_at')::timestamptz = l.started_at and st->'last_purge'->>'outcome' = l.outcome
+                             and st->'last_purge' ? 'error' from loop_runs l where l.loop_name = 'retention_purge' order by l.id desc limit 1)
+                          and st->'last_purge'->>'outcome' = 'success',
+    'storage_scheduled', st->'purge_scheduled',
+    'storage_keys', (select jsonb_agg(k order by k) from jsonb_object_keys(st) k));
 
   -- 3. least privilege, pinned search_path, comments, the cron job -----------------------------------------------------
   begin
@@ -136,22 +148,22 @@ begin
     exception when insufficient_privilege then out := out || '{"anon_charge":"denied"}'; end;
     begin perform purge_retention(); out := out || '{"anon_purge":"allowed"}';
     exception when insufficient_privilege then out := out || '{"anon_purge":"denied"}'; end;
-    begin perform database_size_bytes(); out := out || '{"anon_size":"allowed"}';
-    exception when insufficient_privilege then out := out || '{"anon_size":"denied"}'; end;
+    begin perform storage_status(); out := out || '{"anon_storage":"allowed"}';
+    exception when insufficient_privilege then out := out || '{"anon_storage":"denied"}'; end;
     reset role;
   exception when others then out := out || jsonb_build_object('anon_charge', 'set role failed: ' || sqlerrm);
   end;
   begin
     set local role service_role;
     select * into r from charge_read(t2, 1, 'print:us_unemployment_rate:2026-09:__selftest_prints_service__');
-    out := out || jsonb_build_object('service_charge', r.charged, 'service_size', database_size_bytes() > 0);
+    out := out || jsonb_build_object('service_charge', r.charged, 'service_storage', (storage_status()->>'database_bytes')::bigint > 0);
     reset role;
   exception when others then out := out || jsonb_build_object('service_charge', 'error: ' || sqlerrm);
   end;
   out := out || jsonb_build_object(
     'authenticated_denied', not has_function_privilege('authenticated', 'public.charge_read(uuid,integer,text)', 'execute')
       and not has_function_privilege('authenticated', 'public.purge_retention()', 'execute')
-      and not has_function_privilege('authenticated', 'public.database_size_bytes()', 'execute'),
+      and not has_function_privilege('authenticated', 'public.storage_status()', 'execute'),
     'public_execute', (select count(*) from pg_proc f where f.oid in (${FNS})
       and (f.proacl is null or exists (select 1 from aclexplode(f.proacl) a where a.grantee = 0))),
     'definer_search_path', (select bool_and(f.prosecdef and exists (select 1 from unnest(f.proconfig) c where c like 'search_path=%')) from pg_proc f where f.oid in (${FNS})),
@@ -176,8 +188,9 @@ export const PRINTS_EXPECT: Record<string, unknown> = {
   old_loop_run_deleted: true, recent_loop_run_kept: true,
   old_settled_excerpt: null, old_settled_row_kept: true, recent_settled_excerpt: "recent excerpt of a settled market",
   old_open_excerpt: "old excerpt of an open market", old_deleted_excerpt: null,
-  purge_counted: true, purge_run_row: ["success", true, 30], size_is_pg_database_size: true,
-  anon_charge: "denied", anon_purge: "denied", anon_size: "denied", service_charge: 1, service_size: true,
+  purge_counted: true, purge_run_row: ["success", true, 30],
+  storage_size_is_pg_database_size: true, storage_last_purge: true, storage_scheduled: true, storage_keys: ["database_bytes", "last_purge", "purge_scheduled"],
+  anon_charge: "denied", anon_purge: "denied", anon_storage: "denied", service_charge: 1, service_storage: true,
   authenticated_denied: true, public_execute: 0, definer_search_path: true, uncommented: 0, cron_job: true,
 };
 
@@ -195,7 +208,7 @@ async function main(): Promise<number> {
   const r = raisedResults(TAG, raw);
   if (!r) { console.error("FAIL prints: the block did not return results:", raw.slice(0, 1200)); return 1; }
   // a local cluster without pg_cron keeps the function and schedules nothing
-  const expect = { ...PRINTS_EXPECT, ...(runner.via === "psql" && r.cron_job === "no_pg_cron" ? { cron_job: "no_pg_cron" } : {}) };
+  const expect = { ...PRINTS_EXPECT, ...(runner.via === "psql" && r.cron_job === "no_pg_cron" ? { cron_job: "no_pg_cron", storage_scheduled: null } : {}) };
   let bad = check(r, expect, "prints.");
   for (const k of Object.keys(r)) if (!(k in expect)) { bad++; console.log(`FAIL prints.${k} = ${JSON.stringify(r[k])} (unexpected key)`); }
   console.log(`rolled back: nothing persisted from the prints block (${runner.via})`);

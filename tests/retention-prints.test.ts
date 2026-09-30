@@ -2,7 +2,7 @@
  * Migration 022 (static lint; it is never applied from here: scripts/selftest/prints.ts proves it on a database):
  * charge_read (one ledger charge per request id, a replay free, a short balance refused, a "<kind>:" id that can never be
  * a verdict's), purge_retention (loop_runs and closed markets' evidence excerpts older than 30 days, nothing else, and
- * never a table of the record), database_size_bytes, the daily cron job, and the conventions of 019-021 (one
+ * never a table of the record), storage_status (read-only), the daily cron job, and the conventions of 019-021 (one
  * transaction, SECURITY DEFINER with a pinned search_path, comments, revoked from public/anon/authenticated, granted to
  * service_role). Also the self-test block itself: every expected key is produced, it rolls back, and it covers every
  * protected table.
@@ -33,7 +33,7 @@ describe("migration 022 (static lint; never applied from here)", () => {
 
   it("every function is SECURITY DEFINER with a pinned search_path, commented, revoked from public/anon/authenticated, granted to service_role only", () => {
     const fns = [...body.matchAll(/create or replace function public\.(\w+)\(/g)].map((m) => m[1]!);
-    expect([...fns].sort()).toEqual(["charge_read", "database_size_bytes", "purge_retention"]);
+    expect([...fns].sort()).toEqual(["charge_read", "purge_retention", "storage_status"]);
     for (const name of fns) {
       const head = body.slice(body.indexOf(`create or replace function public.${name}(`));
       const decl = head.slice(0, head.indexOf("$$"));
@@ -50,15 +50,21 @@ describe("migration 022 (static lint; never applied from here)", () => {
     const f = fnBody("charge_read");
     expect(writes(f)).toEqual([["update", "tenants"], ["insert into", "credit_ledger"]]);
     expect(f).toMatch(/values \(p_tenant, -p_amount, 'charge', p_request_id, v_balance, 'read'\)/);
+    // the tenant row lock comes first, before the ledger is read at all: a concurrent call with the same id waits for
+    // the first to commit and then finds its charge (a replay). Looked up before the lock, both calls miss it and, at
+    // the last credit, the second is refused as short: a 402 for a print already paid (scripts/selftest-db.ts
+    // --concurrency-probe runs that race on Postgres)
+    const lock = f.indexOf("select t.credits_balance, t.deleted_at is null into v_balance, v_live from tenants t where t.id = p_tenant for update;");
+    expect(lock).toBeGreaterThan(0);
+    expect(lock).toBeLessThan(f.indexOf("from credit_ledger"));
     // the replay is found before anything is written, by the ledger's unique (reason, request_id), and answered free:
     // without it a replay at a zero balance would be refused as short (the unique index alone cannot answer it)
     expect(f.indexOf("where l.reason = 'charge' and l.request_id = p_request_id")).toBeLessThan(f.indexOf("update tenants"));
-    expect(f).toMatch(/select \* into v_led from credit_ledger l where l\.reason = 'charge' and l\.request_id = p_request_id;\s+if found then\s+if v_led\.tenant_id is distinct from p_tenant then\s+raise exception using errcode = 'RS003'[^;]*;\s+end if;\s+return query select true, true, 0, /);
-    // the debit is conditional: a short balance or a deleted tenant updates nothing
-    expect(f).toMatch(/where t\.id = p_tenant and t\.deleted_at is null and t\.credits_balance >= p_amount/);
-    expect(f).toMatch(/if v_balance is null then\s+return query select false, false, 0,/);
-    // a concurrent duplicate is a replay, its debit rolled back with the block
-    expect(f).toMatch(/exception when unique_violation then/);
+    expect(f).toMatch(/select \* into v_led from credit_ledger l where l\.reason = 'charge' and l\.request_id = p_request_id;\s+if found then\s+if v_led\.tenant_id is distinct from p_tenant then\s+raise exception using errcode = 'RS003'[^;]*;\s+end if;\s+return query select true, true, 0, v_balance;/);
+    // a short balance, a deleted or an unknown tenant answers ok false before the debit
+    expect(f).toMatch(/if v_live is not true or v_balance < p_amount then\s+return query select false, false, 0, case when v_live then v_balance else 0 end;\s+return;\s+end if;\s+update tenants t set credits_balance = t\.credits_balance - p_amount where t\.id = p_tenant/);
+    // no exception handler: nothing can turn a refused ledger row into an ok answer (another tenant's id fails the call)
+    expect(f).not.toMatch(/\bexception\s+when\b/);
     // a "<kind>:" id only: begin_resolution's ids are bare hex, so a read never replays a verdict's charge
     expect(f).toContain("p_request_id !~ '^[a-z_]+:.+'");
     expect(f).toMatch(/p_amount is null or p_amount < 1/);
@@ -79,8 +85,17 @@ describe("migration 022 (static lint; never applied from here)", () => {
     expect(f).toMatch(/exception when others then/);
   });
 
-  it("database_size_bytes is pg_database_size of this database, and the purge runs daily from pg_cron where it exists", () => {
-    expect(fnBody("database_size_bytes").trim()).toBe("select pg_catalog.pg_database_size(pg_catalog.current_database());");
+  it("storage_status reads only: pg_database_size of this database, the newest retention_purge run, the cron job where pg_cron exists", () => {
+    const f = fnBody("storage_status");
+    expect(writes(f)).toEqual([]);
+    expect(raw).toMatch(/create or replace function public\.storage_status\(\)\s+returns jsonb language plpgsql stable security definer set search_path = '' as/);
+    expect(f).toContain("'database_bytes', pg_catalog.pg_database_size(pg_catalog.current_database())");
+    expect(f).toMatch(/select r\.started_at, r\.outcome, r\.error into v_at, v_outcome, v_error\s+from public\.loop_runs r where r\.loop_name = 'retention_purge' order by r\.started_at desc limit 1;/);
+    expect(f).toMatch(/if exists \(select 1 from pg_catalog\.pg_extension x where x\.extname = 'pg_cron'\) then\s+execute 'select exists \(select 1 from cron\.job j where j\.jobname = ''purge_retention'' and j\.active\)' into v_scheduled;/);
+    expect(f).toMatch(/'last_purge', case when v_at is null then null\s+else pg_catalog\.jsonb_build_object\('started_at', v_at, 'outcome', v_outcome, 'error', v_error\) end\)/);
+  });
+
+  it("the purge runs daily from pg_cron where it exists", () => {
     expect(body).toMatch(/perform cron\.unschedule\(jobid\) from cron\.job where jobname = 'purge_retention';\s+perform cron\.schedule\('purge_retention', '23 3 \* \* \*', 'select public\.purge_retention\(\)'\);/);
     expect(body).toMatch(/if exists \(select 1 from pg_extension where extname = 'pg_cron'\) then/);
   });
@@ -108,5 +123,16 @@ describe("scripts/selftest/prints.ts (the rollback-only block for migration 022)
     for (const t of PROTECTED_TABLES) expect(PRINTS_BLOCK.split(`from ${t} x`).length - 1, t).toBe(2);
     expect(PRINTS_BLOCK.indexOf("into fp_before")).toBeLessThan(PRINTS_BLOCK.indexOf("purge := purge_retention();"));
     expect(PRINTS_BLOCK.indexOf("purge := purge_retention();")).toBeLessThan(PRINTS_BLOCK.indexOf("into fp_after"));
+  });
+  it("reads the balance after a refund in a statement of its own (the refund's statement sees its snapshot, from before)", () => {
+    expect(PRINTS_BLOCK).toMatch(/out := out \|\| jsonb_build_object\('refund', refund_credits\('[^']+'\)\);\s+out := out \|\| jsonb_build_object\('refund_balance', \(select credits_balance from tenants where id = t1\)\);/);
+  });
+  it("the persisting staging probe races charge_read: 10 parallel calls with one id at the last credit, one charge and nine replays", () => {
+    const probe = readFileSync(resolve(import.meta.dirname, "../scripts/selftest-db.ts"), "utf8");
+    expect(probe).toMatch(/if \(argv\.includes\("--concurrency-probe"\)\) bad \+= await concurrencyProbe\(\) \+ await chargeReadProbe\(\);/);
+    const fn = probe.slice(probe.indexOf("async function chargeReadProbe()"));
+    expect(fn).toContain("credits_balance) values ('__selftest_concurrency_read__', 1)");
+    expect(fn).toMatch(/Array\.from\(\{ length: 10 \}, \(\) => sql<[^>]+>\(`select \* from charge_read\('\$\{tid\}'::uuid, 1, '\$\{id\}'\)`\)\)/);
+    expect(fn).toContain("const ok = cnt!.charges === 1 && cnt!.balance === 0 && charged === 1 && replayed === 9;");
   });
 });

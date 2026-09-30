@@ -2,7 +2,10 @@
  * Money events (plan §16.4 P3 step 3). payment.credited goes out when a deposit is credited: by the deposit scan
  * (credit_from_deposit answered 'credited') and by a manual match (match_deposit). credits.low goes out when a charge
  * that stands leaves the balance below app_config low_credit_threshold, once per crossing: claim_low_credit_notice()
- * (migration 020) sets tenants.low_credit_notified_at, and the next purchase or grant clears it. Payload builders are pure.
+ * (migration 020) sets tenants.low_credit_notified_at, and the next purchase or grant clears it. Its top_up points to
+ * the card rail while card checkout is offered, else to the pricing page, never to the USDC address: no third-party
+ * USDC is solicited (the charge that crosses may be a free key's first print, GET /v1/prints/{series}/{period}).
+ * Payload builders are pure.
  */
 import { z } from "zod";
 import type { Env } from "../env";
@@ -12,6 +15,7 @@ import { COST } from "../ops/budget";
 import { redact } from "../ops/redact";
 import { queueEvents, type EventItem } from "../webhooks/deliver";
 import { formatUsdc, parseUsdc } from "./tiers";
+import { cardCheckoutOffered, whopConfig } from "./whop";
 
 export interface PaymentCredited { tx_hash: string; log_index: number; amount_usdc: string; credits: number; balance_after: number }
 
@@ -20,11 +24,16 @@ export function paymentCreditedPayload(p: PaymentCredited): Record<string, unkno
   return { tx_hash: p.tx_hash.toLowerCase(), log_index: p.log_index, amount_usdc: formatUsdc(parseUsdc(p.amount_usdc)), credits: p.credits, balance_after: p.balance_after };
 }
 
-export interface CreditsLow { balance: number; threshold: number; request_id: string }
+export interface CreditsLow { balance: number; threshold: number; request_id: string; top_up: string }
 
-/** Pure. The credits.low payload: the balance the charge left, the threshold it fell below, the charge that crossed it. */
+/** Pure. Where credits.low points to top up: the card rail while it is offered (src/billing/whop.ts), else /pricing. Never the USDC address. */
+export function creditsLowTopUp(env: Env): string {
+  return cardCheckoutOffered(whopConfig(env)) ? "POST /v1/billing/checkout" : "/pricing";
+}
+
+/** Pure. The credits.low payload: the balance the charge left, the threshold it fell below, the charge that crossed it, where to top up. */
 export function creditsLowPayload(p: CreditsLow): Record<string, unknown> {
-  return { balance: p.balance, threshold: p.threshold, request_id: p.request_id, top_up: "GET /v1/payments/address" };
+  return { balance: p.balance, threshold: p.threshold, request_id: p.request_id, top_up: p.top_up };
 }
 
 // ---- payment.credited from the deposit scan ---------------------------------------------------------------------------
@@ -79,7 +88,7 @@ export async function noteCharge(env: Env, tenantId: string, requestId: string):
     const out = await rpc<unknown>(client, "claim_low_credit_notice", { p_tenant: tenantId });
     const claim = LowCreditClaim.parse(Array.isArray(out) ? out[0] : out);
     if (!claim.crossed) return { crossed: false, queued: 0 };
-    const q = await queueEvents(env, [{ tenant: tenantId, eventType: "credits.low", payload: creditsLowPayload({ balance: claim.balance, threshold: claim.threshold, request_id: requestId }) }]);
+    const q = await queueEvents(env, [{ tenant: tenantId, eventType: "credits.low", payload: creditsLowPayload({ balance: claim.balance, threshold: claim.threshold, request_id: requestId, top_up: creditsLowTopUp(env) }) }]);
     if (!q.error) return { crossed: true, queued: q.rows.length };
     let released = "given back: the next charge queues it again";
     try { await rpc(client, "release_low_credit_notice", { p_tenant: tenantId }); }

@@ -8,9 +8,11 @@
  *   npx tsx scripts/selftest-db.ts --all                 also every scripts/selftest/*.ts (other packages' blocks; each
  *                                                        is a child process, its PASS/FAIL lines are aggregated) and the
  *                                                        official_release block; --psql is passed on to them
- *   npx tsx scripts/selftest-db.ts --concurrency-probe   also the one PERSISTING test: 10 parallel begin_resolution calls
- *                                                        with one Idempotency-Key against a __selftest__ tenant
- *                                                        (soft-deleted afterwards; ledger rows are append-only by design).
+ *   npx tsx scripts/selftest-db.ts --concurrency-probe   also the PERSISTING tests: 10 parallel begin_resolution calls
+ *                                                        with one Idempotency-Key, and 10 parallel charge_read calls
+ *                                                        with one request id at the last credit, each against its own
+ *                                                        __selftest__ tenant (soft-deleted afterwards; ledger rows are
+ *                                                        append-only by design).
  *                                                        Refused unless SUPABASE_PROJECT_REF equals STAGING_SUPABASE_PROJECT_REF.
  *   npx tsx scripts/selftest-db.ts --official            only the official_release block (migration 016)
  * Every mode prints its target first and refuses before anything runs unless SUPABASE_PROJECT_REF equals
@@ -450,8 +452,8 @@ async function rollbackBlocks(run: BlockRunner): Promise<number> {
 }
 
 /**
- * The one test that persists rows: 10 parallel begin_resolution calls with one Idempotency-Key must charge once. Staging
- * only, through the Management API (parallel requests are the point).
+ * A test that persists rows: 10 parallel begin_resolution calls with one Idempotency-Key must charge once. Staging only,
+ * through the Management API (parallel requests are the point).
  */
 async function concurrencyProbe(): Promise<number> {
   const [t] = await sql<{ id: string }>("insert into tenants (display_name, credits_balance) values ('__selftest_concurrency__', 100) returning id");
@@ -463,6 +465,29 @@ async function concurrencyProbe(): Promise<number> {
   const errors = results.filter((x: any) => x.error).length;
   const ok = cnt!.charges === 1 && cnt!.balance === 95 && errors === 0;
   console.log(`${ok ? "PASS" : "FAIL"} concurrency: 10 parallel calls -> charge_rows=${cnt!.charges} balance=${cnt!.balance} replayed=${replayed} errors=${errors}`);
+  await sql(`update tenants set deleted_at = now() where id='${tid}'`);
+  return ok ? 0 : 1;
+}
+
+/**
+ * The same for charge_read (migration 022; GET /v1/prints/{series}/{period}): 10 parallel calls with one request id
+ * against a tenant holding exactly the price. One charges, the nine others are replays; none is refused as short (a
+ * 402 for a print already paid, which a lookup made before the tenant row lock gives). The id carries the tenant, so a
+ * second run on the same database is not another tenant's id.
+ */
+async function chargeReadProbe(): Promise<number> {
+  const [t] = await sql<{ id: string }>("insert into tenants (display_name, credits_balance) values ('__selftest_concurrency_read__', 1) returning id");
+  const tid = t!.id;
+  const id = `print:selftest:concurrency:${tid}`;
+  const calls = Array.from({ length: 10 }, () => sql<{ ok: boolean; replayed: boolean; charged: number }>(`select * from charge_read('${tid}'::uuid, 1, '${id}')`));
+  const results = (await Promise.allSettled(calls)).map((x) => (x.status === "fulfilled" ? x.value[0] : { error: String(x.reason).slice(0, 80) }));
+  const [cnt] = await sql<{ charges: number; balance: number }>(`select (select count(*)::int from credit_ledger where tenant_id='${tid}' and reason='charge') as charges, (select credits_balance from tenants where id='${tid}') as balance`);
+  const charged = results.filter((x: any) => x.ok === true && x.replayed === false && x.charged === 1).length;
+  const replayed = results.filter((x: any) => x.ok === true && x.replayed === true && x.charged === 0).length;
+  const refused = results.filter((x: any) => x.ok === false).length;
+  const errors = results.filter((x: any) => x.error).length;
+  const ok = cnt!.charges === 1 && cnt!.balance === 0 && charged === 1 && replayed === 9;
+  console.log(`${ok ? "PASS" : "FAIL"} concurrency charge_read: 10 parallel calls at the last credit -> charge_rows=${cnt!.charges} balance=${cnt!.balance} charged=${charged} replayed=${replayed} refused=${refused} errors=${errors}`);
   await sql(`update tenants set deleted_at = now() where id='${tid}'`);
   return ok ? 0 : 1;
 }
@@ -514,7 +539,7 @@ async function main(): Promise<number> {
     if (!targetIsStaging()) { console.error("--concurrency-probe refused: it persists rows, and SUPABASE_PROJECT_REF is not STAGING_SUPABASE_PROJECT_REF"); return 2; }
   }
   let bad = await rollbackBlocks(runner.run);
-  if (argv.includes("--concurrency-probe")) bad += await concurrencyProbe();
+  if (argv.includes("--concurrency-probe")) bad += await concurrencyProbe() + await chargeReadProbe();
   if (argv.includes("--all")) {
     bad += await officialSelftest(runner.run);
     bad += selftestFiles(psqlArgs);

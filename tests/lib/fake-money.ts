@@ -100,22 +100,22 @@ export async function grantCredits(db: FakeDb, a: Record<string, any>): Promise<
 }
 
 /**
- * charge_read (migration 022), step for step: the argument checks (22023), a replay when this request id's charge
- * already stands (another tenant's: RS003), else the conditional debit (a short balance or a deleted tenant: ok false,
- * nothing written) and one 'charge' ledger row under UNIQUE(reason, request_id).
+ * charge_read (migration 022), step for step: the argument checks (22023), the tenant row (locked there; one caller at a
+ * time here), a replay when this request id's charge already stands (another tenant's: RS003), else a short balance or
+ * a deleted tenant answered ok false with nothing written, else the debit and one 'charge' ledger row under
+ * UNIQUE(reason, request_id). The lock's ordering of concurrent calls is proven on Postgres (scripts/selftest-db.ts
+ * --concurrency-probe), not here.
  */
 export async function chargeRead(db: FakeDb, a: Record<string, any>): Promise<{ data: any; error: any }> {
   if (!a.p_tenant || a.p_amount == null || a.p_amount < 1) return fail("22023", `charge_read: tenant and a positive amount are required, got amount ${a.p_amount}`);
   if (typeof a.p_request_id !== "string" || !/^[a-z_]+:.+/.test(a.p_request_id) || a.p_request_id.length > 300) return fail("22023", 'charge_read: request_id must be "<kind>:<id>" (at most 300 characters)');
-  const tenants = table(db, "tenants");
-  const balanceOf = (live: boolean) => tenants.find((t) => t.id === a.p_tenant && (!live || !t.deleted_at))?.credits_balance ?? null;
+  const t = table(db, "tenants").find((x) => x.id === a.p_tenant);
   const led = table(db, "credit_ledger").find((l) => l.reason === "charge" && l.request_id === a.p_request_id);
   if (led) {
     if (led.tenant_id !== a.p_tenant) return fail("RS003", "charge_read: this request id was charged to another tenant");
-    return { data: [{ ok: true, replayed: true, charged: 0, balance: balanceOf(false) }], error: null };
+    return { data: [{ ok: true, replayed: true, charged: 0, balance: t?.credits_balance ?? null }], error: null };
   }
-  const t = tenants.find((x) => x.id === a.p_tenant && !x.deleted_at && x.credits_balance >= a.p_amount);
-  if (!t) return { data: [{ ok: false, replayed: false, charged: 0, balance: balanceOf(true) ?? 0 }], error: null };
+  if (!t || t.deleted_at || t.credits_balance < a.p_amount) return { data: [{ ok: false, replayed: false, charged: 0, balance: t && !t.deleted_at ? t.credits_balance : 0 }], error: null };
   t.credits_balance -= a.p_amount;
   const l = ledgerInsert(db, { tenant_id: t.id, delta: -a.p_amount, reason: "charge", request_id: a.p_request_id, balance_after: t.credits_balance, note: "read" });
   if ("error" in l) return { data: null, error: l.error };

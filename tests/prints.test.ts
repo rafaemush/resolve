@@ -61,7 +61,7 @@ vi.mock("../src/billing/events", () => ({ noteCharge: vi.fn(async () => ({ cross
 import { app } from "../src/index";
 import { noteCharge } from "../src/billing/events";
 import { KNOWN_RELEASES, OFFICIAL_SERIES, missingAfterMs, type OfficialSeriesId } from "../src/resolve/official";
-import { chargeRequestId, isSeries, listSeries, nextRelease, scheduledAnswer, shapePrint, topUpHint, LIST_READ_CAP, PRINT_COLUMNS, PRINT_PRICE_CREDITS, VERIFY_HINT, type PrintRow } from "../src/api/prints";
+import { chargeRequestId, isSeries, listSeries, nextRelease, observedBeforeRelease, scheduledAnswer, shapePrint, topUpHint, LIST_READ_CAP, PRINT_COLUMNS, PRINT_PRICE_CREDITS, VERIFY_HINT, type PrintRow } from "../src/api/prints";
 
 const NAMES = /jev|typesafe/i;
 const env = {} as Env;
@@ -247,6 +247,49 @@ describe("GET /v1/prints/{series}/{period}: the first print, 1 credit once per r
     h.failFrom = "official_observations";
     expect((await get("/v1/prints/us_unemployment_rate/2026-09")).status).toBe(503);
     expect(chargeCalls()).toHaveLength(0);
+  });
+
+  it("HEAD (curl -I, an uptime monitor) is refused with 405 before anything is read or charged: its answer would carry no print", async () => {
+    h.db = newDb();
+    for (const headers of [{}, { "idempotency-key": "head-1" }] as Array<Record<string, string>>) {
+      const res = await app.request("/v1/prints/us_unemployment_rate/2026-09", { method: "HEAD", headers: { authorization: `Bearer rsl_test_${"a".repeat(32)}`, ...headers } }, env, ctx);
+      expect(res.status).toBe(405);
+      expect(res.headers.get("allow")).toBe("GET");
+      expect(await res.text()).toBe("");
+    }
+    expect(chargeCalls()).toHaveLength(0);
+    expect(charges()).toHaveLength(0);
+    expect(h.db.tables.tenants![0]!.credits_balance).toBe(300);
+    expect(h.selects.filter(([t]) => t === "official_observations")).toHaveLength(0);
+    expect(vi.mocked(noteCharge)).not.toHaveBeenCalled();
+    // the free list answers HEAD as any GET route does; GET of the print still serves and charges
+    expect((await app.request("/v1/prints", { method: "HEAD", headers: { authorization: `Bearer rsl_test_${"a".repeat(32)}` } }, env, ctx)).status).toBe(200);
+    expect((await get("/v1/prints/us_unemployment_rate/2026-09")).status).toBe(200);
+    expect(charges()).toHaveLength(1);
+  });
+
+  it("a stored row observed before its scheduled release is not a first print: scheduled until the release, then 404; never charged or listed", async () => {
+    const early = { ...PRINT, observed_at: "2026-10-02T11:00:00+00:00" };
+    h.db = newDb({ prints: [early] });
+    vi.setSystemTime(RELEASE - 3600_000);
+    let res = await get("/v1/prints/us_unemployment_rate/2026-09");
+    expect(res.status).toBe(200);
+    let b = await body(res);
+    expect(b.data).toMatchObject({ status: "scheduled", release_at: EMPSIT.release_at, credits_charged: 0, balance: 300 });
+    expect(JSON.stringify(b)).not.toContain(PRINT.deciding_text);
+    vi.setSystemTime(RELEASE + 60_000);
+    res = await get("/v1/prints/us_unemployment_rate/2026-09");
+    expect(res.status).toBe(404);
+    b = await body(res);
+    expect(b.error!.message).toBe(`the stored observation of us_unemployment_rate 2026-09 (2026-10-02T11:00:00.000Z) predates its scheduled release ${EMPSIT.release_at}, so it is not served as the first print. Nothing was charged.`);
+    expect(JSON.stringify(b)).not.toContain(PRINT.deciding_text);
+    expect(chargeCalls()).toHaveLength(0);
+    expect(charges()).toHaveLength(0);
+    const list = await body(await get("/v1/prints"));
+    expect(list.data.series.find((x: { series: string }) => x.series === "us_unemployment_rate").latest).toBeNull();
+    // observed at the release itself, it is the first print; a period the registry does not schedule has no release time to hold it to
+    expect(observedBeforeRelease({ series: "us_unemployment_rate", period: "2026-09", observed_at: EMPSIT.release_at })).toBe(false);
+    expect(observedBeforeRelease({ series: "us_unemployment_rate", period: "2031-01", observed_at: "2000-01-01T00:00:00Z" })).toBe(false);
   });
 });
 

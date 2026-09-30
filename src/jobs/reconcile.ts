@@ -43,7 +43,7 @@ export { limitlessSlug, mapOfficialLabel, normalizeLabel } from "../markets/outc
 
 /**
  * Of Workers Free's 50 subrequests per invocation: the 10-minute invocation runs the dispatch check first (the pg_net
- * failure count and the database size, one alert) and keeps one alert back for a job that throws (src/jobs/schedule.ts),
+ * failure count and the storage status, one alert) and keeps one alert back for a job that throws (src/jobs/schedule.ts),
  * so reconcile gets 50 - 7 - 5 = 38.
  */
 export const RECONCILE_SUBREQUESTS = INVOCATION_SUBREQUESTS - DISPATCH_CHECK_SUBREQUESTS - EXCEPTION_RESERVE;

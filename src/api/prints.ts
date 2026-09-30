@@ -7,10 +7,15 @@
  *                                    saw it, the scheduled release, the source URL, the SHA-256 of the upstream body and
  *                                    the second source's status (never the corroboration jsonb itself: after an audited
  *                                    re-check it carries operator text). 1 credit per served print, charged once per
- *                                    request by charge_read() (migration 022; UNIQUE(reason, request_id) makes a replay of
- *                                    the same Idempotency-Key for the same print free). Before the release, or while the
- *                                    rail has not recorded it yet: {status: "scheduled", release_at}, 0 credits; an
- *                                    unknown series or period, or a release nobody recorded: 404, 0 credits.
+ *                                    request by charge_read() (migration 022: a replay of the same Idempotency-Key
+ *                                    for the same print is free, also while the first request is still running).
+ *                                    Before the release, or while the rail has not recorded it yet: {status:
+ *                                    "scheduled", release_at}, 0 credits; an unknown series or period, or a release
+ *                                    nobody recorded: 404, 0 credits. A row observed before its scheduled release is
+ *                                    not a first print (the rail's gate 1, decideOfficial, holds it as
+ *                                    awaiting_release): never served or charged. HEAD, which Hono answers from this GET
+ *                                    route without the body, is refused (405) before anything is read or charged: it
+ *                                    would pay for a print it never delivers.
  * Both run behind the v1 key middleware (src/api/v1.ts): the key, its daily cap and the per-key rate limit apply as on
  * every /v1 route. Free keys may call them: a print is structured data, no model is involved.
  * The 402 answer points to the card rail only (src/billing/whop.ts cardCheckoutOffered), never to the USDC address.
@@ -63,11 +68,21 @@ export function nextRelease(series: OfficialSeriesId, now: number): { period: st
 
 export interface RecordedPeriod { series: string; period: string; observed_at: string }
 
+/**
+ * Pure. A stored row observed before the scheduled release of its (series, period) in KNOWN_RELEASES: not a first print.
+ * The rail's own gate 1 (decideOfficial) holds such a row as awaiting_release; this route neither serves nor lists it.
+ */
+export function observedBeforeRelease(r: { series: string; period: string; observed_at: string }): boolean {
+  const known = KNOWN_RELEASES[`${r.series}:${r.period}`];
+  return !!known && Date.parse(r.observed_at) < Date.parse(known.release_at);
+}
+
 /** Pure. Every series in OFFICIAL_SERIES order: its label, unit, period format, latest recorded period and next release. */
 export function listSeries(now: number, recorded: readonly RecordedPeriod[]) {
   // Periods of one series share one format (YYYY-MM, YYYY-Qn, YYYY-MM-DD), so the greatest string is the latest period.
   const latest = new Map<string, RecordedPeriod>();
   for (const r of recorded) {
+    if (observedBeforeRelease(r)) continue;
     const cur = latest.get(r.series);
     if (!cur || r.period > cur.period) latest.set(r.series, r);
   }
@@ -157,6 +172,11 @@ prints.get("/", async (c) => {
 });
 
 prints.get("/:series/:period", async (c) => {
+  // Hono routes HEAD here and drops the body of the answer: a charge for a print never delivered. Refused first.
+  if (c.req.method !== "GET") {
+    c.header("Allow", "GET");
+    return err(c, "method_not_allowed", "Use GET: a first print is charged when it is served, and an answer to HEAD carries none. Nothing was charged.", 405);
+  }
   const auth = c.get("auth");
   const series = c.req.param("series");
   const period = c.req.param("period");
@@ -166,10 +186,14 @@ prints.get("/:series/:period", async (c) => {
   const client = db(c.env);
   const { data: row, error } = await client.from("official_observations").select(PRINT_COLUMNS.join(", ")).eq("series", series).eq("period", period).maybeSingle();
   if (error) return storeDown(c, "first-print store");
-  if (!row) {
+  const known = KNOWN_RELEASES[`${series}:${period}`];
+  const early = row !== null && observedBeforeRelease(row as unknown as PrintRow);
+  if (early && Date.now() >= Date.parse(known!.release_at)) {
+    return err(c, "not_found", `the stored observation of ${series} ${period} (${new Date((row as unknown as PrintRow).observed_at).toISOString()}) predates its scheduled release ${known!.release_at}, so it is not served as the first print. Nothing was charged.`, 404);
+  }
+  if (!row || early) {
     const s = scheduledAnswer(series, period, Date.now());
     if (!s) {
-      const known = KNOWN_RELEASES[`${series}:${period}`];
       return err(c, "not_found", known
         ? `no first print of ${series} ${period} was recorded (its release was scheduled for ${known.release_at}). Nothing was charged.`
         : `no first print of ${series} ${period} is recorded and no release of it is scheduled; GET /v1/prints lists each series' latest period and next release. Nothing was charged.`, 404);
