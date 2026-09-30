@@ -4,9 +4,9 @@
  * touches nothing; a verified payment of a pack credits its tenant exactly once whatever repeats, and moves a free
  * tenant to payg with its key's expiry cleared while every other plan is left alone; a wrong amount or currency, an
  * unknown plan, a missing or deleted tenant grant nothing and alert; refunds and disputes take back their share once,
- * never more than the payment granted and never below a zero balance (the shortfall is alerted, never thrown); unknown
- * event types are ignored and logged without the body; every answer is no-store; no alert carries the buyer's full
- * email address.
+ * never more than the payment granted and never below a zero balance (the shortfall is alerted, never thrown); a refund
+ * or formal dispute processed before its payment is credited stops the automatic grant; unknown event types are ignored
+ * and logged without the body; every answer is no-store; no alert carries the buyer's full email address.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
@@ -34,6 +34,7 @@ vi.mock("../src/ops/alerts", () => ({
 }));
 
 import { app } from "../src/index";
+import { upgradeIfFree } from "../src/billing/whop-events";
 
 const DOWN = { code: "08006", message: "connection failure" };
 function client(): FakeDb["client"] {
@@ -202,6 +203,44 @@ describe("a verified payment of a pack credits its tenant exactly once", () => {
     expect(tenant(FREE)).toMatchObject({ plan: "payg", watch_limit: 12 });
   });
 
+  it("another tenant's newer key is never touched: only the buyer's own newest key stops expiring", async () => {
+    const otherEnd = new Date(NOW + 9 * DAY).toISOString();
+    rows("api_keys").push({ id: "k-builder-newest", tenant_id: BUILDER, name: "rotated", environment: "live", expires_at: otherEnd, revoked_at: null, deleted_at: null, created_at: new Date(NOW - 60_000).toISOString() });
+    await expectAnswer(await send(paymentSucceeded(FREE)), 200, "credited");
+    expect(rows("api_keys").find((k) => k.id === "k-builder-newest")!.expires_at).toBe(otherEnd);
+    expect(rows("api_keys").find((k) => k.id === "k-free-new")!.expires_at).toBeNull();
+    expect(tenant(FREE)).toMatchObject({ plan: "payg" });
+    expect(h.alerts[0]!.text).toContain("key k-free-new no longer expires");
+  });
+
+  it("a tenant moved off free between the read and the write is never moved down to payg", async () => {
+    tenant(FREE).plan = "builder"; // an operator's change lands after the tenant was read as free
+    const r = await upgradeIfFree(client() as never, { id: FREE, plan: "free", watch_limit: 5, deleted_at: null });
+    expect(r).toMatchObject({ result: "unchanged" });
+    expect(r.line).toContain("no longer free when updated");
+    expect(tenant(FREE)).toMatchObject({ plan: "builder", watch_limit: 5 });
+  });
+
+  it("another event of the same payment running: the payment answers 409 and grants nothing, then is credited once let go", async () => {
+    h.db.tables.rate_limit_buckets = [{ key: "whop:payment:pay_test50", count: 1, reset_at: new Date(NOW + 30_000).toISOString() }];
+    await expectAnswer(await send(paymentSucceeded(FREE)), 409, "busy");
+    expect(ledger()).toEqual([]);
+    expect(h.db.calls.filter((c) => c.table === "rpc:grant_credits")).toEqual([]);
+    h.db.tables.rate_limit_buckets[0]!.reset_at = "1970-01-01T00:00:00.000Z";
+    await expectAnswer(await send(paymentSucceeded(FREE)), 200, "credited");
+    expect(rows("rate_limit_buckets").find((b) => b.key === "whop:payment:pay_test50")!.reset_at).toBe("1970-01-01T00:00:00.000Z");
+  });
+
+  it("a repeat of a credited payment that now shows a refund: already_processed, and no 'NOT credited' alert", async () => {
+    await expectAnswer(await send(paymentSucceeded(FREE)), 200, "credited");
+    h.alerts = [];
+    await expectAnswer(await send(paymentSucceeded(FREE, { refunded_amount: whopMoney("50.00") })), 200, "already_processed");
+    await expectAnswer(await send(paymentSucceeded(FREE, { total: whopMoney("45.00") })), 200, "already_processed");
+    expect(h.alerts).toEqual([]);
+    expect(ledger()).toHaveLength(1);
+    expect(tenant(FREE).credits_balance).toBe(5300);
+  });
+
   it("a plan move that failed is retried when the payment comes again, without a second grant", async () => {
     h.broken = (w) => w === "tenants.update";
     await expectAnswer(await send(paymentSucceeded(FREE)), 200, "credited");
@@ -244,6 +283,18 @@ describe("a payment that does not match grants nothing and alerts for manual mat
     expect(ledger()).toEqual([]);
     expect(h.alerts.map((a) => a.key)).toEqual(["whop_config_missing"]);
     expect(h.alerts[0]!.text).toContain("WHOP_PLAN_ID_250");
+  });
+  it("with the plan ids unset, a payment that names no Resolve tenant (a dashboard test event, another product) is answered 200", async () => {
+    // the wrangler.toml defaults: both plan ids empty. A 503 here would fail every such delivery for 3 days and Whop
+    // would disable the webhook before the first real pack is sold.
+    const shipped = { ...env, WHOP_PLAN_ID_50: "", WHOP_PLAN_ID_250: "" } as Env;
+    await expectAnswer(await send(paymentSucceeded(null, { plan_id: "plan_xxxxxxxxxxxxx" }), {}, shipped), 200, "ignored_plan");
+    expect(ledger()).toEqual([]);
+    expect(h.alerts.map((a) => a.key)).toEqual(["whop_unknown_plan_pay_test50"]);
+    for (const s of ["not a configured Resolve credit pack", "WHOP_PLAN_ID_50", "names no Resolve tenant", "'whop:pay_test50'"]) expect(h.alerts[0]!.text).toContain(s);
+    // one Resolve opened (its tenant in the metadata) is still refused for Whop to retry once the plan ids are set
+    await expectAnswer(await send(paymentSucceeded(FREE, { plan_id: "plan_xxxxxxxxxxxxx" }), {}, shipped), 503);
+    expect(ledger()).toEqual([]);
   });
   it("a payment that does not parse as a pinned payment is alerted as not understood, never guessed", async () => {
     await expectAnswer(await send(envelope("payment.succeeded", { id: "pay_legacy", plan: { id: PLAN_50 }, total: 50, currency: "usd" })), 200, "not_understood");
@@ -382,10 +433,117 @@ describe("refunds and disputes take back their share once", () => {
     expect(h.alerts[0]!.key).toBe("whop_dispute_inquiry_dspt_test1");
   });
 
+  it("an inquiry in a formal status still moves no money; an early alert status without the flag neither", async () => {
+    await credited();
+    for (const status of ["needs_response", "under_review", "lost"]) {
+      await expectAnswer(await send(disputeEvent("dispute.updated", { inquiry: true, status })), 200, "dispute_inquiry");
+    }
+    await expectAnswer(await send(disputeEvent("dispute.created", { id: "dspt_warn", inquiry: false, status: "warning_under_review" })), 200, "dispute_inquiry");
+    expect(reversals()).toEqual([]);
+    expect(tenant(FREE).credits_balance).toBe(5300);
+    expect(h.alerts.map((a) => a.key)).toEqual(["whop_dispute_inquiry_dspt_test1", "whop_dispute_inquiry_dspt_test1", "whop_dispute_inquiry_dspt_test1", "whop_dispute_inquiry_dspt_warn"]);
+  });
+
   it("a refund of a payment Resolve never credited takes nothing and alerts", async () => {
     await expectAnswer(await send(refundEvent("refund.created", { paymentId: "pay_unknown" })), 200, "no_grant");
     expect(reversals()).toEqual([]);
     expect(h.alerts[0]!.text).toContain("Resolve granted nothing for that payment");
+  });
+
+  it("a refund processed before its payment is credited (the payment answered 503, then retried): nothing is granted", async () => {
+    h.broken = (w) => w === "rpc:grant_credits";
+    await expectAnswer(await send(paymentSucceeded(FREE)), 503);
+    h.broken = null;
+    await expectAnswer(await send(refundEvent("refund.created")), 200, "no_grant");
+    expect(rows("rate_limit_buckets").find((b) => b.key === "whop:reversed-first:pay_test50")).toBeDefined();
+    h.alerts = [];
+    // Whop retries the original delivery: the same payload, refunded_amount still null
+    await expectAnswer(await send(paymentSucceeded(FREE)), 200, "reversed_first");
+    expect(ledger()).toEqual([]);
+    expect(tenant(FREE)).toMatchObject({ plan: "free", credits_balance: 300 });
+    expect(rows("api_keys").find((k) => k.id === "k-free-new")!.expires_at).not.toBeNull();
+    expect(h.alerts.map((a) => a.key)).toEqual(["whop_unmatched_pay_test50"]);
+    expect(h.alerts[0]!.text).toContain("was processed before this payment.succeeded");
+    expect(h.alerts[0]!.text).toContain("'whop:pay_test50'");
+    // and it stays so on every later delivery
+    await expectAnswer(await send(paymentSucceeded(FREE)), 200, "reversed_first");
+    expect(ledger()).toEqual([]);
+  });
+
+  it("a formal dispute delivered before its payment stops the grant the same way", async () => {
+    await expectAnswer(await send(disputeEvent("dispute.created", { status: "needs_response" })), 200, "no_grant");
+    await expectAnswer(await send(paymentSucceeded(FREE)), 200, "reversed_first");
+    expect(tenant(FREE).credits_balance).toBe(300);
+    expect(ledger()).toEqual([]);
+  });
+
+  it("a refund still pending, or an inquiry, before the payment leaves no marker: the payment is credited", async () => {
+    await expectAnswer(await send(refundEvent("refund.created", { status: "pending" })), 200, "refund_not_succeeded");
+    await expectAnswer(await send(disputeEvent("dispute.created", { inquiry: true })), 200, "dispute_inquiry");
+    await expectAnswer(await send(paymentSucceeded(FREE)), 200, "credited");
+    expect(tenant(FREE).credits_balance).toBe(5300);
+  });
+
+  it("a refund before its payment whose marker cannot be written is refused for Whop to retry", async () => {
+    h.broken = (w, a) => w === "rpc:rate_limit_hit" && String(a?.p_key).startsWith("whop:reversed-first:");
+    await expectAnswer(await send(refundEvent("refund.created")), 503);
+    h.broken = null;
+    await expectAnswer(await send(refundEvent("refund.created")), 200, "no_grant");
+    await expectAnswer(await send(paymentSucceeded(FREE)), 200, "reversed_first");
+    expect(ledger()).toEqual([]);
+  });
+
+  it("two payments of one tenant: each refund takes back its own payment's credits, never capped by the other's", async () => {
+    await credited();
+    await expectAnswer(await send(paymentSucceeded(FREE, { id: "pay_second" })), 200, "credited");
+    expect(tenant(FREE).credits_balance).toBe(10300);
+    await expectAnswer(await send(refundEvent("refund.created")), 200, "reversed");
+    await expectAnswer(await send(refundEvent("refund.created", { id: "ref_second", paymentId: "pay_second" })), 200, "reversed");
+    expect(reversals().map((r) => [r.request_id, r.delta])).toEqual([["whop-refund:pay_test50:ref_test1", -5000], ["whop-refund:pay_second:ref_second", -5000]]);
+    expect(tenant(FREE).credits_balance).toBe(300);
+  });
+
+  it("the earlier reversals of a payment are found however many older adjustments the tenant has", async () => {
+    const old = new Date(NOW - 100 * DAY).toISOString();
+    for (let i = 0; i < 1000; i++) ledger().push({ id: 10_000 + i, tenant_id: FREE, delta: -1, reason: "adjustment", request_id: `hand-fix-${i}`, balance_after: 300, created_at: old });
+    await credited();
+    tenant(FREE).credits_balance = 20000;
+    await expectAnswer(await send(disputeEvent("dispute.created")), 200, "reversed");
+    await expectAnswer(await send(refundEvent("refund.created", { id: "ref_after" })), 200, "nothing_left");
+    expect(reversals().filter((r) => String(r.request_id).startsWith("whop-")).map((r) => [r.request_id, r.delta])).toEqual([["whop-dispute:pay_test50:dspt_test1", -5000]]);
+    expect(tenant(FREE).credits_balance).toBe(15000);
+  });
+
+  it("another delivery of the same refund writing first (a lapsed hold): the unique request_id answers already_processed", async () => {
+    await credited();
+    let once = true;
+    h.before = (fn, a) => {
+      if (fn !== "grant_credits" || a.p_amount >= 0 || !once) return;
+      once = false;
+      tenant(FREE).credits_balance += a.p_amount;
+      ledger().push({ id: 900, tenant_id: FREE, delta: a.p_amount, reason: "adjustment", request_id: a.p_request_id, balance_after: tenant(FREE).credits_balance, created_at: new Date().toISOString() });
+    };
+    await expectAnswer(await send(refundEvent("refund.created")), 200, "already_processed");
+    expect(reversals()).toEqual([expect.objectContaining({ id: 900, delta: -5000 })]);
+    expect(tenant(FREE).credits_balance).toBe(300);
+  });
+
+  it("with tax added on top, a refund of the pack's price takes all its credits, and a partial one its share, in either shape", async () => {
+    const taxed = { id: "pay_t250", plan_id: PLAN_250, total: whopMoney("271.88"), tax_amount: whopMoney("21.88"), tax_behavior: "exclusive" };
+    await expectAnswer(await send(paymentSucceeded(PAYG, taxed)), 200, "credited");
+    await expectAnswer(await send(refundEvent("refund.created", { id: "ref_legacy", paymentId: "pay_t250", amount: 250, total: 271.88 })), 200, "reversed");
+    expect(reversals().map((r) => r.delta)).toEqual([-27500]);
+    h.db = seed();
+    await expectAnswer(await send(paymentSucceeded(PAYG, taxed)), 200, "credited");
+    await expectAnswer(await send(nativeRefundEvent("refund.created", { paymentId: "pay_t250", amount: "250.00" })), 200, "reversed");
+    expect(reversals().map((r) => r.delta)).toEqual([-27500]);
+    for (const shape of ["legacy", "native"] as const) {
+      h.db = seed();
+      await expectAnswer(await send(paymentSucceeded(PAYG, taxed)), 200, "credited");
+      const ev = shape === "legacy" ? refundEvent("refund.created", { paymentId: "pay_t250", amount: 125, total: 271.88 }) : nativeRefundEvent("refund.created", { paymentId: "pay_t250", amount: "125.00" });
+      await expectAnswer(await send(ev), 200, "reversed");
+      expect(reversals().map((r) => r.delta), shape).toEqual([-13750]);
+    }
   });
 
   it("another event of the same payment running: 409 for Whop to retry, nothing taken", async () => {

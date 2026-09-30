@@ -175,8 +175,9 @@ describe("what a refund or dispute takes back", () => {
     expect(packPriceFor(4999)).toBeNull();
   });
   it("a refund reads the same in either documented shape: the SDK's RefundLegacy or the native Refund", () => {
-    expect(readRefund(refundEvent("refund.created", { amount: 10, total: 50 }).data)).toEqual({ id: "ref_test1", paymentId: "pay_test50", status: "succeeded", partCents: 1000, wholeCents: 5000 });
-    expect(readRefund(nativeRefundEvent("refund.updated", { amount: "10.00" }).data)).toEqual({ id: "rf_test1", paymentId: "pay_test50", status: "succeeded", partCents: 1000, wholeCents: null });
+    // the legacy shape's payment total is not read: every reversal is measured against the pack's price (packPriceFor)
+    expect(readRefund(refundEvent("refund.created", { amount: 10, total: 54.38 }).data)).toEqual({ id: "ref_test1", paymentId: "pay_test50", status: "succeeded", partCents: 1000 });
+    expect(readRefund(nativeRefundEvent("refund.updated", { amount: "10.00" }).data)).toEqual({ id: "rf_test1", paymentId: "pay_test50", status: "succeeded", partCents: 1000 });
     expect(readRefund(nativeRefundEvent("refund.created", { amount: null }).data)).toMatchObject({ partCents: null });
     expect(readRefund(refundEvent("refund.created", { amount: 10, currency: "eur" }).data)).toMatchObject({ partCents: null });
     expect(readRefund({ id: "ref_x", status: "succeeded" })).toHaveProperty("error");

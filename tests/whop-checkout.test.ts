@@ -291,6 +291,22 @@ describe("the /pricing form", () => {
     expect(whopCalls).toEqual([]);
     await expectKeyNowhere(await res.text(), await json.text());
   });
+  it("the key's per-minute limit: 429 page, nothing asked of Whop, the key nowhere; the API route is limited the same way", async () => {
+    const asked: string[][] = [];
+    h.db.options.rpc = { ...WHOP_RPCS, check_gates: async (_db, a) => { asked.push(a.p_keys); return { data: { buckets: [{ key: "key:k1:min", allowed: false, remaining: 0, reset_at: new Date(NOW + 30_000).toISOString() }] }, error: null }; } };
+    const res = await formCheckout({ key: KEY, pack: "50" });
+    expect(res.status).toBe(429);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    const html = await res.text();
+    expect(text(html)).toContain("Too many requests for this key in the last minute.");
+    expect(asked).toEqual([["key:k1:min"]]);
+    expect(whopCalls).toEqual([]);
+    const api = await apiCheckout({ pack: "50" });
+    expect(api.status).toBe(429);
+    expect(api.headers.get("cache-control")).toBe("no-store");
+    expect(whopCalls).toEqual([]);
+    await expectKeyNowhere(html, await api.text());
+  });
   it("Whop failing: 503 page, nothing charged, no redirect", async () => {
     whopAnswer = () => new Response("{}", { status: 500 });
     const res = await formCheckout({ key: KEY, pack: "50" });

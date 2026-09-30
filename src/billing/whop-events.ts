@@ -3,19 +3,30 @@
  * grant and every reversal is one credit_ledger row written by grant_credits() (migration 004), keyed so it happens once:
  *   - payment.succeeded: grant_credits(tenant, pack credits, note, "whop:<payment id>"). A repeat is refused by the
  *     ledger's UNIQUE(reason, request_id) (23505) and answers already_processed: never an error Whop would retry for 3
- *     days. A free tenant's credited purchase moves it to payg (watch_limit at least PAYG_WATCH_LIMIT) and clears the
- *     expiry of its newest live key (its evaluation key; a key rotated out earlier keeps its own end); no other plan is
- *     ever changed, and a repeat retries a move that failed.
+ *     days; so does a repeat that fails a check it passed before (a refund shown since), never a "NOT credited" alert
+ *     about a payment the ledger holds. A free tenant's credited purchase moves it to payg (watch_limit at least
+ *     PAYG_WATCH_LIMIT) and clears the expiry of its newest live key (its evaluation key; a key rotated out earlier keeps
+ *     its own end); no other plan is ever changed, and a repeat retries a move that failed. The grant runs under the
+ *     payment's hold (below), and a payment whose refund or formal dispute was processed first is not credited
+ *     automatically: deliveries come in any order ([W1]) and a payment.succeeded answered 503 is retried with the same
+ *     payload, so the refund leaves a marker the grant checks, and the operator decides what the buyer kept.
+ *   - a payment on a plan that is no pack while a plan variable is unset answers 503 (Whop retries once it is set) only
+ *     when it names a Resolve tenant in its metadata, i.e. came from a checkout Resolve opened; a test event from the
+ *     Whop dashboard or a sale of another product is answered 200, so the webhook is never failed into being disabled.
  *   - a refund (status succeeded) or a formal dispute that holds or took the money (DISPUTE_REVERSES):
  *     grant_credits(tenant, -n, note, "whop-refund|whop-dispute:<payment id>:<id>"), n its share of what the payment
  *     granted less what earlier reversals of the payment took, and at most the balance: a shortfall is alerted, never
- *     thrown. One payment's events run one at a time (a rate_limit_hit hold, released at the end), so two of them never
- *     both read the same remainder; a reversal that could take nothing leaves a 20-day marker, so a repeat of it stays
+ *     thrown. One payment's events, its grant included, run one at a time (a rate_limit_hit hold, released at the end),
+ *     so two of them never both read the same remainder and a refund never passes its grant unseen; the earlier
+ *     reversals are read by the payment's request_id prefix, never from a window of the tenant's ledger. A reversal of
+ *     a payment Resolve never credited leaves a 20-day marker that stops the payment's automatic grant (Whop retries a
+ *     delivery for about 3 days). A reversal that could take nothing leaves a 20-day marker, so a repeat of it stays
  *     a no-op while Whop can still redeliver it, and so does a dispute ruled won or closed before anything was taken
  *     (deliveries come in any order: its late dispute.created then takes nothing). A dispute won after its credits were
  *     taken is alerted with the call that gives them back; the operator decides.
- *   - everything that grants nothing (an unknown plan, a wrong amount or currency, no tenant, a deleted tenant) is
- *     alerted with what the operator needs to credit it by hand under the same request_id the automatic grant uses.
+ *   - everything that grants nothing (an unknown plan, a wrong amount or currency, no tenant, a deleted tenant, a refund
+ *     or dispute processed first) is alerted with what the operator needs to credit it by hand under the same
+ *     request_id the automatic grant uses.
  * Answers: 200 for every outcome a retry cannot change; 503 (a database error, a missing configuration) and 409 (another
  * event of the payment is running) for the ones a Whop retry can fix. An alert never carries the buyer's full email
  * address; nothing here ever sees a Resolve key.
@@ -27,7 +38,8 @@ import { maskEmail, redact } from "../ops/redact";
 import { PAYG_WATCH_LIMIT } from "../api/keys";
 import {
   CARD_PACKS, DISPUTE_RETURNS, DISPUTE_REVERSES, TENANT_METADATA_KEY, WHOP_API_VERSION_DATE, WhopDispute, WhopPayment,
-  decideGrant, grantRequestIdFor, packPriceFor, readRefund, reversalCredits, reversalRequestIdFor, usd, usdCents, type PackId, type WhopConfig, type WhopEnvelope,
+  decideGrant, grantRequestIdFor, packPriceFor, readRefund, reversalCredits, reversalRequestIdFor, usd, usdCents,
+  type GrantDecision, type PackId, type WhopConfig, type WhopEnvelope,
 } from "./whop";
 
 export interface EventAnswer {
@@ -48,6 +60,8 @@ const SETTLED_MS = 20 * 86_400_000;
 const RELEASED = "1970-01-01T00:00:00.000Z";
 const holdKey = (paymentId: string) => `whop:payment:${paymentId}`;
 const settledKey = (requestId: string) => `whop:settled:${requestId}`;
+/** A refund or formal dispute of a payment Resolve had not credited: the payment's automatic grant is stopped. */
+const reversedFirstKey = (paymentId: string) => `whop:reversed-first:${paymentId}`;
 const why = (e: unknown) => redact(String((e as { message?: unknown })?.message ?? e)).slice(0, 200);
 const log = (o: Record<string, unknown>) => console.log(JSON.stringify({ job: "whop_webhook", ...o }));
 
@@ -56,7 +70,7 @@ interface TenantRow { id: string; plan: string; watch_limit: number | null; dele
 /** Act on one verified event. Types other than HANDLED_EVENTS are answered 200 and ignored. */
 export async function handleWhopEvent(env: Env, cfg: WhopConfig, ev: WhopEnvelope, now = Date.now()): Promise<EventAnswer> {
   switch (ev.type) {
-    case "payment.succeeded": return onPayment(env, cfg, ev);
+    case "payment.succeeded": return onPayment(env, cfg, ev, now);
     case "refund.created": case "refund.updated": return onRefund(env, ev, now);
     case "dispute.created": case "dispute.updated": return onDispute(env, ev, now);
     default: return { status: 200, result: "ignored" };
@@ -83,23 +97,35 @@ const issues = (e: { issues: Array<{ path: PropertyKey[]; message: string }> }) 
 
 // ---- payment.succeeded ----------------------------------------------------------------------------------------------
 
-async function onPayment(env: Env, cfg: WhopConfig, ev: WhopEnvelope): Promise<EventAnswer> {
+async function onPayment(env: Env, cfg: WhopConfig, ev: WhopEnvelope, now: number): Promise<EventAnswer> {
   const parsed = WhopPayment.safeParse(ev.data);
   if (!parsed.success) return notUnderstood(env, ev, "payment", issues(parsed.error));
   const p = parsed.data;
   const d = decideGrant(p, cfg);
   const ids = { payment_id: p.id, plan_id: p.plan_id };
   if (d.result === "unknown_plan") {
-    if (d.configIncomplete) return configMissing(env, cfg.planMissing, `Whop payment ${p.id} (plan ${p.plan_id ?? "none"})`);
-    await alert(env, `whop_unknown_plan_${p.id}`, `Whop payment ${p.id} is on plan ${p.plan_id ?? "none"}, which is not a Resolve credit pack (${Object.entries(cfg.planOf).map(([k, v]) => `$${k}: ${v}`).join(", ")}): no credits were granted. Nothing to do when it is another product.`, { dedupMinutes: ONCE, meta: ids });
+    // A plan variable is unset, so the plan may be a pack. Only a checkout Resolve opened names a tenant in the metadata:
+    // that payment is refused for Whop to retry once the plan ids are set. Anything else is answered 200 like any other
+    // plan, so a webhook made before the plan ids are set is not failed for 3 days and disabled ([W1]).
+    const fromResolve = p.metadata?.[TENANT_METADATA_KEY] !== undefined;
+    if (d.configIncomplete && fromResolve) return configMissing(env, cfg.planMissing, `Whop payment ${p.id} (plan ${p.plan_id ?? "none"}, from a checkout Resolve opened)`);
+    const packs = Object.entries(cfg.planOf).map(([k, v]) => `$${k}: ${v}`).join(", ") || "none set";
+    const text = d.configIncomplete
+      ? `Whop payment ${p.id} is on plan ${p.plan_id ?? "none"}, which is not a configured Resolve credit pack (${packs}; unset or invalid: ${cfg.planMissing.join(", ")}), and it names no Resolve tenant, so it is not a checkout Resolve opened: no credits were granted. Nothing to do for a test event from the Whop dashboard or another product. A pack bought through a plain Whop link is credited by hand once its tenant is known: grant_credits('<tenant id>', <credits>, 'Whop ${p.id} matched by hand: <why>', '${grantRequestIdFor(p.id)}').`
+      : `Whop payment ${p.id} is on plan ${p.plan_id ?? "none"}, which is not a Resolve credit pack (${packs}): no credits were granted. Nothing to do when it is another product.`;
+    await alert(env, `whop_unknown_plan_${p.id}`, text, { dedupMinutes: ONCE, meta: { ...ids, config_incomplete: d.configIncomplete } });
     return { status: 200, result: "ignored_plan", detail: ids };
   }
   if (d.result !== "grant") {
     const reason = d.result === "not_paid" ? `its status is ${p.status}, not paid` : d.result === "refunded_already" ? `it was already refunded when the event was read (${d.detail})` : d.result === "amount_mismatch" ? `the amount or currency does not match the pack: ${d.detail}` : d.detail;
     return unmatched(env, p, d.pack, d.result, reason);
   }
-
   const client = db(env);
+  return held(env, client, p.id, ids, () => grantHeld(env, client, p, d, ids, now));
+}
+
+/** A payment that passed every check, under its hold: the tenant, then the reversed-first marker, then the grant. */
+async function grantHeld(env: Env, client: Db, p: WhopPayment, d: Extract<GrantDecision, { result: "grant" }>, ids: { payment_id: string; plan_id: string | null }, now: number): Promise<EventAnswer> {
   let tenant: TenantRow | null;
   try {
     const t = await client.from("tenants").select("id, plan, watch_limit, deleted_at").eq("id", d.tenantId).maybeSingle();
@@ -108,6 +134,17 @@ async function onPayment(env: Env, cfg: WhopConfig, ev: WhopEnvelope): Promise<E
   } catch (e) { return dbTrouble(env, `the tenant read for payment ${p.id}`, e); }
   if (!tenant) return unmatched(env, p, d.pack, "tenant_missing", `no tenant ${d.tenantId} exists`);
   if (tenant.deleted_at) return unmatched(env, p, d.pack, "tenant_deleted", `tenant ${d.tenantId} is deleted`);
+
+  // A refund or formal dispute of this payment ran before it was credited (this event may be a retry of one answered
+  // 503): the money went back or is held, so nothing is granted automatically and the operator decides.
+  let reversedFirst: boolean;
+  try {
+    const m = await client.from("rate_limit_buckets").select("key, reset_at").eq("key", reversedFirstKey(p.id)).maybeSingle();
+    if (m.error) return dbTrouble(env, `the refund marker read for payment ${p.id}`, m.error);
+    const row = m.data as { reset_at: string } | null;
+    reversedFirst = !!row && Date.parse(row.reset_at) > now;
+  } catch (e) { return dbTrouble(env, `the refund marker read for payment ${p.id}`, e); }
+  if (reversedFirst) return unmatched(env, p, d.pack, "reversed_first", `a refund or dispute of it was processed before this payment.succeeded (Whop delivers events in any order; see the whop_nogrant alert of payment ${p.id}), so its money went back to the buyer or is held. Check the payment in Whop: credit by hand only what the buyer kept (a partial refund, a dispute won)`);
 
   const price = CARD_PACKS[d.pack].priceCents;
   let g: { data: unknown; error: { code?: string; message?: string } | null };
@@ -138,15 +175,29 @@ async function onPayment(env: Env, cfg: WhopConfig, ev: WhopEnvelope): Promise<E
   return { status: 200, result: "credited", detail: { ...ids, tenant_id: tenant.id, credits: d.credits, balance: Number.isFinite(balance) ? balance : null } };
 }
 
-/** A pack payment that grants nothing: alerted once with everything needed to credit it by hand. */
+/**
+ * A pack payment that grants nothing: alerted once with everything needed to credit it by hand. A payment the ledger
+ * already credited (a repeat that now fails a check it passed, e.g. it shows a refund since; or a hand match under the
+ * same request_id) answers already_processed instead: its refund events take the credits back, and nothing is alerted.
+ */
 async function unmatched(env: Env, p: WhopPayment, pack: PackId, result: string, reason: string): Promise<EventAnswer> {
+  let granted: { tenant_id: string } | null;
+  try {
+    const g = await db(env).from("credit_ledger").select("tenant_id").eq("reason", "grant").eq("request_id", grantRequestIdFor(p.id)).maybeSingle();
+    if (g.error) return dbTrouble(env, `the grant read for payment ${p.id}`, g.error);
+    granted = (g.data as { tenant_id: string } | null) ?? null;
+  } catch (e) { return dbTrouble(env, `the grant read for payment ${p.id}`, e); }
+  if (granted) {
+    log({ outcome: "already_processed", payment_id: p.id, now_failing: result });
+    return { status: 200, result: "already_processed", detail: { payment_id: p.id, plan_id: p.plan_id, tenant_id: granted.tenant_id } };
+  }
   const { credits, priceCents } = CARD_PACKS[pack];
   const hint = p.metadata?.[TENANT_METADATA_KEY];
   const tenantHint = typeof hint === "string" ? hint.slice(0, 64) : null;
   await alert(env, `whop_unmatched_${p.id}`, [
     `Whop payment ${p.id} was NOT credited: ${reason}.`,
     `Pack ${usd(priceCents)} (${credits} credits), plan ${p.plan_id}; paid ${p.total ? `${p.total.amount} ${p.total.currency}` : "unknown"}; status ${p.status}; buyer ${p.customer_email ? maskEmail(p.customer_email) : "no email in the event"}; metadata tenant ${tenantHint ?? "none"}.`,
-    `Recorded here for manual matching. To credit it once the tenant is known: grant_credits('<tenant id>', ${credits}, 'Whop ${p.id} matched by hand: <why>', '${grantRequestIdFor(p.id)}'), the automatic grant's request_id, so the payment can never be credited twice; a free tenant also moves to plan payg and its key's expires_at is cleared. Otherwise refund it in Whop.`,
+    `Recorded here for manual matching. To credit it once the tenant is known: grant_credits('<tenant id>', ${credits}, 'Whop ${p.id} matched by hand: <why>', '${grantRequestIdFor(p.id)}'), the automatic grant's request_id, so the payment can never be credited twice; a free tenant also moves to plan payg and its key's expires_at is cleared. Otherwise refund it in Whop unless it is refunded already.`,
   ].join("\n"), { dedupMinutes: ONCE, meta: { payment_id: p.id, plan_id: p.plan_id, pack, credits, amount: p.total?.amount ?? null, currency: p.total?.currency ?? p.currency, metadata_tenant: tenantHint, reason: result } });
   return { status: 200, result, detail: { payment_id: p.id, plan_id: p.plan_id } };
 }
@@ -167,6 +218,7 @@ export async function upgradeIfFree(client: Db, t: TenantRow): Promise<{ result:
     if (key?.expires_at) {
       const u = await client.from("api_keys").update({ expires_at: null }).eq("id", key.id).eq("tenant_id", t.id).select("id");
       if (u.error) return failed(`key update: ${why(u.error)}`);
+      if (!Array.isArray(u.data) || u.data.length !== 1) return failed(`key update: key ${key.id} of this tenant not found`);
       keyLine = `key ${key.id} no longer expires (it expired ${key.expires_at})`;
     }
     const watchLimit = Math.max(Number(t.watch_limit) || 0, PAYG_WATCH_LIMIT);
@@ -184,7 +236,7 @@ async function onRefund(env: Env, ev: WhopEnvelope, now: number): Promise<EventA
   if ("error" in r) return notUnderstood(env, ev, "refund", r.error);
   // The money is back with the buyer only once the refund succeeded; refund.updated brings that status.
   if (r.status !== "succeeded") return { status: 200, result: "refund_not_succeeded", detail: { refund_id: r.id, payment_id: r.paymentId, status: r.status } };
-  return reverse(env, { kind: "refund", id: r.id, paymentId: r.paymentId, partCents: r.partCents, wholeCents: r.wholeCents }, now);
+  return reverse(env, { kind: "refund", id: r.id, paymentId: r.paymentId, partCents: r.partCents }, now);
 }
 
 async function onDispute(env: Env, ev: WhopEnvelope, now: number): Promise<EventAnswer> {
@@ -197,7 +249,7 @@ async function onDispute(env: Env, ev: WhopEnvelope, now: number): Promise<Event
     return { status: 200, result: "dispute_inquiry", detail: ids };
   }
   if (DISPUTE_REVERSES.has(d.status)) {
-    return reverse(env, { kind: "dispute", id: d.id, paymentId: d.payment.id, partCents: usdCents(d.amount, d.currency), wholeCents: usdCents(d.payment.amount, d.payment.currency) }, now);
+    return reverse(env, { kind: "dispute", id: d.id, paymentId: d.payment.id, partCents: usdCents(d.amount, d.currency) }, now);
   }
   if (DISPUTE_RETURNS.has(d.status)) {
     // The money stays with Resolve. Credits taken when the dispute opened stay taken: the operator decides.
@@ -228,34 +280,39 @@ interface Reversal {
   kind: "refund" | "dispute";
   id: string;
   paymentId: string;
-  /** The amount refunded or disputed, in US cents (null: not given, or in another currency). */
+  /** The amount refunded or disputed, in US cents (null: not given, or in another currency): its share of the pack's price. */
   partCents: number | null;
-  /** The payment's total in US cents, when the payload carries it; else the pack's price stands in. */
-  wholeCents: number | null;
+}
+
+/**
+ * Run `run` holding the payment, so its events (the grant, refunds, disputes) run one at a time: 409 for Whop to retry
+ * while another holds it. The hold is let go at the end; a release that fails lapses after HOLD_MS.
+ */
+async function held(env: Env, client: Db, paymentId: string, ids: Record<string, unknown>, run: () => Promise<EventAnswer>): Promise<EventAnswer> {
+  let got: boolean;
+  try {
+    const { data, error } = await client.rpc("rate_limit_hit", { p_key: holdKey(paymentId), p_window_ms: HOLD_MS, p_limit: 1 });
+    if (error) return dbTrouble(env, `the hold on payment ${paymentId}`, error);
+    const row = (Array.isArray(data) ? data[0] : data) as { allowed?: unknown } | null;
+    if (!row || typeof row.allowed !== "boolean") return dbTrouble(env, `the hold on payment ${paymentId}`, "rate_limit_hit answered without allowed");
+    got = row.allowed;
+  } catch (e) { return dbTrouble(env, `the hold on payment ${paymentId}`, e); }
+  if (!got) return { status: 409, result: "busy", message: "another event of this payment is being processed; retry", detail: ids };
+  try {
+    return await run();
+  } finally {
+    try {
+      const { error } = await client.from("rate_limit_buckets").update({ count: 0, reset_at: RELEASED }).eq("key", holdKey(paymentId));
+      if (error) log({ outcome: "hold_release_failed", payment_id: paymentId, error: why(error) });
+    } catch (e) { log({ outcome: "hold_release_failed", payment_id: paymentId, error: why(e) }); }
+  }
 }
 
 /** Take back a refund's or dispute's credits, holding the payment so its events run one at a time. */
 async function reverse(env: Env, o: Reversal, now: number): Promise<EventAnswer> {
   const client = db(env);
   const ids = { payment_id: o.paymentId, [`${o.kind}_id`]: o.id };
-  let held: boolean;
-  try {
-    const { data, error } = await client.rpc("rate_limit_hit", { p_key: holdKey(o.paymentId), p_window_ms: HOLD_MS, p_limit: 1 });
-    if (error) return dbTrouble(env, `the hold on payment ${o.paymentId}`, error);
-    const row = (Array.isArray(data) ? data[0] : data) as { allowed?: unknown } | null;
-    if (!row || typeof row.allowed !== "boolean") return dbTrouble(env, `the hold on payment ${o.paymentId}`, "rate_limit_hit answered without allowed");
-    held = row.allowed;
-  } catch (e) { return dbTrouble(env, `the hold on payment ${o.paymentId}`, e); }
-  if (!held) return { status: 409, result: "busy", message: "another event of this payment is being processed; retry", detail: ids };
-  try {
-    return await reverseHeld(env, client, o, ids, now);
-  } finally {
-    // Let the payment go at once; a release that fails lapses after HOLD_MS.
-    try {
-      const { error } = await client.from("rate_limit_buckets").update({ count: 0, reset_at: RELEASED }).eq("key", holdKey(o.paymentId));
-      if (error) log({ outcome: "hold_release_failed", payment_id: o.paymentId, error: why(error) });
-    } catch (e) { log({ outcome: "hold_release_failed", payment_id: o.paymentId, error: why(e) }); }
-  }
+  return held(env, client, o.paymentId, ids, () => reverseHeld(env, client, o, ids, now));
 }
 
 async function reverseHeld(env: Env, client: Db, o: Reversal, ids: Record<string, unknown>, now: number): Promise<EventAnswer> {
@@ -266,14 +323,21 @@ async function reverseHeld(env: Env, client: Db, o: Reversal, ids: Record<string
     const g = await client.from("credit_ledger").select("tenant_id, delta").eq("reason", "grant").eq("request_id", grantRequestIdFor(o.paymentId)).maybeSingle();
     if (g.error) return dbTrouble(env, `the grant read for payment ${o.paymentId}`, g.error);
     if (!g.data) {
-      await alert(env, `whop_nogrant_${requestId}`, `Whop ${o.kind} ${o.id} of payment ${o.paymentId}: Resolve granted nothing for that payment (not a Resolve pack, never matched, or its payment.succeeded is not processed yet), so nothing was taken back. If the payment is credited later, take its credits back by hand: grant_credits('<tenant id>', -<credits>, 'Whop ${o.kind} ${o.id}', '${requestId}').`, { dedupMinutes: ONCE, meta: ids });
+      // The payment's own payment.succeeded may still come: answered 503 and retried with the same payload, or delivered
+      // late ([W1]). This marker stops its automatic grant, so credits are never granted for money that went back; a
+      // marker that cannot be written refuses this event for Whop to retry.
+      const s = await client.rpc("rate_limit_hit", { p_key: reversedFirstKey(o.paymentId), p_window_ms: SETTLED_MS, p_limit: 1 });
+      if (s.error) return dbTrouble(env, `the refund marker of payment ${o.paymentId}`, s.error);
+      await alert(env, `whop_nogrant_${requestId}`, `Whop ${o.kind} ${o.id} of payment ${o.paymentId}: Resolve granted nothing for that payment (not a Resolve pack, never matched, or its payment.succeeded is not processed yet), so nothing was taken back. Its payment.succeeded, if it comes within 20 days, grants nothing automatically and is alerted for a decision by hand. A payment credited by hand later must take this ${o.kind} into account: grant_credits('<tenant id>', -<credits>, 'Whop ${o.kind} ${o.id}', '${requestId}').`, { dedupMinutes: ONCE, meta: ids });
       return { status: 200, result: "no_grant", detail: ids };
     }
     const tenantId = String((g.data as { tenant_id: unknown }).tenant_id);
     const granted = Number((g.data as { delta: unknown }).delta);
 
-    // 2. what earlier reversals of the payment took, and whether this one already ran
-    const prior = await client.from("credit_ledger").select("delta, request_id").eq("tenant_id", tenantId).eq("reason", "adjustment").order("created_at", { ascending: true }).limit(1000);
+    // 2. what earlier reversals of the payment took, and whether this one already ran: read by the payment's request_id
+    // pattern, never from a window of the tenant's ledger that older rows could fill. "_" in a payment id matches any one
+    // character in LIKE, so the pattern only narrows the read; the prefix test below is exact.
+    const prior = await client.from("credit_ledger").select("delta, request_id").eq("tenant_id", tenantId).eq("reason", "adjustment").like("request_id", `whop-%:${o.paymentId}:%`).limit(1000);
     if (prior.error || !Array.isArray(prior.data)) return dbTrouble(env, `the reversal read for payment ${o.paymentId}`, prior.error ?? "no rows array");
     const mine = (prior.data as Array<{ delta: number; request_id: string | null }>).filter((r) => typeof r.request_id === "string" && (r.request_id.startsWith(`whop-refund:${o.paymentId}:`) || r.request_id.startsWith(`whop-dispute:${o.paymentId}:`)));
     if (mine.some((r) => r.request_id === requestId)) return done();
@@ -282,7 +346,7 @@ async function reverseHeld(env: Env, client: Db, o: Reversal, ids: Record<string
     const m = marker.data as { reset_at: string } | null;
     if (m && Date.parse(m.reset_at) > now) return done();
     const takenBefore = mine.reduce((s, r) => s - Number(r.delta), 0);
-    const share = reversalCredits(granted, o.partCents, o.wholeCents ?? packPriceFor(granted));
+    const share = reversalCredits(granted, o.partCents, packPriceFor(granted));
     const want = Math.max(0, Math.min(share.credits, granted - takenBefore));
 
     // 3. at most the balance: the ledger never goes below zero. A charge between the read and the write is read again once.

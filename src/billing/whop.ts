@@ -14,8 +14,9 @@
  *   - the tenant comes from the checkout's metadata, which Resolve set when it opened the checkout (resolve_tenant_id:
  *     the tenant id, never the key); nothing else in a payment names a tenant;
  *   - a refund or dispute takes back its share of the credits one payment granted: proportional to the amount when the
- *     payload gives it in US dollars (against the payment's total, or the pack's price when the payload has no total;
- *     rounded up, so a refunded cent never keeps its credits), else all of them.
+ *     payload gives it in US dollars, against the pack's price (what the credits were sold for, the amount the grant
+ *     was checked against; the same base whichever shape the event comes in, so a refund of the whole price takes them
+ *     all even when tax was added on top), rounded up so a refunded cent never keeps its credits; else all of them.
  *
  * Whop sources (read 2026-09-30):
  *  [W1] https://docs.whop.com/developer/guides/webhooks
@@ -251,7 +252,7 @@ export const WhopRefundLegacy = z.object({
   amount: Amount,
   currency: Currency,
   status: z.string().max(40),
-  payment: z.object({ id: z.string().regex(PAYMENT_ID), total: Amount, currency: Currency }),
+  payment: z.object({ id: z.string().regex(PAYMENT_ID) }),
 });
 /** The same as the native Refund resource ([W8b]): Money amounts, the payment by id. */
 export const WhopRefundNative = z.object({
@@ -261,17 +262,15 @@ export const WhopRefundNative = z.object({
   status: z.string().max(40),
 });
 
-/** A refund in cents of US dollars, whichever documented shape it came in: `wholeCents` null = the payment's total is not in it. */
-export interface RefundRead { id: string; paymentId: string; status: string; partCents: number | null; wholeCents: number | null }
+/** A refund in cents of US dollars, whichever documented shape it came in (`partCents` null: no amount, or another currency). */
+export interface RefundRead { id: string; paymentId: string; status: string; partCents: number | null }
 
 /** Pure. Read refund.created / refund.updated's data in either documented shape; an amount in another currency reads as unknown. */
 export function readRefund(data: unknown): RefundRead | { error: string } {
   const n = WhopRefundNative.safeParse(data);
-  if (n.success) return { id: n.data.id, paymentId: n.data.payment_id, status: n.data.status, partCents: moneyCents(n.data.amount), wholeCents: null };
+  if (n.success) return { id: n.data.id, paymentId: n.data.payment_id, status: n.data.status, partCents: moneyCents(n.data.amount) };
   const l = WhopRefundLegacy.safeParse(data);
-  if (l.success) {
-    return { id: l.data.id, paymentId: l.data.payment.id, status: l.data.status, partCents: usdCents(l.data.amount, l.data.currency), wholeCents: usdCents(l.data.payment.total, l.data.payment.currency) };
-  }
+  if (l.success) return { id: l.data.id, paymentId: l.data.payment.id, status: l.data.status, partCents: usdCents(l.data.amount, l.data.currency) };
   return { error: l.error.issues.slice(0, 3).map((i) => `${i.path.map(String).join(".") || "data"}: ${i.message}`).join("; ") };
 }
 
@@ -282,7 +281,7 @@ export const WhopDispute = z.object({
   currency: Currency,
   status: z.string().max(40),
   inquiry: z.boolean().nullish(),
-  payment: z.object({ id: z.string().regex(PAYMENT_ID), amount: Amount, currency: Currency }),
+  payment: z.object({ id: z.string().regex(PAYMENT_ID) }),
 });
 export type WhopDispute = z.infer<typeof WhopDispute>;
 
@@ -358,16 +357,17 @@ export function decideGrant(p: WhopPayment, cfg: WhopConfig): GrantDecision {
 }
 
 /**
- * Pure. The credits a refund or dispute of `partCents` takes back of the `granted` of a payment of `wholeCents` (both US
+ * Pure. The credits a refund or dispute of `partCents` takes back of the `granted` of a pack priced `wholeCents` (both US
  * cents): proportional, rounded up so a refunded cent never keeps its credits, when both are known and the part is less
- * than the whole; else all of them.
+ * than the whole; else all of them. The whole is always the pack's price (packPriceFor), never a payload's total: the
+ * legacy and native refund shapes then agree, and tax added on top never lowers what a refund of the price takes.
  */
 export function reversalCredits(granted: number, partCents: number | null, wholeCents: number | null): { credits: number; proportional: boolean } {
   if (partCents === null || wholeCents === null || wholeCents <= 0 || partCents >= wholeCents) return { credits: granted, proportional: false };
   return { credits: Math.min(granted, Math.ceil((granted * Math.max(0, partCents)) / wholeCents)), proportional: true };
 }
 
-/** Pure. The price of the pack that grants `credits`, the base of a reversal whose payload does not carry the payment's total. */
+/** Pure. The price of the pack that grants `credits`: the base of every reversal (null for a grant of another size: all of it goes). */
 export function packPriceFor(credits: number): number | null {
   const p = PACK_IDS.find((k) => CARD_PACKS[k].credits === credits);
   return p ? CARD_PACKS[p].priceCents : null;

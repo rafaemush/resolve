@@ -1,6 +1,6 @@
 /**
  * In-memory stand-in for the PostgREST query shapes the commit/reconcile code uses: select (eq on a column or an
- * embedded "a.b" path, in, lt, lte, gte, is null, order (repeatable), limit, single, maybeSingle, head count), insert (+ select().single()),
+ * embedded "a.b" path, in, lt, lte, gte, like, is null, order (repeatable), limit, single, maybeSingle, head count), insert (+ select().single()),
  * upsert (on onConflict, else the table's primary key: FakeDbOptions.primaryKey, default "id"; ignoreDuplicates skips,
  * otherwise the row is merged like ON CONFLICT DO UPDATE), update (+ select() returns the updated rows), and rpc()
  * through test-supplied stand-ins. Unique columns and partial
@@ -27,6 +27,17 @@ export interface FakeDb {
 }
 
 const path = (r: Row, col: string): unknown => col.split(".").reduce<any>((o, k) => (o == null ? undefined : o[k]), r);
+function likeRegex(pattern: string): RegExp {
+  let out = "";
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i]!;
+    if (ch === "\\" && i + 1 < pattern.length) out += pattern[++i]!.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    else if (ch === "%") out += "[\\s\\S]*";
+    else if (ch === "_") out += "[\\s\\S]";
+    else out += ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+  return new RegExp(`^${out}$`);
+}
 let seq = 0;
 
 class Query implements PromiseLike<{ data: any; error: any; count?: number | null }> {
@@ -62,6 +73,8 @@ class Query implements PromiseLike<{ data: any; error: any; count?: number | nul
   gte(col: string, v: string) { this.filters.push((r) => String(path(r, col)) >= v); return this; }
   not(col: string, op: "is", v: null) { if (op !== "is") throw new Error(`fake-db: not.${op} unsupported`); this.filters.push((r) => (path(r, col) ?? null) !== v); return this; }
   is(col: string, v: null) { this.filters.push((r) => (path(r, col) ?? null) === v); return this; }
+  /** SQL LIKE: % any run, _ any one character, \ escapes the next; NULL never matches. */
+  like(col: string, pattern: string) { const re = likeRegex(pattern); this.filters.push((r) => typeof path(r, col) === "string" && re.test(path(r, col) as string)); return this; }
   order(col: string, opts?: { ascending?: boolean }) { this.orderBy.push({ col, asc: opts?.ascending !== false }); return this; }
   limit(n: number) { this.max = n; return this; }
   single() { return Promise.resolve(this.exec(true)); }
