@@ -42,8 +42,9 @@ import { limitlessLabels, limitlessOutcomeAt, limitlessSlug, mapOfficialLabel } 
 export { limitlessSlug, mapOfficialLabel, normalizeLabel } from "../markets/outcomes";
 
 /**
- * Of Workers Free's 50 subrequests per invocation: the 10-minute invocation runs the pg_net dispatch check first and
- * keeps one alert back for a job that throws (src/jobs/schedule.ts), so reconcile gets 50 - 6 - 5 = 39.
+ * Of Workers Free's 50 subrequests per invocation: the 10-minute invocation runs the dispatch check first (the pg_net
+ * failure count and the database size, one alert) and keeps one alert back for a job that throws (src/jobs/schedule.ts),
+ * so reconcile gets 50 - 7 - 5 = 38.
  */
 export const RECONCILE_SUBREQUESTS = INVOCATION_SUBREQUESTS - DISPATCH_CHECK_SUBREQUESTS - EXCEPTION_RESERVE;
 export const MARKETS_PER_RUN = 25;

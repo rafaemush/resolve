@@ -17,8 +17,8 @@ export const COST = {
 export const INVOCATION_SUBREQUESTS = 50;
 /** Every scheduled invocation keeps one alert back for a job that throws (src/jobs/schedule.ts). */
 export const EXCEPTION_RESERVE = COST.alert;
-/** The 10-minute pg_net dispatch check: one RPC and at most one alert (src/jobs/dispatch.ts). */
-export const DISPATCH_CHECK_SUBREQUESTS = COST.db + COST.alert;
+/** The 10-minute dispatch check: the pg_net failure count and the database size (two RPCs) and one alertMany (src/jobs/dispatch.ts). */
+export const DISPATCH_CHECK_SUBREQUESTS = 2 * COST.db + COST.alert;
 
 /**
  * A reservation failed: the job stops where it is and the rest runs next invocation. Never a failure of the operation

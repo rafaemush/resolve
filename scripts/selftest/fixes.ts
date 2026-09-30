@@ -50,8 +50,8 @@ const SERVICE_TABLES: Array<[string, string]> = [
 ];
 /** RPCs the Worker calls (grep of src/: rpc("...")). */
 const SERVICE_RPCS = [
-  "begin_resolution", "bump_api_key_usage_atomic", "check_gates", "claim_official_fetch", "claim_post_lease", "claim_webhook_deliveries", "commit_context",
-  "credit_from_deposit", "defer_reconcile", "dispatch_failures", "extend_official_fetch", "follow_entitlements", "follow_market", "grant_credits",
+  "begin_resolution", "bump_api_key_usage_atomic", "charge_read", "check_gates", "claim_official_fetch", "claim_post_lease", "claim_webhook_deliveries", "commit_context",
+  "credit_from_deposit", "database_size_bytes", "defer_reconcile", "dispatch_failures", "extend_official_fetch", "follow_entitlements", "follow_market", "grant_credits",
   "note_post_failure", "recheck_official_corroboration", "record_jev_spend", "record_official_observation", "refund_credits", "release_post_lease",
   "report_eval_run", "settle_market", "upstream_record_failure", "upstream_record_success",
 ];

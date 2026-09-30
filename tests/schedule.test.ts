@@ -74,8 +74,9 @@ describe("exception alert keys", () => {
 
 describe("per-invocation subrequest budgets (Workers Free: 50)", async () => {
   const { RECONCILE_SUBREQUESTS } = await vi.importActual<typeof import("../src/jobs/reconcile")>("../src/jobs/reconcile");
-  it("10-minute invocation: dispatch check + reconcile + one exception alert fit", () => {
-    expect(DISPATCH_CHECK_SUBREQUESTS).toBe(COST.db + COST.alert);
+  it("10-minute invocation: dispatch check (failure count + database size, one alertMany) + reconcile + one exception alert fit", () => {
+    expect(DISPATCH_CHECK_SUBREQUESTS).toBe(2 * COST.db + COST.alert);
+    expect(RECONCILE_SUBREQUESTS).toBe(38);
     expect(DISPATCH_CHECK_SUBREQUESTS + RECONCILE_SUBREQUESTS + EXCEPTION_RESERVE).toBeLessThanOrEqual(INVOCATION_SUBREQUESTS);
   });
   it("5-minute invocation: the drain's fixed budget + the deposit scan's budget + one exception alert = 50", () => {

@@ -1,8 +1,9 @@
 /**
  * The every-minute tick and the 10-minute dispatch check (plan §16.4 P0 step 7): which alert each dispatch observation
  * raises (skipped, failure, no row at all, unreadable), that a failed liveness insert alerts, that the healthy tick costs
- * exactly two subrequests, that "could not count" pg_net failures is never "counted zero", and that the tick at :05,
- * :15, ... alerts a Limitless recorder with no run for 30 minutes, none at all, or an unreadable one.
+ * exactly two subrequests, that "could not count" pg_net failures is never "counted zero", that the same check alerts
+ * once the database passes 300 MB and again past 400 MB (and "could not read the size" is never "small"), and that the
+ * tick at :05, :15, ... alerts a Limitless recorder with no run for 30 minutes, none at all, or an unreadable one.
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
@@ -28,7 +29,7 @@ vi.mock("../src/db/supabase", () => ({
 vi.mock("../src/ops/alerts", () => ({ alert: vi.fn(async () => ({ sent: true, deduped: false })), alertMany: vi.fn(async () => ({ sent: [], deduped: [] })) }));
 
 import { recorderCheckDue, recorderStaleAlert, runTick, tickAlerts, DISPATCH_LOOKBACK_MINUTES, RECORDER_STALE_MINUTES, type DispatchState } from "../src/jobs/tick";
-import { checkDispatchFailures, dispatchCheckAlert, DISPATCH_WINDOW_MINUTES } from "../src/jobs/dispatch";
+import { checkDispatchFailures, dbSizeAlert, dispatchCheckAlert, DB_SIZE_ALERT_MB, DISPATCH_WINDOW_MINUTES, MB } from "../src/jobs/dispatch";
 import { alert, alertMany } from "../src/ops/alerts";
 
 const put = vi.fn(async () => undefined);
@@ -167,7 +168,7 @@ describe("Limitless recorder staleness (the tick at :05, :15, ...)", () => {
 });
 
 describe("dispatch_failures check", () => {
-  beforeEach(() => vi.mocked(alert).mockClear());
+  beforeEach(() => { vi.mocked(alert).mockClear(); vi.mocked(alertMany).mockClear(); });
   it("pure: zero is quiet, a count alerts, could-not-count is its own alert", () => {
     expect(dispatchCheckAlert(0, null)).toBeNull();
     expect(dispatchCheckAlert(3, null)!.key).toBe("dispatch_http_failures");
@@ -182,28 +183,78 @@ describe("dispatch_failures check", () => {
     expect(text).not.toContain("dispatch(es) of watch polls");
   });
 
-  const withRpc = (answer: { data: unknown; error: unknown }) => {
+  const SMALL = 40 * MB;
+  const withRpc = (answer: { data: unknown; error: unknown }, size: { data: unknown; error: unknown } = { data: SMALL, error: null }) => {
     const seen: unknown[] = [];
-    h.db = fakeDb({}, {}, { rpc: { dispatch_failures: async (_db, args) => { seen.push(args); return answer; } } });
+    h.db = fakeDb({}, {}, { rpc: { dispatch_failures: async (_db, args) => { seen.push(args); return answer; }, database_size_bytes: async () => size } });
     return seen;
   };
-  it("asks for the cron window and alerts above zero (dedup 60)", async () => {
+  const sent = () => vi.mocked(alertMany).mock.calls.flatMap((c) => c[1].map((i) => [i.key, i.dedupMinutes]));
+  it("asks for the cron window and alerts above zero (dedup 60), in one alertMany", async () => {
     const seen = withRpc({ data: 4, error: null });
     const r = await checkDispatchFailures(env);
     expect(seen).toEqual([{ p_minutes: DISPATCH_WINDOW_MINUTES }]);
-    expect(r).toMatchObject({ ok: false, failures: 4, alert: "dispatch_http_failures" });
-    expect(vi.mocked(alert).mock.calls.map((c) => [c[1], c[3]?.dedupMinutes])).toEqual([["dispatch_http_failures", 60]]);
-  });
-  it("zero failures: one RPC, no alert", async () => {
-    withRpc({ data: 0, error: null });
-    expect(await checkDispatchFailures(env)).toMatchObject({ ok: true, failures: 0, alert: null });
+    expect(r).toMatchObject({ ok: false, failures: 4, alert: "dispatch_http_failures", db_size: { bytes: SMALL, alert: null } });
+    expect(sent()).toEqual([["dispatch_http_failures", 60]]);
+    expect(vi.mocked(alertMany)).toHaveBeenCalledTimes(1);
     expect(vi.mocked(alert)).not.toHaveBeenCalled();
-    expect(h.db.calls).toEqual([{ table: "rpc:dispatch_failures", action: "rpc" }]);
+  });
+  it("zero failures and a small database: two RPCs, no alert", async () => {
+    withRpc({ data: 0, error: null });
+    expect(await checkDispatchFailures(env)).toMatchObject({ ok: true, failures: 0, alert: null, db_size: { bytes: SMALL, error: null, alert: null } });
+    expect(vi.mocked(alertMany)).not.toHaveBeenCalled();
+    expect(h.db.calls).toEqual([{ table: "rpc:dispatch_failures", action: "rpc" }, { table: "rpc:database_size_bytes", action: "rpc" }]);
   });
   it("an RPC error or a non-count answer is dispatch_check_failed, never zero", async () => {
     withRpc({ data: null, error: { code: "PGRST202", message: "Could not find the function public.dispatch_failures" } });
     expect(await checkDispatchFailures(env)).toMatchObject({ ok: false, failures: null, alert: "dispatch_check_failed" });
     withRpc({ data: "3", error: null });
     expect(await checkDispatchFailures(env)).toMatchObject({ ok: false, failures: null, alert: "dispatch_check_failed" });
+  });
+});
+
+describe("database size check (migration 022's database_size_bytes)", () => {
+  beforeEach(() => { vi.mocked(alert).mockClear(); vi.mocked(alertMany).mockClear(); });
+  it("pure: quiet up to 300 MB, db_size_300mb past it, db_size_400mb past 400 MB (its own key, so it is never deduplicated by the first)", () => {
+    expect(DB_SIZE_ALERT_MB).toEqual([300, 400]);
+    expect(MB).toBe(1_048_576);
+    expect(dbSizeAlert(0, null)).toBeNull();
+    expect(dbSizeAlert(300 * MB, null)).toBeNull();
+    const a = dbSizeAlert(300 * MB + 1, null)!;
+    expect([a.key, a.dedupMinutes]).toEqual(["db_size_300mb", 7 * 1440]);
+    expect(a.text).toContain("past 300 MB of the Supabase Free plan's 500 MB");
+    expect(a.text).toContain("loop_name = 'retention_purge'");
+    expect(dbSizeAlert(400 * MB, null)!.key).toBe("db_size_300mb");
+    const b = dbSizeAlert(400 * MB + 1, null)!;
+    expect([b.key, b.dedupMinutes]).toEqual(["db_size_400mb", 1440]);
+    expect(b.text).toContain("The database is 400.0 MB");
+    expect(b.meta).toEqual({ bytes: 400 * MB + 1, level_mb: 400 });
+  });
+  it("pure: could-not-read is its own alert, never small", () => {
+    expect(dbSizeAlert(null, "rpc database_size_bytes: PGRST202")!.key).toBe("db_size_check_failed");
+    expect(dbSizeAlert(5, "late error")!.key).toBe("db_size_check_failed");
+  });
+
+  const withSize = (size: { data: unknown; error: unknown }, failures = 0) => {
+    h.db = fakeDb({}, {}, { rpc: { dispatch_failures: async () => ({ data: failures, error: null }), database_size_bytes: async () => size } });
+  };
+  const sent = () => vi.mocked(alertMany).mock.calls.flatMap((c) => c[1].map((i) => i.key));
+  it("alerts past 300 MB and again past 400 MB, through the same alertMany as a dispatch failure", async () => {
+    withSize({ data: 350 * MB, error: null });
+    expect(await checkDispatchFailures(env)).toMatchObject({ ok: false, alert: null, db_size: { bytes: 350 * MB, alert: "db_size_300mb" } });
+    expect(sent()).toEqual(["db_size_300mb"]);
+    vi.mocked(alertMany).mockClear();
+    withSize({ data: String(420 * MB), error: null }, 2);
+    expect(await checkDispatchFailures(env)).toMatchObject({ ok: false, alert: "dispatch_http_failures", db_size: { bytes: 420 * MB, alert: "db_size_400mb" } });
+    expect(vi.mocked(alertMany)).toHaveBeenCalledTimes(1);
+    expect(sent()).toEqual(["dispatch_http_failures", "db_size_400mb"]);
+  });
+  it("an RPC error or a non-size answer is db_size_check_failed, never quiet", async () => {
+    withSize({ data: null, error: { code: "PGRST202", message: "Could not find the function public.database_size_bytes" } });
+    expect(await checkDispatchFailures(env)).toMatchObject({ ok: false, db_size: { bytes: null, alert: "db_size_check_failed" } });
+    withSize({ data: "lots", error: null });
+    expect(await checkDispatchFailures(env)).toMatchObject({ ok: false, db_size: { bytes: null, alert: "db_size_check_failed" } });
+    withSize({ data: -1, error: null });
+    expect(await checkDispatchFailures(env)).toMatchObject({ ok: false, db_size: { bytes: null, alert: "db_size_check_failed" } });
   });
 });

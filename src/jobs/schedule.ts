@@ -23,7 +23,8 @@
  *                  (both providers answering range errors through every halving, 2 x 5 + the write) needs 11, so there
  *                  the second provider gets its header and one eth_getLogs and the scan reports a budget run-out
  *                  instead of "no provider answered": still a failure with the cursor held and an alert
- *   every 10 min   pg_net dispatch check (6), then reconcile on its own budget (RECONCILE_SUBREQUESTS = 39)
+ *   every 10 min   dispatch check (7: the pg_net failure count and the database size, one alertMany), then reconcile on
+ *                  its own budget (RECONCILE_SUBREQUESTS = 38)
  * Every invocation keeps EXCEPTION_RESERVE back: a job that throws becomes an operator alert, not a log line.
  * wrangler.toml [triggers] must list exactly the CRONS below (tests/schedule.test.ts reads it).
  */
