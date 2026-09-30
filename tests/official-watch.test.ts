@@ -990,6 +990,23 @@ describe("election captures", () => {
     expect(calls.filter((x) => x.url === EQ_RESULTS_URL)).toHaveLength(3);
   });
 
+  it("Élections Québec: a read a second short of 10 min after the first still waits, and leaves the kept first read alone", async () => {
+    const m = eqSeatsCaq();
+    setWatch(m);
+    serve((url) => (url === EQ_RESULTS_URL ? ok(EQ_2026, "application/json") : new Response("", { status: 404 })));
+    await fetchOfficial(env(), watchRow(), m, clock("2026-10-06T03:40:00Z").deps);
+    const nearly = await fetchOfficial(env(), watchRow(), m, clock("2026-10-06T03:49:59Z").deps);
+    expect(nearly).toMatchObject({ notModified: true });
+    expect(nearly.evidence).toBeUndefined();
+    expect(nearly.note).toContain("was first read at 2026-10-06T03:40:00.000Z; it is recorded once a read at or after 2026-10-06T03:50:00.000Z shows the same counts");
+    expect(h.state.obs.size).toBe(0);
+    expect(JSON.parse(h.state.appConfig.get(CONFIRM_KEY)!).first_read_at).toBe("2026-10-06T03:40:00.000Z");
+    // the next read once the contest's fetch lease (ELECTION_REFETCH_S after 03:49:59) has passed: recorded, naming the first read
+    const done = await fetchOfficial(env(), watchRow(), m, clock("2026-10-06T03:54:00Z").deps);
+    expect(done.evidence!.structured).toMatchObject({ kind: "official_observation", series: "qc_seats_caq", period: "2026-10-05" });
+    expect(h.state.obs.get("qc_seats_caq|2026-10-05")!.meta).toMatchObject({ first_final_read_at: "2026-10-06T03:40:00.000Z" });
+  });
+
   it("Élections Québec: counts that change between two final reads start the 10 min again", async () => {
     const m = eqSeatsCaq();
     setWatch(m);
@@ -1130,5 +1147,153 @@ describe("election captures", () => {
     expect(done.evidence!.structured).toMatchObject({ kind: "official_observation", series: "qc_seats_caq", period: "2026-10-05" });
     expect(h.state.obs.get("qc_seats_caq|2026-10-05")!.meta).toMatchObject({ first_final_read_at: "2026-10-06T03:55:00.000Z" });
     expect(decideOfficial(m, done.evidence!)).toMatchObject({ status: "RESOLVED", outcome: "OPTION_A" });
+  });
+});
+
+// ---- election captures: the stamp, the finality flags, the subject and the confirming read (each alone) --------------
+
+/** The flags eqAs2026's body carries beyond EqBody's declared fields (the production parser reads them). */
+type EqFlags = Omit<EqBody, "statistiques" | "circonscriptions"> & { statistiques: EqBody["statistiques"] & { isResultatsFinaux: boolean; nbCirconscriptionSansResultat: number }; circonscriptions: Array<EqBody["circonscriptions"][number] & { isResultatsFinaux: boolean }> };
+/** SYNTHETIC EQ_2026 with one change; Abitibi-Est (648) stands for any riding. */
+const eq2026With = (f: (d: EqFlags) => void): string => { const d = eq2026() as unknown as EqFlags; f(d); return eqText(d); };
+const abitibi = (d: EqFlags) => d.circonscriptions.find((r) => r.numeroCirconscription === 648)!;
+/** SYNTHETIC EQ_2026 with one vote moved from the CAQ's candidate in Abitibi-Est (2358) to the CAQ's in Taschereau (2311): every file-wide and party total unchanged, two ridings' counts differ. */
+const EQ_2026_RIDINGS_MOVED = eqApply(EQ_2026, { votes: [["2358", 9761], ["2311", 7538]] });
+/** A poll through the route's waitUntil, as in production: returns once the capture task is done. */
+async function pollWaitUntil(m: MarketRow, at: string) {
+  const tasks: Array<Promise<unknown>> = [];
+  const out = await fetchOfficial(env(), watchRow(), m, { ...clock(at).deps, waitUntil: (p) => { tasks.push(p); } });
+  await Promise.all(tasks);
+  return out;
+}
+
+describe("election captures: each condition of a first print alone", () => {
+  it("Élections Québec: a file stamped before polls closed (a simulation, another election) is pending; stamped exactly at polls close it is read", async () => {
+    const read = async (body: string) => {
+      serve((url) => (url === EQ_RESULTS_URL ? ok(body, "application/json") : new Response("", { status: 404 })));
+      return fetchPrimary("qc_seats_caq", "2026-10-05", budget(() => Date.parse("2026-10-06T03:40:00Z"), 10_000, 2));
+    };
+    const early = await read(eqText(eqAs2026(fx("eq_gen2022_resultats.json"), 127, "2026-10-05T19:59:00,000-04:00")));
+    expect(early).toMatchObject({ kind: "pending", detail: "the Élections Québec file is stamped 2026-10-05T19:59:00.000-04:00, before polls closed on 2026-10-05 (a simulation or an earlier election)" });
+    expect(early).not.toHaveProperty("confirm");
+    expect(early).not.toHaveProperty("obs");
+    expect(await read(eqText(eqAs2026(fx("eq_gen2022_resultats.json"), 127, "2026-10-05T20:00:00,000-04:00")))).toMatchObject({ kind: "observed", confirm: { as_of: "2026-10-05T20:00:00.000-04:00" } });
+    // through the watch: nothing is kept as a first read, nothing recorded
+    const m = eqSeatsCaq();
+    setWatch(m);
+    serve((url) => (url === EQ_RESULTS_URL ? ok(eqText(eqAs2026(fx("eq_gen2022_resultats.json"), 127, "2026-10-05T19:59:00,000-04:00")), "application/json") : new Response("", { status: 404 })));
+    const out = await pollWaitUntil(m, "2026-10-06T03:40:00Z");
+    expect(out.evidence).toBeUndefined();
+    expect(h.state.appConfig.has(CONFIRM_KEY)).toBe(false);
+    expect(h.state.obs.size).toBe(0);
+  });
+
+  it("Élections Québec: a file that is not final by any one of its flags or counts is pending, never a first read", async () => {
+    const read = async (body: string) => {
+      serve((url) => (url === EQ_RESULTS_URL ? ok(body, "application/json") : new Response("", { status: 404 })));
+      return fetchPrimary("qc_seats_caq", "2026-10-05", budget(() => Date.parse("2026-10-06T03:40:00Z"), 10_000, 2));
+    };
+    const variants: Array<[string, string, string]> = [
+      ["the file's flag", eq2026With((d) => { d.statistiques.isResultatsFinaux = false; }), "isResultatsFinaux is false"],
+      ["a riding without result", eq2026With((d) => { d.statistiques.nbCirconscriptionAvecResultat--; d.statistiques.nbCirconscriptionSansResultat++; }), "126 of 127 ridings have results"],
+      ["a polling station unreported in the statistics", eq2026With((d) => { d.statistiques.nbBureauVoteRempli--; }), "22161 of 22162 polling stations reported"],
+      ["a riding not final", eq2026With((d) => { abitibi(d).isResultatsFinaux = false; }), "1 riding(s) not final (Abitibi-Est)"],
+      ["a riding's polling station unreported", eq2026With((d) => { abitibi(d).nbBureauComplete--; d.statistiques.nbBureauVoteRempli--; }), "1 riding(s) not final (Abitibi-Est)"],
+    ];
+    for (const [name, body, why] of variants) {
+      const r = await read(body);
+      expect(r, name).toMatchObject({ kind: "pending", detail: expect.stringContaining("Élections Québec count not final (as of 2026-10-05T23:30:00.000-04:00): ") });
+      expect((r as { detail: string }).detail, name).toContain(why);
+      expect(r, name).not.toHaveProperty("confirm");
+      expect(r, name).not.toHaveProperty("obs");
+    }
+    // through the watch: a riding not final is never kept as a first read
+    const m = eqSeatsCaq();
+    setWatch(m);
+    serve((url) => (url === EQ_RESULTS_URL ? ok(variants[3]![1], "application/json") : new Response("", { status: 404 })));
+    await pollWaitUntil(m, "2026-10-06T03:40:00Z");
+    await pollWaitUntil(m, "2026-10-06T03:50:00Z");
+    expect(h.state.appConfig.has(CONFIRM_KEY)).toBe(false);
+    expect(h.state.obs.size).toBe(0);
+  });
+
+  it("Élections Québec: votes moved between two ridings (every file-wide and party total unchanged) are other counts: the 10 min start again", async () => {
+    const a = parseEqResults(EQ_2026), b = parseEqResults(EQ_2026_RIDINGS_MOVED);
+    if (!a.ok || !b.ok) throw new Error("parse");
+    expect({ ...b.snap, ridings: [] }).toEqual({ ...a.snap, ridings: [] }); // the statistics and party totals are the same
+    expect(b.snap.ridings).not.toEqual(a.snap.ridings);
+    const m = eqSeatsCaq();
+    setWatch(m);
+    let body = EQ_2026;
+    serve((url) => (url === EQ_RESULTS_URL ? ok(body, "application/json") : new Response("", { status: 404 })));
+    await fetchOfficial(env(), watchRow(), m, clock("2026-10-06T03:40:00Z").deps);
+    body = EQ_2026_RIDINGS_MOVED;
+    const moved = await fetchOfficial(env(), watchRow(), m, clock("2026-10-06T03:45:00Z").deps);
+    expect(moved.note).toContain("the counts differ from the read kept at 2026-10-06T03:40:00.000Z");
+    expect(JSON.parse(h.state.appConfig.get(CONFIRM_KEY)!).first_read_at).toBe("2026-10-06T03:45:00.000Z");
+    const early = await fetchOfficial(env(), watchRow(), m, clock("2026-10-06T03:50:00Z").deps);
+    expect(early.evidence).toBeUndefined();
+    expect(early.note).toContain("was first read at 2026-10-06T03:45:00.000Z");
+    expect(h.state.obs.size).toBe(0);
+    const done = await fetchOfficial(env(), watchRow(), m, clock("2026-10-06T03:55:00Z").deps);
+    expect(done.evidence).toBeDefined();
+    expect(h.state.obs.get("qc_seats_caq|2026-10-05")!.meta).toMatchObject({ first_final_read_at: "2026-10-06T03:45:00.000Z" });
+  });
+
+  it("Élections Québec through waitUntil (as in production): a read awaiting its confirmation records no series of the fetch group; the confirming read records all of them", async () => {
+    const m = eqSeatsCaq();
+    setWatch(m);
+    serve((url) => (url === EQ_RESULTS_URL ? ok(EQ_2026, "application/json") : new Response("", { status: 404 })));
+    const first = await pollWaitUntil(m, "2026-10-06T03:40:00Z");
+    expect(first.evidence).toBeUndefined();
+    expect(JSON.parse(h.state.appConfig.get(CONFIRM_KEY)!).first_read_at).toBe("2026-10-06T03:40:00.000Z");
+    expect([...h.state.obs.keys()]).toEqual([]); // no sibling of the Québec file either
+    await pollWaitUntil(m, "2026-10-06T03:45:00Z");
+    expect([...h.state.obs.keys()]).toEqual([]);
+    await pollWaitUntil(m, "2026-10-06T03:50:00Z");
+    const group = fetchGroupOf("qc_seats_caq");
+    expect(group.length).toBeGreaterThan(20);
+    expect([...h.state.obs.keys()].sort()).toEqual(group.map((x) => `${x}|2026-10-05`).sort());
+    for (const x of group) expect(h.state.obs.get(`${x}|2026-10-05`)!.meta, x).toMatchObject({ first_final_read_at: "2026-10-06T03:40:00.000Z" });
+    expect(calls.filter((x) => x.url === EQ_RESULTS_URL)).toHaveLength(3);
+  });
+
+  it("TSE: a file flagged tf=s whose other flags say the count is not final (dv, and, esae, sections) is pending and never recorded", async () => {
+    const variants: Array<[string, () => string, string]> = [
+      ["dv=n", () => once(TSE_FINAL, '"dv" : "s"', '"dv" : "n"'), "dv=n (votes may not be published)"],
+      ["and=p", () => once(TSE_FINAL, '"and" : "f"', '"and" : "p"'), "and=p (count not finished)"],
+      ["esae=s", () => once(TSE_FINAL, '"esae" : "n"', '"esae" : "s"'), "esae=s"],
+      ["a section not totalized", () => once(once(TSE_FINAL, '"st" : "528951"', '"st" : "528950"'), '"snt" : "0"', '"snt" : "1"'), "528950 of 528951 sections totalized"],
+    ];
+    for (const [name, body, why] of variants) {
+      __resetElectionMemo();
+      serveTse(body);
+      const r = await fetchPrimary("br_pres_r1_turnout", "2026-10-04", budget(() => Date.parse("2026-10-05T01:10:00Z"), 10_000, 2));
+      expect(r, name).toMatchObject({ kind: "pending", detail: expect.stringContaining("TSE BR count not final") });
+      expect((r as { detail: string }).detail, name).toContain(why);
+      expect(r, name).not.toHaveProperty("obs");
+      // through the watch: no series of the national file is locked to it
+      Object.assign(h.state, { obs: new Map(), slots: new Map() });
+      __resetElectionMemo();
+      const m = tseTurnout8590();
+      setWatch(m);
+      const out = await pollWaitUntil(m, "2026-10-05T01:10:00Z");
+      expect(out.evidence, name).toBeUndefined();
+      expect(h.state.obs.size, name).toBe(0);
+    }
+  });
+
+  it("TSE: a file of another scope, round or election than the configuration names is schema drift, never an observation", async () => {
+    const variants: Array<[string, () => string, string]> = [
+      ["scope", () => once(TSE_FINAL, '"cdabr" : "br"', '"cdabr" : "ac"'), "is the AC office 1 round 1 file of election 21270"],
+      ["round", () => once(TSE_FINAL, '"t" : "1"', '"t" : "2"'), "is the BR office 1 round 2 file of election 21270"],
+      ["election", () => once(TSE_FINAL, '"ele" : "21270"', '"ele" : "21271"'), "is the BR office 1 round 1 file of election 21271"],
+    ];
+    for (const [name, body, why] of variants) {
+      __resetElectionMemo();
+      serveTse(body);
+      const r = await fetchPrimary("br_pres_r1_turnout", "2026-10-04", budget(() => Date.parse("2026-10-05T01:10:00Z"), 10_000, 2));
+      expect(r, name).toMatchObject({ kind: "error", drift: true, retryable: false, error: `schema drift: ${TSE_BR_URL} ${why}` });
+    }
   });
 });

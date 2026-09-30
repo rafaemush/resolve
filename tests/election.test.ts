@@ -3,7 +3,8 @@
  * (evals/fixtures/official/), result URLs built only from the configuration, the finality, integrity and completeness
  * checks, the event keys (one per platform event: two events on one key are refused), the TSE label mapper (exact names
  * or a curated table, never a word subset), the Québec seat-margin, PQ-majority and PVQ-seat legs, the criteria basis
- * mark, the registered condition text and the registration rules. The resolve paths are also covered by the frozen
+ * mark, the registered condition text and the registration rules, each finality flag, integrity check, registration
+ * rule and label rule alone (SYNTHETIC edits of the saved files). The resolve paths are also covered by the frozen
  * cases in evals/official.ts (groups election_final, election_margin, election_complete, election_mapping).
  */
 import { afterEach, describe, expect, it } from "vitest";
@@ -17,7 +18,7 @@ import {
 import { KNOWN_RELEASES, OFFICIAL_SERIES, fetchGroupOf } from "../src/resolve/official";
 import { ElectionSeries } from "../src/resolve/schema";
 import { __setRailsForMutationTesting } from "../src/resolve/rails";
-import { buildElectionLeg, criteriaBasis, eqRegistryFromSnapshot, eventKeyProblems, legsWithOneKeyPerEvent, mapTseCandidate, seatMarginForeignLabels, tseRegistryFromSnapshot, TSE_LABEL_NUMBERS, type TseRegistry } from "../src/markets/election-legs";
+import { buildElectionLeg, criteriaBasis, eqRegistryFromSnapshot, eventKeyProblems, legsWithOneKeyPerEvent, mapEqCandidate, mapTseCandidate, seatMarginForeignLabels, tseRegistryFromSnapshot, TSE_LABEL_NUMBERS, type TseRegistry } from "../src/markets/election-legs";
 import { eventKey } from "../src/markets/event-key";
 
 afterEach(() => __setRailsForMutationTesting([]));
@@ -531,5 +532,205 @@ describe("the registered condition of an election leg", () => {
     if (!turnout.ok) throw new Error(turnout.reason);
     expect(turnout.market.condition).toContain(`stays unresolved. ${tie}`);
     expect(turnout.market.condition).not.toMatch(/otherwise no/i);
+  });
+});
+
+// ---- each finality flag, integrity check, registration rule and mapping rule alone (SYNTHETIC edits of saved files) ----
+
+const TSE_FINAL_2022 = "tse_2022_br_c0001_e000544_r_20221004T163422Z.json";
+/** SYNTHETIC: a saved TSE file with replacements, each applying exactly once, as the production parser reads it. */
+function tseEdited(fixture: string, day: string, ...edits: Array<[string, string]>) {
+  let body = fx(fixture);
+  for (const [from, to] of edits) { if (body.split(from).length !== 2) throw new Error(`"${from}" is not exactly once in ${fixture}`); body = body.replace(from, to); }
+  const p = parseTseResult(body, day);
+  if (!p.ok) throw new Error(p.detail);
+  return p.snap;
+}
+const tse2022 = (...edits: Array<[string, string]>) => tseEdited(TSE_FINAL_2022, "2022-10-02", ...edits);
+
+describe("TSE finality: every flag is read, not only tf", () => {
+  it("a 2022 national file flagged tf=s is still not final when dv, esae or the sections say so, each alone", () => {
+    expect(tseNotFinal(tse2022())).toEqual([]);
+    expect(tseNotFinal(tse2022(['"dv" : "s"', '"dv" : "n"']))).toEqual(["dv=n (votes may not be published)"]);
+    expect(tseNotFinal(tse2022(['"esae" : "n"', '"esae" : "s"']))).toEqual(["esae=s"]);
+    expect(tseNotFinal(tse2022(['"st" : "472075"', '"st" : "472074"']))).toEqual(["472074 of 472075 sections totalized"]);
+    expect(tseNotFinal(tse2022(['"snt" : "0"', '"snt" : "1"']))).toEqual(["472075 of 472075 sections totalized"]);
+    expect(tseNotFinal(tse2022(['"tf" : "s"', '"tf" : "n"']))).toEqual(["tf=n (final totalization not reached)"]);
+  });
+  it("the EA20 layout's and flag: and=p (count in progress) is not final although tf=s", () => {
+    const sim = (...e: Array<[string, string]>) => tseEdited("tse_sim2026_br_c0001_e021270_u.json", "2026-10-04", ...e);
+    expect(sim().flags).toMatchObject({ tf: "s", and: "f", dv: "s", esae: "n" });
+    expect(tseNotFinal(sim())).toEqual([]);
+    expect(tseNotFinal(sim(['"and" : "f"', '"and" : "p"']))).toEqual(["and=p (count not finished)"]);
+  });
+});
+
+describe("TSE integrity: each check alone", () => {
+  it("names the sub judice total, the total votes, the turnout, the electorate's order and a ballot number listed twice", () => {
+    expect(tseIntegrity(tse2022())).toEqual([]);
+    expect(tseIntegrity(tse2022(['"vansj" : "0"', '"vansj" : "5"']))).toEqual(["the sub judice candidates add up to 0, the file's sub judice votes are 5", "vvc 118229719 != vv + van + vansj"]);
+    expect(tseIntegrity(tse2022(['"vb" : "1964779"', '"vb" : "1964780"']))).toEqual(["tv 123682372 != vvc + vb + tvn"]);
+    expect(tseIntegrity(tse2022(['"c" : "123682372"', '"c" : "123682371"']))).toEqual(["turnout 123682371 != total votes 123682372"]);
+    expect(tseIntegrity(tse2022(['"esi" : "156453354"', '"esi" : "156454012"']))).toEqual(["electorate 156454011 / installed 156454012 / turnout 123682372 out of order"]);
+    expect(tseIntegrity(tse2022(['"esi" : "156453354"', '"esi" : "123682371"']))).toEqual(["electorate 156454011 / installed 123682371 / turnout 123682372 out of order"]);
+    // Constituinte Eymael (27) under Soraya Thronicke's ballot number 44: the sums are unchanged
+    expect(tseIntegrity(tse2022(['"n" : "27"', '"n" : "44"']))).toEqual(["a ballot number appears twice"]);
+  });
+});
+
+describe("Élections Québec finality and integrity: each check alone", () => {
+  const ridingEdit = (s: EqSnapshot, name: string, f: (r: EqSnapshot["ridings"][number]) => EqSnapshot["ridings"][number]): EqSnapshot => {
+    if (s.ridings.filter((r) => r.name === name).length !== 1) throw new Error(`riding ${name}`);
+    return { ...s, ridings: s.ridings.map((r) => (r.name === name ? f(r) : r)) };
+  };
+  it("eqNotFinal reads the file's flag, its riding and polling-station counts, and each riding's flag and polling stations", () => {
+    const s = eqSnap();
+    expect(eqNotFinal(s)).toEqual([]);
+    expect(eqNotFinal({ ...s, final: false })).toEqual(["isResultatsFinaux is false"]);
+    expect(eqNotFinal({ ...s, ridings_with_result: "124", ridings_without_result: "1" })).toEqual(["124 of 125 ridings have results"]);
+    expect(eqNotFinal({ ...s, ridings_without_result: "1" })).toEqual(["125 of 125 ridings have results"]);
+    expect(eqNotFinal({ ...s, polls_done: "21896" })).toEqual(["21896 of 21897 polling stations reported"]);
+    expect(eqNotFinal(ridingEdit(s, "Abitibi-Est", (r) => ({ ...r, final: false })))).toEqual(["1 riding(s) not final (Abitibi-Est)"]);
+    expect(eqNotFinal(ridingEdit(s, "Abitibi-Est", (r) => ({ ...r, polls_done: "125" })))).toEqual(["1 riding(s) not final (Abitibi-Est)"]);
+  });
+  it("eqIntegrity names the file's votes cast, its registered electors, a riding's votes cast and a candidate number listed twice in a riding", () => {
+    const s = eqSnap();
+    expect(eqIntegrity({ ...s, rejected: "56317" })).toEqual(["valid 4112821 + rejected 56317 != cast 4169137"]);
+    expect(eqIntegrity({ ...s, registered: "4169136" })).toEqual(["cast 4169137 > registered 4169136"]);
+    expect(eqIntegrity(ridingEdit(s, "Abitibi-Est", (r) => ({ ...r, rejected: "405" })))).toEqual(["Abitibi-Est: valid + rejected != cast"]);
+    expect(eqIntegrity(ridingEdit(s, "Abitibi-Est", (r) => ({ ...r, candidates: r.candidates.map((c, i) => (i === 1 ? { ...c, id: r.candidates[0]!.id } : c)) })))).toEqual(["Abitibi-Est: a candidate number appears twice"]);
+  });
+  it("party 0 (the independents) is never ranked as a party: SYNTHETIC 2022 file with every CAQ candidate an independent", () => {
+    const s = eqSnap();
+    const caq = s.parties.find((x) => x.id === "27")!, ind = s.parties.find((x) => x.id === "0")!;
+    const independents: EqSnapshot = {
+      ...s,
+      ridings: s.ridings.map((r) => ({ ...r, candidates: r.candidates.map((c) => (c.party === "27" ? { ...c, party: "0" } : c)) })),
+      parties: s.parties.filter((x) => x.id !== "27").map((x) => (x.id === "0" ? { ...x, votes: String(Number(ind.votes) + Number(caq.votes)) } : x)),
+    };
+    expect(eqIntegrity(independents)).toEqual([]);
+    // the independents hold 88 to 90 seats; the parties: the PLQ 21 to 22, QS 11, the PQ 3
+    const d = decide("qc_second_place", "Québec solidaire", independents, { labels: ["Québec solidaire", "Parti libéral du Québec"] });
+    expect(d).toMatchObject(YES);
+    expect(d.detail).toContain("seats by party number 6:21-22, 40:11, 8:3");
+    expect(decide("qc_second_place", "Parti libéral du Québec", independents, { labels: ["Québec solidaire", "Parti libéral du Québec"] })).toMatchObject(NO);
+  });
+});
+
+describe("TSE configuration: one President first round per election day", () => {
+  it("a configuration listing two President first-round elections on the day is drift, never the first of them", () => {
+    const cfg = JSON.parse(fx("tse_2022_config_ele-c_20221004T163421Z.json")) as { pl: Array<{ e: Array<{ cd: string; tp: string; t: string }> }> };
+    expect(parseTseConfig(JSON.stringify(cfg), "2022-10-02")).toMatchObject({ ok: true, snap: { electionId: "544" } });
+    const pres = cfg.pl[0]!.e.find((e) => e.tp === "8" && e.t === "1")!;
+    cfg.pl[0]!.e.push({ ...pres, cd: "999" });
+    const c = parseTseConfig(JSON.stringify(cfg), "2022-10-02");
+    expect(c).toMatchObject({ ok: false, reason: "schema_drift" });
+    if (!c.ok) expect(c.detail).toContain("lists 2 President first-round elections dated 02/10/2022");
+  });
+});
+
+describe("registration: every rule of an election leg", () => {
+  type RegInput = Parameters<typeof electionRegistrationIssues>[0];
+  const pct = (label: string, lo: number | undefined, hi: number | undefined) => ({ label, ...(lo !== undefined ? { lo } : {}), ...(hi !== undefined ? { hi } : {}), lo_inclusive: true, hi_inclusive: hi === undefined });
+  const seats = (label: string, lo: number | undefined, hi: number | undefined) => ({ label, ...(lo !== undefined ? { lo } : {}), ...(hi !== undefined ? { hi } : {}), lo_inclusive: true, hi_inclusive: true });
+  const at = (k: number) => ({ label: String(k), lo: k, hi: k, lo_inclusive: true, hi_inclusive: true });
+  const valid: Record<string, RegInput> = {
+    turnout: { series: "br_pres_r1_turnout", period: "2026-10-04", rounding: "election_exact", bucket: pct("75-80%", 75, 80) },
+    share: { series: "br_pres_r1_share_lula", period: "2026-10-04", rounding: "election_exact", bucket: pct("45-50%", 45, 50), election: { subject: { id: "13", name: "LULA" } } },
+    rank: { series: "br_pres_r1_third", period: "2026-10-04", rounding: "election_exact", bucket: at(3), election: { subject: { id: "15", name: "SIMONE TEBET" }, listed: ["13", "22", "15"] } },
+    riding: { series: "qc_riding_751", period: "2026-10-05", rounding: "election_exact", bucket: at(1), election: { subject: { id: "1", name: "Etienne Grandmont" }, unit: "751" } },
+    seats: { series: "qc_seats_caq", period: "2026-10-05", rounding: "election_exact", bucket: seats("80+", 80, undefined), election: { subject: { id: "27", name: "CAQ" } } },
+    majority: { series: "qc_pq_majority", period: "2026-10-05", rounding: "election_exact", bucket: { label: "at least 64 of 127 seats", lo: 64, lo_inclusive: true, hi_inclusive: true }, election: { subject: { id: "8", name: "Parti québécois" } } },
+    margin: { series: "qc_seat_margin", period: "2026-10-05", rounding: "election_exact", bucket: seats("10-19", 10, 19), election: { subject: { id: "8", name: "Parti québécois" } } },
+    other: { series: "qc_seat_margin", period: "2026-10-05", rounding: "election_exact", bucket: seats("Another Party Wins", 1, undefined), election: { subject: { id: "8", name: "Parti québécois" }, other_leader: true } },
+  };
+  const issues = (base: keyof typeof valid, change: Partial<RegInput>) => electionRegistrationIssues({ ...valid[base]!, ...change });
+  const leg = (base: keyof typeof valid, e: Partial<NonNullable<RegInput["election"]>>) => ({ election: { ...valid[base]!.election, ...e } });
+
+  it("the valid registrations pass", () => {
+    for (const [k, r] of Object.entries(valid)) expect(electionRegistrationIssues(r), k).toEqual([]);
+  });
+  it("rounding, prior level and the subject's presence", () => {
+    expect(issues("turnout", { rounding: "half_up" })).toEqual(["br_pres_r1_turnout decides from exact counts: rounding must be election_exact"]);
+    expect(issues("turnout", { prior_level: 79 })).toEqual(["br_pres_r1_turnout has no prior level"]);
+    expect(issues("turnout", { election: { subject: { id: "13", name: "LULA" } } })).toEqual(["br_pres_r1_turnout has no subject"]);
+    expect(issues("seats", { election: {} })).toEqual(["qc_seats_caq needs election.subject (the authority's id and name for the leg's party)"]);
+  });
+  it("the subject must be the series' own party or candidate", () => {
+    expect(issues("seats", leg("seats", { subject: { id: "6", name: "PLQ" } }))).toEqual(["qc_seats_caq is about party 27; the leg names 6 (PLQ)"]);
+    expect(issues("margin", leg("margin", { subject: { id: "27", name: "CAQ" } }))).toEqual(["qc_seat_margin is about party 8; the leg names 27 (CAQ)"]);
+    expect(issues("share", leg("share", { subject: { id: "22", name: "JAIR BOLSONARO" } }))).toEqual(["br_pres_r1_share_lula is about Lula; the leg names JAIR BOLSONARO"]);
+    expect(issues("share", leg("share", { subject: { id: "13", name: "LUIZ", full_name: "LUIZ INÁCIO LULA DA SILVA" } }))).toEqual([]); // the civil name names him
+  });
+  it("a riding leg names its series' riding in the 2026 election; no other leg names a riding", () => {
+    expect(issues("riding", leg("riding", { unit: "730" }))).toEqual(["qc_riding_751 is riding 751 (Taschereau) in the 2026-10-05 election; the leg names riding 730"]);
+    expect(issues("riding", { period: "2022-10-03", ...leg("riding", { unit: "730" }) })).toEqual([]); // a past election's map (the frozen evals)
+    expect(issues("riding", { election: { subject: { id: "1", name: "Etienne Grandmont" } } })).toEqual(["qc_riding_751 needs election.unit (the riding)"]);
+    expect(issues("seats", leg("seats", { unit: "751" }))).toEqual(["qc_seats_caq takes no riding"]);
+  });
+  it("a Brazilian rank leg lists the event's named candidates, its own among them; no other leg lists any", () => {
+    expect(issues("rank", leg("rank", { listed: ["13", "22"] }))).toEqual(["br_pres_r1_third: the leg's candidate 15 is not among election.listed"]);
+    expect(issues("rank", leg("rank", { listed: [] }))).toEqual(["br_pres_r1_third needs election.listed (every candidate the event names, by TSE number)"]);
+    expect(issues("share", leg("share", { listed: ["13"] }))).toEqual(["br_pres_r1_share_lula: election.listed applies to Brazilian rank events only"]);
+    expect(issues("seats", leg("seats", { other_leader: true }))).toEqual(["qc_seats_caq: other_leader applies to the seat-margin event only"]);
+  });
+  it("buckets: a place, a fixed bucket, percentages within 0-100 and not empty, whole seats not empty, a seat margin of at least 1", () => {
+    expect(issues("turnout", { bucket: { label: "none", lo_inclusive: true, hi_inclusive: true } })).toEqual(['bucket "none" has neither lo nor hi']);
+    expect(issues("rank", { bucket: at(2) })).toEqual(["br_pres_r1_third asks about place 3: the bucket must be [3, 3]"]);
+    expect(issues("riding", { bucket: at(2) })).toEqual(["qc_riding_751 asks about place 1: the bucket must be [1, 1]"]);
+    expect(issues("majority", { bucket: seats("60+", 60, undefined) })).toEqual(["qc_pq_majority's bucket is fixed by the event: at least 64 of 127 seats"]);
+    expect(issues("turnout", { bucket: pct("95-105%", 95, 105) })).toEqual(['bucket "95-105%" is outside 0-100%']);
+    expect(issues("turnout", { bucket: pct("80-80%", 80, 80) })).toEqual(['bucket "80-80%" is empty']);
+    expect(issues("seats", { bucket: seats("80.5+", 80.5, undefined) })).toEqual(['bucket "80.5+" must count whole seats']);
+    expect(issues("seats", { bucket: seats("90-80", 90, 80) })).toEqual(['bucket "90-80" is empty']);
+    expect(issues("margin", { bucket: seats("0-9", 0, 9) })).toEqual(['bucket "0-9": a seat margin of 0 is a tie ("Other"), never a leg']);
+    expect(issues("margin", { bucket: { label: "<10", hi: 10, lo_inclusive: true, hi_inclusive: false } })).toEqual(['bucket "<10": a seat margin of 0 is a tie ("Other"), never a leg']);
+    expect(issues("margin", { bucket: seats("1-9", 1, 9) })).toEqual([]);
+  });
+});
+
+describe("leg builder: the leg's subject, riding and registry are the series' own", () => {
+  const reg2022 = () => { const p = parseTseResult(fx(TSE_FINAL_2022), "2022-10-02"); if (!p.ok) throw new Error(p.detail); return tseRegistryFromSnapshot(p.snap, "https://resultados.tse.jus.br/oficial/ele2022/544/dados-simplificados/br/br-c0001-e000544-r.json", "2022-10-04T16:34:22Z"); };
+  const spec = { external_id: "t", open_at: "2022-09-01T00:00:00Z", deadline_utc: "2027-06-30T23:59:00Z" };
+  it("a party event's text must name the series' party (the CAQ seats event naming the PLQ, the PQ margin event naming the CAQ)", () => {
+    const caq = eqLeg("qc_seats_caq", "20+", { party: "Parti libéral du Québec" });
+    expect(caq.ok).toBe(false);
+    if (!caq.ok) expect(caq.reason).toBe('"Parti libéral du Québec" maps to party 6 (Parti libéral du Québec/Quebec Liberal Party); qc_seats_caq is about party 27');
+    const margin = eqLeg("qc_seat_margin", "Another Party Wins", { party: "Coalition Avenir Québec", labels: ["Coalition Avenir Québec 10-19", "Another Party Wins"] });
+    expect(margin.ok).toBe(false);
+    if (!margin.ok) expect(margin.reason).toContain("qc_seat_margin is about party 8");
+    expect(eqLeg("qc_seats_caq", "20+", { party: "Coalition Avenir Québec" }).ok).toBe(true);
+  });
+  it("the 2026 riding event takes its own riding code only; a past election's map may name another", () => {
+    const s = eqSnap();
+    const winner = [...s.ridings.find((r) => r.id === "730")!.candidates].sort((a, b) => Number(b.votes) - Number(a.votes))[0]!.name;
+    const y2026 = eqLeg("qc_riding_751", winner, { unit: "730", period: "2026-10-05" });
+    expect(y2026.ok).toBe(false);
+    if (!y2026.ok) expect(y2026.reason).toBe("riding 730 is not qc_riding_751's riding 751 in the 2026-10-05 election");
+    expect(eqLeg("qc_riding_751", winner, { unit: "730" }).ok).toBe(true); // the 2022 map
+  });
+  it("a TSE registry of another election day is refused for every TSE candidate leg", () => {
+    const tie = "A value exactly between two brackets resolves to the higher bracket.";
+    const ev = (series: ElectionSeriesId, labels: string[]) => ({ series, period: "2026-10-04", release_at: "2026-10-04T20:00:00Z", title: "t", criteria: tie, labels });
+    for (const [series, label] of [["br_pres_r1_winner", "Lula"], ["br_pres_r1_share_lula", "45-50%"], ["br_pres_r1_margin", "Lula 5-7.5%"]] as Array<[ElectionSeriesId, string]>) {
+      const b = buildElectionLeg(ev(series, [label]), { ...spec, label }, { tse: reg2022() });
+      expect(b, series).toMatchObject({ ok: false, reason: "the TSE registry is for 2022-10-02, the event is 2026-10-04" });
+      expect(buildElectionLeg({ ...ev(series, [label]), period: "2022-10-02", release_at: "2022-10-02T20:00:00Z" }, { ...spec, label }, { tse: reg2022() }).ok, series).toBe(true);
+    }
+  });
+  it("a Québec candidate label of one word must be the whole name; two words or more may be words of it", () => {
+    const reg = eqReg().eq;
+    expect(mapEqCandidate("Etienne Grandmont", "730", reg)).toMatchObject({ ok: true, subject: { id: "2505" } });
+    expect(mapEqCandidate("Grandmont", "730", reg)).toMatchObject({ ok: false, reason: '"Grandmont" matches no accepted candidate of riding 730' });
+    expect(mapEqCandidate("Etienne", "730", reg).ok).toBe(false);
+  });
+  it("only the exact label 'Another Party Wins' (any case) is the other-party leg; a longer or shorter label is foreign", () => {
+    const reg = eqReg().eq;
+    expect(seatMarginForeignLabels(["Another Party Wins", "ANOTHER PARTY WINS", " another party wins "], "8", reg)).toEqual([]);
+    expect(seatMarginForeignLabels(["Another Party Wins 10+", "Another party", "Another Party Wins Outright"], "8", reg)).toEqual(["Another Party Wins 10+", "Another party", "Another Party Wins Outright"]);
+    // the event's own "Another Party Wins" leg is refused with it
+    const b = eqLeg("qc_seat_margin", "Another Party Wins", { party: PQ, labels: [...SEAT_MARGIN, "Another Party Wins 10+"] });
+    expect(b.ok).toBe(false);
+    if (!b.ok) expect(b.reason).toContain('the event lists "Another Party Wins 10+"');
   });
 });
