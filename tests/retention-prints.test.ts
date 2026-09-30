@@ -50,8 +50,10 @@ describe("migration 022 (static lint; never applied from here)", () => {
     const f = fnBody("charge_read");
     expect(writes(f)).toEqual([["update", "tenants"], ["insert into", "credit_ledger"]]);
     expect(f).toMatch(/values \(p_tenant, -p_amount, 'charge', p_request_id, v_balance, 'read'\)/);
-    // the replay is found before anything is written, by the ledger's unique (reason, request_id)
+    // the replay is found before anything is written, by the ledger's unique (reason, request_id), and answered free:
+    // without it a replay at a zero balance would be refused as short (the unique index alone cannot answer it)
     expect(f.indexOf("where l.reason = 'charge' and l.request_id = p_request_id")).toBeLessThan(f.indexOf("update tenants"));
+    expect(f).toMatch(/select \* into v_led from credit_ledger l where l\.reason = 'charge' and l\.request_id = p_request_id;\s+if found then\s+if v_led\.tenant_id is distinct from p_tenant then\s+raise exception using errcode = 'RS003'[^;]*;\s+end if;\s+return query select true, true, 0, /);
     // the debit is conditional: a short balance or a deleted tenant updates nothing
     expect(f).toMatch(/where t\.id = p_tenant and t\.deleted_at is null and t\.credits_balance >= p_amount/);
     expect(f).toMatch(/if v_balance is null then\s+return query select false, false, 0,/);
