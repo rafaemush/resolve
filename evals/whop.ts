@@ -12,7 +12,7 @@ import { whopWebhook } from "../src/api/billing";
 
 export type WhopGroup = "signature";
 interface Headers3 { id?: string; timestamp?: string; signature?: string }
-export interface WhopCase { id: string; group: WhopGroup; control: boolean; title: string; via: "verifier" | "route"; secret: string; headers: Headers3; body: string; expect: "accept" | "refuse" }
+export interface WhopCase { id: string; group: WhopGroup; control: boolean; title: string; via: "verifier" | "route"; secret: string; headers: Headers3; body: string; expect: "accept" | "refuse"; env?: Record<string, string> }
 interface Outcome { id: string; group: WhopGroup; control: boolean; result: "pass" | "grader_fail" | "harness_error"; failures: string[] }
 export interface WhopSummary { cases: number; passed: number; grader_fail: number; harness_error: number; skipped: number; outcomes: Outcome[]; label?: string }
 
@@ -23,6 +23,12 @@ const SECRET = "ws_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc
 const MSG = "msg_2mYx0000000000000000000000";
 const BODY = JSON.stringify({ id: MSG, type: "membership.activated", api_version: "v1", api_version_date: "2026-09-29", timestamp: "2026-09-30T12:00:00.000Z", data: { id: "mem_x" } });
 const FORGED_PAYMENT = JSON.stringify({ id: MSG, type: "payment.succeeded", api_version: "v1", data: { id: "pay_forged" } });
+/** The $20 pack's plan as wrangler.toml sets it (plan §22.3 #5): 2,000 credits to whichever tenant the metadata names. */
+const PLAN_20 = "plan_PNgCSGmXG38KW";
+const PAYMENT_20 = JSON.stringify({
+  id: MSG, type: "payment.succeeded", api_version: "v1", api_version_date: "2026-09-29", timestamp: "2026-09-30T12:00:00.000Z",
+  data: { id: "pay_twenty000001", status: "paid", plan_id: PLAN_20, currency: "usd", total: { amount: "20.00", currency: "usd" }, tax_amount: null, tax_behavior: null, refunded_amount: null, metadata: { resolve_tenant_id: "11111111-2222-4333-8444-555555555555" }, customer_email: null },
+});
 
 /** The Standard Webhooks key derivation (base64-decode after a whsec_ prefix), which Whop's backend does not use ([W2]). */
 function decodedKeyBytes(secret: string): string {
@@ -45,6 +51,7 @@ async function authorCases(): Promise<WhopCase[]> {
     c("WH-002", true, "one matching v1 entry among several (a secret rotation sends two)", h({ signature: `v1,${other} v1,${good}` }), "accept"),
     c("WH-003", true, "a timestamp exactly 300 s old is still inside the window", h({ timestamp: edge, signature: `v1,${await whopSignature(SECRET, MSG, edge, BODY)}` }), "accept"),
     c("WH-004", true, "the route answers a genuine event of a type it ignores with 200", h(), "accept", BODY, "route"),
+    c("WH-005", true, "a genuine payment.succeeded on the $20 pack's plan (plan_PNgCSGmXG38KW)", { id: MSG, timestamp: T, signature: `v1,${await whopSignature(SECRET, MSG, T, PAYMENT_20)}` }, "accept", PAYMENT_20),
     // --- refused only with the rail on (red when it is off) --------------------------------------------------------------
     c("WH-101", false, "a signature that is not the HMAC of this request", h({ signature: `v1,${"A".repeat(43)}=` }), "refuse"),
     c("WH-102", false, "the body changed after signing", h(), "refuse", BODY.replace("mem_x", "mem_y")),
@@ -57,6 +64,7 @@ async function authorCases(): Promise<WhopCase[]> {
     c("WH-109", false, "no signature header", h({ signature: undefined }), "refuse"),
     c("WH-110", false, "a timestamp with a leading zero (the text signed must be the number checked)", h({ timestamp: `0${T}`, signature: `v1,${await whopSignature(SECRET, MSG, `0${T}`, BODY)}` }), "refuse"),
     c("WH-111", false, "the route refuses a forged payment.succeeded with 401 before reading it", h({ signature: `v1,${"B".repeat(43)}=` }), "refuse", FORGED_PAYMENT, "route"),
+    { ...c("WH-112", false, "the route refuses a forged $20-pack payment (plan_PNgCSGmXG38KW, 2,000 credits) with 401 while the $20 plan is configured", h({ signature: `v1,${"C".repeat(43)}=` }), "refuse", PAYMENT_20, "route"), env: { WHOP_PLAN_ID_20: PLAN_20 } },
   ];
 }
 
@@ -65,7 +73,7 @@ async function runCase(k: WhopCase): Promise<string[]> {
   if (k.via === "verifier") {
     accepted = (await verifyWhopSignature(k.secret, k.headers, k.body, NOW)).ok;
   } else {
-    const env = { WHOP_WEBHOOK_SECRET: k.secret } as unknown as Env;
+    const env = { WHOP_WEBHOOK_SECRET: k.secret, ...k.env } as unknown as Env;
     const headers: Record<string, string> = { "content-type": "application/json" };
     if (k.headers.id) headers["webhook-id"] = k.headers.id;
     if (k.headers.timestamp) headers["webhook-timestamp"] = k.headers.timestamp;

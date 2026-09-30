@@ -10,7 +10,8 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { botPageHtml } from "../src/api/bot";
 import { docsHtml, keyIssuedHtml, pricingHtml } from "../src/api/site";
-import { VERIFY_HINT, listSeries, scheduledAnswer, topUpHint } from "../src/api/prints";
+import { VERIFY_HINT, listSeries, scheduledAnswer } from "../src/api/prints";
+import { topUp, topUpText } from "../src/billing/top-up";
 import type { Env } from "../src/env";
 import { RESOLVE_BOT_UA } from "../src/ops/ua";
 
@@ -40,6 +41,14 @@ describe("customer-facing documents", () => {
     expect(t).toMatch(/\$750 a month/);
     expect(t).toMatch(/USDC on Base/);
     expect(t).toMatch(/not an oracle of record/);
+  });
+  it("only the invoiced venue offers speak of USDC, and only through the address route opened for that pilot (founder decision 2026-10-01): no self-serve doc names a wallet address", () => {
+    for (const [p, t] of Object.entries(texts)) {
+      if (!["docs/pilot-pack.md", "docs/templates/invoice.md", "docs/templates/pilot-letter.md", "docs/pricing.md"].includes(p)) expect(t, p).not.toMatch(/(pay|paid|prepaid)( once| monthly)? in USDC(?! against an invoice)|send USDC (on|from|to)|receiving address|register the wallet/i);
+      for (const a of t.match(/0x[0-9a-fA-F]{40}\b/g) ?? []) expect(a, p).toBe("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+    }
+    expect(texts["docs/pricing.md"]).toMatch(/Paid in USDC against an invoice, with a W-9 and a one-page pilot letter/);
+    expect(texts["docs/pricing.md"]).toMatch(/the address route is opened for that pilot alone/);
   });
   it("templates carry <placeholders>, no personal data: no email address, no filled wallet address", () => {
     for (const p of ["docs/templates/invoice.md", "docs/templates/pilot-letter.md", "docs/templates/w9-notes.md"]) {
@@ -71,6 +80,16 @@ describe("customer-facing documents", () => {
     expect(texts["docs/templates/pilot-letter.md"]).toMatch(/first delivered to your account/);
     expect(texts["docs/pilot-pack.md"]).not.toMatch(/when the first webhook reached you/);
   });
+  it("docs/pricing.md: card checkout is live, the $20 pack is card only, and no tenant is told to send USDC to an address", () => {
+    const t = texts["docs/pricing.md"]!;
+    expect(t).toMatch(/Card checkout through Whop is live/);
+    expect(t).not.toMatch(/switched off until/);
+    expect(t).toMatch(/\$20 = 2,000 credits, card only/);
+    expect(t).toMatch(/\{"pack": "20"\}/);
+    expect(t).toMatch(/USDC deposits are not offered/);
+    expect(t).not.toMatch(/send USDC on Base from that wallet to the address/i);
+    expect(t).not.toMatch(/lifetime/i);
+  });
   it("the pilot letter fits one page (under 650 words)", () => {
     expect(texts["docs/templates/pilot-letter.md"]!.split(/\s+/).filter(Boolean).length).toBeLessThan(650);
   });
@@ -86,8 +105,8 @@ describe("the quickstart, the key page and the first-print answers", () => {
     "GET /v1/prints": JSON.stringify(listSeries(Date.parse("2026-10-01T00:00:00Z"), [])),
     "a scheduled print": JSON.stringify(scheduledAnswer("us_unemployment_rate", "2026-09", Date.parse("2026-10-01T00:00:00Z"))),
     "the verify hint": VERIFY_HINT,
-    "the 402 top-up (card open)": topUpHint({ WHOP_CHECKOUT_ENABLED: "1", WHOP_API_KEY: "k", WHOP_PLAN_ID_50: "plan_a", WHOP_PLAN_ID_250: "plan_b", USDC_RECEIVING_ADDRESS: `0x${"1".repeat(40)}` } as unknown as Env),
-    "the 402 top-up (card not open)": topUpHint({ USDC_RECEIVING_ADDRESS: `0x${"1".repeat(40)}` } as unknown as Env),
+    "the 402 top-up (card open)": topUpText(topUp({ WHOP_CHECKOUT_ENABLED: "1", WHOP_API_KEY: "k", WHOP_PLAN_ID_20: "plan_c", WHOP_PLAN_ID_50: "plan_a", WHOP_PLAN_ID_250: "plan_b", USDC_RECEIVING_ADDRESS: `0x${"1".repeat(40)}` } as unknown as Env, base)),
+    "the 402 top-up (card not open)": topUpText(topUp({ USDC_RECEIVING_ADDRESS: `0x${"1".repeat(40)}` } as unknown as Env, base)),
   };
   it("never name the model or its vendor, and state no accuracy figure", () => {
     for (const [p, t] of Object.entries(pages)) {

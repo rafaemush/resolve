@@ -18,7 +18,8 @@
  *                                    would pay for a print it never delivers.
  * Both run behind the v1 key middleware (src/api/v1.ts): the key, its daily cap and the per-key rate limit apply as on
  * every /v1 route. Free keys may call them: a print is structured data, no model is involved.
- * The 402 answer points to the card rail only (src/billing/whop.ts cardCheckoutOffered), never to the USDC address.
+ * The 402 answer carries the same top-up pointer as POST /v1/resolve (src/billing/top-up.ts): the card rail while it is
+ * offered, else support; never the USDC address.
  */
 import { Hono, type Context } from "hono";
 import { z } from "zod";
@@ -29,7 +30,7 @@ import { db, rpc } from "../db/supabase";
 import { sha256Hex } from "../resolve/text";
 import { CorroborationStatus, KNOWN_RELEASES, OFFICIAL_SERIES, missingAfterMs, periodValid, type KnownRelease, type OfficialSeriesId, type SeriesDef } from "../resolve/official";
 import { noteCharge } from "../billing/events";
-import { cardCheckoutOffered, whopConfig } from "../billing/whop";
+import { publicBase, topUp, topUpText } from "../billing/top-up";
 
 type Vars = { requestId: string; schemaVersion: string; auth: AuthContext };
 export const prints = new Hono<{ Bindings: Env; Variables: Vars }>();
@@ -151,13 +152,6 @@ export async function chargeRequestId(o: { tenantId: string; series: string; per
 export const ChargeAnswer = z.object({ ok: z.boolean(), replayed: z.boolean(), charged: z.number().int().min(0), balance: z.number().int() });
 export type ChargeAnswer = z.infer<typeof ChargeAnswer>;
 
-/** Pure. Where a tenant short of credits buys more: the card rail when it is offered, else the pricing page. Never the USDC address. */
-export function topUpHint(env: Env): string {
-  return cardCheckoutOffered(whopConfig(env))
-    ? "Buy credits by card: POST /v1/billing/checkout, or the form at /pricing#pay-by-card."
-    : "See /pricing for credit packs.";
-}
-
 const storeDown = (c: Context, what: string) => err(c, "UPSTREAM_UNAVAILABLE", `${what} unavailable; retry shortly. Nothing was charged.`, 503, { retryAfterSeconds: 30 });
 
 prints.get("/", async (c) => {
@@ -214,12 +208,13 @@ prints.get("/:series/:period", async (c) => {
     return err(c, "UPSTREAM_UNAVAILABLE", "billing unavailable; no credits charged, the print was not served. Retry shortly.", 503, { retryAfterSeconds: 30, extra: { error_reason: "BILLING_UNAVAILABLE" } });
   }
   if (!charge.ok) {
-    return err(c, "insufficient_credits", `A first print costs ${PRINT_PRICE_CREDITS} credit; balance is ${charge.balance}. ${topUpHint(c.env)}`, 402, { extra: { balance: charge.balance, price_credits: PRINT_PRICE_CREDITS } });
+    const top = topUp(c.env, publicBase(c.env, c.req.url));
+    return err(c, "insufficient_credits", `A first print costs ${PRINT_PRICE_CREDITS} credit; balance is ${charge.balance}. ${topUpText(top)}`, 402, { extra: { balance: charge.balance, price_credits: PRINT_PRICE_CREDITS, top_up: top } });
   }
   if (charge.replayed) c.header("X-Idempotent-Replay", "true");
   if (charge.charged > 0) {
     // credits.low once per crossing, off the response path (as POST /v1/resolve does)
-    const low = noteCharge(c.env, auth.tenantId, chargeId);
+    const low = noteCharge(c.env, auth.tenantId, chargeId, { plan: auth.plan, base: publicBase(c.env, c.req.url) });
     const wu = waitUntilOf(c);
     if (wu) wu(low); else await low;
   }

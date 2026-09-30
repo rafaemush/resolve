@@ -4,8 +4,8 @@
  *                              that fails the signature or timestamp check answers 401 and nothing is stored. Verified
  *                              events move credits through src/billing/whop-events.ts whether or not checkout is
  *                              switched on, so a test event from the Whop dashboard is answered and recorded.
- *   POST /v1/billing/checkout  authenticated (the v1 key middleware): {pack: "50" | "250"} opens a Whop checkout for the
- *                              calling tenant and answers its URL. 503 while WHOP_CHECKOUT_ENABLED is not "1".
+ *   POST /v1/billing/checkout  authenticated (the v1 key middleware): {pack: "20" | "50" | "250"} opens a Whop checkout
+ *                              for the calling tenant and answers its URL. 503 while WHOP_CHECKOUT_ENABLED is not "1".
  *   POST /billing/checkout     the /pricing form (src/api/site.ts): the same with the key in the form body, answered with
  *                              a 303 to Whop.
  * The key is never logged, echoed, alerted, cached, sent to Whop or put in a URL: Whop receives the tenant id only, and
@@ -106,7 +106,7 @@ export async function startCheckout<E extends { Bindings: Env }>(c: Context<E>, 
   return r;
 }
 
-const CheckoutBody = z.object({ pack: z.union([z.enum(PACK_IDS as [PackId, ...PackId[]]), z.literal(50).transform(() => "50" as const), z.literal(250).transform(() => "250" as const)]) });
+const CheckoutBody = z.object({ pack: z.union([z.enum(PACK_IDS as [PackId, ...PackId[]]), z.literal(20).transform(() => "20" as const), z.literal(50).transform(() => "50" as const), z.literal(250).transform(() => "250" as const)]) });
 
 export const billingV1 = new Hono<{ Bindings: Env; Variables: Vars & { auth: AuthContext } }>();
 

@@ -163,7 +163,7 @@ describe("every curl on a customer page parses against the OpenAPI document", ()
     const ops = curlsOf(PAGES[0]![1]).map((cmd) => { const c = parseCurl(cmd); return `${c.method} ${c.url.pathname}`; });
     expect(ops).toEqual([
       "POST /v1/request-key", "GET /v1/prints/us_unemployment_rate/2026-09", "POST /v1/markets", "POST /v1/resolve", "POST /v1/resolve",
-      "POST /v1/webhooks", "POST /v1/markets/11111111-1111-4111-8111-111111111111/follow", "GET /v1/track-record/verify", "POST /v1/billing/checkout",
+      "POST /v1/webhooks", "POST /v1/markets/polymarket:$EXTERNAL_ID/follow", "GET /v1/track-record/verify", "POST /v1/billing/checkout",
     ]);
     expect(curlsOf(PAGES[2]![1]).map((cmd) => { const c = parseCurl(cmd); return `${c.method} ${c.url.pathname}`; })).toEqual(["GET /v1/prints"]);
   });

@@ -89,6 +89,11 @@ vi.mock("../src/bot/commit", () => ({ commitVerdict: vi.fn(async () => ({ commit
 vi.mock("../src/webhooks/deliver", () => ({ publishEvent: vi.fn(async () => ({ queued: 1 })) }));
 vi.mock("../src/shadow/events", () => ({ publishShadowCommitted: vi.fn(async () => ({ followers: 1, rows: [{ id: "d1" }], error: null })) }));
 vi.mock("../src/ops/alerts", () => ({ alert: vi.fn(async () => ({ sent: true, deduped: false })) }));
+// The real noteCharge, recorded: which public origin a watch charge's credits.low pointers are built from.
+vi.mock("../src/billing/events", async (orig) => {
+  const m = await orig<typeof import("../src/billing/events")>();
+  return { ...m, noteCharge: vi.fn(m.noteCharge) };
+});
 
 import { runWatch } from "../src/ingest/watch";
 import { resolveWithRuntime } from "../src/resolve/runtime";
@@ -96,6 +101,7 @@ import { alert } from "../src/ops/alerts";
 import { commitVerdict } from "../src/bot/commit";
 import { publishEvent } from "../src/webhooks/deliver";
 import { publishShadowCommitted } from "../src/shadow/events";
+import { noteCharge } from "../src/billing/events";
 import { projectForChange } from "../src/ingest/projection";
 import { sha256Hex } from "../src/resolve/text";
 import { engineVersion } from "../src/api/public-names";
@@ -146,6 +152,7 @@ beforeEach(() => {
   vi.mocked(commitVerdict).mockClear();
   vi.mocked(publishEvent).mockClear();
   vi.mocked(publishShadowCommitted).mockClear();
+  vi.mocked(noteCharge).mockClear();
   h.rpc.mockClear();
   resetWatch();
 });
@@ -402,6 +409,19 @@ describe("publishing a verdict that looked (plan §18 (a): first delivery attemp
     const [, to, type, payload, opts] = vi.mocked(publishEvent).mock.calls[0]!;
     expect([to, type, opts]).toEqual([tenant, "market.unresolved_update", { waitUntil }]);
     expect(payload).toMatchObject({ market_id: MARKET_ID, request_id: r.resolution_id, verdict: { resolution_status: "UNRESOLVED" } });
+  });
+
+  it("tenant market: the charge's credits.low pointers use the public origin the dispatching request passed (never a relative page)", async () => {
+    const tenant = "33333333-3333-4333-8333-333333333333";
+    h.rpc.mockImplementation(async (_c: unknown, fn: string) => {
+      if (fn === "begin_resolution") return [{ request_id: "stub5", ok: true, charged: 5 }];
+      if (fn === "claim_low_credit_notice") return [{ crossed: false, balance: 995, threshold: 500 }];
+      throw new Error(`rpc ${fn} not expected`);
+    });
+    resetWatch({ markets: { ...market(7 * 86_400_000), tenant_id: tenant } });
+    serve(200, JSON.stringify(pr(1)));
+    await runWatch(env(), cfg, WATCH_ID, { waitUntil, base: "https://resolve.example.com" });
+    expect(vi.mocked(noteCharge).mock.calls.map((c) => [c[1], c[3]])).toEqual([[tenant, { base: "https://resolve.example.com" }]]);
   });
 
   it("tenant market: the queued verdict is in public names (web_evidence, engine_version, web_evidence_call), never the model's", async () => {

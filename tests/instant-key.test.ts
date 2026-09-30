@@ -14,6 +14,7 @@ import { resolve } from "node:path";
 import type { Env } from "../src/env";
 import { fakeDb, type FakeDb, type Row } from "./lib/fake-db";
 import { REQUEST_KEY_RPCS } from "./lib/fake-request-key";
+import { PLAN_20, PLAN_250, PLAN_50 } from "./lib/fake-whop";
 
 type Broken = "error" | "throw" | "odd" | null;
 const h = vi.hoisted(() => ({
@@ -229,6 +230,16 @@ describe("a stranger gets a working evaluation key from the form", () => {
     expect(html).not.toMatch(NAMES);
     expect(JSON.stringify([...res.headers])).not.toMatch(NAMES);
     expect(html).not.toMatch(/<script/i);
+  });
+
+  it("while card checkout is offered, the key page links paying by card and the JSON answer carries pay_by_card; otherwise neither", async () => {
+    expect(((await (await post(jsonReq(good))).json()) as any).data).not.toHaveProperty("pay_by_card");
+    const card = { ...env, WHOP_CHECKOUT_ENABLED: "1", WHOP_API_KEY: "whop_api_key_test", WHOP_PLAN_ID_20: PLAN_20, WHOP_PLAN_ID_50: PLAN_50, WHOP_PLAN_ID_250: PLAN_250 } as unknown as Env;
+    const html = await (await post(form({ ...good, email: "grace@example.com" }), card)).text();
+    expect(html).toContain('<a href="/pricing#pay-by-card">pay by card</a> for a credit pack with this key');
+    const { data } = (await (await post(jsonReq({ ...good, email: "linus@example.com" }, "198.51.100.4"), card)).json()) as { data: Record<string, unknown> };
+    expect(data).toMatchObject({ key_issued: true, pay_by_card: "https://resolve.example.com/pricing#pay-by-card" });
+    expect(html).not.toMatch(/usdc|payments\/address/i);
   });
 
   it("the tenant and the key are inserted with their terms spelled out, not left to the column defaults", async () => {

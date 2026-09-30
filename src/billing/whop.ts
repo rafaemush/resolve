@@ -8,9 +8,9 @@
  *   - a webhook is believed only when its webhook-signature is the HMAC-SHA256 of "<webhook-id>.<webhook-timestamp>.
  *     <raw body>" keyed by the literal bytes of WHOP_WEBHOOK_SECRET, compared in constant time, with a timestamp within
  *     5 minutes either way (rail whop_signature; evals/whop.ts proves the rail and evals/mutate.ts switches it off);
- *   - a pack is found by the payment's PLAN ID in a server-side map (WHOP_PLAN_ID_50, WHOP_PLAN_ID_250), never by the
- *     amount or the metadata; the amount paid (the total less any tax added on top) and the currency must then equal the
- *     pack's price exactly, or nothing is granted;
+ *   - a pack is found by the payment's PLAN ID in a server-side map (WHOP_PLAN_ID_20, WHOP_PLAN_ID_50,
+ *     WHOP_PLAN_ID_250), never by the amount or the metadata; the amount paid (the total less any tax added on top) and
+ *     the currency must then equal the pack's price exactly, or nothing is granted;
  *   - the tenant comes from the checkout's metadata, which Resolve set when it opened the checkout (resolve_tenant_id:
  *     the tenant id, never the key); nothing else in a payment names a tenant;
  *   - a refund or dispute takes back its share of the credits one payment granted: proportional to the amount when the
@@ -89,8 +89,13 @@ import { safeEqual } from "../api/admin";
 import { railEnabled } from "../resolve/rails";
 import { redact } from "../ops/redact";
 
-/** The packs sold by card (docs/pricing.md, plan §11): price in US cents and the credits it buys. */
+/**
+ * The packs sold by card (docs/pricing.md, plan §11, §22.3 #5): price in US cents and the credits it buys. The $20 pack is
+ * card only (the invoiced and USDC packs, PACKS_USDC in src/billing/tiers.ts, start at $50), at the base rate of
+ * payg_tiers (100 credits a dollar); the others are the plan §11 packs at their tier's rate.
+ */
 export const CARD_PACKS = {
+  "20": { priceCents: 2_000, credits: 2_000, planVar: "WHOP_PLAN_ID_20" },
   "50": { priceCents: 5_000, credits: 5_000, planVar: "WHOP_PLAN_ID_50" },
   "250": { priceCents: 25_000, credits: 27_500, planVar: "WHOP_PLAN_ID_250" },
 } as const satisfies Record<string, { priceCents: number; credits: number; planVar: keyof Env }>;

@@ -996,7 +996,7 @@
             }
           },
           "402": {
-            "description": "insufficient_credits (price_credits, balance, route at top level)",
+            "description": "insufficient_credits (price_credits, balance, route and top_up: {method: \"card\", checkout: \"POST /v1/billing/checkout\", page: \"<site>/pricing#pay-by-card\", packs[] {pack, price, currency, credits}} while card checkout is offered, else {method: \"contact_support\", page: \"<site>/terms#contact\"}; never a USDC address, at top level; the message says the same)",
             "content": {
               "application/json": {
                 "schema": {
@@ -1244,9 +1244,9 @@
             "name": "id",
             "in": "path",
             "required": true,
+            "description": "The market's uuid, or its venue id <platform>:<external_id> (platform polymarket, limitless, custom) exactly as /record and the home page print it. A venue id names only a public shadow market (not a tenant's, not a test market, not deleted); none or more than one match answers 404",
             "schema": {
-              "type": "string",
-              "format": "uuid"
+              "type": "string"
             }
           }
         ],
@@ -1262,7 +1262,7 @@
             }
           },
           "201": {
-            "description": "follow_id, market_id, following, already_following=false, follows_counted (follows of open markets, what the limit counts), follow_limit (null = unlimited), events, read, endpoints_subscribed (active endpoints that receive shadow.committed), warning (only when endpoints_subscribed is 0)",
+            "description": "follow_id, market_id (the uuid), market (platform:external_id), following, already_following=false, follows_counted (follows of open markets, what the limit counts), follow_limit (null = unlimited), events, read, endpoints_subscribed (active endpoints that receive shadow.committed), warning (only when endpoints_subscribed is 0)",
             "content": {
               "application/json": {
                 "schema": {
@@ -1272,7 +1272,7 @@
             }
           },
           "400": {
-            "description": "validation_error: bad id, the tenant's own market, or a market no longer open",
+            "description": "validation_error: an id that is neither a uuid nor a venue id, the tenant's own market, or a market no longer open",
             "content": {
               "application/json": {
                 "schema": {
@@ -1292,7 +1292,7 @@
             }
           },
           "404": {
-            "description": "not_found: no such public shadow market",
+            "description": "not_found: no such public shadow market (or a venue id that matches more than one)",
             "content": {
               "application/json": {
                 "schema": {
@@ -1328,15 +1328,15 @@
             "name": "id",
             "in": "path",
             "required": true,
+            "description": "The market's uuid, or its venue id <platform>:<external_id> (platform polymarket, limitless, custom) exactly as /record and the home page print it. A venue id names only a public shadow market (not a tenant's, not a test market, not deleted); none or more than one match answers 404",
             "schema": {
-              "type": "string",
-              "format": "uuid"
+              "type": "string"
             }
           }
         ],
         "responses": {
           "200": {
-            "description": "unfollowed",
+            "description": "unfollowed (the market's uuid)",
             "content": {
               "application/json": {
                 "schema": {
@@ -1346,7 +1346,7 @@
             }
           },
           "400": {
-            "description": "validation_error",
+            "description": "validation_error: neither a uuid nor a venue id",
             "content": {
               "application/json": {
                 "schema": {
@@ -1356,7 +1356,7 @@
             }
           },
           "404": {
-            "description": "not_found: not following this market",
+            "description": "not_found: not following this market, or no public shadow market with that venue id",
             "content": {
               "application/json": {
                 "schema": {
@@ -1513,9 +1513,9 @@
             "name": "market_id",
             "in": "path",
             "required": true,
+            "description": "The market's uuid, or its venue id <platform>:<external_id> (platform polymarket, limitless, custom) exactly as /record and the home page print it. A venue id names only a public shadow market (not a tenant's, not a test market, not deleted); none or more than one match answers 404",
             "schema": {
-              "type": "string",
-              "format": "uuid"
+              "type": "string"
             }
           }
         ],
@@ -1769,7 +1769,7 @@
             }
           },
           "402": {
-            "description": "insufficient_credits (balance, price_credits at top level): nothing charged, nothing served",
+            "description": "insufficient_credits (balance, price_credits and top_up at top level: the card rail while card checkout is offered, else support; never a USDC address): nothing charged, nothing served",
             "content": {
               "application/json": {
                 "schema": {
@@ -1883,7 +1883,7 @@
     },
     "/v1/account/wallet/challenge": {
       "get": {
-        "summary": "Issue a single-use wallet registration challenge (valid 10 minutes) for the wallet this account sends USDC from. The message to sign is exactly \"Resolve wallet registration\ntenant: <tenant_id>\naddress: <lowercase address>\nnonce: <nonce>\nissued: <ISO time>\"",
+        "summary": "Issue a single-use wallet registration challenge (valid 10 minutes) for a wallet this account controls. The message to sign is exactly \"Resolve wallet registration\ntenant: <tenant_id>\naddress: <lowercase address>\nnonce: <nonce>\nissued: <ISO time>\"",
         "security": [
           {
             "bearerAuth": []
@@ -1939,7 +1939,7 @@
     },
     "/v1/account/wallet": {
       "post": {
-        "summary": "Register the wallet that signed a challenge (EIP-191 personal_sign of the challenge message; externally owned accounts only). USDC it sends to the receiving address is then credited to this account; it replaces a previously registered wallet",
+        "summary": "Register the wallet that signed a challenge (EIP-191 personal_sign of the challenge message; externally owned accounts only); it replaces a previously registered wallet. USDC deposits are not offered unless GET /v1/payments/address answers",
         "security": [
           {
             "bearerAuth": []
@@ -2073,7 +2073,7 @@
     },
     "/v1/payments/address": {
       "get": {
-        "summary": "USDC (Base) receiving address, the PAYG tiers the deposit is credited at (a deposit gets the rate of the highest tier its amount reaches: floor(amount x credits_per_usdc)), the packs they buy, the registered sender wallet, confirmation policy (safe tag). Deposits emit payment.credited",
+        "summary": "Only while USDC deposits are offered (off unless the service switches them on): USDC (Base) receiving address, the PAYG tiers the deposit is credited at (a deposit gets the rate of the highest tier its amount reaches: floor(amount x credits_per_usdc)), the packs they buy, the registered sender wallet, confirmation policy (safe tag). Deposits emit payment.credited. While they are not offered it answers 503 \"USDC deposits are not offered\" with error_reason USDC_NOT_OFFERED and the card pointer",
         "security": [
           {
             "bearerAuth": []
@@ -2094,7 +2094,7 @@
             }
           },
           "503": {
-            "description": "deposits not enabled, or pricing unavailable",
+            "description": "USDC deposits are not offered (error_reason USDC_NOT_OFFERED, top_up: {method: \"card\", checkout: \"POST /v1/billing/checkout\", page: \"<site>/pricing#pay-by-card\", packs[] {pack, price, currency, credits}} while card checkout is offered, else {method: \"contact_support\", page: \"<site>/terms#contact\"}; never a USDC address), deposits not enabled, or pricing unavailable",
             "content": {
               "application/json": {
                 "schema": {
@@ -2385,7 +2385,7 @@
     },
     "/v1/billing/checkout": {
       "post": {
-        "summary": "Open a card checkout (Whop, the merchant of record) for a credit pack for this key's account: \"50\": $50 for 5,000 credits, \"250\": $250 for 27,500 credits. Whop receives this account's id, never the key. The credits are added when Whop confirms the payment (usually within a minute; GET /v1/account shows the balance); a free test key's account moves to pay as you go and its key stops expiring. Credits are a non-refundable prepayment for API services and do not expire while the account is open; a card refund or chargeback removes them. Never cached",
+        "summary": "Open a card checkout (Whop, the merchant of record) for a credit pack for this key's account: \"20\": $20 for 2,000 credits, \"50\": $50 for 5,000 credits, \"250\": $250 for 27,500 credits. Whop receives this account's id, never the key. The credits are added when Whop confirms the payment (usually within a minute; GET /v1/account shows the balance); a free test key's account moves to pay as you go and its key stops expiring. Credits are a non-refundable prepayment for API services and do not expire while the account is open; a card refund or chargeback removes them. Never cached",
         "security": [
           {
             "bearerAuth": []
@@ -2406,6 +2406,7 @@
                   "pack": {
                     "type": "string",
                     "enum": [
+                      "20",
                       "50",
                       "250"
                     ]
@@ -2488,6 +2489,7 @@
                   "pack": {
                     "type": "string",
                     "enum": [
+                      "20",
                       "50",
                       "250"
                     ]
@@ -2668,7 +2670,7 @@
         },
         "responses": {
           "200": {
-            "description": "received=true, key_issued, note; when key_issued: key (shown once, never stored), key_id, environment, plan, credits, watch_limit, expires_at, docs, next (JSON); for a form post, an HTML page with the key or a confirmation. Never cached",
+            "description": "received=true, key_issued, note; when key_issued: key (shown once, never stored), key_id, environment, plan, credits, watch_limit, expires_at, docs, next and pay_by_card (<site>/pricing#pay-by-card, while card checkout is offered) (JSON); for a form post, an HTML page with the key or a confirmation. Never cached",
             "content": {
               "application/json": {
                 "schema": {

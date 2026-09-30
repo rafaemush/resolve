@@ -60,19 +60,31 @@ BASE_FALLBACK_HTTP_URL = "https://mainnet.base.org"
 BASE_LOGS_HTTP_URL = "https://mainnet.base.org"
 SOLANA_FALLBACK_HTTP_URL = "https://api.mainnet-beta.solana.com"
 RESOLVE_BOT_UA = "ResolveBot/1.0 (+https://resolve.rafaemush.workers.dev/bot)"
+# The site's public origin (absolute links in alerts, webhook payloads, the pinned channel post and Whop's return URL;
+# without it those fall back to the request's own origin) and the public Telegram channel's link (shown on the site
+# only when it is an https URL; the channel is @resolvefeed).
+RESOLVE_PUBLIC_URL = "https://resolve.rafaemush.workers.dev"
+PUBLIC_CHANNEL_URL = "https://t.me/resolvefeed"
 LIMITLESS_WS_ENABLED = "1"
 # Evaluation keys the request form issues on the spot per UTC day (src/api/evaluation-key.ts). Past it, and when it is
 # "0", the form stores the request and alerts the operator, who answers by email. Not a whole number from 0 to 1000 = 0.
 REQUEST_KEY_DAILY_CAP = "25"
 # Card checkout through Whop (src/billing/whop.ts). Only "1" opens checkouts and shows the /pricing form; while it is
 # "0", POST /v1/billing/checkout answers 503 and the webhook (POST /webhooks/whop) still verifies and records, so a test
-# event from the Whop dashboard is answered. The plan ids are the Whop plans (plan_...) of the $50 pack (5,000 credits)
-# and the $250 pack (27,500 credits): empty = checkout refuses, and a payment on an unknown plan answers 503 for Whop to
-# retry once they are set only when it names a Resolve tenant in its metadata (a checkout Resolve opened); any other
-# (a dashboard test event, another product) is answered 200 and alerted, so the webhook is never failed into being
-# disabled. Set both plan ids before the checkout is switched on. WHOP_SANDBOX "1" points every Whop call at the
-# sandbox. WHOP_API_KEY and WHOP_WEBHOOK_SECRET are secrets (wrangler secret put), never here.
+# event from the Whop dashboard is answered. The plan ids are the Whop plans (plan_...) of the $20 pack (2,000 credits,
+# card only), the $50 pack (5,000 credits) and the $250 pack (27,500 credits): any one empty = checkout refuses, and a
+# payment on an unknown plan answers 503 for Whop to retry once they are set only when it names a Resolve tenant in its
+# metadata (a checkout Resolve opened); any other (a dashboard test event, another product) is answered 200 and
+# alerted, so the webhook is never failed into being disabled. Set every plan id before the checkout is switched on.
+# WHOP_SANDBOX "1" points every Whop call at the sandbox. WHOP_API_KEY and WHOP_WEBHOOK_SECRET are secrets (wrangler
+# secret put), never here.
 WHOP_CHECKOUT_ENABLED = "1"
+WHOP_PLAN_ID_20 = "plan_PNgCSGmXG38KW"
 WHOP_PLAN_ID_50 = "plan_XsiHbMZVNGoca"
 WHOP_PLAN_ID_250 = "plan_NHZHY3hkYrT2J"
 WHOP_SANDBOX = "0"
+# Only "1" lets GET /v1/payments/address answer the USDC receiving address. Anything else answers 503 "USDC deposits are
+# not offered", and no answer (the 402 of POST /v1/resolve, the credits.low event) ever points a tenant to that address:
+# no third-party USDC is solicited. The deposit scan and the founder's own wallet test are unchanged: they read
+# USDC_RECEIVING_ADDRESS (set outside this file), not this switch.
+USDC_DEPOSITS_OFFERED = "0"

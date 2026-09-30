@@ -58,10 +58,14 @@ export type RegisterResult = (typeof REGISTER_RESULTS)[number];
 
 export interface RegisterAnswer { status: 200 | 404 | 409 | 410; reason: string; message: string }
 
-/** Pure. HTTP answer for a register_wallet() result (and for the same states read before the signature is checked). */
-export function registerAnswer(r: RegisterResult, address: string | null): RegisterAnswer {
+/**
+ * Pure. HTTP answer for a register_wallet() result (and for the same states read before the signature is checked).
+ * `usdcOffered` (src/billing/top-up.ts usdcDepositsOffered): only then does the answer speak of sending USDC; otherwise
+ * it says what happened and no more, since no third-party USDC is solicited.
+ */
+export function registerAnswer(r: RegisterResult, address: string | null, usdcOffered = false): RegisterAnswer {
   switch (r) {
-    case "registered": return { status: 200, reason: "registered", message: `wallet ${address} registered: USDC it sends to the receiving address is credited to this account` };
+    case "registered": return { status: 200, reason: "registered", message: usdcOffered ? `wallet ${address} registered: USDC it sends to the receiving address is credited to this account` : `wallet ${address} registered to this account` };
     case "not_found": return { status: 404, reason: "challenge_not_found", message: "no such challenge for this account (GET /v1/account/wallet/challenge issues one)" };
     case "used": return { status: 409, reason: "challenge_used", message: "this challenge was already used; request a new one (GET /v1/account/wallet/challenge)" };
     case "expired": return { status: 410, reason: "challenge_expired", message: `this challenge expired (challenges live ${CHALLENGE_TTL_MINUTES} minutes); request a new one` };

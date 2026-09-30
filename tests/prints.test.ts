@@ -61,11 +61,11 @@ vi.mock("../src/billing/events", () => ({ noteCharge: vi.fn(async () => ({ cross
 import { app } from "../src/index";
 import { noteCharge } from "../src/billing/events";
 import { KNOWN_RELEASES, OFFICIAL_SERIES, missingAfterMs, type OfficialSeriesId } from "../src/resolve/official";
-import { chargeRequestId, isSeries, listSeries, nextRelease, observedBeforeRelease, scheduledAnswer, shapePrint, topUpHint, LIST_READ_CAP, PRINT_COLUMNS, PRINT_PRICE_CREDITS, VERIFY_HINT, type PrintRow } from "../src/api/prints";
+import { chargeRequestId, isSeries, listSeries, nextRelease, observedBeforeRelease, scheduledAnswer, shapePrint, LIST_READ_CAP, PRINT_COLUMNS, PRINT_PRICE_CREDITS, VERIFY_HINT, type PrintRow } from "../src/api/prints";
 
 const NAMES = /jev|typesafe/i;
-const env = {} as Env;
-const cardEnv = { WHOP_CHECKOUT_ENABLED: "1", WHOP_API_KEY: "whop_test_key", WHOP_PLAN_ID_50: "plan_a", WHOP_PLAN_ID_250: "plan_b" } as unknown as Env;
+const env = { RESOLVE_PUBLIC_URL: "https://resolve.example.com" } as Env;
+const cardEnv = { ...env, WHOP_CHECKOUT_ENABLED: "1", WHOP_API_KEY: "whop_test_key", WHOP_PLAN_ID_20: "plan_c", WHOP_PLAN_ID_50: "plan_a", WHOP_PLAN_ID_250: "plan_b" } as unknown as Env;
 const ctx = { waitUntil: () => undefined, passThroughOnException: () => undefined } as unknown as ExecutionContext;
 const EMPSIT = KNOWN_RELEASES["us_unemployment_rate:2026-09"]!;
 const RELEASE = Date.parse(EMPSIT.release_at);
@@ -165,7 +165,7 @@ describe("GET /v1/prints/{series}/{period}: the first print, 1 credit once per r
     expect(h.db.tables.tenants![0]!.credits_balance).toBe(299);
     // credits.low is claimed after a charge that stands, as on POST /v1/resolve
     expect(vi.mocked(noteCharge)).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(noteCharge).mock.calls[0]!.slice(1)).toEqual(["t1", charges()[0]!.request_id]);
+    expect(vi.mocked(noteCharge).mock.calls[0]!.slice(1)).toEqual(["t1", charges()[0]!.request_id, { plan: "free", base: "https://resolve.example.com" }]);
     expect(res.headers.get("x-idempotent-replay")).toBeNull();
     expect(json).not.toMatch(NAMES);
   });
@@ -199,14 +199,17 @@ describe("GET /v1/prints/{series}/{period}: the first print, 1 credit once per r
   });
 
   it("a short balance is a 402 with nothing written; the top-up names the card rail when it is offered and never the USDC address", async () => {
-    for (const [e, hint] of [[env, "See /pricing for credit packs."], [cardEnv, "Buy credits by card: POST /v1/billing/checkout, or the form at /pricing#pay-by-card."]] as const) {
+    for (const [e, hint, top] of [
+      [env, "Card checkout is not available right now: contact support (https://resolve.example.com/terms#contact) to add credits.", { method: "contact_support", page: "https://resolve.example.com/terms#contact" }],
+      [cardEnv, 'Top up by card: POST /v1/billing/checkout with {"pack": "20" | "50" | "250"} answers a checkout_url, or use the form at https://resolve.example.com/pricing#pay-by-card.', { method: "card", checkout: "POST /v1/billing/checkout", page: "https://resolve.example.com/pricing#pay-by-card" }],
+    ] as const) {
       h.db = newDb({ balance: 0 });
       const res = await get("/v1/prints/us_unemployment_rate/2026-09", {}, { ...e, USDC_RECEIVING_ADDRESS: `0x${"1".repeat(40)}` } as Env);
       expect(res.status).toBe(402);
       const b = await body(res);
       expect(b.error!.code).toBe("insufficient_credits");
       expect(b.error!.message).toBe(`A first print costs 1 credit; balance is 0. ${hint}`);
-      expect(b).toMatchObject({ balance: 0, price_credits: 1 });
+      expect(b).toMatchObject({ balance: 0, price_credits: 1, top_up: top });
       const json = JSON.stringify(b);
       expect(json).not.toMatch(/payments\/address|usdc|0x1111/i);
       expect(json).not.toContain(PRINT.deciding_text);
@@ -214,7 +217,6 @@ describe("GET /v1/prints/{series}/{period}: the first print, 1 credit once per r
       expect(h.db.tables.tenants![0]!.credits_balance).toBe(0);
       expect(vi.mocked(noteCharge)).not.toHaveBeenCalled();
     }
-    expect(topUpHint(env)).not.toMatch(/usdc|payments/i);
   });
 
   it("a replay still answers at a zero balance: the charge stands", async () => {

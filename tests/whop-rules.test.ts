@@ -6,21 +6,23 @@
  * mutation (evals/whop.ts goes red with the rail off while its controls stay green).
  */
 import { afterEach, describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import type { Env } from "../src/env";
 import {
   CARD_PACKS, PACK_IDS, checkoutUrlAllowed, decideGrant, floatCents, grantRequestIdFor, moneyCents, packPriceFor, paidCents, readRefund, reversalCredits,
   reversalRequestIdFor, usdCents, verifyWhopSignature, whopConfig, whopSignature, WhopPayment, cardCheckoutOffered,
 } from "../src/billing/whop";
-import { effectiveTiers, packQuotes } from "../src/billing/tiers";
+import { effectiveTiers, packQuotes, paygCredits } from "../src/billing/tiers";
 import { __setRailsForMutationTesting } from "../src/resolve/rails";
 import { runWhopSuite } from "../evals/whop";
 import { MIGRATION_020_CONFIG } from "./lib/fake-money";
-import { PLAN_250, PLAN_50, WHOP_SECRET, nativeRefundEvent, paymentSucceeded, refundEvent, whopMoney, whopSign } from "./lib/fake-whop";
+import { PLAN_20, PLAN_250, PLAN_50, WHOP_SECRET, nativeRefundEvent, paymentSucceeded, refundEvent, whopMoney, whopSign } from "./lib/fake-whop";
 
 const NOW = Date.parse("2026-09-30T12:00:00Z");
 const T = String(NOW / 1000);
 const BODY = '{"id":"msg_1","type":"payment.succeeded"}';
-const env = (o: Record<string, string> = {}) => ({ WHOP_PLAN_ID_50: PLAN_50, WHOP_PLAN_ID_250: PLAN_250, WHOP_API_KEY: "whop_api_key_test", WHOP_WEBHOOK_SECRET: WHOP_SECRET, WHOP_CHECKOUT_ENABLED: "1", ...o }) as unknown as Env;
+const env = (o: Record<string, string> = {}) => ({ WHOP_PLAN_ID_20: PLAN_20, WHOP_PLAN_ID_50: PLAN_50, WHOP_PLAN_ID_250: PLAN_250, WHOP_API_KEY: "whop_api_key_test", WHOP_WEBHOOK_SECRET: WHOP_SECRET, WHOP_CHECKOUT_ENABLED: "1", ...o }) as unknown as Env;
 const TENANT = "11111111-2222-4333-8444-555555555555";
 const pay = (data: Record<string, unknown> = {}, tenant: string | null = TENANT) => WhopPayment.parse(paymentSucceeded(tenant, data).data);
 
@@ -82,7 +84,7 @@ describe("the webhook signature (Standard Webhooks, keyed by the literal secret)
 describe("configuration: names, never values; a malformed value is missing", () => {
   it("a complete configuration maps each plan id to its pack and offers checkout only when switched on", () => {
     const c = whopConfig(env());
-    expect([...c.plans.entries()]).toEqual([[PLAN_50, "50"], [PLAN_250, "250"]]);
+    expect([...c.plans.entries()]).toEqual([[PLAN_20, "20"], [PLAN_50, "50"], [PLAN_250, "250"]]);
     expect(c.checkoutMissing).toEqual([]);
     expect(cardCheckoutOffered(c)).toBe(true);
     expect(cardCheckoutOffered(whopConfig(env({ WHOP_CHECKOUT_ENABLED: "0" })))).toBe(false);
@@ -91,21 +93,43 @@ describe("configuration: names, never values; a malformed value is missing", () 
     expect(whopConfig(env({ WHOP_SANDBOX: "1" }))).toMatchObject({ apiBase: "https://sandbox-api.whop.com/api/v1", checkoutOrigin: "https://sandbox.whop.com" });
   });
   it("unset, malformed or shared plan ids and an unset API key are listed by name and never offered", () => {
-    const c = whopConfig(env({ WHOP_PLAN_ID_50: "", WHOP_PLAN_ID_250: "prod_abc", WHOP_API_KEY: "" }));
-    expect(c.checkoutMissing).toEqual(["WHOP_API_KEY", "WHOP_PLAN_ID_50", "WHOP_PLAN_ID_250 (not a plan_ id)"]);
+    const c = whopConfig(env({ WHOP_PLAN_ID_20: "", WHOP_PLAN_ID_50: "", WHOP_PLAN_ID_250: "prod_abc", WHOP_API_KEY: "" }));
+    expect(c.checkoutMissing).toEqual(["WHOP_API_KEY", "WHOP_PLAN_ID_20", "WHOP_PLAN_ID_50", "WHOP_PLAN_ID_250 (not a plan_ id)"]);
     expect(c.plans.size).toBe(0);
     expect(cardCheckoutOffered(c)).toBe(false);
+    // the $20 plan alone missing keeps the card checkout closed (every pack's plan is set before it is switched on)
+    const no20 = whopConfig(env({ WHOP_PLAN_ID_20: "" }));
+    expect([no20.checkoutMissing, cardCheckoutOffered(no20)]).toEqual([["WHOP_PLAN_ID_20"], false]);
     const same = whopConfig(env({ WHOP_PLAN_ID_250: PLAN_50 }));
-    expect(same.plans.size).toBe(0);
+    expect([...same.plans.entries()]).toEqual([[PLAN_20, "20"]]); // both packs that share a plan are dropped, never guessed
     expect(same.planMissing).toEqual(expect.arrayContaining(["WHOP_PLAN_ID_50", `WHOP_PLAN_ID_250 (the same plan as WHOP_PLAN_ID_50)`]));
     expect(JSON.stringify(whopConfig(env({ WHOP_API_KEY: "" })).checkoutMissing)).not.toContain(WHOP_SECRET);
   });
-  it("the card packs are the plan §11 packs the USDC tiers of migration 020 sell: $50 = 5,000 and $250 = 27,500 credits", () => {
+  it("three card packs, each at the rate migration 020's USDC tiers credit its price: $20 = 2,000 (card only), $50 = 5,000, $250 = 27,500", () => {
     const eff = effectiveTiers(MIGRATION_020_CONFIG[0]!.value, 100);
     if (!("tiers" in eff)) throw new Error(eff.error);
-    const quotes = packQuotes(eff.tiers);
-    for (const p of PACK_IDS) expect(quotes.find((q) => Number(q.usdc) * 100 === CARD_PACKS[p].priceCents)?.credits).toBe(CARD_PACKS[p].credits);
-    expect(CARD_PACKS).toMatchObject({ "50": { priceCents: 5000, credits: 5000 }, "250": { priceCents: 25000, credits: 27500 } });
+    for (const p of PACK_IDS) expect(paygCredits((CARD_PACKS[p].priceCents / 100).toFixed(2), eff.tiers).credits, p).toBe(CARD_PACKS[p].credits);
+    expect(PACK_IDS).toEqual(["20", "50", "250"]);
+    expect(CARD_PACKS).toEqual({
+      "20": { priceCents: 2000, credits: 2000, planVar: "WHOP_PLAN_ID_20" },
+      "50": { priceCents: 5000, credits: 5000, planVar: "WHOP_PLAN_ID_50" },
+      "250": { priceCents: 25000, credits: 27500, planVar: "WHOP_PLAN_ID_250" },
+    });
+    // the invoiced and USDC packs are unchanged: $20 is a card pack only
+    expect(packQuotes(eff.tiers).map((q) => q.usdc)).toEqual(["50", "250", "1000"]);
+  });
+  it("wrangler.toml ships the $20 plan id and keeps USDC deposits off", () => {
+    const toml = readFileSync(resolve(import.meta.dirname, "../wrangler.toml"), "utf8");
+    const v = (k: string) => new RegExp(`^${k} = "([^"]*)"$`, "m").exec(toml)?.[1];
+    expect(v("WHOP_PLAN_ID_20")).toBe(PLAN_20);
+    expect(v("WHOP_PLAN_ID_20")).toBe("plan_PNgCSGmXG38KW");
+    expect(v("USDC_DEPOSITS_OFFERED")).toBe("0");
+    // absolute links in alerts, payloads and the pinned channel post; the channel link the site shows
+    expect(v("RESOLVE_PUBLIC_URL")).toBe("https://resolve.rafaemush.workers.dev");
+    expect(v("PUBLIC_CHANNEL_URL")).toBe("https://t.me/resolvefeed");
+    const shipped = whopConfig({ WHOP_PLAN_ID_20: v("WHOP_PLAN_ID_20"), WHOP_PLAN_ID_50: v("WHOP_PLAN_ID_50"), WHOP_PLAN_ID_250: v("WHOP_PLAN_ID_250") } as unknown as Env);
+    expect([...shipped.plans.values()]).toEqual(["20", "50", "250"]);
+    expect(shipped.planMissing).toEqual([]);
   });
 });
 
@@ -113,6 +137,11 @@ describe("what a payment grants", () => {
   const cfg = whopConfig(env());
   it("the pack comes from the plan id alone, then the tenant from the metadata Resolve set", () => {
     expect(decideGrant(pay(), cfg)).toEqual({ result: "grant", pack: "50", credits: 5000, tenantId: TENANT });
+    expect(decideGrant(pay({ plan_id: PLAN_20, total: whopMoney("20.00") }), cfg)).toEqual({ result: "grant", pack: "20", credits: 2000, tenantId: TENANT });
+    // $20 paid on another pack's plan, or on a plan that is no pack, grants nothing
+    expect(decideGrant(pay({ total: whopMoney("20.00") }), cfg)).toMatchObject({ result: "amount_mismatch", pack: "50" });
+    expect(decideGrant(pay({ plan_id: "plan_SomeOther20", total: whopMoney("20.00") }), cfg)).toEqual({ result: "unknown_plan", configIncomplete: false });
+    expect(decideGrant(pay({ plan_id: PLAN_20, total: whopMoney("50.00") }), cfg)).toMatchObject({ result: "amount_mismatch", pack: "20" });
     expect(decideGrant(pay({ plan_id: PLAN_250, total: whopMoney("250.00") }), cfg)).toEqual({ result: "grant", pack: "250", credits: 27500, tenantId: TENANT });
     // metadata never picks the pack: a pack claim in the metadata is ignored, and the amount must match the plan's pack
     expect(decideGrant(pay({ metadata: { resolve_tenant_id: TENANT, pack: "250" } }), cfg)).toMatchObject({ result: "grant", pack: "50", credits: 5000 });
@@ -170,6 +199,7 @@ describe("what a refund or dispute takes back", () => {
     expect(reversalCredits(5000, 1000, null)).toEqual({ credits: 5000, proportional: false });
     expect(usdCents(10, "eur")).toBeNull();
     expect(usdCents(10.5, "USD")).toBe(1050);
+    expect(packPriceFor(2000)).toBe(2000);
     expect(packPriceFor(5000)).toBe(5000);
     expect(packPriceFor(27500)).toBe(25000);
     expect(packPriceFor(4999)).toBeNull();
