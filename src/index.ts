@@ -10,6 +10,7 @@ import { webhooks } from "./api/webhooks";
 import { pub } from "./api/public";
 import { site } from "./api/site";
 import { whopWebhook, billingV1, noStore } from "./api/billing";
+import { prints } from "./api/prints";
 import { engineVersion } from "./api/public-names";
 import openapi from "./generated/openapi.json";
 
@@ -67,6 +68,7 @@ app.route("/", whopWebhook);    // public: POST /webhooks/whop, Whop's signed pa
 app.route("/internal", internal);
 v1.route("/webhooks", webhooks);
 v1.route("/billing", billingV1);
+v1.route("/prints", prints);    // GET /v1/prints and /v1/prints/{series}/{period}: first prints (src/api/prints.ts)
 app.use("/v1/billing/*", noStore); // every answer of the checkout route is no-store, the key middleware's refusals included
 app.route("/v1", v1);
 

@@ -221,7 +221,9 @@ describe("a stranger gets a working evaluation key from the form", () => {
     const text = html.replace(/<style>[\s\S]*?<\/style>/, "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ");
     for (const s of ["Your test key", "only time it is shown", "Structured verdicts only", "300 credits, valid 30 days: until 2026-10-30 12:00 UTC", "Up to 5 watches"]) expect(text).toContain(s);
     expect(html).toContain('href="/docs"');
-    expect(html).toContain("curl https://resolve.example.com/v1/account -H \"Authorization: Bearer $RESOLVE_KEY\"");
+    // the next call is the free list of first prints (GET /v1/prints), in the OpenAPI document
+    expect(html).toContain("curl https://resolve.example.com/v1/prints -H \"Authorization: Bearer $RESOLVE_KEY\"");
+    expect(html).not.toContain("/v1/account -H");
     expect(html).not.toMatch(NAMES);
     expect(JSON.stringify([...res.headers])).not.toMatch(NAMES);
     expect(html).not.toMatch(/<script/i);

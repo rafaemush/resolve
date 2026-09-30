@@ -10,6 +10,8 @@ One credit is $0.01.
 |---|---|
 | Structured verdict (machine-readable sources: GitHub API objects, Base and Solana logs, numeric thresholds) | 1 |
 | Web-evidence verdict (free-text evidence read by Resolve's evidence battery) | 5 |
+| A first print (`GET /v1/prints/{series}/{period}`: an official number as first published, with its source and hash) | 1 |
+| The list of series (`GET /v1/prints`), or a first print not recorded yet (`status: scheduled`) | 0 |
 | A request the deterministic pre-checks settle on their own (for example unsafe input, or no anchor in the evidence) | 0 |
 | A replay of the same `Idempotency-Key` | 0 (never charged twice) |
 

@@ -327,7 +327,7 @@ describe("the pages around the checkout", () => {
   });
   it("/docs explains paying by card (and says when it is not open yet); /terms says what a refund or chargeback does", async () => {
     const docs = text(await (await app.request("/docs", {}, on, ctx)).text());
-    for (const s of ["6. Pay by card", "developer data API", "merchant of record", "$50 (5,000 credits) and $250 (27,500 credits)", "non-refundable prepayment for API services", "do not expire while the account is open", "refunded or charged back, the credits it bought are removed", "Your key is never sent to Whop"]) expect(docs).toContain(s);
+    for (const s of ["7. Pay by card", "developer data API", "merchant of record", "$50 (5,000 credits) and $250 (27,500 credits)", "non-refundable prepayment for API services", "do not expire while the account is open", "refunded or charged back, the credits it bought are removed", "Your key is never sent to Whop"]) expect(docs).toContain(s);
     expect(docs).not.toContain("Card checkout is not open yet");
     expect(text(await (await app.request("/docs", {}, off, ctx)).text())).toContain("Card checkout is not open yet");
     const terms = text(await (await app.request("/terms", {}, off, ctx)).text());

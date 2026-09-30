@@ -29,6 +29,7 @@ import { authenticateKey, perKeyRpm, rateLimit } from "./auth";
 import { alert } from "../ops/alerts";
 import { maskEmail } from "../ops/redact";
 import { EVALUATION_KEY_DAYS, EVALUATION_WATCH_LIMIT, FREE_EVALUATION_CREDITS } from "./keys";
+import { PRINT_PRICE_CREDITS } from "./prints";
 import { issueEvaluationKey, type AutoKeyOutcome } from "./evaluation-key";
 import { CARD_PACKS, PACK_IDS, cardCheckoutOffered, isPackId, usd, whopConfig, type WhopConfig } from "../billing/whop";
 import { checkoutRefusal, startCheckout } from "./billing";
@@ -445,6 +446,7 @@ export function pricingHtml(o: { packs: PaygCredit[] | null; channel: string | n
 <ul>
 <li>A structured verdict (machine-readable sources such as official releases, GitHub objects, on-chain logs): <strong>1 credit</strong>.</li>
 <li>A web-evidence verdict (free-text evidence): <strong>5 credits</strong>.</li>
+<li>A first print (<code>GET /v1/prints/{series}/{period}</code>: an official number as first published, with its source and hash): <strong>${PRINT_PRICE_CREDITS} credit</strong>. The list of series, and a release not recorded yet: 0 credits.</li>
 <li>A request the pre-checks settle on their own, or a replay of the same <code>Idempotency-Key</code>: 0 credits.</li>
 <li>A verdict that fails because an upstream is unavailable is refunded in credits.</li>
 </ul>
@@ -487,6 +489,40 @@ site.get("/pricing", (c) => cached(c, "/pricing?site=1", async () => {
 
 // ---- GET /docs -----------------------------------------------------------------------------------------------------
 
+/** The quickstart's first print: the September 2026 US unemployment rate, released on the Employment Situation day. */
+export const QUICKSTART_PRINT = { series: "us_unemployment_rate", period: "2026-09" } as const satisfies { series: OfficialSeriesId; period: string };
+const QUICKSTART_RELEASE = KNOWN_RELEASES[`${QUICKSTART_PRINT.series}:${QUICKSTART_PRINT.period}`]!;
+
+/**
+ * The official-release registration of the quickstart: the shape of a leg the rail registers from a real ladder (the
+ * "≤3.8%" leg of Polymarket's September 2026 unemployment-rate event, private/shadow-markets/
+ * seed-official-bls-polymarket-2026-09-27.json), as a tenant's own market: platform custom, its own external_id and
+ * condition, and the registry's scheduled release (registration refuses any other release_at for a known event). Its
+ * deadline is the date the market texts stop waiting for the September print (the registry's fallback_until).
+ * tests/site.test.ts runs it through validateRegistration.
+ */
+export const DOCS_OFFICIAL_MARKET_EXAMPLE = {
+  platform: "custom", external_id: "demo-us-unemployment-2026-09-le-3.8",
+  // no apostrophe anywhere in the example: the page sends it inside a single-quoted shell argument
+  condition: `Leg "≤3.8%" of "September 2026 US unemployment rate": resolves Yes iff the first print of ${OFFICIAL_SERIES[QUICKSTART_PRINT.series].label} for ${QUICKSTART_PRINT.period}, at the one decimal it is published with, falls in this bucket; otherwise No (another bucket was printed).`,
+  event_statement: `${OFFICIAL_SERIES[QUICKSTART_PRINT.series].label} for ${QUICKSTART_PRINT.period} is in the bucket "≤3.8%"`,
+  option_a: "Yes", option_b: "No", positive_option: "OPTION_A",
+  anchors: [QUICKSTART_PRINT.series],
+  sources: [{ kind: "official_release", ref: `official:${QUICKSTART_PRINT.series}:${QUICKSTART_PRINT.period}` }],
+  open_at: "2026-09-01T00:00:00Z", deadline_utc: QUICKSTART_RELEASE.fallback_until!, grace_seconds: 3600,
+  resolver: {
+    kind: "official_release", series: QUICKSTART_PRINT.series, period: QUICKSTART_PRINT.period, release_at: QUICKSTART_RELEASE.release_at,
+    bucket: { label: "≤3.8%", hi: 3.8, hi_inclusive: true, lo_inclusive: true }, rounding: OFFICIAL_SERIES[QUICKSTART_PRINT.series].rounding,
+  },
+  negative_rule: "explicit_negative", allow_prerelease: false,
+} as const;
+
+/**
+ * Other sources, resolved in one call with the caller's own evidence (POST /v1/resolve {market, evidence}): an
+ * ILLUSTRATION, labelled so on the page. octo-org/octo-repo and PR #4821 are placeholders, and the evidence is the shape
+ * of GitHub's pull request JSON (the fields the github_pr_merged resolver reads, as in evals case A-001).
+ * tests/site.test.ts resolves it through the pipeline.
+ */
 export const DOCS_MARKET_EXAMPLE = {
   platform: "custom", external_id: "demo-pr-4821",
   condition: "Will PR #4821 in octo-org/octo-repo be merged before 2026-12-01 00:00 UTC?",
@@ -495,12 +531,19 @@ export const DOCS_MARKET_EXAMPLE = {
   anchors: ["octo-org/octo-repo", "#4821"],
   sources: [{ kind: "github_api", ref: "repos/octo-org/octo-repo/pulls/4821" }],
   resolver: { kind: "github_pr_merged", repo: "octo-org/octo-repo", pr: 4821 },
-  open_at: "2026-10-01T00:00:00Z", deadline_utc: "2026-12-01T00:00:00Z",
+  open_at: "2026-09-01T00:00:00Z", deadline_utc: "2026-12-01T00:00:00Z",
+} as const;
+export const DOCS_INLINE_EVIDENCE_EXAMPLE = {
+  source_kind: "github_api", source_url: "https://api.github.com/repos/octo-org/octo-repo/pulls/4821",
+  structured: { number: 4821, state: "closed", merged: true, merged_at: "2026-09-20T14:03:11Z", title: "Add retries to the streaming client (#4821) octo-org/octo-repo", base: { repo: { full_name: "octo-org/octo-repo" } } },
+  observed_at: "2026-09-21T10:00:00Z",
 } as const;
 
 export function docsHtml(o: { base: string; channel: string | null; card?: boolean }): string {
   const b = esc(o.base);
-  const market = esc(JSON.stringify(DOCS_MARKET_EXAMPLE, null, 2));
+  const q = QUICKSTART_PRINT;
+  const official = esc(JSON.stringify(DOCS_OFFICIAL_MARKET_EXAMPLE, null, 2));
+  const inline = esc(JSON.stringify({ market: DOCS_MARKET_EXAMPLE, evidence: DOCS_INLINE_EVIDENCE_EXAMPLE }, null, 2));
   const body = `<h1>Quickstart</h1>
 <p class="lede">Every call below is in the <a href="/openapi.json">OpenAPI document</a>. Authenticate with <code>Authorization: Bearer &lt;key&gt;</code> (or <code>X-Api-Key</code>).</p>
 <h2>1. Request a key</h2>
@@ -509,18 +552,27 @@ export function docsHtml(o: { base: string; channel: string | null; card?: boole
   -H 'content-type: application/json' \\
   -d '{"name":"Ada","email":"ada@example.com","company":"Example Bots","purpose":"Settle CPI markets for our bot"}'</pre>
 <p>The answer carries a test key, once (<code>data.key</code>; the form shows it on the next page). Store it then: Resolve keeps only its hash. A test key starts with <code>rsl_test_</code> and carries ${int(FREE_EVALUATION_CREDITS)} credits for ${EVALUATION_KEY_DAYS} days, for structured verdicts, with up to ${EVALUATION_WATCH_LIMIT} watches. One key per email address every ${EVALUATION_KEY_DAYS} days; when a key cannot be issued on the spot (<code>key_issued: false</code>), a person reads the request and answers by email.</p>
-<h2>2. Register a market</h2>
+<h2 id="first-print">2. Read a first print</h2>
+<pre>curl ${b}/v1/prints/${q.series}/${q.period} -H "Authorization: Bearer $RESOLVE_KEY"</pre>
+<p>${esc(OFFICIAL_SERIES[q.series].label)} for ${esc(q.period)}, as the publisher first releases it. Until its scheduled release, ${esc(utc(QUICKSTART_RELEASE.release_at))}, the answer is <code>status: "scheduled"</code> with <code>release_at</code>, for 0 credits. Once Resolve has read the release from the publisher's own site, the answer is the first print, for ${PRINT_PRICE_CREDITS} credit: <code>value</code>, <code>value_text</code> (the number as published), <code>deciding_text</code> (the text it was read from), <code>observed_at</code>, <code>release_at</code>, <code>source_url</code>, <code>raw_sha256</code> (the SHA-256 of the response body Resolve read) and <code>corroboration.status</code> (what a second official source said), with <code>credits_charged</code> and <code>balance</code>. A first print is never revised. A replay with the same <code>Idempotency-Key</code> is free.</p>
+<p><code>GET /v1/prints</code> lists every series, its latest first print and its next scheduled release, for free.</p>
+<h2>3. Register a market on that release and resolve it</h2>
 <pre>curl -X POST ${b}/v1/markets \\
   -H "Authorization: Bearer $RESOLVE_KEY" -H 'content-type: application/json' \\
-  -d '${market}'</pre>
-<p>The answer carries <code>market_id</code>, <code>status</code> and the watches created. Registering the same <code>external_id</code> again returns the existing market.</p>
-<h2>3. Resolve it</h2>
+  -d '${official}'</pre>
+<p>The answer carries <code>market_id</code> and the one watch Resolve keeps on the release. <code>release_at</code> must be the scheduled release of that period; registering the same <code>external_id</code> again returns the existing market. Then:</p>
 <pre>curl -X POST ${b}/v1/resolve \\
   -H "Authorization: Bearer $RESOLVE_KEY" -H 'content-type: application/json' \\
   -H 'Idempotency-Key: 9f1c0b9e-demo' \\
   -d '{"market_id":"&lt;market_id&gt;","fetch":true}'</pre>
-<p>The verdict carries <code>resolution_status</code> (RESOLVED, UNRESOLVED or ERROR), <code>winning_outcome</code>, <code>confidence_score</code> and <code>caveats</code>, plus <code>credits_charged</code> and <code>balance</code>. A replay of the same <code>Idempotency-Key</code> is never charged twice.</p>
-<h2>4. Follow a public market and receive webhooks</h2>
+<p>Before the release there is nothing to decide from yet: the answer is 404 <code>not_found</code> (no evidence stored for this market yet) and nothing is charged. From the release on, the same call decides from the stored first print: <code>resolution_status</code> RESOLVED with <code>winning_outcome</code> OPTION_A (Yes) or OPTION_B (No), <code>confidence_score</code> and <code>caveats</code>, and <code>credits_charged</code> (at most 1 credit) and <code>balance</code>. A replay of the same <code>Idempotency-Key</code> is never charged twice.</p>
+<h2>4. Other sources: resolve in one call with your own evidence</h2>
+<p class="note">Illustration: the repository and pull request below are placeholders. Put your own market and the JSON the GitHub API returned for it.</p>
+<pre>curl -X POST ${b}/v1/resolve \\
+  -H "Authorization: Bearer $RESOLVE_KEY" -H 'content-type: application/json' \\
+  -d '${inline}'</pre>
+<p>The market is registered (without a watch) and resolved from the evidence you pass, in one call: a structured verdict, 1 credit.</p>
+<h2>5. Follow a public market and receive webhooks</h2>
 <pre>curl -X POST ${b}/v1/webhooks \\
   -H "Authorization: Bearer $RESOLVE_KEY" -H 'content-type: application/json' \\
   -d '{"url":"https://example.com/resolve-hook","events":["shadow.committed","shadow.revealed"]}'
@@ -537,12 +589,12 @@ function verify(rawBody, header, secret, toleranceSeconds = 300) {
   const got = String(parts.v1 ?? "");
   return got.length === expected.length &amp;&amp; timingSafeEqual(Buffer.from(got), Buffer.from(expected));
 }</pre>
-<h2>5. Verify a commitment</h2>
+<h2>6. Verify a commitment</h2>
 <pre>curl '${b}/v1/track-record/verify?hash=&lt;commitment sha256&gt;'</pre>
 <p>After the reveal the answer includes <code>preimage</code>. Recompute the hash and compare:</p>
 <pre>printf '%s' "$PREIMAGE" | shasum -a 256</pre>
 <p>The output must equal <code>commitment_sha256</code>. The whole record is at <a href="/record">/record</a>.</p>
-<h2 id="pay-by-card">6. Pay by card</h2>
+<h2 id="pay-by-card">7. Pay by card</h2>
 <p>Resolve is a developer data API, paid for in credits. The ${PACK_IDS.map((k) => `${esc(dollars(CARD_PACKS[k].priceCents))} (${esc(int(CARD_PACKS[k].credits))} credits)`).join(" and ")} packs can be paid by card through Whop, which processes the payment as the merchant of record. Open a checkout for the account of your key:</p>
 <pre>curl -X POST ${b}/v1/billing/checkout \\
   -H "Authorization: Bearer $RESOLVE_KEY" -H 'content-type: application/json' \\
@@ -550,7 +602,7 @@ function verify(rawBody, header, secret, toleranceSeconds = 300) {
 <p>Send the buyer to <code>data.checkout_url</code> (the <a href="/pricing#pay-by-card">pricing page</a> has the same as a form). Whop tells Resolve when the payment is confirmed, and the credits are added to the account then, usually within a minute: <code>GET /v1/account</code> shows the balance. Your key is never sent to Whop. A free test key's account becomes pay as you go with its first pack, and the key stops expiring.</p>
 <p>Credits are a non-refundable prepayment for API services. They pay for this API only: they cannot be withdrawn or moved to another account, and they do not expire while the account is open. If a card payment is refunded or charged back, the credits it bought are removed from the account.</p>
 ${o.card ? "" : `<p class="note">Card checkout is not open yet: until it is, <code>POST /v1/billing/checkout</code> answers 503.</p>\n`}`;
-  return layout({ title: "Docs · Resolve", path: "/docs", description: "Resolve quickstart: request a key, register a market, resolve it, receive webhooks and verify a commitment.", body, channel: o.channel });
+  return layout({ title: "Docs · Resolve", path: "/docs", description: "Resolve quickstart: request a key, read a first print, register a market on an official release and resolve it, receive webhooks and verify a commitment.", body, channel: o.channel });
 }
 
 const baseUrl = (c: Context<{ Bindings: Env; Variables: Vars }>) => (c.env.RESOLVE_PUBLIC_URL?.replace(/\/+$/, "") || new URL(c.req.url).origin);
@@ -618,9 +670,9 @@ export function keyIssuedHtml(o: { key: string; expiresAt: string; base: string;
 <li>Up to ${EVALUATION_WATCH_LIMIT} watches.</li>
 </ul>
 <h2>Next</h2>
-<p>Send it as <code>Authorization: Bearer &lt;key&gt;</code> (or <code>X-Api-Key</code>). Check it:</p>
-<pre>curl ${esc(o.base)}/v1/account -H "Authorization: Bearer $RESOLVE_KEY"</pre>
-<p>The <a href="/docs">quickstart</a> registers a market, resolves it and sets up webhooks. <a href="/pricing">Pricing</a> lists what comes after the test key.</p>`;
+<p>Send it as <code>Authorization: Bearer &lt;key&gt;</code> (or <code>X-Api-Key</code>). Your first call lists every official series Resolve records, with its latest first print and its next scheduled release, for free:</p>
+<pre>curl ${esc(o.base)}/v1/prints -H "Authorization: Bearer $RESOLVE_KEY"</pre>
+<p>The <a href="/docs">quickstart</a> reads a first print, registers a market on an official release, resolves it and sets up webhooks. <a href="/pricing">Pricing</a> lists what comes after the test key.</p>`;
   return layout({ title: "Your test key · Resolve", path: "/v1/request-key", description: "Your Resolve test key.", body, channel: o.channel });
 }
 
@@ -742,6 +794,7 @@ site.post("/v1/request-key", async (c) => {
     return ok(c, {
       received: true, key_issued: true, key: issued.key, key_id: issued.keyId, environment: "test", plan: "free", credits: issued.credits,
       watch_limit: EVALUATION_WATCH_LIMIT, expires_at: issued.expiresAt, docs: `${baseUrl(c)}/docs`,
+      next: "GET /v1/prints (free): every official series, its latest first print and its next scheduled release",
       note: "Shown once: Resolve keeps only its hash. Structured verdicts only.",
     });
   }

@@ -1,8 +1,9 @@
 /**
  * Stand-ins for migration 020's money functions, step for step in the SQL's order, over the in-memory database
  * (tests/lib/fake-db.ts): credit_from_deposit (tier rate), match_deposit, claim_low_credit_notice,
- * release_low_credit_notice, register_wallet, and the credit_ledger_low_credit_reset trigger (ledgerInsert); and
- * migration 004's grant_credits with the ledger's UNIQUE(reason, request_id) (idx_ledger_reason_request). They exist
+ * release_low_credit_notice, register_wallet, and the credit_ledger_low_credit_reset trigger (ledgerInsert); migration
+ * 004's grant_credits with the ledger's UNIQUE(reason, request_id) (idx_ledger_reason_request); and migration 022's
+ * charge_read (proven on Postgres by scripts/selftest/prints.ts). They exist
  * so the routes and jobs can be tested end to end without Postgres; the SQL itself is proven by scripts/selftest/money.ts.
  * Run inside fakeDb's rpc(): one subrequest, rolled back on error.
  */
@@ -98,6 +99,29 @@ export async function grantCredits(db: FakeDb, a: Record<string, any>): Promise<
   return { data: t.credits_balance, error: null };
 }
 
+/**
+ * charge_read (migration 022), step for step: the argument checks (22023), a replay when this request id's charge
+ * already stands (another tenant's: RS003), else the conditional debit (a short balance or a deleted tenant: ok false,
+ * nothing written) and one 'charge' ledger row under UNIQUE(reason, request_id).
+ */
+export async function chargeRead(db: FakeDb, a: Record<string, any>): Promise<{ data: any; error: any }> {
+  if (!a.p_tenant || a.p_amount == null || a.p_amount < 1) return fail("22023", `charge_read: tenant and a positive amount are required, got amount ${a.p_amount}`);
+  if (typeof a.p_request_id !== "string" || !/^[a-z_]+:.+/.test(a.p_request_id) || a.p_request_id.length > 300) return fail("22023", 'charge_read: request_id must be "<kind>:<id>" (at most 300 characters)');
+  const tenants = table(db, "tenants");
+  const balanceOf = (live: boolean) => tenants.find((t) => t.id === a.p_tenant && (!live || !t.deleted_at))?.credits_balance ?? null;
+  const led = table(db, "credit_ledger").find((l) => l.reason === "charge" && l.request_id === a.p_request_id);
+  if (led) {
+    if (led.tenant_id !== a.p_tenant) return fail("RS003", "charge_read: this request id was charged to another tenant");
+    return { data: [{ ok: true, replayed: true, charged: 0, balance: balanceOf(false) }], error: null };
+  }
+  const t = tenants.find((x) => x.id === a.p_tenant && !x.deleted_at && x.credits_balance >= a.p_amount);
+  if (!t) return { data: [{ ok: false, replayed: false, charged: 0, balance: balanceOf(true) ?? 0 }], error: null };
+  t.credits_balance -= a.p_amount;
+  const l = ledgerInsert(db, { tenant_id: t.id, delta: -a.p_amount, reason: "charge", request_id: a.p_request_id, balance_after: t.credits_balance, note: "read" });
+  if ("error" in l) return { data: null, error: l.error };
+  return { data: [{ ok: true, replayed: false, charged: a.p_amount, balance: t.credits_balance }], error: null };
+}
+
 export async function claimLowCreditNotice(db: FakeDb, a: Record<string, any>): Promise<{ data: any; error: any }> {
   const raw = table(db, "app_config").find((r) => r.key === "low_credit_threshold")?.value;
   if (raw !== undefined && !/^\d{1,9}$/.test(String(raw).trim())) return fail("RS004", `app_config low_credit_threshold must be a whole number of credits, got ${raw}`);
@@ -134,7 +158,7 @@ export async function registerWallet(db: FakeDb, a: Record<string, any>): Promis
 
 export const MONEY_RPCS: NonNullable<FakeDbOptions["rpc"]> = {
   credit_from_deposit: creditFromDeposit, match_deposit: matchDeposit, claim_low_credit_notice: claimLowCreditNotice,
-  release_low_credit_notice: releaseLowCreditNotice, register_wallet: registerWallet, grant_credits: grantCredits,
+  release_low_credit_notice: releaseLowCreditNotice, register_wallet: registerWallet, grant_credits: grantCredits, charge_read: chargeRead,
 };
 
 /** The app_config rows migration 020 inserts. */

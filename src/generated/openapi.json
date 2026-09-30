@@ -1573,6 +1573,244 @@
         }
       }
     },
+    "/v1/prints": {
+      "get": {
+        "summary": "Every official series Resolve records first prints for (79 series): series, label, unit (what value is), period_format, latest {period, observed_at, read} (the latest period recorded; null before the first) and next_release {period, release_at, read} (the soonest scheduled release; null when none is scheduled). Free: 0 credits",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "series[] {series, label, unit, period_format, latest, next_release}, count, credits_charged (0), price_credits {list, print}, read",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "auth_required | invalid_key | key_expired",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "rate_limited | daily_cap_reached",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "UPSTREAM_UNAVAILABLE: the first-print store could not be read",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/prints/{series}/{period}": {
+      "get": {
+        "summary": "The first print of one official release, as Resolve recorded it the first time it read the publisher's release (never revised): value (see unit in GET /v1/prints), value_text (as published), deciding_text (the text it was read from), observed_at (when Resolve first read it), release_at (the scheduled release; null when not in the calendar), source_url, raw_sha256 (the SHA-256 of the upstream response body Resolve read), corroboration.status (agree | disagree | unavailable | inconclusive | single_source; null when none was recorded) and verify. 1 credit per served print, charged once per request: a replay of the same Idempotency-Key for the same print is free (replayed=true, X-Idempotent-Replay: true). Before the release, or while Resolve has not recorded it yet (up to 6 h after the release; 72 h for an election count): status scheduled with release_at, 0 credits. Free keys may call it",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "series",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "us_cpi_u_nsa_yoy",
+                "us_cpi_u_sa_mom",
+                "us_core_cpi_nsa_yoy",
+                "us_core_cpi_sa_mom",
+                "us_unemployment_rate",
+                "us_nonfarm_payrolls_change",
+                "us_ppi_fd_nsa_yoy",
+                "fomc_upper_bound",
+                "ecb_dfr",
+                "boe_bank_rate",
+                "bok_base_rate",
+                "kr_gdp_advance_yoy",
+                "bcb_selic_target",
+                "br_pres_r1_first_ac",
+                "br_pres_r1_first_al",
+                "br_pres_r1_first_ap",
+                "br_pres_r1_first_am",
+                "br_pres_r1_first_ba",
+                "br_pres_r1_first_ce",
+                "br_pres_r1_first_df",
+                "br_pres_r1_first_es",
+                "br_pres_r1_first_go",
+                "br_pres_r1_first_ma",
+                "br_pres_r1_first_mt",
+                "br_pres_r1_first_ms",
+                "br_pres_r1_first_mg",
+                "br_pres_r1_first_pa",
+                "br_pres_r1_first_pb",
+                "br_pres_r1_first_pr",
+                "br_pres_r1_first_pe",
+                "br_pres_r1_first_pi",
+                "br_pres_r1_first_rj",
+                "br_pres_r1_first_rn",
+                "br_pres_r1_first_rs",
+                "br_pres_r1_first_ro",
+                "br_pres_r1_first_rr",
+                "br_pres_r1_first_sc",
+                "br_pres_r1_first_sp",
+                "br_pres_r1_first_se",
+                "br_pres_r1_first_to",
+                "br_pres_r1_winner",
+                "br_pres_r1_third",
+                "br_pres_r1_fourth",
+                "br_pres_r1_margin",
+                "br_pres_r1_turnout",
+                "br_pres_r1_share_lula",
+                "br_pres_r1_share_flavio_bolsonaro",
+                "br_pres_r1_share_renan_santos",
+                "br_pres_r1_share_augusto_cury",
+                "qc_riding_119",
+                "qc_riding_137",
+                "qc_riding_141",
+                "qc_riding_151",
+                "qc_riding_179",
+                "qc_riding_199",
+                "qc_riding_227",
+                "qc_riding_281",
+                "qc_riding_307",
+                "qc_riding_317",
+                "qc_riding_319",
+                "qc_riding_577",
+                "qc_riding_693",
+                "qc_riding_697",
+                "qc_riding_709",
+                "qc_riding_749",
+                "qc_riding_751",
+                "qc_riding_757",
+                "qc_riding_767",
+                "qc_riding_791",
+                "qc_riding_799",
+                "qc_seats_caq",
+                "qc_seats_pq",
+                "qc_seats_plq",
+                "qc_seats_pcq",
+                "qc_second_place",
+                "qc_third_place",
+                "qc_pq_majority",
+                "qc_pvq_seat",
+                "qc_seat_margin"
+              ]
+            }
+          },
+          {
+            "name": "period",
+            "in": "path",
+            "required": true,
+            "description": "The series' period_format (GET /v1/prints): YYYY-MM for a monthly print, YYYY-Qn for a quarterly one, YYYY-MM-DD for a decision or election day",
+            "schema": {
+              "type": "string",
+              "pattern": "^\\d{4}-(\\d{2}(-\\d{2})?|Q[1-4])$"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "status recorded: series, period, value, value_text, deciding_text, observed_at, release_at, source_url, raw_sha256, corroboration {status} or null, verify, credits_charged (1, or 0 on a replay), balance, replayed; or status scheduled: series, period, release_at, note, credits_charged (0), balance",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "auth_required | invalid_key | key_expired",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "insufficient_credits (balance, price_credits at top level): nothing charged, nothing served",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not_found: an unknown series, a period not in the series' format, or no first print recorded and none scheduled; nothing charged",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "rate_limited | daily_cap_reached",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "UPSTREAM_UNAVAILABLE: the first-print store or billing could not be reached; nothing charged, nothing served",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/resolutions/{id}": {
       "get": {
         "summary": "One resolution by request_id",
@@ -2420,7 +2658,7 @@
         },
         "responses": {
           "200": {
-            "description": "received=true, key_issued, note; when key_issued: key (shown once, never stored), key_id, environment, plan, credits, watch_limit, expires_at, docs (JSON); for a form post, an HTML page with the key or a confirmation. Never cached",
+            "description": "received=true, key_issued, note; when key_issued: key (shown once, never stored), key_id, environment, plan, credits, watch_limit, expires_at, docs, next (JSON); for a form post, an HTML page with the key or a confirmation. Never cached",
             "content": {
               "application/json": {
                 "schema": {

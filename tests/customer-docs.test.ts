@@ -2,12 +2,16 @@
  * Customer-facing text (plan §17.5, MCA §2.3(a)): the pilot pack, the invoice / pilot-letter / W-9 templates, the
  * pricing page and the /bot page never name the model, never say "DCM-grade" or quote "24–72 h", never state an
  * accuracy figure, describe credits as a non-refundable prepayment for API services, and carry placeholders instead of
- * personal data.
+ * personal data. The quickstart (/docs), the key page and the first-print answers (plan §22.3 items 3 and 6) keep the
+ * same rules, never call credits "lifetime", and never point a tenant to the USDC address.
  */
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { botPageHtml } from "../src/api/bot";
+import { docsHtml, keyIssuedHtml, pricingHtml } from "../src/api/site";
+import { VERIFY_HINT, listSeries, scheduledAnswer, topUpHint } from "../src/api/prints";
+import type { Env } from "../src/env";
 import { RESOLVE_BOT_UA } from "../src/ops/ua";
 
 const ROOT = resolve(import.meta.dirname, "..");
@@ -69,5 +73,46 @@ describe("customer-facing documents", () => {
   });
   it("the pilot letter fits one page (under 650 words)", () => {
     expect(texts["docs/templates/pilot-letter.md"]!.split(/\s+/).filter(Boolean).length).toBeLessThan(650);
+  });
+});
+
+describe("the quickstart, the key page and the first-print answers", () => {
+  const base = "https://resolve.example.com";
+  const pages: Record<string, string> = {
+    "/docs": docsHtml({ base, channel: null, card: true }),
+    "/docs (card not open)": docsHtml({ base, channel: null, card: false }),
+    "the key page": keyIssuedHtml({ key: `rsl_test_${"a".repeat(32)}`, expiresAt: "2026-10-31T00:00:00Z", base, channel: null }),
+    "/pricing": pricingHtml({ packs: null, channel: null, card: { base } }),
+    "GET /v1/prints": JSON.stringify(listSeries(Date.parse("2026-10-01T00:00:00Z"), [])),
+    "a scheduled print": JSON.stringify(scheduledAnswer("us_unemployment_rate", "2026-09", Date.parse("2026-10-01T00:00:00Z"))),
+    "the verify hint": VERIFY_HINT,
+    "the 402 top-up (card open)": topUpHint({ WHOP_CHECKOUT_ENABLED: "1", WHOP_API_KEY: "k", WHOP_PLAN_ID_50: "plan_a", WHOP_PLAN_ID_250: "plan_b", USDC_RECEIVING_ADDRESS: `0x${"1".repeat(40)}` } as unknown as Env),
+    "the 402 top-up (card not open)": topUpHint({ USDC_RECEIVING_ADDRESS: `0x${"1".repeat(40)}` } as unknown as Env),
+  };
+  it("never name the model or its vendor, and state no accuracy figure", () => {
+    for (const [p, t] of Object.entries(pages)) {
+      expect(t, p).not.toMatch(/\bjev\b|typesafe/i);
+      expect(t, p).not.toMatch(/\d+(\.\d+)?\s*%\s*(accura|precis|correct|right)|(accura|precis)\w*\s*(of|is|at)\s*\d/i);
+    }
+  });
+  it("credits: a non-refundable prepayment for API services that does not expire while the account is open; never lifetime", () => {
+    for (const p of ["/docs", "/pricing"]) {
+      expect(pages[p], p).toMatch(/non-refundable prepayment for API services/);
+      expect(pages[p], p).toMatch(/do not expire while the account is open/);
+    }
+    for (const [p, t] of Object.entries(pages)) expect(t, p).not.toMatch(/lifetime/i);
+  });
+  it("never point a tenant to the USDC address: no /v1/payments/address, no receiving address, no USDC", () => {
+    for (const [p, t] of Object.entries(pages)) {
+      expect(t, p).not.toMatch(/payments\/address/);
+      expect(t, p).not.toMatch(/0x[0-9a-f]{40}/i);
+    }
+    for (const p of ["/docs", "/docs (card not open)", "the key page", "GET /v1/prints", "a scheduled print", "the verify hint", "the 402 top-up (card open)", "the 402 top-up (card not open)"]) expect(pages[p], p).not.toMatch(/usdc/i);
+  });
+  it("the quickstart leads with the official-release product: a first print before any market, the GitHub example labelled an illustration", () => {
+    const d = pages["/docs"]!;
+    expect(d.indexOf("/v1/prints/us_unemployment_rate/2026-09")).toBeLessThan(d.indexOf("/v1/markets"));
+    expect(d).toMatch(/Illustration: the repository and pull request below are placeholders/);
+    expect(pages["the key page"]).toContain("/v1/prints -H");
   });
 });

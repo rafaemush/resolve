@@ -16,7 +16,12 @@ vi.mock("../src/ops/alerts", () => ({ alert: vi.fn(async (_env: unknown, key: st
 
 import { app } from "../src/index";
 import { MarketRegistration } from "../src/resolve/schema";
-import { DOCS_MARKET_EXAMPLE, maskEmail, officialReleaseAt, SITE_CSP, summarizeRecord, upcomingReleases } from "../src/api/site";
+import { DOCS_INLINE_EVIDENCE_EXAMPLE, DOCS_MARKET_EXAMPLE, DOCS_OFFICIAL_MARKET_EXAMPLE, QUICKSTART_PRINT, maskEmail, officialReleaseAt, SITE_CSP, summarizeRecord, upcomingReleases } from "../src/api/site";
+import { validateRegistration } from "../src/markets/register";
+import { registrationPolicyIssues } from "../src/markets/policy";
+import { EvidenceInput } from "../src/resolve/schema";
+import { thresholdsFromEnv } from "../src/resolve/thresholds";
+import { resolveMarket } from "../src/resolve";
 import { KNOWN_RELEASES } from "../src/resolve/official";
 
 const NAMES = /jev|typesafe/i;
@@ -74,7 +79,9 @@ describe("pages", () => {
         const html = await res.text();
         expect(html).not.toMatch(NAMES);
         expect(JSON.stringify([...res.headers])).not.toMatch(NAMES);
-        expect(html).not.toMatch(/<script|https?:\/\/(?!t\.me\/resolve_feed|example\.com|localhost)[a-z]/i);
+        // no script, no external asset or link: only the channel, example.com, localhost, and the GitHub API URL of the
+        // /docs illustration's evidence (a value inside a code sample, not a link)
+        expect(html).not.toMatch(/<script|https?:\/\/(?!t\.me\/resolve_feed|example\.com|localhost|api\.github\.com\/repos\/octo-org\/)[a-z]/i);
         expect(h.db.calls.length).toBeLessThanOrEqual(3);
         expect(html).toContain('href="https://t.me/resolve_feed"');
       });
@@ -205,16 +212,56 @@ describe("pages", () => {
     expect(t).not.toMatch(/0x[0-9a-f]{40}/i);
   });
 
-  it("/docs: the registration example is a valid market; the signature snippet matches the header format", async () => {
-    expect(MarketRegistration.safeParse(DOCS_MARKET_EXAMPLE).success).toBe(true);
+  it("/docs: the signature snippet matches the header format; the key terms are the code's", async () => {
     h.db = fakeDb({});
     const html = await (await app.request("/docs", {}, env, ctx)).text();
     expect(html).toContain("X-Resolve-Signature: t=&lt;unix seconds&gt;,v1=&lt;hex&gt;");
-    for (const p of ["/v1/request-key", "/v1/markets", "/v1/resolve", "/v1/webhooks", "/follow", "/v1/track-record/verify"]) expect(html).toContain(p);
+    for (const p of ["/v1/request-key", "/v1/prints/us_unemployment_rate/2026-09", "/v1/markets", "/v1/resolve", "/v1/webhooks", "/follow", "/v1/track-record/verify"]) expect(html).toContain(p);
     // the key comes back in the answer (tests/instant-key.test.ts), with the terms the code issues
     expect(html).toContain("The answer carries a test key, once (<code>data.key</code>");
     expect(html).toContain("carries 300 credits for 30 days, for structured verdicts, with up to 5 watches");
     expect(html).not.toContain("sends the key by email");
+  });
+
+  it("/docs quickstart: key, then ONE curl that returns a first print, then an official-release market and its resolve, then the inline path; the GitHub example only after, labelled an illustration", async () => {
+    h.db = fakeDb({});
+    const html = await (await app.request("/docs", {}, env, ctx)).text();
+    const curls = [...html.matchAll(/<pre>(curl[^<]*?)(?:<\/pre>|\n\n)/g)].map((m) => m[1]!.replace(/\s+/g, " "));
+    expect(curls[0]).toContain("/v1/request-key");
+    expect(curls[1]).toBe(`curl http://localhost/v1/prints/${QUICKSTART_PRINT.series}/${QUICKSTART_PRINT.period} -H "Authorization: Bearer $RESOLVE_KEY"`);
+    expect(curls[2]).toContain("/v1/markets");
+    expect(curls[2]).toContain("&quot;official:us_unemployment_rate:2026-09&quot;");
+    expect(curls[3]).toContain("/v1/resolve");
+    expect(curls[3]).toContain("&quot;fetch&quot;:true".replace(/&quot;/g, '"'));
+    expect(curls[4]).toContain("/v1/resolve");
+    expect(curls[4]).toContain("&quot;evidence&quot;");
+    // the scheduled answer names the registry's release time, from code
+    expect(html).toContain(`Until its scheduled release, 2026-10-02 12:30 UTC, the answer is <code>status: "scheduled"</code>`);
+    // the made-up GitHub PR is not the quickstart's market any more: it appears only in the labelled illustration
+    const pr = html.indexOf("octo-org/octo-repo");
+    expect(pr).toBeGreaterThan(html.indexOf("official:us_unemployment_rate:2026-09"));
+    expect(html.lastIndexOf("Illustration:", pr)).toBeGreaterThan(html.indexOf("4. Other sources"));
+    expect(html.slice(0, html.indexOf("4. Other sources"))).not.toContain("octo-org");
+  });
+
+  it("/docs examples are real shapes: the official market passes registration with the scheduled release; the illustration resolves structured from its evidence", async () => {
+    const official = validateRegistration(DOCS_OFFICIAL_MARKET_EXAMPLE);
+    expect(registrationPolicyIssues(official)).toEqual([]);
+    expect(official).toMatchObject({ platform: "custom", positive_option: "OPTION_A", negative_rule: "explicit_negative", sources: [{ kind: "official_release", ref: "official:us_unemployment_rate:2026-09" }] });
+    const known = KNOWN_RELEASES["us_unemployment_rate:2026-09"]!;
+    expect(official.resolver).toMatchObject({ kind: "official_release", series: "us_unemployment_rate", period: "2026-09", release_at: known.release_at, rounding: "pct_1dp", bucket: { label: "≤3.8%", hi: 3.8 } });
+    expect(official.deadline_utc).toBe(known.fallback_until);
+    // no apostrophe: every body goes inside a single-quoted shell argument
+    expect(JSON.stringify(DOCS_OFFICIAL_MARKET_EXAMPLE)).not.toContain("'");
+    expect(JSON.stringify({ market: DOCS_MARKET_EXAMPLE, evidence: DOCS_INLINE_EVIDENCE_EXAMPLE })).not.toContain("'");
+
+    const market = validateRegistration(DOCS_MARKET_EXAMPLE);
+    expect(registrationPolicyIssues(market)).toEqual([]);
+    const evidence = EvidenceInput.parse({ ...DOCS_INLINE_EVIDENCE_EXAMPLE, fetched_at: "2026-10-01T00:00:00Z", provenance: { inline: true } });
+    const th = thresholdsFromEnv({});
+    const r = await resolveMarket({ marketId: "m-docs", market, evidence, thresholds: th, spotlightSecret: "docs", model: "none", now: new Date(NOW) }, { jev: async () => { throw new Error("the illustration must never reach the model"); } });
+    expect(r.route).toBe("structured");
+    expect(r.verdict).toMatchObject({ resolution_status: "RESOLVED", winning_outcome: "OPTION_A" });
   });
 
   it("uses the Cache API when present", async () => {
