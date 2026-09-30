@@ -72,7 +72,7 @@ REQUEST_KEY_DAILY_CAP = "25"
 # (a dashboard test event, another product) is answered 200 and alerted, so the webhook is never failed into being
 # disabled. Set both plan ids before the checkout is switched on. WHOP_SANDBOX "1" points every Whop call at the
 # sandbox. WHOP_API_KEY and WHOP_WEBHOOK_SECRET are secrets (wrangler secret put), never here.
-WHOP_CHECKOUT_ENABLED = "0"
+WHOP_CHECKOUT_ENABLED = "1"
 WHOP_PLAN_ID_50 = "plan_XsiHbMZVNGoca"
 WHOP_PLAN_ID_250 = "plan_NHZHY3hkYrT2J"
 WHOP_SANDBOX = "0"
