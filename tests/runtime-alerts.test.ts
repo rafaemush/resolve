@@ -127,6 +127,49 @@ describe("resolveWithRuntime alerts", () => {
   });
 });
 
+describe("the free plan has structured verdicts only, whatever JEV_PAID_ROUTES_ENABLED says", () => {
+  let jevHits: number;
+  const gatesRead: unknown[] = [];
+  const rpcs = { check_gates: async () => { gatesRead.push(1); return { data: { jev_breaker_open: false, jev_spend_today_usd: 0.1 }, error: null }; }, record_jev_spend: async () => ({ data: null, error: null }), upstream_record_failure: async () => ({ data: false, error: null }) };
+  const on = { ...cfg, jevPaidRoutesEnabled: true };
+  const tenant = { ...input, mode: "tenant" as const, tenantId: "t1", requestId: null, creditsCharged: 5 };
+  beforeEach(() => {
+    jevHits = 0; gatesRead.length = 0;
+    vi.mocked(alertMany).mockClear();
+    vi.stubGlobal("fetch", async () => { jevHits++; return new Response("upstream overloaded", { status: 529 }); });
+  });
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("a free-plan key (the plan from the key's auth): WEB_EVIDENCE_DISABLED, no model call, no gate read", async () => {
+    h.db = fakeDb({ resolutions: [], jev_calls: [], tenants: [{ id: "t1", plan: "payg" }] }, {}, { rpc: rpcs });
+    const r = await resolveWithRuntime(env, on, { ...tenant, tenantPlan: "free" });
+    expect(r.result.route).toBe("jev");
+    expect(r.result.verdict).toMatchObject({ error_code: "UPSTREAM_UNAVAILABLE", error_reason: "PAID_JEV_DISABLED" });
+    expect(jevHits).toBe(0);
+    expect(gatesRead).toEqual([]);
+    expect(h.db.tables.jev_calls).toEqual([]);
+  });
+
+  it("no plan passed (a watch): tenants.plan is read; free or unreadable refuses, a paid plan reaches the model", async () => {
+    for (const [tenants, called] of [[[{ id: "t1", plan: "free" }], 0], [[], 0], [[{ id: "t1", plan: "enterprise" }], 0], [[{ id: "t1", plan: "payg" }], 2]] as const) {
+      h.db = fakeDb({ resolutions: [], jev_calls: [], tenants: tenants.map((t) => ({ ...t })) }, {}, { rpc: rpcs });
+      jevHits = 0;
+      const r = await resolveWithRuntime(env, on, tenant);
+      expect(jevHits, JSON.stringify(tenants)).toBe(called);
+      if (!called) expect(r.result.verdict.error_reason).toBe("PAID_JEV_DISABLED");
+    }
+  });
+
+  it("a paid plan from the key's auth reaches the model; shadow resolutions are not a tenant's", async () => {
+    h.db = fakeDb({ resolutions: [], jev_calls: [] }, {}, { rpc: rpcs });
+    await resolveWithRuntime(env, on, { ...tenant, tenantPlan: "builder" });
+    expect(jevHits).toBe(2);
+    jevHits = 0;
+    await resolveWithRuntime(env, on, input);
+    expect(jevHits).toBe(2);
+  });
+});
+
 describe("a verdict that cannot be recorded", () => {
   const usage = JSON.stringify({ error: "overloaded", usage: { input_tokens: 1_000, output_tokens: 0 } });
   const spend: unknown[] = [];
@@ -142,7 +185,7 @@ describe("a verdict that cannot be recorded", () => {
   it("/v1/resolve stub: the Jev call is still ledgered, the stub is marked failed, resolution_write_failed is raised, and it throws", async () => {
     h.refuseVerdictRow = "new row for relation \"resolutions\" violates check constraint";
     h.db = fakeDb({ resolutions: [{ id: "req1", status_row: "pending", tenant_id: "t1" }], jev_calls: [] }, {}, { rpc: rpcs });
-    const err = await resolveWithRuntime(env, { ...cfg, jevPaidRoutesEnabled: true }, { ...input, mode: "tenant", tenantId: "t1", requestId: "req1", creditsCharged: 5 }).catch((e) => e);
+    const err = await resolveWithRuntime(env, { ...cfg, jevPaidRoutesEnabled: true }, { ...input, mode: "tenant", tenantId: "t1", tenantPlan: "payg", requestId: "req1", creditsCharged: 5 }).catch((e) => e);
     expect(err).toBeInstanceOf(ResolutionNotRecordedError);
     expect(h.db.tables.jev_calls!.map((c) => c.resolution_id)).toEqual(["req1", "req1"]);
     expect(spend).toEqual([{ p_input_tokens: 2_000, p_usd: expect.any(Number) }]);

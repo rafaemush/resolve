@@ -1,5 +1,5 @@
 /**
- * The pure resolver wrapped with I/O: gates (paid-route flag, breaker, daily ceiling),
+ * The pure resolver wrapped with I/O: gates (paid-route flag, the tenant's plan, breaker, daily ceiling),
  * Jev accounting (jev_calls, jev_spend_daily, breaker updates) and the resolutions row.
  * The breaker opening, the ceiling refusing a Jev call and a gate or accounting write that failed are operator alerts:
  * each turns every Jev-routed verdict into "could not look" (or leaves spend unenforced) until someone acts.
@@ -8,7 +8,7 @@
  * the caller refunds the charge instead of answering a verdict that does not exist.
  */
 import type { Env, Config } from "../env";
-import { db, rpc } from "../db/supabase";
+import { db, rpc, type Db } from "../db/supabase";
 import { resolveMarket, JevUnavailableError, type ResolveResult } from "./index";
 import { thresholdsFromEnv } from "./thresholds";
 import { makeJevCaller, jevCostUsd } from "../jev/client";
@@ -56,6 +56,11 @@ export interface RuntimeInput {
   evidenceId: string | null;
   mode: "tenant" | "shadow";
   tenantId: string | null;
+  /**
+   * tenants.plan of a tenant resolution when the caller already has it (POST /v1/resolve: the key's auth); omitted, the
+   * runtime reads it. The free plan has structured verdicts only (docs/pricing.md, the evaluation key's page).
+   */
+  tenantPlan?: string;
   apiKeyId: string | null;
   /** Pre-created stub id from begin_resolution (tenant queries); null => a new row is inserted. */
   requestId: string | null;
@@ -81,13 +86,32 @@ function notRecordedAlert(o: Pick<RuntimeInput, "tenantId" | "marketId" | "mode"
   };
 }
 
+/** Plans whose tenant resolutions may use web evidence while JEV_PAID_ROUTES_ENABLED is on. The free plan is not one. */
+const WEB_EVIDENCE_PLANS = new Set(["payg", "builder", "growth", "platform"]);
+
+/**
+ * Whether a tenant resolution may use web evidence by its plan. The free plan's evaluation key is for structured
+ * verdicts only, whatever JEV_PAID_ROUTES_ENABLED says, so a stranger's key from POST /v1/request-key never reaches the
+ * model. Fail-closed: a plan that cannot be read is not a paid plan (the verdict is PAID_JEV_DISABLED, refunded).
+ */
+async function planAllowsWebEvidence(client: Db, o: RuntimeInput): Promise<boolean> {
+  let plan = o.tenantPlan;
+  if (plan === undefined && o.tenantId) {
+    try {
+      const { data, error } = await client.from("tenants").select("plan").eq("id", o.tenantId).maybeSingle();
+      if (!error && typeof data?.plan === "string") plan = data.plan;
+    } catch { /* unread: not a paid plan */ }
+  }
+  return plan !== undefined && WEB_EVIDENCE_PLANS.has(plan);
+}
+
 export async function resolveWithRuntime(env: Env, cfg: Config, o: RuntimeInput): Promise<RuntimeOutput> {
   const client = db(env);
   const th = thresholdsFromEnv(env as unknown as Record<string, string | undefined>, cfg.thresholdsVersion);
   let jevBlocked: RuntimeGate = null;
   let gatesError: string | null = null;
   let spendTodayUsd: number | null = null;
-  if (o.mode === "tenant" && !cfg.jevPaidRoutesEnabled) jevBlocked = "PAID_JEV_DISABLED";
+  if (o.mode === "tenant" && (!cfg.jevPaidRoutesEnabled || !(await planAllowsWebEvidence(client, o)))) jevBlocked = "PAID_JEV_DISABLED";
   else {
     try {
       const g = await rpc<{ jev_breaker_open: boolean; jev_spend_today_usd: number | string }>(client, "check_gates", { p_keys: [], p_window_ms: [], p_limits: [] });

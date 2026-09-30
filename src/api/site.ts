@@ -577,14 +577,20 @@ export function keyIssuedHtml(o: { key: string; expiresAt: string; base: string;
   return layout({ title: "Your test key · Resolve", path: "/v1/request-key", description: "Your Resolve test key.", body, channel: o.channel });
 }
 
+/** A known address's tenant created this recently is most likely the same form sent twice (a double click, a reload). */
+const DOUBLE_SUBMIT_SECONDS = 600;
+
 /** Pure. What happened to the key, for the operator alert: ids and reasons, never the key. */
 export function keyOutcomeLine(o: AutoKeyOutcome): string {
+  const hold = (h: string | null) => (h ? `; ${h}` : "");
   switch (o.result) {
     case "issued": return `issued on the spot: tenant ${o.tenantId}, key id ${o.keyId}, ${o.credits} credits, expires ${utc(o.expiresAt)}`;
     case "off": return `not issued (${o.reason}); answer by email`;
-    case "known_address": return `not issued: this address had a key in the last ${EVALUATION_KEY_DAYS} days, or another request for it is being handled; answer by email`;
-    case "cap_reached": return `not issued: today's cap of ${o.cap} keys issued on the spot is reached; answer by email (scripts/issue-test-key.ts issues one by hand)`;
-    case "db_error": return `not issued: database error at ${o.step}: ${o.detail}${o.tenantId ? `; tenant ${o.tenantId} was created without a key` : ""}; answer by email`;
+    case "known_address": return `not issued: tenant ${o.tenantId} was created for this address ${utc(o.createdAt)}, within ${EVALUATION_KEY_DAYS} days${o.secondsAgo < DOUBLE_SUBMIT_SECONDS ? ` (${o.secondsAgo} s ago: most likely the same form sent twice, so the requester may never have seen the key; issue one by hand)` : ""}; answer by email`;
+    case "address_held": return `not issued: another request for this address holds it${o.until ? ` until ${utc(o.until)}` : ""} (one running at the same moment, or one that ended without a key and could not release it); answer by email`;
+    case "network_limit": return `not issued: ${o.limit} keys were already issued on the spot to this network today${hold(o.hold)}; answer by email`;
+    case "cap_reached": return `not issued: today's cap of ${o.cap} keys issued on the spot is reached${hold(o.hold)}; answer by email (scripts/issue-test-key.ts issues one by hand)`;
+    case "db_error": return `not issued: database error at ${o.step}: ${o.detail}${o.tenantId ? `; tenant ${o.tenantId} was created without a key` : ""}${hold(o.hold)}; answer by email`;
   }
 }
 
@@ -632,7 +638,7 @@ site.post("/v1/request-key", async (c) => {
     return fail(400, "validation_error", "Please check the form", `Please check the form: ${msg}.`, { values, error: msg });
   }
   const r = p.data;
-  // One neutral answer for every request that gets no key (a known address, the daily cap, a database error, a bot):
+  // One neutral answer for every request that gets no key (a known address, a limit, a database error, a bot):
   // it never says which.
   const done = () => json
     ? ok(c, { received: true, key_issued: false, note: "No key was issued with this answer. A person reads the request and answers by email." })
@@ -668,7 +674,7 @@ site.post("/v1/request-key", async (c) => {
 
   // The key, when every check passes (src/api/evaluation-key.ts). Anything else, a database error included, is the
   // neutral answer below with the lead stored and the operator alerted.
-  const issued = await issueEvaluationKey(client, { email: r.email, company: r.company, leadId, requestId: c.get("requestId"), now: Date.now(), dailyCap: c.env.REQUEST_KEY_DAILY_CAP });
+  const issued = await issueEvaluationKey(client, { email: r.email, company: r.company, ip, leadId, requestId: c.get("requestId"), now: Date.now(), dailyCap: c.env.REQUEST_KEY_DAILY_CAP });
 
   let touch = "recorded";
   try {
@@ -677,7 +683,7 @@ site.post("/v1/request-key", async (c) => {
     if (error) touch = `not recorded (${String(error.message ?? "").slice(0, 120)})`;
   } catch (e) { touch = `not recorded (${String(e).slice(0, 120)})`; }
 
-  const ids = issued.result === "issued" ? { tenant_id: issued.tenantId, key_id: issued.keyId } : issued.result === "db_error" && issued.tenantId ? { tenant_id: issued.tenantId } : {};
+  const ids = issued.result === "issued" ? { tenant_id: issued.tenantId, key_id: issued.keyId } : (issued.result === "db_error" || issued.result === "known_address") && issued.tenantId ? { tenant_id: issued.tenantId } : {};
   await alert(c.env, `request_key_${leadId}`, [
     "Test-key request (web form)",
     `Name: ${r.name}`, `Project: ${r.company}`, `Purpose: ${r.purpose.slice(0, 600)}`, venue ? `Venue: ${venue}` : null,

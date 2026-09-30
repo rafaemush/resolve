@@ -2137,7 +2137,7 @@
     },
     "/v1/request-key": {
       "post": {
-        "summary": "Request a test key (public, no auth). Issues an evaluation key on the spot and returns it once (data.key): rsl_test_, 300 credits, valid 30 days, structured verdicts only, up to 5 watches. One key per email address every 30 days and a daily cap on keys issued this way (25 by default); past either, or when the service is unsure, no key is issued (key_issued=false) and a person answers by email. At most 5 requests per hour per IP address",
+        "summary": "Request a test key (public, no auth). Issues an evaluation key on the spot and returns it once (data.key): rsl_test_, 300 credits, valid 30 days, structured verdicts only, up to 5 watches. One key per email address every 30 days, 3 keys a day per network (IPv4 address or IPv6 /64) and a daily cap on keys issued this way (25 by default); past any of these, or when the service is unsure, no key is issued (key_issued=false) and a person answers by email. At most 5 requests per hour per IP address",
         "requestBody": {
           "content": {
             "application/json": {

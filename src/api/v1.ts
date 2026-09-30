@@ -214,7 +214,7 @@ v1.post("/resolve", async (c) => {
   // 4. resolve
   let rt: RuntimeOutput;
   try {
-    rt = await resolveWithRuntime(c.env, cfg, { marketId: market.id, market, evidence, evidenceId, mode: "tenant", tenantId: auth.tenantId, apiKeyId: auth.keyId, requestId: br.request_id, creditsCharged: br.charged });
+    rt = await resolveWithRuntime(c.env, cfg, { marketId: market.id, market, evidence, evidenceId, mode: "tenant", tenantId: auth.tenantId, tenantPlan: auth.plan, apiKeyId: auth.keyId, requestId: br.request_id, creditsCharged: br.charged });
   } catch {
     // ResolutionNotRecordedError, the runtime's only throw: it alerted, ran the Jev accounting and marked the stub failed.
     const refunded = br.charged > 0 ? await refundOrAlert(c.env, client, br.request_id, auth.tenantId, br.charged, "a verdict that was not recorded") : 0;

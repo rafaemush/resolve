@@ -43,6 +43,7 @@ vi.mock("../src/resolve/runtime", async () => {
 import { v1 } from "../src/api/v1";
 import { alert } from "../src/ops/alerts";
 import { runWatch } from "../src/ingest/watch";
+import { resolveWithRuntime } from "../src/resolve/runtime";
 import { MarketRegistration } from "../src/resolve/schema";
 import { sha256Hex } from "../src/resolve/text";
 
@@ -93,6 +94,8 @@ describe("POST /v1/resolve: a verdict that could not be recorded", () => {
     expect(j.credits_refunded).toBe(5); // the web-evidence (Jev) price
     expect(refunds).toEqual([id]);
     expect(vi.mocked(alert)).not.toHaveBeenCalled();
+    // the key's plan goes to the runtime, which refuses web evidence to the free plan (tests/runtime-alerts.test.ts)
+    expect(vi.mocked(resolveWithRuntime).mock.calls.at(-1)![2]).toMatchObject({ mode: "tenant", tenantId: "t1", tenantPlan: "payg" });
 
     const replay = await post("idem-1");
     expect(replay.status).toBe(503);
