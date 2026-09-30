@@ -30,20 +30,31 @@ describe("customer-facing documents", () => {
   it("describe credits as a non-refundable prepayment for API services where money is taken", () => {
     for (const p of ["docs/pilot-pack.md", "docs/templates/invoice.md", "docs/templates/pilot-letter.md", "docs/pricing.md"]) expect(texts[p], p).toMatch(/non-refundable prepayment for API services/);
   });
-  it("the pilot pack names both offers and the payment rail", () => {
+  it("the pilot pack names both offers and how they are paid: against an invoice, never in USDC", () => {
     const t = texts["docs/pilot-pack.md"]!;
     expect(t).toMatch(/\$1,000/);
     expect(t).toMatch(/\$750 a month/);
-    expect(t).toMatch(/USDC on Base/);
+    expect(t).toMatch(/Paid once against an invoice/);
+    expect(t).toMatch(/Prepaid monthly against an invoice/);
+    expect(t).toMatch(/Resolve does not accept payment in USDC at present/);
     expect(t).toMatch(/not an oracle of record/);
+  });
+  it("no customer document solicits USDC (no third-party USDC; plan §22.3 #1): no USDC payment step, no wallet address, never the address route as where to pay", () => {
+    for (const [p, t] of Object.entries(texts)) {
+      expect(t, p).not.toMatch(/(pay|paid|prepaid)( once| monthly)? in USDC|send USDC (on|from|to)(?! any address)|USDC on Base|receiving address|register the wallet/i);
+      expect(t, p).not.toMatch(/0x[0-9a-fA-F]{40}/);
+      expect(t, p).not.toMatch(/payments\/address` returns|payments\/address returns/);
+    }
+    expect(texts["docs/templates/invoice.md"]).toMatch(/Resolve does not accept payment in USDC at present/);
+    expect(texts["docs/templates/pilot-letter.md"]).toMatch(/paid against invoice `<INV-YYYY-NNN>` by the method it states/);
+    expect(texts["docs/pricing.md"]).toMatch(/Paid against an invoice, with a W-9 and a one-page pilot letter \(details: \[pilot-pack\.md\]\(pilot-pack\.md\)\); USDC is not accepted/);
+    expect(texts["docs/pricing.md"]).toMatch(/Prepaid monthly against an invoice, month to month/);
   });
   it("templates carry <placeholders>, no personal data: no email address, no filled wallet address", () => {
     for (const p of ["docs/templates/invoice.md", "docs/templates/pilot-letter.md", "docs/templates/w9-notes.md"]) {
       const t = texts[p]!;
       expect(t, p).toMatch(/<[^<>\n]+>/);
       expect(t, p).not.toMatch(/[\w.+-]+@[\w-]+\.[a-z]{2,}/i);
-      // the only 0x address allowed is the public USDC contract on Base
-      for (const a of t.match(/0x[0-9a-fA-F]{40}\b/g) ?? []) expect(a).toBe("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
     }
     expect(texts["docs/templates/w9-notes.md"]).toMatch(/Not tax or legal advice/);
     expect(texts["docs/templates/w9-notes.md"]).toMatch(/Never sign a W-8BEN/);

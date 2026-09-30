@@ -138,6 +138,14 @@ describe("the operator's credits.low alert (plan §22.3 #2)", () => {
     expect(paid.text).toContain("Card checkout is not offered");
     expect(creditsLowAlert({ tenantId: "t1", plan: null, balance: 1, threshold: 500, requestId: "r", topUp: CARD_TOP_UP }).text).toContain("Plan: unknown");
   });
+  it("'first paid use' is the free plan's label alone: never on another plan, nor on a plan that could not be read", () => {
+    for (const plan of ["payg", "builder", "growth", "platform", null, "Free", "free "]) {
+      const a = creditsLowAlert({ tenantId: "t1", plan, balance: 1, threshold: 500, requestId: "r", topUp: CARD_TOP_UP });
+      expect(a.text, String(plan)).not.toContain("first paid use");
+      expect(a.text.split("\n")[0], String(plan)).toBe("Credits low");
+      expect(a.meta!.first_paid_use, String(plan)).toBe(false);
+    }
+  });
 });
 
 describe("noteCharge: credits.low once per crossing", () => {
@@ -212,15 +220,28 @@ describe("noteCharge: credits.low once per crossing", () => {
     expect((await noteCharge(env, "t1", "r2")).crossed).toBe(true);
   });
 
-  it("an event that could not be queued gives the notice back (the next charge retries) and alerts; the operator hears of the crossing from the charge that claims it", async () => {
+  it("an event that could not be queued gives the notice back (the next charge retries); the operator hears of the crossing at once, in the failure's DM", async () => {
     newDb(400);
     h.failInsert = true;
-    expect(await noteCharge(env, "t1", "r1")).toEqual({ crossed: true, queued: 0 });
+    expect(await noteCharge(card, "t1", "r1", { plan: "free" })).toEqual({ crossed: true, queued: 0 });
     expect(h.db.tables.tenants![0]!.low_credit_notified_at).toBeNull();
-    expect(alertKeys()).toEqual(["low_credit_event_failed"]);
+    expect(h.alerts.map((a) => [a.key, a.batch])).toEqual([["low_credit_event_failed_t1", 1], ["credits_low_t1_r1", 1]]);
+    expect(h.alerts[0]!.text).toContain("given back: the next charge queues it again");
+    expect(h.alerts[1]!.text).toContain("first paid use");
+    // the charge that claims it again queues credits.low and says so, for that charge
     h.failInsert = false;
-    expect(await noteCharge(env, "t1", "r2")).toEqual({ crossed: true, queued: 1 });
-    expect(alertKeys()).toEqual(["low_credit_event_failed", "credits_low_t1_r2"]);
+    expect(await noteCharge(card, "t1", "r2")).toEqual({ crossed: true, queued: 1 });
+    expect(alertKeys()).toEqual(["low_credit_event_failed_t1", "credits_low_t1_r1", "credits_low_t1_r2"]);
+  });
+
+  it("the failure alert is keyed per tenant: a second tenant's failure in the same hour is not deduplicated into the first", async () => {
+    newDb(400);
+    h.db.tables.tenants!.push({ id: "t2", plan: "free", credits_balance: 300, deleted_at: null, low_credit_notified_at: null });
+    h.db.tables.webhook_endpoints!.push({ ...hook(["credits.low"]), id: "e2", tenant_id: "t2" });
+    h.failInsert = true;
+    await noteCharge(card, "t1", "r1");
+    await noteCharge(card, "t2", "r2");
+    expect(alertKeys()).toEqual(["low_credit_event_failed_t1", "credits_low_t1_r1", "low_credit_event_failed_t2", "credits_low_t2_r2"]);
   });
 
   it("a notice that could not be given back either: the operator's alert goes now, in the same DM as the failure", async () => {
@@ -228,7 +249,7 @@ describe("noteCharge: credits.low once per crossing", () => {
     h.failInsert = true;
     h.db.options.rpc = { ...MONEY_RPCS, release_low_credit_notice: async () => ({ data: null, error: { code: "57014", message: "statement timeout" } }) };
     expect(await noteCharge(card, "t1", "r1", { plan: "free" })).toEqual({ crossed: true, queued: 0 });
-    expect(h.alerts.map((a) => [a.key, a.batch])).toEqual([["low_credit_event_failed", 1], ["credits_low_t1_r1", 1]]);
+    expect(h.alerts.map((a) => [a.key, a.batch])).toEqual([["low_credit_event_failed_t1", 1], ["credits_low_t1_r1", 1]]);
     expect(h.alerts[0]!.text).toContain("not given back either");
     expect(h.alerts[1]!.text).toContain("first paid use");
   });
@@ -373,6 +394,24 @@ describe("a charge that crosses the threshold alerts the operator once, never wi
     expect(all).not.toContain(KEY.slice("rsl_test_".length));
     expect(all).not.toMatch(/[\w.+-]+@[\w-]+\.[a-z]{2,}/i);
     expectNoUsdc(all);
+  });
+  it("the route passes the key's plan: no plan read at the crossing, and the key's plan is the one alerted", async () => {
+    resolvingDb(300, "free");
+    h.db.tables.tenants![0]!.plan = "payg"; // the row says otherwise: the alert must carry the key's plan, not read it
+    h.db.calls.length = 0;
+    expect((await resolveWith(card)).status).toBe(200);
+    expect(h.db.calls.filter((c) => c.table === "tenants")).toEqual([]);
+    expect(h.alerts[0]!.text).toContain("Plan: free");
+    expect(h.alerts[0]!.text).toContain("first paid use");
+  });
+  it("a crossing that empties the balance and whose event could not be queued still reaches the operator: the next request is a 402 and charges nothing", async () => {
+    resolvingDb(5, "free");
+    h.failInsert = true;
+    expect((await resolveWith(card)).status).toBe(200); // 0 left: crossed
+    expect(alertKeys()).toEqual(["low_credit_event_failed_t1", "credits_low_t1_req0"]);
+    expect(h.alerts[1]!.text).toContain("first paid use");
+    expect((await resolveWith(card)).status).toBe(402);
+    expect(alertKeys()).toEqual(["low_credit_event_failed_t1", "credits_low_t1_req0"]);
   });
   it("a failing alert store never fails the charge's answer", async () => {
     resolvingDb(300, "free");

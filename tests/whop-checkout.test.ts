@@ -125,6 +125,9 @@ describe("switched off: no form, and both routes refuse", () => {
     const html = await res.text();
     expect(html).not.toContain('action="/billing/checkout"');
     expect(html).not.toContain("Pay by card");
+    // the $20 pack is sold by card only: while card checkout is off, no price or pack row names it
+    expect(text(html)).toContain("Pay as you go Packs of $50, $250 or $1,000 Credits do not expire");
+    expect(html).not.toContain("$20");
     expect(res.headers.get("content-security-policy")).toBe(SITE_CSP);
     expect(whopCalls).toEqual([]);
   });
@@ -264,6 +267,9 @@ describe("the /pricing form", () => {
     expect(res.headers.get("content-security-policy")).toContain("default-src 'none'");
     const t = text(html);
     expect(t).toContain("The $20, $50 and $250 packs can be paid by card (above); the $20 pack (2,000 credits) is sold by card only.");
+    // the Plans row and the pack table name the smallest pack the card form sells, never a larger one as the smallest
+    expect(t).toContain("Pay as you go Packs of $20 (card only), $50, $250 or $1,000 Credits do not expire");
+    expect(html).toContain('<tbody><tr><td class="n">$20 (card only)</td><td class="n">2,000</td></tr><tr><td class="n">$50</td><td class="n">5,000</td></tr>');
     for (const s of ["Resolve developer data API", "merchant of record", "non-refundable prepayment for API services", "do not expire while the account is open", "refunded or charged back, the credits it bought are removed", "cannot be withdrawn", "cannot be moved to another account"]) expect(t).toContain(s);
     expect(t).not.toMatch(/lifetime|wallet|bet\b|betting|scrap/i);
     expect(html).not.toMatch(NAMES);

@@ -1,7 +1,8 @@
 # Invoice
 
 <!-- Template. Replace every <placeholder>; delete the line of the offer that does not apply. Keep the filled copy
-     under private/ (gitignored), never in the repository. -->
+     under private/ (gitignored), never in the repository. USDC is not accepted while USDC_DEPOSITS_OFFERED is not "1"
+     (no third-party USDC before counsel's answer): never put a wallet address or a USDC instruction on an invoice. -->
 
 | | |
 |---|---|
@@ -33,10 +34,9 @@ Taxes: `<none charged, or the tax and rate that applies: confirm with counsel>`.
 
 ## Payment
 
-- Pay in USDC on Base (chain id 8453), USDC contract `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`. For this invoice, 1 USDC settles 1 US dollar.
-- Receiving address: `<0x receiving address, exactly as GET /v1/payments/address returns it>`. If the address your account's API returns differs from this one, do not send; ask first.
-- Send from the wallet registered to your Resolve account: `<0x registered sender wallet>`. A payment from an unregistered wallet is held until it is matched to your account.
-- After sending, reply with the transaction hash and this invoice number.
+- Pay in US dollars by `<the payment method agreed for this invoice, with its instructions>`.
+- Resolve does not accept payment in USDC at present. Do not send USDC to any address for this invoice.
+- Quote this invoice number with the payment, and reply with its reference once it is sent.
 
 ## Terms
 

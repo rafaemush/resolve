@@ -406,21 +406,29 @@ site.get("/record", (c) => cached(c, "/record?site=1", async () => {
 
 // ---- GET /pricing --------------------------------------------------------------------------------------------------
 
-/** The plans as sold (docs/pricing.md); follow limits and request rates come from the code that enforces them. */
-export const PUBLIC_PLANS: ReadonlyArray<{ plan: Plan | null; name: string; price: string; contents: string }> = [
-  { plan: "free", name: "Free test key", price: "$0", contents: "300 credits for 30 days, structured verdicts only." },
-  { plan: "payg", name: "Pay as you go", price: "Packs of $50, $250 or $1,000", contents: "Credits do not expire while the account is open." },
-  { plan: "builder", name: "Builder", price: "$99 a month", contents: "12,000 credits a month, 50 watches, webhooks and private early reveals." },
-  { plan: "growth", name: "Growth", price: "$399 a month", contents: "60,000 credits a month, 500 watches, a higher request rate." },
-  { plan: null, name: "Venue Design Partner", price: "$750 a month", contents: "Your venue's markets, webhooks in your venue's payload shape (including a proposed winning outcome index), and a weekly reconciliation report." },
-  { plan: null, name: "Pilot pack", price: "$1,000 for 30 days", contents: "A shorter start for a venue: private early reveals for the markets you name, webhooks in your payload shape and a weekly reconciliation report." },
-];
-
 const dollars = (cents: number) => usd(cents).replace(/\.00$/, "");
 /** "a", "a and b", "a, b and c" (or "or"). */
 const listed = (items: string[], last = "and") => (items.length < 2 ? items.join("") : `${items.slice(0, -1).join(", ")} ${last} ${items[items.length - 1]}`);
 /** The card packs that are sold by card only (not among the invoiced packs, PACKS_USDC): the $20 pack. */
 const CARD_ONLY = PACK_IDS.filter((k) => !(PACKS_USDC as readonly string[]).includes(k));
+/** The card-only packs as rows of the pack table and entries of the price, while card checkout is offered. */
+const cardOnlyPacks = () => CARD_ONLY.map((k) => ({ label: `$${int(CARD_PACKS[k].priceCents / 100)} (card only)`, credits: CARD_PACKS[k].credits }));
+/**
+ * The pay-as-you-go price on /pricing: the invoiced packs (PACKS_USDC) and, while card checkout is offered, the card-only
+ * packs before them, so the Plans row never names a smallest pack other than the one the card form sells.
+ */
+export const paygPrice = (card: boolean): string => `Packs of ${listed([...(card ? cardOnlyPacks().map((p) => p.label) : []), ...PACKS_USDC.map((u) => `$${int(Number(u))}`)], "or")}`;
+
+/** The plans as sold (docs/pricing.md); follow limits and request rates come from the code that enforces them. */
+export const PUBLIC_PLANS: ReadonlyArray<{ plan: Plan | null; name: string; price: string; contents: string }> = [
+  { plan: "free", name: "Free test key", price: "$0", contents: "300 credits for 30 days, structured verdicts only." },
+  // the price without card checkout; pricingHtml adds the card-only packs while it is offered (paygPrice)
+  { plan: "payg", name: "Pay as you go", price: paygPrice(false), contents: "Credits do not expire while the account is open." },
+  { plan: "builder", name: "Builder", price: "$99 a month", contents: "12,000 credits a month, 50 watches, webhooks and private early reveals." },
+  { plan: "growth", name: "Growth", price: "$399 a month", contents: "60,000 credits a month, 500 watches, a higher request rate." },
+  { plan: null, name: "Venue Design Partner", price: "$750 a month", contents: "Your venue's markets, webhooks in your venue's payload shape (including a proposed winning outcome index), and a weekly reconciliation report." },
+  { plan: null, name: "Pilot pack", price: "$1,000 for 30 days", contents: "A shorter start for a venue: private early reveals for the markets you name, webhooks in your payload shape and a weekly reconciliation report." },
+];
 
 /**
  * The "Pay by card" section of /pricing (and of a refused form answer): what a card pack is, the form that opens a Whop
@@ -454,8 +462,9 @@ export function pricingHtml(o: { packs: PaygCredit[] | null; channel: string | n
     const cap = followCap(p);
     return `<td class="n">${p === "free" ? "up to 50 while the key is valid" : cap === null ? "no limit" : `up to ${int(cap)}`}</td><td class="n">${int(perKeyRpm(p))}</td>`;
   };
+  const cardRows = o.card ? cardOnlyPacks().map((p) => `<tr><td class="n">${esc(p.label)}</td><td class="n">${esc(int(p.credits))}</td></tr>`).join("") : "";
   const packs = o.packs
-    ? `<div class="table"><table><thead><tr><th scope="col">Pack</th><th scope="col">Credits</th></tr></thead><tbody>${o.packs.map((p) => `<tr><td class="n">$${esc(int(Number(p.usdc)))}</td><td class="n">${esc(int(p.credits))}</td></tr>`).join("")}</tbody></table></div>`
+    ? `<div class="table"><table><thead><tr><th scope="col">Pack</th><th scope="col">Credits</th></tr></thead><tbody>${cardRows}${o.packs.map((p) => `<tr><td class="n">$${esc(int(Number(p.usdc)))}</td><td class="n">${esc(int(p.credits))}</td></tr>`).join("")}</tbody></table></div>`
     : `<p class="muted">Pack credit amounts are unavailable right now; ask us for a quote.</p>`;
   const body = `<h1>Pricing</h1>
 <p class="lede">Resolve is a developer data API; credits pay for its calls. Prices are in US dollars. The smallest pack gives 100 credits per dollar; larger packs give more (see the table below).</p>
@@ -469,7 +478,7 @@ export function pricingHtml(o: { packs: PaygCredit[] | null; channel: string | n
 <h2>Plans</h2>
 <div class="table"><table>
 <thead><tr><th scope="col">Plan</th><th scope="col">Price</th><th scope="col">What you get</th><th scope="col">Followed markets (early reveals)</th><th scope="col">Requests per minute per key</th></tr></thead>
-<tbody>${PUBLIC_PLANS.map((p) => `<tr><td>${esc(p.name)}</td><td>${esc(p.price)}</td><td>${esc(p.contents)}</td>${limits(p.plan)}</tr>`).join("\n")}</tbody>
+<tbody>${PUBLIC_PLANS.map((p) => `<tr><td>${esc(p.name)}</td><td>${esc(p.plan === "payg" ? paygPrice(!!o.card) : p.price)}</td><td>${esc(p.contents)}</td>${limits(p.plan)}</tr>`).join("\n")}</tbody>
 </table></div>
 <p class="muted">Monthly plans and venue offers are set up by agreement; the figures above are what the plan includes.</p>
 <h2>Pay-as-you-go packs</h2>

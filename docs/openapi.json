@@ -1635,7 +1635,7 @@
     },
     "/v1/account/wallet/challenge": {
       "get": {
-        "summary": "Issue a single-use wallet registration challenge (valid 10 minutes) for the wallet this account sends USDC from. The message to sign is exactly \"Resolve wallet registration\ntenant: <tenant_id>\naddress: <lowercase address>\nnonce: <nonce>\nissued: <ISO time>\"",
+        "summary": "Issue a single-use wallet registration challenge (valid 10 minutes) for a wallet this account controls. The message to sign is exactly \"Resolve wallet registration\ntenant: <tenant_id>\naddress: <lowercase address>\nnonce: <nonce>\nissued: <ISO time>\"",
         "security": [
           {
             "bearerAuth": []
@@ -1691,7 +1691,7 @@
     },
     "/v1/account/wallet": {
       "post": {
-        "summary": "Register the wallet that signed a challenge (EIP-191 personal_sign of the challenge message; externally owned accounts only). USDC it sends to the receiving address is then credited to this account; it replaces a previously registered wallet",
+        "summary": "Register the wallet that signed a challenge (EIP-191 personal_sign of the challenge message; externally owned accounts only); it replaces a previously registered wallet. USDC deposits are not offered unless GET /v1/payments/address answers",
         "security": [
           {
             "bearerAuth": []

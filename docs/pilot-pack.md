@@ -1,6 +1,6 @@
 # Resolve for venues: Design Partner and the 30-day pilot
 
-Resolve checks whether the stated condition of a prediction market has happened, from the sources registered for it, and commits every verdict publicly as a hash before the platform resolves. For a venue, that gives three things: an independent, pre-committed check of each manual resolution, a record you can point to when a resolution is questioned, and an audit log anyone can recompute. Prices are in US dollars and paid in USDC on Base. Last updated 2026-09-25.
+Resolve checks whether the stated condition of a prediction market has happened, from the sources registered for it, and commits every verdict publicly as a hash before the platform resolves. For a venue, that gives three things: an independent, pre-committed check of each manual resolution, a record you can point to when a resolution is questioned, and an audit log anyone can recompute. Prices are in US dollars, paid against an invoice. Last updated 2026-10-01.
 
 ## Two ways to start
 
@@ -10,7 +10,7 @@ Resolve checks whether the stated condition of a prediction market has happened,
 - Private early reveals for all of that platform's markets we shadow: each verdict reaches you by webhook when its commitment is recorded, before the public reveal. The account has no follow limit, so every one of those markets can be followed.
 - Webhooks in your platform's own identifiers (below).
 - The weekly reconciliation report for your markets.
-- Prepaid monthly in USDC, month to month. No SLA and no master agreement; it converts to a Platform agreement once Resolve's operating entity exists.
+- Prepaid monthly against an invoice, month to month. No SLA and no master agreement; it converts to a Platform agreement once Resolve's operating entity exists.
 
 ### 30-day venue pilot: $1,000
 
@@ -18,7 +18,7 @@ Resolve checks whether the stated condition of a prediction market has happened,
 - Webhooks in your platform's own identifiers (below).
 - The weekly reconciliation report for your markets.
 - A named contact for the pilot.
-- Paid once in USDC against an invoice, with a W-9 and a one-page pilot letter. The payment is credited to your account as the $1,000 pack: 120,000 credits for API calls.
+- Paid once against an invoice, with a W-9 and a one-page pilot letter. The payment is credited to your account as the $1,000 pack: 120,000 credits for API calls.
 
 Resolve is operated by its founder as an individual until its operating entity exists; the invoice, the W-9 and the pilot letter are issued on that basis.
 
@@ -48,9 +48,9 @@ A proposal is present only when the committed verdict is RESOLVED. When the evid
 
 ## How to pay
 
-1. Register the wallet you will pay from: `GET /v1/account/wallet/challenge?address=<your address>` returns a message; sign it with that wallet (`personal_sign`) and send the signature with `POST /v1/account/wallet` within 10 minutes.
-2. Send USDC on Base (chain id 8453, USDC contract `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`) from that wallet to the receiving address `GET /v1/payments/address` returns. The invoice states the same address; if the two ever differ, do not send, and ask.
-3. The payment is credited once Base marks its block safe, typically 5 to 10 minutes; a `payment.credited` webhook reports it. Send the transaction hash with the invoice number so accounts can match it.
+1. You receive the pilot letter and the invoice for review before anything is paid. The invoice states how to pay it.
+2. Resolve does not accept payment in USDC at present: no invoice names a wallet address, and `GET /v1/payments/address` answers that USDC deposits are not offered. Do not send USDC to any address for these offers.
+3. Quote the invoice number with the payment. Once it is received, it is credited to the account named on the invoice: the $1,000 pack (120,000 credits) for the pilot, or the month's Design Partner prepayment.
 
 **Credits are a non-refundable prepayment for API services.** They are not a balance, wallet, deposit or stored value: they cannot be withdrawn, transferred to another account, or exchanged for money or crypto, and Resolve holds no funds on your behalf.
 

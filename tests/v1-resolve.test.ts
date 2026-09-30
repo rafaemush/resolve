@@ -163,7 +163,8 @@ describe("POST /v1/resolve fetch:true: one run of a watch at a time", () => {
     fetchDb(null);
     const first = await fetchNow();
     expect(first.status).toBe(404); // ran; no evidence stored yet for the market
-    expect(vi.mocked(runWatch).mock.calls.map((c) => [c[2], c[3]?.dispatch])).toEqual([[W, "tenant_fetch"]]);
+    // with the request's public origin, which the charge's credits.low pointers use (never a relative page)
+    expect(vi.mocked(runWatch).mock.calls.map((c) => [c[2], c[3]?.dispatch, c[3]?.base])).toEqual([[W, "tenant_fetch", "http://localhost"]]);
     expect(leaseAtRun).toHaveLength(1);
     expect(Date.parse(leaseAtRun[0]!)).toBeGreaterThan(Date.now());
     const second = await fetchNow();

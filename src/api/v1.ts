@@ -154,7 +154,7 @@ v1.post("/resolve", async (c) => {
       if (leased !== "leased") return leased === "busy"
         ? err(c, "conflict", "a poll of this watch is in progress (a scheduled dispatch or another fetch); retry in a minute", 409)
         : err(c, "UPSTREAM_UNAVAILABLE", `could not lease the watch, the fetch did not run: ${redact(leased.error).slice(0, 200)}`, 503);
-      const s = await runWatch(c.env, cfg, w.id as string, { waitUntil: waitUntilOf(c), dispatch: "tenant_fetch" });
+      const s = await runWatch(c.env, cfg, w.id as string, { waitUntil: waitUntilOf(c), dispatch: "tenant_fetch", base: publicBase(c.env, c.req.url) });
       if (s.resolution_id) {
         // The verdict as GET /v1/resolutions/:id answers it, never the raw row (it holds the model's own answers).
         const { data: r } = await client.from("resolutions").select("*").eq("id", s.resolution_id).single();
@@ -555,7 +555,10 @@ const WalletBody = z.strictObject({
 });
 const RegisterRow = z.object({ result: z.enum(REGISTER_RESULTS), address: z.string().nullable(), previous_address: z.string().nullable() });
 
-/** A single-use challenge for the wallet the tenant sends USDC from. One subrequest: the insert. */
+/**
+ * A single-use challenge for a wallet the tenant controls (the one it sends USDC from, while USDC deposits are offered:
+ * only then does the answer say so). One subrequest: the insert.
+ */
 v1.get("/account/wallet/challenge", async (c) => {
   const a = WalletAddress.safeParse(c.req.query("address"));
   if (!a.success) return err(c, "validation_error", `address: ${a.error.issues[0]?.message ?? "required"}`, 400);
@@ -568,7 +571,7 @@ v1.get("/account/wallet/challenge", async (c) => {
   if (error || !data) return storeDown(c, "wallet challenge store (no challenge was issued)");
   return ok(c, {
     challenge_id: data.id, address, message, nonce, issued_at: issuedAt, expires_at: data.expires_at,
-    sign: "EIP-191 personal_sign of `message`, exactly as given, with the wallet at `address` (the one that will send USDC)",
+    sign: `EIP-191 personal_sign of \`message\`, exactly as given, with the wallet at \`address\`${usdcDepositsOffered(c.env) ? " (the one that will send USDC)" : ""}`,
     submit: "POST /v1/account/wallet {challenge_id, signature}; the challenge is single use",
   });
 });
@@ -602,7 +605,7 @@ v1.post("/account/wallet", async (c) => {
     return storeDown(c, "wallet registration (nothing was registered)");
   }
   if (row.result !== "registered") return refuse(row.result, row.address);
-  return ok(c, { wallet_address: row.address, previous_wallet_address: row.previous_address, registered: true, message: registerAnswer("registered", row.address).message });
+  return ok(c, { wallet_address: row.address, previous_wallet_address: row.previous_address, registered: true, message: registerAnswer("registered", row.address, usdcDepositsOffered(c.env)).message });
 });
 v1.post("/keys/rotate", async (c) => {
   const auth = c.get("auth");

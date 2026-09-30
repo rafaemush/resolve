@@ -151,6 +151,12 @@ export interface WatchRunOptions {
    * lease taken first by lease_watch_now). The run releases the lease when it records its outcome.
    */
   dispatch?: "pg_net" | "admin" | "tenant_fetch";
+  /**
+   * The site's public origin for the credits.low pointers of a charge this run makes (src/billing/top-up.ts publicBase
+   * of the request that started it: RESOLVE_PUBLIC_URL, else that request's origin, which for a pg_net dispatch is
+   * app_config worker_base_url). Without it, RESOLVE_PUBLIC_URL alone, and a relative page when that is unset.
+   */
+  base?: string | null;
 }
 
 export async function runWatch(env: Env, cfg: Config, watchId: string, opts: WatchRunOptions = {}): Promise<WatchRunSummary> {
@@ -347,9 +353,10 @@ export async function runWatch(env: Env, cfg: Config, watchId: string, opts: Wat
       // The tenant's verdict in its public shape (engine_version, web_evidence; src/api/public-names.ts).
       await publishEvent(env, market.tenant_id, type, { market_id: market.id, external_id: market.external_id, request_id: rt.resolutionId, verdict: toPublicVerdict(v) }, { waitUntil: opts.waitUntil });
     }
-    // A charge that looked stands (only a could-not-look verdict is refunded): credits.low and the operator's alert once
-    // per crossing. noteCharge never throws; 1 subrequest, 10 at most at the crossing (the event, the plan read, one alert).
-    if (looked && charged > 0 && market.tenant_id && chargeRequestId) await noteCharge(env, market.tenant_id, chargeRequestId);
+    // A charge that looked stands (only a could-not-look verdict is refunded): credits.low (its pointers at the public
+    // origin of the request that started this run) and the operator's alert once per crossing. noteCharge never throws;
+    // 1 subrequest, 10 at most at the crossing (the event, the plan read, one alert).
+    if (looked && charged > 0 && market.tenant_id && chargeRequestId) await noteCharge(env, market.tenant_id, chargeRequestId, { base: opts.base });
   } catch (e) {
     // The runtime threw ResolutionNotRecordedError (alerted there): no verdict row exists, so the charge bought nothing.
     if (!recorded && charged > 0 && chargeRequestId) await refund(chargeRequestId, null);

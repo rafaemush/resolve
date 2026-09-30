@@ -110,13 +110,14 @@ async function planOf(client: Db, tenantId: string): Promise<string | null> {
 /**
  * After a charge that stands (not refunded): claim the low-credit notice and, when this charge crossed, queue credits.low
  * and alert the operator (creditsLowAlert). `plan` is the tenant's plan when the caller holds it (POST /v1/resolve: the
- * key's); without it the crossing reads it. `base` is the public origin the pointers use (publicBase). Subrequests: 1
- * (the claim); at the crossing + the endpoint read and the insert (the 5-minute drain delivers it, a low balance does
- * not need an inline attempt), + the plan read when not given, + one alert (5): 9 at most; an event that could not be
- * queued: + the release and the failure alert instead, the operator's alert in the same DM when the notice could not be
- * given back: 10 at most. Never throws, and no alert can fail the charge: a claim that fails is alerted and the next
- * charge claims again; an event that could not be queued gives its claim back, and the charge that claims it again
- * sends the operator's alert then (once per crossing).
+ * key's); without it the crossing reads it. `base` is the public origin the pointers use (publicBase; a watch run passes
+ * the origin of the request that started it). Subrequests: 1 (the claim); at the crossing + the endpoint read and the
+ * insert (the 5-minute drain delivers it, a low balance does not need an inline attempt), + the plan read when not
+ * given, + one alert (5): 9 at most; an event that could not be queued: + the release, and the failure goes in the same
+ * DM as the operator's alert: 10 at most. Never throws, and no alert can fail the charge: a claim that fails is alerted
+ * and the next charge claims again. An event that could not be queued gives its claim back and the operator hears of
+ * the crossing at once, whatever happens next (the tenant may never be charged again: at a zero balance the next
+ * request is a 402); the charge that claims it again queues credits.low and alerts once more, for that charge.
  */
 export async function noteCharge(env: Env, tenantId: string, requestId: string, o: { plan?: string; base?: string | null } = {}): Promise<{ crossed: boolean; queued: number }> {
   const meta = { tenant_id: tenantId, request_id: requestId };
@@ -134,13 +135,13 @@ export async function noteCharge(env: Env, tenantId: string, requestId: string, 
       await tell([await operator()]);
       return { crossed: true, queued: q.rows.length };
     }
-    let givenBack = true;
     let released = "given back: the next charge queues it again";
     try { await rpc(client, "release_low_credit_notice", { p_tenant: tenantId }); }
-    catch (e) { givenBack = false; released = `not given back either (${redact(String(e)).slice(0, 120)}): no credits.low until the next purchase or grant`; }
-    const failed: AlertItem = { key: "low_credit_event_failed", text: `credits.low for tenant ${tenantId} (balance ${claim.balance} < ${claim.threshold}) was not queued: ${q.error}. The notice was ${released}.`, dedupMinutes: 60, meta };
-    // Given back, the charge that claims it again alerts the operator; otherwise no later charge will, so it goes now.
-    await tell(givenBack ? [failed] : [failed, await operator()]);
+    catch (e) { released = `not given back either (${redact(String(e)).slice(0, 120)}): no credits.low until the next purchase or grant`; }
+    // Keyed per tenant: another tenant's failure in the same hour is its own alert, never deduplicated into this one.
+    const failed: AlertItem = { key: `low_credit_event_failed_${tenantId}`, text: `credits.low for tenant ${tenantId} (balance ${claim.balance} < ${claim.threshold}) was not queued: ${q.error}. The notice was ${released}.`, dedupMinutes: 60, meta };
+    // The crossing reaches the operator now, in the same DM: a charge that claims the notice again may never come.
+    await tell([failed, await operator()]);
     return { crossed: true, queued: 0 };
   } catch (e) {
     await alert(env, "low_credit_check_failed", `claim_low_credit_notice failed after charge ${requestId} (tenant ${tenantId}); credits.low waits for the next charge: ${redact(String(e)).slice(0, 200)}`, { dedupMinutes: 60, meta });

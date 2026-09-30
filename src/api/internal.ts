@@ -25,6 +25,7 @@ import { PROBE_GROUPS, PROBE_SERIES, probePlan, probeRefusal, runOfficialProbe }
 import { MatchBody, MatchRow, matchRefusal } from "../billing/match";
 import { paymentCreditedPayload } from "../billing/events";
 import { formatUsdc, parseUsdc } from "../billing/tiers";
+import { publicBase } from "../billing/top-up";
 
 type Vars = { requestId: string; schemaVersion: string };
 export const internal = new Hono<{ Bindings: Env; Variables: Vars }>();
@@ -89,7 +90,7 @@ internal.post("/watch/:id", async (c) => {
     console.log(JSON.stringify({ job: "watch_dispatch", dispatch: "admin", watch_id: id, note: "manual run: lease and single-use signature not checked" }));
   }
   const cfg = parseConfig(c.env);
-  const s = await runWatch(c.env, cfg, id, { waitUntil: waitUntilOf(c), dispatch: admin ? "admin" : "pg_net" });
+  const s = await runWatch(c.env, cfg, id, { waitUntil: waitUntilOf(c), dispatch: admin ? "admin" : "pg_net", base: publicBase(c.env, c.req.url) });
   // pg_net stores this status in net._http_response and dispatch_failures() (migration 013) counts >= 400 as a poll that
   // did not happen. A run that recorded its outcome, 'failure' included (a source error, alerted by the runner's own
   // transition and streak logic), is a delivered dispatch; only a run that could not record itself (loop_runs row or

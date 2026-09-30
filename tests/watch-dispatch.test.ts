@@ -16,6 +16,7 @@ const h = vi.hoisted(() => ({
   claims: [] as Array<{ p_watch: string; p_minute: string }>,
   failClaim: null as string | null,
   runs: [] as Array<{ id: string; dispatch: string | undefined; waitUntil?: boolean }>,
+  bases: [] as Array<string | null | undefined>,
 }));
 vi.mock("../src/db/supabase", () => ({
   db: () => ({}),
@@ -38,7 +39,8 @@ vi.mock("../src/db/supabase", () => ({
   }),
 }));
 vi.mock("../src/ingest/watch", () => ({
-  runWatch: vi.fn(async (_env: unknown, _cfg: unknown, id: string, opts: { dispatch?: string; waitUntil?: unknown }) => {
+  runWatch: vi.fn(async (_env: unknown, _cfg: unknown, id: string, opts: { dispatch?: string; waitUntil?: unknown; base?: string | null }) => {
+    h.bases.push(opts.base);
     h.runs.push({ id, dispatch: opts.dispatch, ...(opts.waitUntil ? { waitUntil: typeof opts.waitUntil === "function" } : {}) });
     return { watch_id: id, outcome: "no_op", rows_written: 0, detail: "unchanged", recorded: true };
   }),
@@ -59,7 +61,7 @@ async function dispatch(id = W, minute = minuteNow(), sig?: string) {
 const message = async (res: Response) => ((await res.json()) as { error?: { message: string } }).error?.message;
 
 beforeEach(() => {
-  h.used.clear(); h.leases.clear(); h.claims = []; h.failClaim = null; h.runs = [];
+  h.used.clear(); h.leases.clear(); h.claims = []; h.failClaim = null; h.runs = []; h.bases = [];
   h.leases.set(W, Date.now() + 120_000); // select_due_watches() leased it 120 s ahead
 });
 afterEach(() => vi.restoreAllMocks());
@@ -72,6 +74,13 @@ describe("POST /internal/watch/:id: single-use signature and lease", () => {
     expect(res.status).toBe(200);
     expect(h.claims).toEqual([{ p_watch: W, p_minute: minute }]);
     expect(h.runs).toEqual([{ id: W, dispatch: "pg_net", waitUntil: true }]);
+  });
+
+  it("hands the poll the public origin for its credits.low pointers: RESOLVE_PUBLIC_URL, else the dispatching request's own (worker_base_url)", async () => {
+    expect((await dispatch()).status).toBe(200);
+    const res = await internal.request(`/watch/${W}`, { method: "POST", headers: { authorization: "Bearer admin-test" } }, { ...env, RESOLVE_PUBLIC_URL: "https://resolve.example.com/" } as Env, ctx);
+    expect(res.status).toBe(200);
+    expect(h.bases).toEqual(["http://localhost", "https://resolve.example.com"]);
   });
 
   it("refuses a replayed signature with 409 and never runs the watch a second time", async () => {

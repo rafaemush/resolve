@@ -43,6 +43,7 @@ vi.mock("viem/accounts", async (importOriginal) => {
 import { v1 } from "../src/api/v1";
 import { challengeMessage, registerAnswer, signedBy, REGISTER_RESULTS } from "../src/billing/wallet";
 import { alert } from "../src/ops/alerts";
+import openapi from "../src/generated/openapi.json";
 // Read as this file loads, after src/billing/wallet.ts has: vitest clears mock history before each test.
 const atLoad = { calls: [...vi.mocked(privateKeyToAddress).mock.calls], results: [...vi.mocked(privateKeyToAddress).mock.results] };
 
@@ -89,6 +90,18 @@ describe("signedBy: an EIP-191 personal_sign by exactly this address", () => {
 describe("registerAnswer", () => {
   it("maps every register_wallet result to its status", () => {
     expect(Object.fromEntries(REGISTER_RESULTS.map((r) => [r, registerAnswer(r, "0xab").status]))).toEqual({ registered: 200, not_found: 404, used: 409, expired: 410, taken: 409 });
+  });
+  it("speaks of sending USDC only while USDC deposits are offered (no third-party USDC is solicited otherwise)", () => {
+    expect(registerAnswer("registered", "0xab").message).toBe("wallet 0xab registered to this account");
+    expect(registerAnswer("registered", "0xab", false).message).toBe("wallet 0xab registered to this account");
+    expect(registerAnswer("registered", "0xab", true).message).toBe("wallet 0xab registered: USDC it sends to the receiving address is credited to this account");
+    for (const r of REGISTER_RESULTS) expect(registerAnswer(r, "0xab").message, r).not.toMatch(/usdc|receiving address/i);
+  });
+  it("the published OpenAPI entries of the wallet routes do not invite USDC deposits either", () => {
+    const paths = (openapi as { paths: Record<string, Record<string, { summary: string }>> }).paths;
+    expect(paths["/v1/account/wallet/challenge"]!.get!.summary).toMatch(/^Issue a single-use wallet registration challenge \(valid \d+ minutes\) for a wallet this account controls\./);
+    expect(paths["/v1/account/wallet"]!.post!.summary).toContain("USDC deposits are not offered unless GET /v1/payments/address answers");
+    for (const p of ["/v1/account/wallet/challenge", "/v1/account/wallet"]) expect(JSON.stringify(paths[p]), p).not.toMatch(/sends USDC|send USDC|USDC it sends|receiving address/i);
   });
 });
 
@@ -141,6 +154,19 @@ describe("GET /v1/account/wallet/challenge and POST /v1/account/wallet", () => {
     expect(h.db.tables.tenants![0]!.wallet_address).toBe(account.address.toLowerCase());
     expect(h.db.tables.wallet_challenges![0]).toMatchObject({ used_at: expect.any(String), replaced_address: OLD_WALLET });
     expect((await call("GET", "/account")).body.data.tenant.wallet_address).toBe(account.address.toLowerCase());
+  });
+
+  it("while USDC deposits are not offered (the default), neither answer invites USDC; exactly \"1\" restores the deposit wording", async () => {
+    const ch = await challenge();
+    expect(ch.sign).toBe("EIP-191 personal_sign of `message`, exactly as given, with the wallet at `address`");
+    const r = await call("POST", "/account/wallet", { challenge_id: ch.challenge_id, signature: await sign(ch) });
+    expect(r.body.data.message).toBe(`wallet ${account.address.toLowerCase()} registered to this account`);
+    for (const v of [JSON.stringify(ch), JSON.stringify(r.body)]) expect(v).not.toMatch(/usdc|receiving address/i);
+    const offered = { ...env, USDC_DEPOSITS_OFFERED: "1" } as unknown as Env;
+    const on = async (method: string, path: string, body?: unknown) => (await (await v1.request(path, { method, ...(body === undefined ? {} : { headers: { "content-type": "application/json" }, body: JSON.stringify(body) }) }, offered, ctx)).json()) as Record<string, any>;
+    const ch2 = (await on("GET", `/account/wallet/challenge?address=${account.address}`)).data as Record<string, string>;
+    expect(ch2.sign).toContain("(the one that will send USDC)");
+    expect((await on("POST", "/account/wallet", { challenge_id: ch2.challenge_id, signature: await sign(ch2) })).data.message).toContain("USDC it sends to the receiving address is credited to this account");
   });
 
   it("a replayed challenge is 409 challenge_used, even with the same valid signature", async () => {
