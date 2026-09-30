@@ -162,6 +162,17 @@ describe("the registry generated from it", () => {
     expect(generated.releases["bcb_selic_target:2026-12-09"]!.basis).toMatch(/time UNVERIFIED.*earliest time/);
     expect(generated.releases["us_cpi_u_nsa_yoy:2026-10"]!.basis).not.toContain("UNVERIFIED");
   });
+
+  it("synthetic rows: an UNVERIFIED date is flagged in the basis, on the release and on the fallback it sets (no calendar row has one yet)", () => {
+    const r = calendarReleases([
+      row({ family: "fomc", period: "2027-07-28", release_local: "2027-07-28 14:00 ET", release_at: "2027-07-28T18:00:00Z", next_release_at: "2027-09-22T18:00:00Z", date_status: "UNVERIFIED", note: "tentative date" }),
+      row({ family: "fomc", period: "2027-09-22", release_local: "2027-09-22 14:00 ET", release_at: "2027-09-22T18:00:00Z", next_release_at: "2027-11-03T18:00:00Z", date_status: "UNVERIFIED", time_status: "UNVERIFIED", note: "tentative date and time" }),
+    ]);
+    expect(r.releases["fomc_upper_bound:2027-07-28"]!.basis).toMatch(/^FOMC statement 2027-07-28: 2027-07-28 14:00 ET = 2027-07-28T18:00:00Z \(date UNVERIFIED\); fallback at the next FOMC statement, 2027-09-22T18:00:00Z \(date UNVERIFIED, time UNVERIFIED\),/);
+    expect(r.releases["fomc_upper_bound:2027-09-22"]!.basis).toMatch(/^FOMC statement 2027-09-22: 2027-09-22 14:00 ET = 2027-09-22T18:00:00Z \(date UNVERIFIED, time UNVERIFIED\);/);
+    const bok = calendarReleases([row({ family: "bok_rate", period: "2027-01-14", release_local: "2027-01-14 KST" }), row({ family: "bok_rate", period: "2027-02-25", date_status: "UNVERIFIED" })]);
+    expect(bok.releases["bok_base_rate:2027-01-14"]!.basis).toContain("fallback at the next meeting, 2027-02-25 10:00 KST (date UNVERIFIED)");
+  });
 });
 
 describe("US Eastern time without a time-zone database", () => {

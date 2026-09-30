@@ -14,75 +14,29 @@
  * against the rail's stored first print of the meeting before it, or derived from that print; without either the
  * group is skipped with the reason. That check is one read-only select of official_observations with the service role
  * (SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY from .env, never printed), made only when a group's previous meeting is in
- * the release calendar. The output copies platform market texts: it is written under private/ only.
+ * the release calendar and already released. An ad-hoc ladder's legs are kept only when the platform's own title and
+ * texts are about the period it was named with. The groups and the run live in scripts/lib/official-legs.ts (tested
+ * in tests/official-prior.test.ts); this file supplies the network, the database client and the output file. The
+ * output copies platform market texts: it is written under private/ only.
  */
 import { writeFileSync, mkdirSync } from "node:fs";
 import { dirname, relative, resolve } from "node:path";
 import { createClient } from "@supabase/supabase-js";
 import { loadEnv, need } from "./lib/env";
-import { USAGE, UsageError, outPathRefusal, parseLegArgs, readFirstPrints, withPriors, type LegArgs, type ObservationsClient } from "./lib/official-legs";
-import { buildLegRegistration, type LegGroup } from "../src/markets/official-legs";
-import { limitlessLabels, limitlessOutcomeIndex } from "../src/markets/outcomes";
-import { validateRegistration } from "../src/markets/register";
-import { UNSUPPORTED_OFFICIAL_SERIES, knownRelease } from "../src/resolve/official";
+import { REFUSED, USAGE, UsageError, outPathRefusal, parseLegArgs, readFirstPrints, selectGroups, suggestLegs, type Group, type LegArgs, type ObservationsClient } from "./lib/official-legs";
+import { UNSUPPORTED_OFFICIAL_SERIES } from "../src/resolve/official";
 import { OFFICIAL_UA } from "../src/ingest/official";
-import type { MarketRegistration } from "../src/resolve/schema";
-
-/** slug: a Limitless group (its Polymarket mirror is found through externalSlug); pmSlug: a Polymarket-only event. */
-interface Group extends LegGroup { slug?: string; pmSlug?: string; basis: string }
-
-/** release_at comes from the event registry (src/resolve/official.ts KNOWN_RELEASES): registration refuses any other. */
-const scheduled = (series: LegGroup["series"], period: string): string => {
-  const k = knownRelease(series, period);
-  if (!k) throw new Error(`${series}:${period} is not in KNOWN_RELEASES`);
-  return k.release_at;
-};
-
-const GROUPS: Group[] = [
-  { slug: "september-inflation-us-annual-1789462576803", series: "us_cpi_u_nsa_yoy", period: "2026-09", release_at: scheduled("us_cpi_u_nsa_yoy", "2026-09"), title: "September Inflation US - Annual",
-    basis: "BLS CPI schedule: September 2026 -> Oct. 14, 2026 08:30 AM ET (observed)" },
-  { slug: "ppi-yoy-september-2026-1789463068607", series: "us_ppi_fd_nsa_yoy", period: "2026-09", release_at: scheduled("us_ppi_fd_nsa_yoy", "2026-09"), title: "PPI YoY - September 2026",
-    basis: "BLS PPI schedule: September 2026 -> Oct. 15, 2026 08:30 AM ET (observed)" },
-  { slug: "bank-of-korea-decision-in-october-1788169618885", series: "bok_base_rate", period: "2026-10-22", release_at: scheduled("bok_base_rate", "2026-10-22"), prior_level: 3.0, title: "Bank of Korea decision in October?",
-    basis: "BoK 2026 MPB dates PDF: October Thursday 22 (observed); 10:00 KST decision time UNVERIFIED (earlier decision items are stamped 10:30 KST); prior 3.00% (raised 2026-08-27)" },
-  { slug: "south-korea-gdp-growth-yoy-in-q3-2026-1786348145771", series: "kr_gdp_advance_yoy", period: "2026-Q3", release_at: scheduled("kr_gdp_advance_yoy", "2026-Q3"), title: "South Korea GDP growth (YoY) in Q3 2026?",
-    basis: "BoK statistical calendar: 2026-10-27 08:00 KST Real GDP Q3 advance (observed)" },
-  { slug: "fed-decision-in-october-1786349804918", series: "fomc_upper_bound", period: "2026-10-28", release_at: scheduled("fomc_upper_bound", "2026-10-28"), prior_level: 4.0, title: "Fed Decision in October?",
-    basis: "FOMC calendar: October 27-28 (observed); 2:00 p.m. EDT statement time from the September statement (UNVERIFIED for October); prior upper bound 4.00 (September 16)" },
-  { slug: "ecb-interest-rates-october-2026-1789050608644", series: "ecb_dfr", period: "2026-10-29", release_at: scheduled("ecb_dfr", "2026-10-29"), prior_level: 2.5, title: "ECB Interest Rates: October 2026",
-    basis: "ECB calendar: 29/10/2026 meeting day 2 (observed); 14:15 CET release time UNVERIFIED; prior DFR 2.50% (September 10, effective 16th)" },
-  { slug: "bank-of-brazil-decision-in-november-1789385653368", series: "bcb_selic_target", period: "2026-11-04", release_at: scheduled("bcb_selic_target", "2026-11-04"), prior_level: 13.75, title: "Bank of Brazil decision in November?",
-    basis: "Copom November 3-4 (SGS 432 fill ends 04/11/2026; the official calendar page is JS-only); ~18:30 BRT decision time UNVERIFIED; prior Selic 13.75% (meeting 281)" },
-  { slug: "bank-of-england-decision-in-november-1789387521621", series: "boe_bank_rate", period: "2026-11-05", release_at: scheduled("boe_bank_rate", "2026-11-05"), prior_level: 3.75, title: "Bank of England decision in November?",
-    basis: "BoE MPC dates: Thursday 5 November (observed); 12:00 UK (GMT) from the September pattern (UNVERIFIED for November); prior Bank Rate 3.75%" },
-];
-// Polymarket-only BLS ladders (gamma events observed 2026-09-27; no Limitless group). Titles as on the platform.
-const BLS_CPI_BASIS = "BLS CPI schedule: September 2026 -> Oct. 14, 2026 08:30 AM ET (observed 2026-09-27); Table A of the release";
-const BLS_EMPSIT_BASIS = "BLS Employment Situation schedule: September 2026 -> Oct. 02, 2026 08:30 AM ET (observed 2026-09-27); the platform endDate (08:30Z) is not the release time";
-GROUPS.push(
-  { pmSlug: "september-inflation-us-monthly", series: "us_cpi_u_sa_mom", period: "2026-09", release_at: scheduled("us_cpi_u_sa_mom", "2026-09"), title: "September Inflation US - Monthly", basis: BLS_CPI_BASIS },
-  { pmSlug: "core-cpi-yoy-september-2026", series: "us_core_cpi_nsa_yoy", period: "2026-09", release_at: scheduled("us_core_cpi_nsa_yoy", "2026-09"), title: "Core CPI YoY - September 2026", basis: BLS_CPI_BASIS },
-  { pmSlug: "core-cpi-mom-september-2026", series: "us_core_cpi_sa_mom", period: "2026-09", release_at: scheduled("us_core_cpi_sa_mom", "2026-09"), title: "Core CPI MoM - September 2026", basis: BLS_CPI_BASIS },
-  { pmSlug: "september-unemployment-rate-2026", series: "us_unemployment_rate", period: "2026-09", release_at: scheduled("us_unemployment_rate", "2026-09"), title: "September Unemployment Rate", basis: BLS_EMPSIT_BASIS },
-  { pmSlug: "how-many-jobs-added-in-september-2026", series: "us_nonfarm_payrolls_change", period: "2026-09", release_at: scheduled("us_nonfarm_payrolls_change", "2026-09"), title: "How many jobs added in September?", basis: BLS_EMPSIT_BASIS },
-);
-const REFUSED = [{ slug: "bank-of-japan-decision-in-october-1789388114859", series: "boj_policy_rate", title: "Bank of Japan Decision in October?" }];
 
 let args: LegArgs;
-try { args = parseLegArgs(process.argv.slice(2)); }
+let selected: Group[];
+try { args = parseLegArgs(process.argv.slice(2)); selected = selectGroups(args); }
 catch (e) { if (e instanceof UsageError) { console.error(`${e.message}\n${USAGE}`); process.exit(2); } throw e; }
 const { only, adhoc } = args;
 const root = resolve(import.meta.dirname, "..");
 const out = resolve(root, args.out);
 const refusedOut = outPathRefusal(root, out);
 if (refusedOut) { console.error(`${refusedOut}\n${USAGE}`); process.exit(2); }
-for (const s of only ?? []) if (!GROUPS.some((g) => g.series === s)) throw new Error(`--only ${s}: no ladder group for that series`);
-/** An ad-hoc group takes its release_at and basis from the registry (parseLegArgs refused anything outside it). */
-const selected: Group[] = adhoc
-  ? [{ ...(adhoc.pmSlug ? { pmSlug: adhoc.pmSlug } : { slug: adhoc.slug! }), series: adhoc.series, period: adhoc.period, release_at: scheduled(adhoc.series, adhoc.period), title: adhoc.title, basis: knownRelease(adhoc.series, adhoc.period)!.basis }]
-  : GROUPS.filter((g) => !only || only.includes(g.series));
 loadEnv();
-const key = process.env.LIMITLESS_API_KEY;
 
 const sources: Array<{ url: string; http_status: number | null; fetched_at: string; note?: string }> = [];
 let last = 0;
@@ -102,42 +56,6 @@ async function getJson(url: string, headers: Record<string, string> = {}): Promi
   }
 }
 
-type Obj = Record<string, unknown>;
-const str = (v: unknown) => (typeof v === "string" && v ? v : undefined);
-const iso = (v: unknown) => { const t = typeof v === "number" ? v : typeof v === "string" ? Date.parse(v) : NaN; return Number.isFinite(t) ? new Date(t).toISOString() : undefined; };
-
-interface Entry { market: MarketRegistration; meta: Record<string, unknown>; approved: false }
-const entries: Entry[] = [];
-const skipped: Array<{ platform: string; group: string; label: string; external_id: string; reason: string }> = [];
-const notes: string[] = [];
-
-const groupName = (g: Group) => g.slug ?? g.pmSlug ?? g.title;
-const deadlineNotes = new Set<string>();
-
-function add(platform: "limitless" | "polymarket", g: Group, leg: { external_id: string; label: string; open_at?: string; deadline_utc?: string; criteria: string }, meta: Record<string, unknown>) {
-  if (!leg.open_at || !leg.deadline_utc) { skipped.push({ platform, group: groupName(g), label: leg.label, external_id: leg.external_id, reason: "no creation or expiration time on the platform object" }); return; }
-  const b = buildLegRegistration({ platform, external_id: leg.external_id, group: g, label: leg.label, open_at: leg.open_at, deadline_utc: leg.deadline_utc, criteria: leg.criteria });
-  if (!b.ok) { skipped.push({ platform, group: groupName(g), label: leg.label, external_id: leg.external_id, reason: b.reason }); return; }
-  try { validateRegistration(b.market); }
-  catch (e) { skipped.push({ platform, group: groupName(g), label: leg.label, external_id: leg.external_id, reason: String(e).slice(0, 300) }); return; }
-  // The rail decides from the scheduled release whatever the trading close; say so where the platform closes first.
-  if (Date.parse(leg.deadline_utc) < Date.parse(g.release_at)) deadlineNotes.add(`${groupName(g)}: the ${platform} deadline ${leg.deadline_utc} is before the release ${g.release_at}; the legs still decide from the release (the deadline is the trading close, not part of the question)`);
-  entries.push({ market: b.market, meta: { ...meta, category: "official_release", series: g.series, period: g.period, resolver_basis: g.basis }, approved: false });
-}
-
-/** Every open leg of one gamma event, as Polymarket registrations of the group. */
-async function addPolymarketEvent(g: Group, slug: string, provider: string): Promise<void> {
-  const ev = (await getJson(`https://gamma-api.polymarket.com/events?slug=${encodeURIComponent(slug)}`)) as Obj[] | null;
-  const event = Array.isArray(ev) ? ev[0] : undefined;
-  if (!event) { notes.push(`${groupName(g)}: gamma has no event with slug ${slug} (externalProvider ${provider})`); return; }
-  const pms = Array.isArray(event.markets) ? (event.markets as Obj[]) : [];
-  for (const m of pms) {
-    if (m.closed === true) { skipped.push({ platform: "polymarket", group: groupName(g), label: String(m.groupItemTitle ?? m.question ?? ""), external_id: String(m.id ?? ""), reason: "closed on Polymarket" }); continue; }
-    add("polymarket", g, { external_id: String(m.id ?? ""), label: String(m.groupItemTitle ?? ""), open_at: iso(m.startDate ?? m.createdAt ?? event.startDate), deadline_utc: iso(m.endDate ?? event.endDate), criteria: String(m.description ?? event.description ?? "") },
-      { condition_id: m.conditionId ?? null, slug: m.slug ?? null, event_id: event.id ?? null, event_slug: event.slug ?? slug });
-  }
-}
-
 /** The stored first prints of the meetings before the rate groups: one read-only select, only when some are needed. */
 async function readStored(keys: Parameters<typeof readFirstPrints>[1]) {
   const client = createClient(need("SUPABASE_URL"), need("SUPABASE_SERVICE_ROLE_KEY"), { auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false } });
@@ -146,34 +64,7 @@ async function readStored(keys: Parameters<typeof readFirstPrints>[1]) {
 }
 
 async function main() {
-  // prior_level of every rate group before any platform request: a hand-written prior that disagrees with a stored
-  // first print stops the run (withPriors throws with both values); a group without a prior is skipped with the reason
-  const priced = await withPriors(selected, readStored, Date.now());
-  const skippedGroups = priced.skipped.map((s) => ({ group: groupName(s.group), series: s.group.series, period: s.group.period, reason: s.reason }));
-  notes.push(...skippedGroups.map((s) => `${s.group}: skipped, ${s.reason}`));
-  for (const g of priced.groups) {
-    if (!g.slug) { await addPolymarketEvent(g, g.pmSlug!, "none: Polymarket-only ladder"); continue; }
-    const lm = (await getJson(`https://api.limitless.exchange/markets/${g.slug}`, key ? { "X-API-Key": key } : {})) as Obj | null;
-    if (!lm) { notes.push(`${g.slug}: Limitless GET failed; no legs from it`); continue; }
-    const legs = Array.isArray(lm.markets) ? (lm.markets as Obj[]) : [];
-    if (!legs.length) notes.push(`${g.slug}: Limitless group returned no sub-markets`);
-    for (const m of legs) {
-      if (m.hidden === true) { skipped.push({ platform: "limitless", group: g.slug, label: String(m.title ?? ""), external_id: String(m.slug ?? ""), reason: "hidden sub-market" }); continue; }
-      // The labels reconcile reads this leg's winningOutcomeIndex with; the venue payload proposes over the same list.
-      const labels = limitlessLabels({ outcomeTokens: Array.isArray(m.outcomeTokens) && m.outcomeTokens.every((x) => typeof x === "string") ? (m.outcomeTokens as string[]) : null, tokens: m.tokens && typeof m.tokens === "object" ? (m.tokens as Record<string, unknown>) : null });
-      if (!labels || limitlessOutcomeIndex("OPTION_A", { option_a: "Yes", option_b: "No" }, labels) === null || limitlessOutcomeIndex("OPTION_B", { option_a: "Yes", option_b: "No" }, labels) === null) {
-        skipped.push({ platform: "limitless", group: g.slug, label: String(m.title ?? ""), external_id: String(m.slug ?? ""), reason: `outcome labels ${JSON.stringify(labels)} do not map Yes and No to one index each: reconcile could not read the outcome` });
-        continue;
-      }
-      add("limitless", g, { external_id: String(m.slug ?? ""), label: String(m.title ?? ""), open_at: iso(m.createdAt), deadline_utc: iso(m.expirationTimestamp), criteria: String(m.description ?? lm.description ?? "") },
-        { limitless_slug: m.slug, group_slug: g.slug, ...(str(m.conditionId) ? { condition_id: m.conditionId } : {}), outcome_labels: [...labels], limitless_market_id: m.id ?? null, status: m.status ?? null });
-    }
-    const meta = (lm.metadata ?? {}) as Obj;
-    const ext = str(lm.externalSlug) ?? str(meta.externalSlug);
-    if (!ext) { notes.push(`${g.slug}: no externalSlug on the Limitless group; no Polymarket mirror looked up`); continue; }
-    await addPolymarketEvent(g, ext, String(meta.externalProvider ?? lm.externalProvider ?? "null"));
-  }
-  notes.push(...deadlineNotes);
+  const { entries, skipped, skipped_groups: skippedGroups, notes } = await suggestLegs(selected, { getJson, readStored, nowMs: Date.now(), limitlessKey: process.env.LIMITLESS_API_KEY });
   if (!only && !adhoc) for (const r of REFUSED) notes.push(`${r.slug} (${r.title}): refused, ${UNSUPPORTED_OFFICIAL_SERIES[r.series]}; the market also allows "a consensus of credible reporting"`);
 
   const lim = entries.filter((e) => e.market.platform === "limitless").length;
