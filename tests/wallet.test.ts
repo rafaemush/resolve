@@ -196,7 +196,8 @@ describe("GET /v1/account/wallet/challenge and POST /v1/account/wallet", () => {
 });
 
 describe("GET /v1/payments/address quotes the tiers the database credits at", () => {
-  const withAddress = { ...env, USDC_RECEIVING_ADDRESS: "0x00000000000000000000000000000000000000ee", CREDITS_PER_USDC: "100" } as unknown as Env;
+  // USDC deposits switched on (the founder's switch; off by default, tests/money-events.test.ts covers the refusal)
+  const withAddress = { ...env, USDC_DEPOSITS_OFFERED: "1", USDC_RECEIVING_ADDRESS: "0x00000000000000000000000000000000000000ee", CREDITS_PER_USDC: "100" } as unknown as Env;
   const get = async () => { const res = await v1.request("/payments/address", { method: "GET" }, withAddress, ctx); return { status: res.status, body: (await res.json()) as Record<string, any> }; };
   beforeEach(() => {
     vi.mocked(alert).mockClear();

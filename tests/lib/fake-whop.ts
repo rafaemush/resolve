@@ -12,6 +12,8 @@ import { grantCredits } from "./fake-money";
 import { rateLimitHit } from "./fake-request-key";
 
 export const WHOP_SECRET = `ws_${"0123456789abcdef".repeat(4)}`;
+/** The $20 pack's plan as wrangler.toml sets it (a real plan id: the webhook must grant 2,000 credits for exactly this one). */
+export const PLAN_20 = "plan_PNgCSGmXG38KW";
 export const PLAN_50 = "plan_Pack50xxxxxxxx";
 export const PLAN_250 = "plan_Pack250xxxxxxx";
 export const WHOP_RPCS: NonNullable<FakeDbOptions["rpc"]> = { grant_credits: grantCredits, rate_limit_hit: rateLimitHit };

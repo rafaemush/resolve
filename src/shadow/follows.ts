@@ -5,7 +5,8 @@
  * of the public record, and it never carries the nonce or the preimage, which stay private until the public reveal.
  * A follow delivers only while it is entitled (followBlock): a free-plan (evaluation) tenant only while it holds a live
  * key, and every plan only for its oldest follows of open markets up to the plan's cap, so an expired evaluation key or
- * a lowered plan stops the early reveal instead of leaving it on forever.
+ * a lowered plan stops the early reveal instead of leaving it on forever. The routes name a market by its uuid or by
+ * the venue id /record prints, "<platform>:<external_id>" (plan §22.3 #4, parseMarketRef).
  * Pure rules here (tested in tests/follows.test.ts); the atomic cap + insert is follow_market() and the facts the rules
  * read are follow_entitlements() (migration 014).
  */
@@ -13,6 +14,7 @@ import { z } from "zod";
 import type { Db } from "../db/supabase";
 import { CommittedVerdict, DISCLAIMER, marketRef, type CommittedFields } from "../bot/commit";
 import type { MarketRow } from "../ingest/types";
+import { Platform } from "../resolve/schema";
 import { venueBasis } from "../api/public-names";
 
 export const PLANS = ["free", "payg", "builder", "growth", "platform"] as const;
@@ -33,6 +35,29 @@ export function followCap(plan: Plan): number | null {
     default: { const never: never = plan; throw new Error(`unknown plan ${String(never)}`); }
   }
 }
+
+const MarketUuid = z.string().uuid();
+/** "<platform>:<external_id>": the platforms of markets.platform (migration 002), an external_id as registered (1-200 characters). */
+const VENUE_ID = new RegExp(`^(${Platform.options.join("|")}):([\\s\\S]{1,200})$`);
+export const MARKET_REF_HINT = `market id must be a uuid or a venue id <platform>:<external_id> (platform ${Platform.options.join(", ")}), as /record prints it`;
+
+/** A market as a follow or early-reveal path names it. */
+export type MarketRef = { kind: "uuid"; id: string } | { kind: "venue"; platform: z.infer<typeof Platform>; externalId: string };
+
+/**
+ * Pure. The market a path names: its uuid, or its venue id "<platform>:<external_id>" exactly as /record and the home
+ * page print it (external_id as registered, 1 to 200 characters). A venue id names only a public shadow market: the
+ * route looks it up with tenant_id null, is_test false and deleted_at null, and one match is required. Null for
+ * anything else.
+ */
+export function parseMarketRef(raw: string): MarketRef | null {
+  if (MarketUuid.safeParse(raw).success) return { kind: "uuid", id: raw };
+  const m = VENUE_ID.exec(raw);
+  return m ? { kind: "venue", platform: m[1] as z.infer<typeof Platform>, externalId: m[2]! } : null;
+}
+
+/** Pure. The one market a lookup found: a venue id that matches more than one public shadow market is refused, never guessed. */
+export const onlyMatch = <T>(rows: readonly T[] | null | undefined): T | null => (rows?.length === 1 ? rows[0]! : null);
 
 /** The markets columns the follow rules read. */
 export interface FollowTarget { id: string; tenant_id: string | null; is_test: boolean; status: string; deleted_at: string | null }

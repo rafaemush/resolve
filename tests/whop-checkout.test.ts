@@ -9,7 +9,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
 import { fakeDb, type FakeDb, type Row } from "./lib/fake-db";
-import { PLAN_250, PLAN_50, WHOP_RPCS, WHOP_SECRET } from "./lib/fake-whop";
+import { PLAN_20, PLAN_250, PLAN_50, WHOP_RPCS, WHOP_SECRET } from "./lib/fake-whop";
 
 const h = vi.hoisted(() => ({
   db: null as unknown as FakeDb,
@@ -67,7 +67,7 @@ const KEY = `rsl_test_${"a1b2c3d4e5f6g7h8".repeat(2)}`;
 const KEY_BODY = KEY.slice("rsl_test_".length);
 const WHOP_API_KEY = "whop_secret_api_key_for_tests_0001";
 const base = { RESOLVE_PUBLIC_URL: "https://resolve.example.com", PUBLIC_CHANNEL_URL: "https://t.me/resolve_feed", CREDITS_PER_USDC: "100" };
-const on = { ...base, WHOP_CHECKOUT_ENABLED: "1", WHOP_API_KEY, WHOP_WEBHOOK_SECRET: WHOP_SECRET, WHOP_PLAN_ID_50: PLAN_50, WHOP_PLAN_ID_250: PLAN_250 } as unknown as Env;
+const on = { ...base, WHOP_CHECKOUT_ENABLED: "1", WHOP_API_KEY, WHOP_WEBHOOK_SECRET: WHOP_SECRET, WHOP_PLAN_ID_20: PLAN_20, WHOP_PLAN_ID_50: PLAN_50, WHOP_PLAN_ID_250: PLAN_250 } as unknown as Env;
 const off = { ...on, WHOP_CHECKOUT_ENABLED: "0" } as unknown as Env;
 const pending: Array<Promise<unknown>> = [];
 const ctx = { waitUntil: (p: Promise<unknown>) => { pending.push(p); }, passThroughOnException: () => undefined } as unknown as ExecutionContext;
@@ -184,6 +184,19 @@ describe("the API route: a valid key opens a checkout for its own tenant", () =>
     expect(JSON.parse(String(call.init.body))).toEqual({ plan_id: PLAN_50, mode: "payment", metadata: { resolve_tenant_id: TENANT }, redirect_url: "https://resolve.example.com/billing/done" });
     await expectKeyNowhere(answer);
   });
+  it("the $20 pack (card only) opens a checkout on its own plan for 2,000 credits; the number 20 is accepted too", async () => {
+    whopAnswer = () => new Response(JSON.stringify({ id: "ch_T20", purchase_url: "https://whop.com/checkout/ch_T20/", plan: { id: PLAN_20 } }), { status: 200 });
+    const res = await apiCheckout({ pack: "20" });
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as any).data).toMatchObject({ pack: "20", price: "20.00", currency: "usd", credits: 2000 });
+    expect(JSON.parse(String(whopCalls[0]!.init.body))).toMatchObject({ plan_id: PLAN_20, metadata: { resolve_tenant_id: TENANT } });
+    expect((await apiCheckout({ pack: 20 })).status).toBe(200);
+    expect(JSON.parse(String(whopCalls[1]!.init.body)).plan_id).toBe(PLAN_20);
+    // without its plan id the whole card checkout is closed (never a checkout that could not be credited)
+    const no20 = await apiCheckout({ pack: "50" }, { ...on, WHOP_PLAN_ID_20: "" } as unknown as Env);
+    expect(no20.status).toBe(503);
+    expect(h.alerts.map((a) => a.text).join("\n")).toContain("WHOP_PLAN_ID_20");
+  });
   it("the $250 pack uses its own plan; a number is accepted for the pack", async () => {
     whopAnswer = () => new Response(JSON.stringify({ id: "ch_T250", purchase_url: "https://whop.com/checkout/ch_T250/", plan: { id: PLAN_250 } }), { status: 200 });
     const res = await apiCheckout({ pack: 250 });
@@ -243,12 +256,14 @@ describe("the /pricing form", () => {
     expect(html).toContain('<form method="post" action="/billing/checkout" autocomplete="off">');
     expect(html).toContain('<input name="key" type="password"');
     expect(html).not.toMatch(/name="key"[^>]*value=/);
+    expect(html).toContain('<option value="20">$20: 2,000 credits</option>');
     expect(html).toContain('<option value="50">$50: 5,000 credits</option>');
     expect(html).toContain('<option value="250">$250: 27,500 credits</option>');
     expect(html).toContain("curl -X POST https://resolve.example.com/v1/billing/checkout");
     expect(res.headers.get("content-security-policy")).toBe(SITE_CSP.replace("form-action 'self'", "form-action 'self' https://whop.com https://*.whop.com"));
     expect(res.headers.get("content-security-policy")).toContain("default-src 'none'");
     const t = text(html);
+    expect(t).toContain("The $20, $50 and $250 packs can be paid by card (above); the $20 pack (2,000 credits) is sold by card only.");
     for (const s of ["Resolve developer data API", "merchant of record", "non-refundable prepayment for API services", "do not expire while the account is open", "refunded or charged back, the credits it bought are removed", "cannot be withdrawn", "cannot be moved to another account"]) expect(t).toContain(s);
     expect(t).not.toMatch(/lifetime|wallet|bet\b|betting|scrap/i);
     expect(html).not.toMatch(NAMES);
@@ -284,6 +299,8 @@ describe("the /pricing form", () => {
   it("no pack, or not the form: 400, the key never read", async () => {
     const res = await formCheckout({ key: KEY, pack: "1000" });
     expect(res.status).toBe(400);
+    const refused = await res.clone().text();
+    expect(text(refused)).toContain("Choose one of the packs: $20, $50 or $250.");
     expect(res.headers.get("cache-control")).toBe("no-store");
     const json = await app.request("/billing/checkout", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ key: KEY, pack: "50" }) }, on, ctx);
     expect(json.status).toBe(400);
@@ -327,7 +344,7 @@ describe("the pages around the checkout", () => {
   });
   it("/docs explains paying by card (and says when it is not open yet); /terms says what a refund or chargeback does", async () => {
     const docs = text(await (await app.request("/docs", {}, on, ctx)).text());
-    for (const s of ["6. Pay by card", "developer data API", "merchant of record", "$50 (5,000 credits) and $250 (27,500 credits)", "non-refundable prepayment for API services", "do not expire while the account is open", "refunded or charged back, the credits it bought are removed", "Your key is never sent to Whop"]) expect(docs).toContain(s);
+    for (const s of ["6. Pay by card", "developer data API", "merchant of record", "$20 (2,000 credits), $50 (5,000 credits) and $250 (27,500 credits)", "When the test credits run out, pay by card", "non-refundable prepayment for API services", "do not expire while the account is open", "refunded or charged back, the credits it bought are removed", "Your key is never sent to Whop"]) expect(docs).toContain(s);
     expect(docs).not.toContain("Card checkout is not open yet");
     expect(text(await (await app.request("/docs", {}, off, ctx)).text())).toContain("Card checkout is not open yet");
     const terms = text(await (await app.request("/terms", {}, off, ctx)).text());

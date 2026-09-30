@@ -67,6 +67,16 @@ describe("customer-facing documents", () => {
     expect(texts["docs/templates/pilot-letter.md"]).toMatch(/first delivered to your account/);
     expect(texts["docs/pilot-pack.md"]).not.toMatch(/when the first webhook reached you/);
   });
+  it("docs/pricing.md: card checkout is live, the $20 pack is card only, and no tenant is told to send USDC to an address", () => {
+    const t = texts["docs/pricing.md"]!;
+    expect(t).toMatch(/Card checkout through Whop is live/);
+    expect(t).not.toMatch(/switched off until/);
+    expect(t).toMatch(/\$20 = 2,000 credits, card only/);
+    expect(t).toMatch(/\{"pack": "20"\}/);
+    expect(t).toMatch(/USDC deposits are not offered/);
+    expect(t).not.toMatch(/send USDC on Base from that wallet to the address/i);
+    expect(t).not.toMatch(/lifetime/i);
+  });
   it("the pilot letter fits one page (under 650 words)", () => {
     expect(texts["docs/templates/pilot-letter.md"]!.split(/\s+/).filter(Boolean).length).toBeLessThan(650);
   });

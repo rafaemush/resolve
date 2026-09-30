@@ -230,7 +230,7 @@ const STORED: Record<WebhookEvent, () => Promise<Record<string, unknown>>> = {
   "market.resolved": async () => ({ market_id: "m1", external_id: "t-1", request_id: "r1", verdict: await webVerdict() }),
   "market.unresolved_update": async () => ({ market_id: "m1", external_id: "t-1", request_id: "r1", verdict: await unresolvedVerdict() }),
   "market.error": async () => ({ market_id: "m1", external_id: "t-1", request_id: "r1", verdict: await failedCallVerdict() }),
-  "credits.low": async () => creditsLowPayload({ balance: 3, threshold: 10, request_id: "r1" }),
+  "credits.low": async () => creditsLowPayload({ balance: 3, threshold: 10, request_id: "r1", top_up: { method: "contact_support", page: "/terms#contact" } }),
   "payment.credited": async () => paymentCreditedPayload({ tx_hash: `0x${"b".repeat(64)}`, log_index: 2, amount_usdc: "1", credits: 100, balance_after: 400 }),
   "shadow.committed": async () => { const p = await shadowCommittedNow(); return { ...p, verdict: internalBasis(p.verdict) }; },
   "shadow.revealed": async () => { const p = await shadowRevealedNow(); return { ...p, commits: (p.commits as Row[]).map((c) => ({ ...c, verdict: internalBasis(c.verdict) })) }; },

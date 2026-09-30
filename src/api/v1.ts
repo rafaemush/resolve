@@ -18,12 +18,13 @@ import type { MarketRow } from "../ingest/types";
 import { alert } from "../ops/alerts";
 import { redact } from "../ops/redact";
 import { mintKey, rotationExpiry } from "./keys";
-import { followBlock, followCap, followEntitlements, followMarket, followRefusal, Plan, shapeShadow, EARLY_REVEAL_LABEL, type FollowAnswer, type FollowTarget, type ShadowCommitRow, type ShadowMarket } from "../shadow/follows";
+import { followBlock, followCap, followEntitlements, followMarket, followRefusal, onlyMatch, parseMarketRef, Plan, shapeShadow, EARLY_REVEAL_LABEL, MARKET_REF_HINT, type FollowAnswer, type FollowTarget, type MarketRef, type ShadowCommitRow, type ShadowMarket } from "../shadow/follows";
 import { subscribes } from "../webhooks/deliver";
 import { chunks, entitledFollows, exportCsv, exportRows, EXPORT_COLUMNS, EXPORT_ROW_CAP, EXPORT_VIEW_COLUMNS, ExportQuery, type ExportFollow, type ExportViewRow } from "../shadow/export";
 import { DISCLAIMER } from "../bot/commit";
 import { noteCharge } from "../billing/events";
 import { effectiveTiers, packQuotes, paygRate } from "../billing/tiers";
+import { publicBase, topUp, topUpText, usdcDepositsOffered, USDC_NOT_OFFERED } from "../billing/top-up";
 import { publicBasis, publicRoute, publicText, publicVerdictRecord, publicWatchSummary, toPublicVerdict } from "./public-names";
 import { challengeMessage, newNonce, registerAnswer, signedBy, REGISTER_RESULTS, SIGNATURE, WALLET_ADDRESS, type RegisterResult } from "../billing/wallet";
 
@@ -209,7 +210,11 @@ v1.post("/resolve", async (c) => {
     if (!r || r.status_row !== "complete") return ok(c, { request_id: br.request_id, status_row: r?.status_row ?? "pending", message: "original request still in flight" }, 202);
     return ok(c, { request_id: br.request_id, ...rowToVerdict(r), replayed: true, credits_charged: r.credits_charged, balance: br.balance });
   }
-  if (!br.ok) return err(c, "insufficient_credits", `This request costs ${amount} credit(s); balance is ${br.balance}. Top up at GET /v1/payments/address.`, 402, { extra: { balance: br.balance, price_credits: amount, route: publicRoute(plan.route) } });
+  if (!br.ok) {
+    // Where to top up: the card rail while it is offered, else support; never the USDC address (src/billing/top-up.ts).
+    const top = topUp(c.env, publicBase(c.env, c.req.url));
+    return err(c, "insufficient_credits", `This request costs ${amount} credit(s); balance is ${br.balance}. ${topUpText(top)}`, 402, { extra: { balance: br.balance, price_credits: amount, route: publicRoute(plan.route), top_up: top } });
+  }
 
   // 4. resolve
   let rt: RuntimeOutput;
@@ -222,9 +227,10 @@ v1.post("/resolve", async (c) => {
   }
   let refunded = 0;
   if (rt.result.verdict.error_code === "UPSTREAM_UNAVAILABLE" && br.charged > 0) refunded = await refundOrAlert(c.env, client, br.request_id, auth.tenantId, br.charged, "an UPSTREAM_UNAVAILABLE verdict");
-  // The charge stands: credits.low once per crossing, off the response path (noteCharge: 1 subrequest, 3 at the crossing).
+  // The charge stands: credits.low and the operator's alert once per crossing, off the response path (noteCharge: 1
+  // subrequest, 9 at most at the crossing; the key's plan saves the plan read).
   if (br.charged - refunded > 0) {
-    const low = noteCharge(c.env, auth.tenantId, br.request_id);
+    const low = noteCharge(c.env, auth.tenantId, br.request_id, { plan: auth.plan, base: publicBase(c.env, c.req.url) });
     const wu = waitUntilOf(c);
     if (wu) wu(low); else await low;
   }
@@ -290,7 +296,6 @@ v1.get("/markets/:id/resolutions", async (c) => {
 
 // ---- follows and the private early reveal (plan §17.3 P7-lite) ---------------------------------------------------
 
-const MarketId = z.string().uuid();
 const SHADOW_EVENTS = ["shadow.committed", "shadow.revealed"] as const;
 /** GET /v1/follows returns the newest this many; active_follows is the full count. */
 const FOLLOWS_PAGE = 1000;
@@ -305,36 +310,60 @@ async function tenantPlan(client: Db, tenantId: string): Promise<{ plan: Plan } 
 }
 
 /**
+ * The markets read of a market a path names (parseMarketRef), one subrequest: a uuid as it is (every tenant's market, so
+ * the follow rules can refuse another tenant's exactly like a missing one); a venue id only among public shadow markets
+ * (tenant_id null, not a test market, not deleted), two rows read so that a second match is seen and refused (onlyMatch).
+ */
+function readMarketRef(client: Db, ref: MarketRef, columns: string) {
+  const q = client.from("markets").select(columns);
+  return ref.kind === "uuid"
+    ? q.eq("id", ref.id).limit(1)
+    : q.eq("platform", ref.platform).eq("external_id", ref.externalId).is("tenant_id", null).eq("is_test", false).is("deleted_at", null).limit(2);
+}
+
+/** The uuid a market ref names: as given, or the one public shadow market with that venue id (one read); null when none or several. */
+async function marketIdOf(client: Db, ref: MarketRef): Promise<{ id: string | null } | { error: string }> {
+  if (ref.kind === "uuid") return { id: ref.id };
+  const { data, error } = await readMarketRef(client, ref, "id");
+  if (error) return { error: error.message };
+  return { id: onlyMatch(data as unknown as Array<{ id: string }> | null)?.id ?? null };
+}
+
+/**
  * Follow a public shadow market: private early reveals by webhook (shadow.committed, shadow.revealed) and GET /v1/shadow/:id.
+ * The market is named by its uuid or its venue id, "<platform>:<external_id>" as /record prints it (the same one read).
  * The answer counts the tenant's endpoints that will receive shadow.committed: an endpoint registered before these events
  * existed was subscribed to the old defaults, and a follow with no subscribed endpoint must say so rather than deliver
  * nothing silently.
  */
 v1.post("/markets/:id/follow", async (c) => {
   const auth = c.get("auth");
-  const id = MarketId.safeParse(c.req.param("id"));
-  if (!id.success) return err(c, "validation_error", "market id must be a uuid", 400);
+  const ref = parseMarketRef(c.req.param("id"));
+  if (!ref) return err(c, "validation_error", MARKET_REF_HINT, 400);
   const client = db(c.env);
-  const [{ data: m, error: me }, plan, { data: eps, error: ee }] = await Promise.all([
-    client.from("markets").select("id, tenant_id, is_test, status, deleted_at").eq("id", id.data).maybeSingle(),
+  const [{ data: rows, error: me }, plan, { data: eps, error: ee }] = await Promise.all([
+    readMarketRef(client, ref, "id, tenant_id, is_test, status, deleted_at, platform, external_id"),
     tenantPlan(client, auth.tenantId),
     // the endpoints enqueueEvent would read for this tenant
     client.from("webhook_endpoints").select("id, events").eq("tenant_id", auth.tenantId).eq("active", true).is("deleted_at", null),
   ]);
   if (me || ee || "error" in plan) return storeDown(c, "market, tenant or webhook store");
-  const refusal = followRefusal(m as FollowTarget | null, auth.tenantId);
+  // none, or a venue id that two rows share: answered like any missing market
+  const m = onlyMatch(rows as unknown as Array<FollowTarget & { platform: string; external_id: string }> | null);
+  if (!m) return err(c, "not_found", "market not found", 404);
+  const refusal = followRefusal(m, auth.tenantId);
   if (refusal) return err(c, refusal.code, refusal.message, refusal.status);
   const cap = followCap(plan.plan);
   const subscribed = ((eps ?? []) as Array<{ events: string[] | null }>).filter((e) => subscribes(e, "shadow.committed")).length;
   let a: FollowAnswer;
   // follow_market is one transaction: an error means no follow was recorded.
-  try { a = await followMarket(client, auth.tenantId, id.data, cap); }
+  try { a = await followMarket(client, auth.tenantId, m.id, cap); }
   catch { return storeDown(c, "follow store (no follow was recorded)"); }
   const followed = (following: { follow_id: string; active: number }, created: boolean) => ok(c, {
-    follow_id: following.follow_id, market_id: id.data, following: true, already_following: !created, follows_counted: following.active, follow_limit: cap,
-    events: SHADOW_EVENTS, read: `/v1/shadow/${id.data}`, endpoints_subscribed: subscribed,
+    follow_id: following.follow_id, market_id: m.id, market: `${m.platform}:${m.external_id}`, following: true, already_following: !created, follows_counted: following.active, follow_limit: cap,
+    events: SHADOW_EVENTS, read: `/v1/shadow/${m.id}`, endpoints_subscribed: subscribed,
     note: "Verdicts arrive as shadow.committed on every active endpoint subscribed to it (POST /v1/webhooks) and at the read URL. Private early reveal, excluded from the public record.",
-    ...(subscribed === 0 ? { warning: `No active webhook endpoint of this account is subscribed to shadow.committed, so no webhook will arrive for this follow; read /v1/shadow/${id.data}, or register an endpoint whose events include ${SHADOW_EVENTS.join(" and ")} (POST /v1/webhooks). An endpoint's events are fixed when it is registered.` } : {}),
+    ...(subscribed === 0 ? { warning: `No active webhook endpoint of this account is subscribed to shadow.committed, so no webhook will arrive for this follow; read /v1/shadow/${m.id}, or register an endpoint whose events include ${SHADOW_EVENTS.join(" and ")} (POST /v1/webhooks). An endpoint's events are fixed when it is registered.` } : {}),
   }, created ? 201 : 200);
   switch (a.result) {
     case "followed": return followed(a, true);
@@ -346,13 +375,17 @@ v1.post("/markets/:id/follow", async (c) => {
 });
 
 v1.delete("/markets/:id/follow", async (c) => {
-  const id = MarketId.safeParse(c.req.param("id"));
-  if (!id.success) return err(c, "validation_error", "market id must be a uuid", 400);
-  const { data, error } = await db(c.env).from("market_follows").update({ deleted_at: new Date().toISOString() })
-    .eq("tenant_id", c.get("auth").tenantId).eq("market_id", id.data).is("deleted_at", null).select("id");
+  const ref = parseMarketRef(c.req.param("id"));
+  if (!ref) return err(c, "validation_error", MARKET_REF_HINT, 400);
+  const client = db(c.env);
+  const id = await marketIdOf(client, ref);
+  if ("error" in id) return storeDown(c, "market store");
+  if (!id.id) return err(c, "not_found", "market not found", 404);
+  const { data, error } = await client.from("market_follows").update({ deleted_at: new Date().toISOString() })
+    .eq("tenant_id", c.get("auth").tenantId).eq("market_id", id.id).is("deleted_at", null).select("id");
   if (error) return storeDown(c, "follow store");
   if (!data?.length) return err(c, "not_found", "not following this market", 404);
-  return ok(c, { unfollowed: id.data });
+  return ok(c, { unfollowed: id.id });
 });
 
 v1.get("/follows", async (c) => {
@@ -422,13 +455,19 @@ v1.get("/shadow/export", async (c) => {
   });
 });
 
-/** The private early reveal of one followed market: its committed verdicts, never the nonce or the preimage. */
+/**
+ * The private early reveal of one followed market (its uuid or venue id): its committed verdicts, never the nonce or the
+ * preimage. A venue id costs one read more.
+ */
 v1.get("/shadow/:market_id", async (c) => {
-  const id = MarketId.safeParse(c.req.param("market_id"));
-  if (!id.success) return err(c, "validation_error", "market id must be a uuid", 400);
+  const ref = parseMarketRef(c.req.param("market_id"));
+  if (!ref) return err(c, "validation_error", MARKET_REF_HINT, 400);
   const client = db(c.env);
+  const id = await marketIdOf(client, ref);
+  if ("error" in id) return storeDown(c, "market store");
+  if (!id.id) return err(c, "not_found", "market not found", 404);
   // The same entitlement as the webhooks (followBlock): a follow above the plan's limit reads nothing either.
-  const ent = await followEntitlements(client, id.data, c.get("auth").tenantId);
+  const ent = await followEntitlements(client, id.id, c.get("auth").tenantId);
   if (ent.error) return storeDown(c, "follow store");
   const follow = ent.rows[0];
   if (!follow) return err(c, "not_found", "not following this market (POST /v1/markets/:id/follow first)", 404);
@@ -440,9 +479,9 @@ v1.get("/shadow/:market_id", async (c) => {
     return err(c, "validation_error", `early reveal not available: ${why}`, 403);
   }
   const [{ data: market, error: me }, { data: commits, error: ce }] = await Promise.all([
-    client.from("markets").select("id, platform, external_id, status, deadline_utc").eq("id", id.data).maybeSingle(),
+    client.from("markets").select("id, platform, external_id, status, deadline_utc").eq("id", id.id).maybeSingle(),
     client.from("bot_posts").select("id, commitment_sha256, created_at, channel, telegram_date, payload")
-      .eq("market_id", id.data).eq("kind", "commit").order("created_at", { ascending: false }).limit(50),
+      .eq("market_id", id.id).eq("kind", "commit").order("created_at", { ascending: false }).limit(50),
   ]);
   if (me || !market) return storeDown(c, "market store");
   if (ce) return storeDown(c, "commit store");
@@ -477,9 +516,15 @@ v1.get("/usage", async (c) => {
 /**
  * Where and how to pay, with the rates the database credits at (app_config payg_tiers, else the flat CREDITS_PER_USDC
  * credit_from_deposit is passed) and the plan §11 packs they buy. Tiers the database would refuse are never quoted.
+ * Only while USDC_DEPOSITS_OFFERED is exactly "1": otherwise 503 before anything is read, with the card pointer instead
+ * (no third-party USDC is solicited; the deposit scan is unchanged).
  */
 v1.get("/payments/address", async (c) => {
   const cfg = parseConfig(c.env);
+  if (!usdcDepositsOffered(c.env)) {
+    const top = topUp(c.env, publicBase(c.env, c.req.url));
+    return err(c, "UPSTREAM_UNAVAILABLE", `${USDC_NOT_OFFERED}. ${topUpText(top)}`, 503, { extra: { error_reason: "USDC_NOT_OFFERED", top_up: top } });
+  }
   if (!c.env.USDC_RECEIVING_ADDRESS) return err(c, "UPSTREAM_UNAVAILABLE", "USDC deposits are not enabled yet; contact support for a credit grant.", 503);
   const client = db(c.env);
   const [{ data: t }, { data: row, error: ce }] = await Promise.all([

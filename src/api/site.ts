@@ -23,7 +23,7 @@ import { ok, err } from "./envelope";
 import { trackRecordRows } from "./public";
 import { KNOWN_RELEASES, OFFICIAL_SERIES, knownRelease, type OfficialSeriesId } from "../resolve/official";
 import { ELECTION_SERIES, isElectionSeries } from "../resolve/election";
-import { effectiveTiers, packQuotes, type PaygCredit } from "../billing/tiers";
+import { effectiveTiers, packQuotes, PACKS_USDC, type PaygCredit } from "../billing/tiers";
 import { followCap, type Plan } from "../shadow/follows";
 import { authenticateKey, perKeyRpm, rateLimit } from "./auth";
 import { alert } from "../ops/alerts";
@@ -32,6 +32,7 @@ import { EVALUATION_KEY_DAYS, EVALUATION_WATCH_LIMIT, FREE_EVALUATION_CREDITS } 
 import { issueEvaluationKey, type AutoKeyOutcome } from "./evaluation-key";
 import { CARD_PACKS, PACK_IDS, cardCheckoutOffered, isPackId, usd, whopConfig, type WhopConfig } from "../billing/whop";
 import { checkoutRefusal, startCheckout } from "./billing";
+import { PAY_BY_CARD_PATH } from "../billing/top-up";
 
 type Vars = { requestId: string; schemaVersion: string };
 export const site = new Hono<{ Bindings: Env; Variables: Vars }>();
@@ -160,9 +161,12 @@ const platformName = (p: string) => PLATFORM_NAME[p] ?? p;
 
 /**
  * One row of the table: one scheduled release (event_keys: its one event key), or one election, whose contests are
- * each their own series and event key (one per platform event) and share one release time, polls close.
+ * each their own series and event key (one per platform event) and share one release time, polls close. ids: the venue
+ * ids ("<platform>:<external_id>") of its open markets, sorted, which POST /v1/markets/{id}/follow accepts as printed.
  */
-export interface UpcomingRelease { event_key: string; event_keys: string[]; series: OfficialSeriesId; period: string; label: string; release_at: string; markets: Record<string, number> }
+export interface UpcomingRelease { event_key: string; event_keys: string[]; series: OfficialSeriesId; period: string; label: string; release_at: string; markets: Record<string, number>; ids: string[] }
+/** The public markets columns the table reads (never a title or criteria text). */
+export interface UpcomingMarket { platform: string; event_key: string | null; external_id?: string | null; status?: string | null }
 
 const ELECTION_ROW_LABEL: Record<string, string> = {
   tse: "Brazil presidential election, first round: the TSE's final count (polls close)",
@@ -171,17 +175,20 @@ const ELECTION_ROW_LABEL: Record<string, string> = {
 
 /**
  * Pure. The next release of each series in KNOWN_RELEASES scheduled after `now`, soonest first, with the public markets
- * per platform of each event. A later period of a series appears once the earlier one is out, so a registry that holds
- * months ahead never crowds the table (nor the one markets read, which asks only for these event keys); the contests of
- * one election are one row (their markets summed), so an election day never crowds the releases out either.
+ * per platform of each event and the venue ids of the open ones. A later period of a series appears once the earlier one
+ * is out, so a registry that holds months ahead never crowds the table (nor the one markets read, which asks only for
+ * these event keys); the contests of one election are one row (their markets summed), so an election day never crowds
+ * the releases out either.
  */
-export function upcomingReleases(now: number, markets: ReadonlyArray<{ platform: string; event_key: string | null }>, limit = 20): UpcomingRelease[] {
+export function upcomingReleases(now: number, markets: ReadonlyArray<UpcomingMarket>, limit = 20): UpcomingRelease[] {
   const counts = new Map<string, Record<string, number>>();
+  const ids = new Map<string, string[]>();
   for (const m of markets) {
     if (!m.event_key) continue;
     const c = counts.get(m.event_key) ?? {};
     c[m.platform] = (c[m.platform] ?? 0) + 1;
     counts.set(m.event_key, c);
+    if (m.status === "open" && m.external_id) ids.set(m.event_key, [...(ids.get(m.event_key) ?? []), `${m.platform}:${m.external_id}`]);
   }
   // the soonest future event of each series
   const next = new Map<string, [string, (typeof KNOWN_RELEASES)[string]]>();
@@ -201,26 +208,30 @@ export function upcomingReleases(now: number, markets: ReadonlyArray<{ platform:
     const id = authority ? `election:${authority}:${period}` : event_key;
     let row = rows.get(id);
     if (!row) {
-      row = { event_key: id, event_keys: [], series, period, label: authority ? ELECTION_ROW_LABEL[authority] ?? authority : OFFICIAL_SERIES[series]?.label ?? series, release_at: r.release_at, markets: {} };
+      row = { event_key: id, event_keys: [], series, period, label: authority ? ELECTION_ROW_LABEL[authority] ?? authority : OFFICIAL_SERIES[series]?.label ?? series, release_at: r.release_at, markets: {}, ids: [] };
       rows.set(id, row);
     }
     row.event_keys.push(event_key);
     for (const [p, n] of Object.entries(counts.get(event_key) ?? {})) row.markets[p] = (row.markets[p] ?? 0) + n;
+    row.ids.push(...(ids.get(event_key) ?? []));
   }
-  for (const row of rows.values()) if (row.event_keys.length > 1) row.label = `${row.label}, ${row.event_keys.length} contests`;
+  for (const row of rows.values()) {
+    if (row.event_keys.length > 1) row.label = `${row.label}, ${row.event_keys.length} contests`;
+    row.ids.sort();
+  }
   return [...rows.values()]
     .sort((a, b) => a.release_at.localeCompare(b.release_at) || a.series.localeCompare(b.series))
     .slice(0, limit);
 }
 
-/** One read: public, non-test, undeleted markets of the upcoming events (event_key and platform only). */
+/** One read: public, non-test, undeleted markets of the upcoming events (event_key, platform, external_id and status only). */
 async function upcomingWithCounts(env: Env, now: number): Promise<{ rows: UpcomingRelease[]; countsOk: boolean }> {
   const keys = upcomingReleases(now, []).flatMap((u) => u.event_keys);
   if (!keys.length) return { rows: [], countsOk: true };
   try {
-    const { data, error } = await db(env).from("markets").select("platform, event_key").is("tenant_id", null).eq("is_test", false).is("deleted_at", null).in("event_key", keys);
+    const { data, error } = await db(env).from("markets").select("platform, event_key, external_id, status").is("tenant_id", null).eq("is_test", false).is("deleted_at", null).in("event_key", keys);
     if (error) throw new Error(error.message);
-    return { rows: upcomingReleases(now, (data ?? []) as Array<{ platform: string; event_key: string | null }>), countsOk: true };
+    return { rows: upcomingReleases(now, (data ?? []) as UpcomingMarket[]), countsOk: true };
   } catch {
     return { rows: upcomingReleases(now, []), countsOk: false };
   }
@@ -228,15 +239,18 @@ async function upcomingWithCounts(env: Env, now: number): Promise<{ rows: Upcomi
 
 function upcomingTable(rows: UpcomingRelease[], countsOk: boolean): string {
   if (!rows.length) return `<p class="muted">No scheduled release is registered right now.</p>`;
-  const cov = (m: Record<string, number>) => {
+  const cov = (r: UpcomingRelease) => {
     if (!countsOk) return `<span class="muted">unavailable</span>`;
-    const parts = Object.entries(m).sort().map(([p, n]) => `${esc(platformName(p))}: ${int(n)} market${n === 1 ? "" : "s"}`);
-    return parts.length ? parts.join("<br>") : `<span class="muted">none registered yet</span>`;
+    const parts = Object.entries(r.markets).sort().map(([p, n]) => `${esc(platformName(p))}: ${int(n)} market${n === 1 ? "" : "s"}`);
+    if (!parts.length) return `<span class="muted">none registered yet</span>`;
+    // the venue id of each open market, the id POST /v1/markets/{id}/follow takes as printed (never a title)
+    const ids = r.ids.length ? `<details><summary>Market ids (${int(r.ids.length)} open)</summary>${r.ids.map((id) => `<code>${esc(id)}</code>`).join(" ")}</details>` : "";
+    return parts.join("<br>") + ids;
   };
   return `<div class="table"><table>
-<caption class="muted" style="text-align:left;caption-side:bottom;padding-top:.4rem">Scheduled release times as published by each agency or central bank; for an election, the time polls close (the final count comes hours or days later). Markets: public markets Resolve shadows for that release, per venue.</caption>
+<caption class="muted" style="text-align:left;caption-side:bottom;padding-top:.4rem">Scheduled release times as published by each agency or central bank; for an election, the time polls close (the final count comes hours or days later). Markets: public markets Resolve shadows for that release, per venue; each market id (<code>platform:external_id</code>) can be followed as printed: <code>POST /v1/markets/&lt;id&gt;/follow</code>.</caption>
 <thead><tr><th scope="col">Release (UTC)</th><th scope="col">Series</th><th scope="col">Period</th><th scope="col">Markets covered</th></tr></thead>
-<tbody>${rows.map((r) => `<tr><td class="n">${esc(utc(r.release_at))}</td><td>${esc(r.label)}</td><td class="n">${esc(r.period)}</td><td>${cov(r.markets)}</td></tr>`).join("\n")}</tbody>
+<tbody>${rows.map((r) => `<tr><td class="n">${esc(utc(r.release_at))}</td><td>${esc(r.label)}</td><td class="n">${esc(r.period)}</td><td>${cov(r)}</td></tr>`).join("\n")}</tbody>
 </table></div>`;
 }
 
@@ -349,7 +363,7 @@ function recordBody(s: RecordSummary, rows: readonly RecordRow[], upcoming: stri
       : `<tr><td>${esc(platformName(p.platform))}</td><td class="n">${int(p.events_reconciled)}</td><td colspan="2" class="muted">not yet reportable: percentages appear at 100 reconciled markets</td></tr>`).join("\n")}</tbody>
 </table></div>` : "";
   const table = rows.length ? `<h2>Most recent commitments</h2>
-<p class="muted">One row per market, newest first. Release to commit: seconds from the scheduled official release to the first commitment. The hash links to the public verification of the latest commitment.</p>
+<p class="muted">One row per market, newest first. Market: its id, <code>platform:external_id</code>, which <code>POST /v1/markets/&lt;id&gt;/follow</code> and <code>GET /v1/shadow/&lt;id&gt;</code> accept as printed. Release to commit: seconds from the scheduled official release to the first commitment. The hash links to the public verification of the latest commitment.</p>
 <div class="table"><table>
 <thead><tr><th scope="col">Market</th><th scope="col">Committed</th><th scope="col">Official release</th><th scope="col">Release to commit</th><th scope="col">Venue resolved</th><th scope="col">Agreement</th><th scope="col">Commitment</th></tr></thead>
 <tbody>${rows.map((r) => {
@@ -403,6 +417,10 @@ export const PUBLIC_PLANS: ReadonlyArray<{ plan: Plan | null; name: string; pric
 ];
 
 const dollars = (cents: number) => usd(cents).replace(/\.00$/, "");
+/** "a", "a and b", "a, b and c" (or "or"). */
+const listed = (items: string[], last = "and") => (items.length < 2 ? items.join("") : `${items.slice(0, -1).join(", ")} ${last} ${items[items.length - 1]}`);
+/** The card packs that are sold by card only (not among the invoiced packs, PACKS_USDC): the $20 pack. */
+const CARD_ONLY = PACK_IDS.filter((k) => !(PACKS_USDC as readonly string[]).includes(k));
 
 /**
  * The "Pay by card" section of /pricing (and of a refused form answer): what a card pack is, the form that opens a Whop
@@ -457,7 +475,7 @@ export function pricingHtml(o: { packs: PaygCredit[] | null; channel: string | n
 <h2>Pay-as-you-go packs</h2>
 ${packs}
 ${o.card ? payByCardHtml({ base: o.card.base }) + "\n" : ""}<h2>Payment</h2>
-<p>Invoiced in USD; ask us for payment options.${o.card ? ` The ${PACK_IDS.map((k) => esc(dollars(CARD_PACKS[k].priceCents))).join(" and ")} packs can also be paid by card (above).` : ""} For the Design Partner offer or the pilot pack, name the markets and a start date and we send an invoice to review before anything is paid.</p>
+<p>Invoiced in USD; ask us for payment options.${o.card ? ` The ${esc(listed(PACK_IDS.map((k) => dollars(CARD_PACKS[k].priceCents))))} packs can be paid by card (above)${CARD_ONLY.length ? `; the ${esc(listed(CARD_ONLY.map((k) => `${dollars(CARD_PACKS[k].priceCents)} pack (${int(CARD_PACKS[k].credits)} credits)`)))} ${CARD_ONLY.length === 1 ? "is" : "are"} sold by card only` : ""}.` : ""} For the Design Partner offer or the pilot pack, name the markets and a start date and we send an invoice to review before anything is paid.</p>
 <p><strong>Credits are a non-refundable prepayment for API services.</strong> They cannot be withdrawn, transferred, or exchanged for money or crypto.</p>
 <h2>What we do not claim</h2>
 <ul>
@@ -509,6 +527,7 @@ export function docsHtml(o: { base: string; channel: string | null; card?: boole
   -H 'content-type: application/json' \\
   -d '{"name":"Ada","email":"ada@example.com","company":"Example Bots","purpose":"Settle CPI markets for our bot"}'</pre>
 <p>The answer carries a test key, once (<code>data.key</code>; the form shows it on the next page). Store it then: Resolve keeps only its hash. A test key starts with <code>rsl_test_</code> and carries ${int(FREE_EVALUATION_CREDITS)} credits for ${EVALUATION_KEY_DAYS} days, for structured verdicts, with up to ${EVALUATION_WATCH_LIMIT} watches. One key per email address every ${EVALUATION_KEY_DAYS} days; when a key cannot be issued on the spot (<code>key_issued: false</code>), a person reads the request and answers by email.</p>
+${o.card ? `<p>When the test credits run out, <a href="${PAY_BY_CARD_PATH}">pay by card</a> for a credit pack (step 6): the same key keeps working and stops expiring.</p>\n` : ""}
 <h2>2. Register a market</h2>
 <pre>curl -X POST ${b}/v1/markets \\
   -H "Authorization: Bearer $RESOLVE_KEY" -H 'content-type: application/json' \\
@@ -525,8 +544,8 @@ export function docsHtml(o: { base: string; channel: string | null; card?: boole
   -H "Authorization: Bearer $RESOLVE_KEY" -H 'content-type: application/json' \\
   -d '{"url":"https://example.com/resolve-hook","events":["shadow.committed","shadow.revealed"]}'
 
-curl -X POST ${b}/v1/markets/&lt;market_id&gt;/follow -H "Authorization: Bearer $RESOLVE_KEY"</pre>
-<p>The endpoint's secret is shown once. Each delivery carries <code>X-Resolve-Signature: t=&lt;unix seconds&gt;,v1=&lt;hex&gt;</code>, where the hex is HMAC-SHA256 of <code>&lt;t&gt;.&lt;raw body&gt;</code> with that secret, and <code>X-Resolve-Event-Id</code>, by which you drop duplicates. Verify before you parse (Node):</p>
+curl -X POST ${b}/v1/markets/polymarket:&lt;external_id&gt;/follow -H "Authorization: Bearer $RESOLVE_KEY"</pre>
+<p>A public market is named by its id exactly as the <a href="/record">record</a> and the home page's table of scheduled releases print it, <code>platform:external_id</code> (above, <code>&lt;external_id&gt;</code> is a placeholder, not a real market: copy an id from those pages), or by its uuid. <code>GET /v1/shadow/&lt;id&gt;</code> reads its committed verdicts with the same id. The endpoint's secret is shown once. Each delivery carries <code>X-Resolve-Signature: t=&lt;unix seconds&gt;,v1=&lt;hex&gt;</code>, where the hex is HMAC-SHA256 of <code>&lt;t&gt;.&lt;raw body&gt;</code> with that secret, and <code>X-Resolve-Event-Id</code>, by which you drop duplicates. Verify before you parse (Node):</p>
 <pre>import { createHmac, timingSafeEqual } from "node:crypto";
 
 function verify(rawBody, header, secret, toleranceSeconds = 300) {
@@ -543,7 +562,7 @@ function verify(rawBody, header, secret, toleranceSeconds = 300) {
 <pre>printf '%s' "$PREIMAGE" | shasum -a 256</pre>
 <p>The output must equal <code>commitment_sha256</code>. The whole record is at <a href="/record">/record</a>.</p>
 <h2 id="pay-by-card">6. Pay by card</h2>
-<p>Resolve is a developer data API, paid for in credits. The ${PACK_IDS.map((k) => `${esc(dollars(CARD_PACKS[k].priceCents))} (${esc(int(CARD_PACKS[k].credits))} credits)`).join(" and ")} packs can be paid by card through Whop, which processes the payment as the merchant of record. Open a checkout for the account of your key:</p>
+<p>Resolve is a developer data API, paid for in credits. The ${esc(listed(PACK_IDS.map((k) => `${dollars(CARD_PACKS[k].priceCents)} (${int(CARD_PACKS[k].credits)} credits)`)))} packs can be paid by card through Whop, which processes the payment as the merchant of record. Open a checkout for the account of your key:</p>
 <pre>curl -X POST ${b}/v1/billing/checkout \\
   -H "Authorization: Bearer $RESOLVE_KEY" -H 'content-type: application/json' \\
   -d '{"pack":"50"}'</pre>
@@ -577,7 +596,7 @@ export function termsHtml(o: { channel: string | null }): string {
 <li>Do not present a Resolve verdict as the venue's official resolution.</li>
 </ul>
 <p>A key used against these terms may be revoked.</p>
-<h2>Contact</h2>
+<h2 id="contact">Contact</h2>
 <p>Use the <a href="/#request-key">request form</a> and say what it is about; we answer by email. To stop ResolveBot fetching your pages, see <a href="/bot">/bot</a>.</p>`;
   return layout({ title: "Terms · Resolve", path: "/terms", description: "Resolve terms: informational signal, credits, acceptable use and contact.", body, channel: o.channel });
 }
@@ -606,8 +625,11 @@ export { maskEmail };
 
 const VENUES = new Set(["polymarket", "limitless"]);
 
-/** The page that shows a new evaluation key: the key exactly once, what it can do, and where to start. Never cached. */
-export function keyIssuedHtml(o: { key: string; expiresAt: string; base: string; channel: string | null }): string {
+/**
+ * The page that shows a new evaluation key: the key exactly once, what it can do, where to start, and while card checkout
+ * is offered, where to buy credits. Never cached.
+ */
+export function keyIssuedHtml(o: { key: string; expiresAt: string; base: string; channel: string | null; card?: boolean }): string {
   const body = `<h1>Your test key</h1>
 <p class="note" role="alert">Copy it now: this is the only time it is shown. Resolve keeps only a hash of it, so it cannot be shown again or recovered.</p>
 <pre><code>${esc(o.key)}</code></pre>
@@ -620,7 +642,8 @@ export function keyIssuedHtml(o: { key: string; expiresAt: string; base: string;
 <h2>Next</h2>
 <p>Send it as <code>Authorization: Bearer &lt;key&gt;</code> (or <code>X-Api-Key</code>). Check it:</p>
 <pre>curl ${esc(o.base)}/v1/account -H "Authorization: Bearer $RESOLVE_KEY"</pre>
-<p>The <a href="/docs">quickstart</a> registers a market, resolves it and sets up webhooks. <a href="/pricing">Pricing</a> lists what comes after the test key.</p>`;
+<p>The <a href="/docs">quickstart</a> registers a market, resolves it and sets up webhooks. <a href="/pricing">Pricing</a> lists what comes after the test key.</p>
+${o.card ? `<p>When the ${int(FREE_EVALUATION_CREDITS)} credits run out, <a href="${PAY_BY_CARD_PATH}">pay by card</a> for a credit pack with this key: the credits go to its account and the key stops expiring.</p>\n` : ""}`;
   return layout({ title: "Your test key · Resolve", path: "/v1/request-key", description: "Your Resolve test key.", body, channel: o.channel });
 }
 
@@ -738,14 +761,15 @@ site.post("/v1/request-key", async (c) => {
   ].filter(Boolean).join("\n"), { dedupMinutes: 1, meta: { lead_id: leadId, key_result: issued.result, ...ids } });
 
   if (issued.result !== "issued") return done();
+  const card = cardCheckoutOffered(whopConfig(c.env));
   if (json) {
     return ok(c, {
       received: true, key_issued: true, key: issued.key, key_id: issued.keyId, environment: "test", plan: "free", credits: issued.credits,
-      watch_limit: EVALUATION_WATCH_LIMIT, expires_at: issued.expiresAt, docs: `${baseUrl(c)}/docs`,
+      watch_limit: EVALUATION_WATCH_LIMIT, expires_at: issued.expiresAt, docs: `${baseUrl(c)}/docs`, ...(card ? { pay_by_card: `${baseUrl(c)}${PAY_BY_CARD_PATH}` } : {}),
       note: "Shown once: Resolve keeps only its hash. Structured verdicts only.",
     });
   }
-  return page(c, keyIssuedHtml({ key: issued.key, expiresAt: issued.expiresAt, base: baseUrl(c), channel }), 200, false);
+  return page(c, keyIssuedHtml({ key: issued.key, expiresAt: issued.expiresAt, base: baseUrl(c), channel, card }), 200, false);
 });
 
 // ---- POST /billing/checkout, GET /billing/done ---------------------------------------------------------------------
@@ -777,7 +801,7 @@ site.post("/billing/checkout", async (c) => {
   if (text.length > CHECKOUT_FORM_MAX) return answer(400, "Request too large", "The request body is too large.");
   const f = new URLSearchParams(text);
   const pack = f.get("pack");
-  if (!isPackId(pack)) return answer(400, "Please choose a pack", `Choose one of the packs: ${PACK_IDS.map((k) => dollars(CARD_PACKS[k].priceCents)).join(" or ")}.`);
+  if (!isPackId(pack)) return answer(400, "Please choose a pack", `Choose one of the packs: ${listed(PACK_IDS.map((k) => dollars(CARD_PACKS[k].priceCents)), "or")}.`);
   const a = await authenticateKey(c, f.get("key")?.trim() || null);
   if (!a.ok) {
     // The refusal's own message (auth.ts): it names the problem, never the key.

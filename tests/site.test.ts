@@ -16,7 +16,7 @@ vi.mock("../src/ops/alerts", () => ({ alert: vi.fn(async (_env: unknown, key: st
 
 import { app } from "../src/index";
 import { MarketRegistration } from "../src/resolve/schema";
-import { DOCS_MARKET_EXAMPLE, maskEmail, officialReleaseAt, SITE_CSP, summarizeRecord, upcomingReleases } from "../src/api/site";
+import { DOCS_MARKET_EXAMPLE, docsHtml, keyIssuedHtml, maskEmail, officialReleaseAt, SITE_CSP, summarizeRecord, upcomingReleases } from "../src/api/site";
 import { KNOWN_RELEASES } from "../src/resolve/official";
 
 const NAMES = /jev|typesafe/i;
@@ -38,10 +38,11 @@ const touchRpc = async (db: FakeDb, a: Record<string, any>) => {
 function sampleDb(): FakeDb {
   return fakeDb({
     markets: [
-      { id: "m1", platform: "polymarket", event_key: "official:us_cpi_u_nsa_yoy:2026-09", tenant_id: null, is_test: false, deleted_at: null },
-      { id: "m2", platform: "polymarket", event_key: "official:us_cpi_u_nsa_yoy:2026-09", tenant_id: null, is_test: false, deleted_at: null },
-      { id: "m3", platform: "limitless", event_key: "official:us_cpi_u_nsa_yoy:2026-09", tenant_id: null, is_test: false, deleted_at: null },
-      { id: "m4", platform: "limitless", event_key: "official:us_cpi_u_nsa_yoy:2026-09", tenant_id: null, is_test: true, deleted_at: null },
+      { id: "m1", platform: "polymarket", external_id: "551234", status: "open", event_key: "official:us_cpi_u_nsa_yoy:2026-09", tenant_id: null, is_test: false, deleted_at: null, condition: "Will CPI be above 3.1%?" },
+      { id: "m2", platform: "polymarket", external_id: "<b>551235</b>", status: "open", event_key: "official:us_cpi_u_nsa_yoy:2026-09", tenant_id: null, is_test: false, deleted_at: null, condition: "Will CPI be above 3.2%?" },
+      { id: "m3", platform: "limitless", external_id: "cpi-above-3pt1-1789462576803", status: "void", event_key: "official:us_cpi_u_nsa_yoy:2026-09", tenant_id: null, is_test: false, deleted_at: null, condition: "CPI above 3.1?" },
+      { id: "m4", platform: "limitless", external_id: "test-leg", status: "open", event_key: "official:us_cpi_u_nsa_yoy:2026-09", tenant_id: null, is_test: true, deleted_at: null },
+      { id: "m5", platform: "polymarket", external_id: "tenant-leg", status: "open", event_key: "official:us_cpi_u_nsa_yoy:2026-09", tenant_id: "t9", is_test: false, deleted_at: null },
     ],
     v_track_record: [
       { platform: "polymarket", week: "2026-10-12T00:00:00+00:00", n_events_committed: 2, n_events_reconciled: 1, n_events_reconciled_cumulative: 1, resolved_correct_cumulative: 3, resolved_wrong_cumulative: 1, abstained_cumulative: 0, voided: 0, unresolved_by_platform: 0, reportable: false, precision: null, jev_share: 0 },
@@ -95,12 +96,27 @@ describe("pages", () => {
     const html = await (await app.request("/", {}, env, ctx)).text();
     expect(html).toContain("2026-10-14 12:30 UTC");
     expect(html).toContain("Limitless: 1 market<br>Polymarket: 2 markets");
+    // the venue id of each open public market, copyable as printed, escaped; never a title, a test or a tenant's market
+    expect(html).toContain("<details><summary>Market ids (2 open)</summary><code>polymarket:551234</code> <code>polymarket:&lt;b&gt;551235&lt;/b&gt;</code></details>");
+    expect(html).toContain("POST /v1/markets/&lt;id&gt;/follow");
+    for (const never of ["test-leg", "tenant-leg", "cpi-above-3pt1-1789462576803", "Will CPI", "CPI above 3.1?", "<b>551235"]) expect(html, never).not.toContain(never);
     expect(html).toContain('action="/v1/request-key"');
     for (const l of ["/record", "/pricing", "/docs", "/openapi.json"]) expect(html).toContain(`href="${l}"`);
     // the form says the key is shown on the next page, with its terms from the code that issues it
     expect(html).toContain("A free test key carries 300 credits for 30 days, for structured verdicts, with up to 5 watches");
     expect(html).toContain("the key is shown on the next page, once");
     expect(html).not.toMatch(/no key is issued automatically/i);
+  });
+
+  it("upcomingReleases: the ids are the open markets' venue ids, sorted, summed over an election's contests", () => {
+    const rows = upcomingReleases(NOW, [
+      { platform: "polymarket", event_key: "official:qc_seats_caq:2026-10-05", external_id: "900002", status: "open" },
+      { platform: "polymarket", event_key: "official:qc_riding_751:2026-10-05", external_id: "900001", status: "open" },
+      { platform: "polymarket", event_key: "official:qc_riding_751:2026-10-05", external_id: "900003", status: "resolved" },
+      { platform: "limitless", event_key: "official:us_cpi_u_nsa_yoy:2026-09", external_id: null, status: "open" },
+    ]);
+    expect(rows.find((r) => r.event_key === "election:eq:2026-10-05")).toMatchObject({ markets: { polymarket: 3 }, ids: ["polymarket:900001", "polymarket:900002"] });
+    expect(rows.find((r) => r.series === "us_cpi_u_nsa_yoy")).toMatchObject({ markets: { limitless: 1 }, ids: [] });
   });
 
   it("upcomingReleases: only releases after now, soonest first", () => {
@@ -165,6 +181,8 @@ describe("pages", () => {
     const html = await (await app.request("/record", {}, env, ctx)).text();
     expect(html).not.toContain("<script>alert(1)</script>");
     expect(html).toContain("polymarket:&lt;script&gt;alert(1)&lt;/script&gt;");
+    // the id a follow takes, as printed
+    expect(html).toContain("<code>POST /v1/markets/&lt;id&gt;/follow</code> and <code>GET /v1/shadow/&lt;id&gt;</code> accept as printed");
     expect(html).toContain(`href="/v1/track-record/verify?hash=${HASH}"`);
     expect(html).not.toContain("<img>");
     expect(html).toContain("41 s");
@@ -215,6 +233,26 @@ describe("pages", () => {
     expect(html).toContain("The answer carries a test key, once (<code>data.key</code>");
     expect(html).toContain("carries 300 credits for 30 days, for structured verdicts, with up to 5 watches");
     expect(html).not.toContain("sends the key by email");
+    // step 4 follows by venue id, a placeholder that says it is one (no market id is invented)
+    expect(html).toContain("/v1/markets/polymarket:&lt;external_id&gt;/follow");
+    expect(text(html)).toContain("&lt;external_id&gt; is a placeholder, not a real market: copy an id from those pages");
+    // no card checkout configured here: no pay-by-card line at step 1
+    expect(html).not.toContain("When the test credits run out");
+  });
+
+  it("/docs and the key page link to paying by card only while card checkout is offered", () => {
+    const docs = (card: boolean) => docsHtml({ base: "https://resolve.example.com", channel: null, card });
+    expect(docs(true)).toContain('When the test credits run out, <a href="/pricing#pay-by-card">pay by card</a>');
+    expect(docs(false)).not.toContain("When the test credits run out");
+    const key = (card: boolean) => keyIssuedHtml({ key: "rsl_test_x", expiresAt: "2026-10-28T00:00:00Z", base: "https://resolve.example.com", channel: null, card });
+    expect(key(true)).toContain('When the 300 credits run out, <a href="/pricing#pay-by-card">pay by card</a> for a credit pack with this key');
+    expect(key(false)).not.toContain("pay-by-card");
+    for (const h of [docs(true), key(true)]) { expect(h).not.toMatch(/usdc|payments\/address|0x[0-9a-f]{40}/i); expect(h).not.toMatch(NAMES); }
+  });
+
+  it("/terms has the contact section the no-card pointer links to (/terms#contact)", async () => {
+    h.db = fakeDb({});
+    expect(await (await app.request("/terms", {}, env, ctx)).text()).toContain('<h2 id="contact">Contact</h2>');
   });
 
   it("uses the Cache API when present", async () => {

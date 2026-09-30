@@ -11,7 +11,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
 import { fakeDb, type FakeDb, type Row } from "./lib/fake-db";
-import { PLAN_250, PLAN_50, WHOP_RPCS, WHOP_SECRET, disputeEvent, envelope, nativeRefundEvent, paymentSucceeded, refundEvent, whopMoney, whopRequest } from "./lib/fake-whop";
+import { PLAN_20, PLAN_250, PLAN_50, WHOP_RPCS, WHOP_SECRET, disputeEvent, envelope, nativeRefundEvent, paymentSucceeded, refundEvent, whopMoney, whopRequest } from "./lib/fake-whop";
 
 const h = vi.hoisted(() => ({
   db: null as unknown as FakeDb,
@@ -67,7 +67,7 @@ const FREE = "11111111-1111-4111-8111-111111111111";
 const BUILDER = "22222222-2222-4222-8222-222222222222";
 const PAYG = "33333333-3333-4333-8333-333333333333";
 const GONE = "44444444-4444-4444-8444-444444444444";
-const env = { WHOP_WEBHOOK_SECRET: WHOP_SECRET, WHOP_PLAN_ID_50: PLAN_50, WHOP_PLAN_ID_250: PLAN_250, WHOP_API_KEY: "whop_api_key_test", WHOP_CHECKOUT_ENABLED: "0" } as unknown as Env;
+const env = { WHOP_WEBHOOK_SECRET: WHOP_SECRET, WHOP_PLAN_ID_20: PLAN_20, WHOP_PLAN_ID_50: PLAN_50, WHOP_PLAN_ID_250: PLAN_250, WHOP_API_KEY: "whop_api_key_test", WHOP_CHECKOUT_ENABLED: "0" } as unknown as Env;
 const ctx = { waitUntil: () => undefined, passThroughOnException: () => undefined } as unknown as ExecutionContext;
 const send = (event: unknown, o: Parameters<typeof whopRequest>[1] = {}, e: Env = env) => app.request("/webhooks/whop", whopRequest(event, o), e, ctx);
 const rows = (t: string) => h.db.tables[t] ?? [];
@@ -253,6 +253,46 @@ describe("a verified payment of a pack credits its tenant exactly once", () => {
   });
 });
 
+describe("the $20 pack (plan §22.3 #5): 2,000 credits for its own plan and nothing for $20 on any other", () => {
+  const pay20 = (tenantId: string, data: Record<string, unknown> = {}) => paymentSucceeded(tenantId, { id: "pay_t20", plan_id: PLAN_20, total: whopMoney("20.00"), subtotal: whopMoney("20.00"), usd_total: whopMoney("20.00"), ...data });
+
+  it("plan_PNgCSGmXG38KW grants 2,000 once: a free tenant moves to payg; the replay grants nothing", async () => {
+    expect(PLAN_20).toBe("plan_PNgCSGmXG38KW");
+    const body = await expectAnswer(await send(pay20(FREE), { id: "msg_t20" }), 200, "credited");
+    expect(body.data).toMatchObject({ payment_id: "pay_t20", tenant_id: FREE, credits: 2000, balance: 2300 });
+    expect(ledger()).toEqual([expect.objectContaining({ tenant_id: FREE, delta: 2000, reason: "grant", request_id: "whop:pay_t20", balance_after: 2300 })]);
+    expect(tenant(FREE)).toMatchObject({ plan: "payg", credits_balance: 2300 });
+    expect(h.alerts[0]!.text).toContain("Card payment credited (Whop): $20.00 pack, 2000 credits");
+    await expectAnswer(await send(pay20(FREE), { id: "msg_t20" }), 200, "already_processed");
+    expect(ledger()).toHaveLength(1);
+    expect(tenant(FREE).credits_balance).toBe(2300);
+  });
+
+  it("a full refund of the $20 payment takes the 2,000 back; a partial one its share of the $20 price", async () => {
+    await expectAnswer(await send(pay20(PAYG)), 200, "credited");
+    await expectAnswer(await send(refundEvent("refund.created", { id: "ref_t20a", paymentId: "pay_t20", amount: 5, total: 20 })), 200, "reversed");
+    await expectAnswer(await send(refundEvent("refund.created", { id: "ref_t20b", paymentId: "pay_t20", amount: 15, total: 20 })), 200, "reversed");
+    expect(ledger().filter((l) => l.reason === "adjustment").map((l) => l.delta)).toEqual([-500, -1500]);
+    expect(tenant(PAYG).credits_balance).toBe(100);
+  });
+
+  it("$20 paid on the $50 plan, on a plan that is no pack, or the $20 plan paid another amount: nothing granted", async () => {
+    await expectAnswer(await send(paymentSucceeded(FREE, { id: "pay_x1", total: whopMoney("20.00") })), 200, "amount_mismatch");
+    await expectAnswer(await send(paymentSucceeded(FREE, { id: "pay_x2", plan_id: "plan_AnotherTwenty", total: whopMoney("20.00") })), 200, "ignored_plan");
+    await expectAnswer(await send(pay20(FREE, { id: "pay_x3", total: whopMoney("50.00") })), 200, "amount_mismatch");
+    expect(ledger()).toEqual([]);
+    expect(h.db.calls.filter((c) => c.table === "rpc:grant_credits")).toEqual([]);
+    expect(tenant(FREE)).toMatchObject({ plan: "free", credits_balance: 300 });
+  });
+
+  it("with WHOP_PLAN_ID_20 unset, a $20 payment from a checkout Resolve opened answers 503 for Whop to retry, alerted by name", async () => {
+    await expectAnswer(await send(pay20(FREE), {}, { ...env, WHOP_PLAN_ID_20: "" } as Env), 503);
+    expect(ledger()).toEqual([]);
+    expect(h.alerts.map((a) => a.key)).toEqual(["whop_config_missing"]);
+    expect(h.alerts[0]!.text).toContain("WHOP_PLAN_ID_20");
+  });
+});
+
 describe("a payment that does not match grants nothing and alerts for manual matching", () => {
   const unmatched = async (ev: unknown, result: string, text: string) => {
     await expectAnswer(await send(ev), 200, result);
@@ -285,9 +325,9 @@ describe("a payment that does not match grants nothing and alerts for manual mat
     expect(h.alerts[0]!.text).toContain("WHOP_PLAN_ID_250");
   });
   it("with the plan ids unset, a payment that names no Resolve tenant (a dashboard test event, another product) is answered 200", async () => {
-    // the wrangler.toml defaults: both plan ids empty. A 503 here would fail every such delivery for 3 days and Whop
-    // would disable the webhook before the first real pack is sold.
-    const shipped = { ...env, WHOP_PLAN_ID_50: "", WHOP_PLAN_ID_250: "" } as Env;
+    // every plan id empty (as wrangler.toml shipped before the plans existed). A 503 here would fail every such delivery
+    // for 3 days and Whop would disable the webhook before the first real pack is sold.
+    const shipped = { ...env, WHOP_PLAN_ID_20: "", WHOP_PLAN_ID_50: "", WHOP_PLAN_ID_250: "" } as Env;
     await expectAnswer(await send(paymentSucceeded(null, { plan_id: "plan_xxxxxxxxxxxxx" }), {}, shipped), 200, "ignored_plan");
     expect(ledger()).toEqual([]);
     expect(h.alerts.map((a) => a.key)).toEqual(["whop_unknown_plan_pay_test50"]);

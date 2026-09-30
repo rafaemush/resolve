@@ -347,8 +347,8 @@ export async function runWatch(env: Env, cfg: Config, watchId: string, opts: Wat
       // The tenant's verdict in its public shape (engine_version, web_evidence; src/api/public-names.ts).
       await publishEvent(env, market.tenant_id, type, { market_id: market.id, external_id: market.external_id, request_id: rt.resolutionId, verdict: toPublicVerdict(v) }, { waitUntil: opts.waitUntil });
     }
-    // A charge that looked stands (only a could-not-look verdict is refunded): credits.low once per crossing. noteCharge
-    // never throws; 1 subrequest, 3 at the crossing, + 1 alert on a failure.
+    // A charge that looked stands (only a could-not-look verdict is refunded): credits.low and the operator's alert once
+    // per crossing. noteCharge never throws; 1 subrequest, 10 at most at the crossing (the event, the plan read, one alert).
     if (looked && charged > 0 && market.tenant_id && chargeRequestId) await noteCharge(env, market.tenant_id, chargeRequestId);
   } catch (e) {
     // The runtime threw ResolutionNotRecordedError (alerted there): no verdict row exists, so the charge bought nothing.

@@ -2,7 +2,9 @@
  * Follows and the private early reveal (plan §17.3 P7-lite, §19.2 item 5): the follow rules, per-plan caps and the
  * entitlement rule (an evaluation ends with its key; a lowered plan keeps only its oldest follows), the shadow response
  * and the event payloads (never the nonce or the preimage before the reveal), and the four tenant routes over an
- * in-memory database with migration 014's follow_market() and follow_entitlements() stand-ins.
+ * in-memory database with migration 014's follow_market() and follow_entitlements() stand-ins. The routes name a market
+ * by its uuid or by its venue id "<platform>:<external_id>" (plan §22.3 #4), which resolves only to the one public
+ * shadow market (never a tenant's, never a test market, never a deleted one, never a guess between two).
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
@@ -28,7 +30,7 @@ vi.mock("../src/api/auth", () => ({
 vi.mock("../src/ops/alerts", () => ({ alert: vi.fn(async () => ({ sent: true, deduped: false })) }));
 
 import { v1 } from "../src/api/v1";
-import { followBlock, followCap, followEntitlements, followerTenants, followRefusal, shadowVerdict, shapeShadow, shapeShadowCommit, venueBasis, EARLY_REVEAL_LABEL, PLANS, type FollowEntitlement, type FollowTarget, type ShadowCommitRow } from "../src/shadow/follows";
+import { followBlock, followCap, followEntitlements, followerTenants, followRefusal, onlyMatch, parseMarketRef, shadowVerdict, shapeShadow, shapeShadowCommit, venueBasis, EARLY_REVEAL_LABEL, PLANS, type FollowEntitlement, type FollowTarget, type ShadowCommitRow } from "../src/shadow/follows";
 import { shadowCommittedPayload, shadowRevealedPayload } from "../src/shadow/events";
 import { buildPreimage, committedFields, DISCLAIMER, type CommittedVerdict, type OfficialRecord } from "../src/bot/commit";
 import { sha256Hex } from "../src/resolve/text";
@@ -74,6 +76,24 @@ describe("followBlock: an evaluation ends with its key; only follows within the 
     expect(await followerTenants(client(null, { message: "timeout" }), "m1")).toEqual({ tenants: [], error: "timeout" });
     expect((await followEntitlements(client([{ tenant_id: "t1", follow_id: "f1", plan: "gold", live_key: true, open_rank: 1 }]), "m1")).error).toContain("follow_entitlements answered");
     expect(await followerTenants(client([]), "m1")).toEqual({ tenants: [], error: null });
+  });
+});
+
+describe("parseMarketRef: a uuid, or a venue id <platform>:<external_id> as /record prints it", () => {
+  it("a uuid is a uuid; a venue id names a known platform and an external_id of 1-200 characters, taken as registered", () => {
+    expect(parseMarketRef(M)).toEqual({ kind: "uuid", id: M });
+    expect(parseMarketRef("polymarket:551234")).toEqual({ kind: "venue", platform: "polymarket", externalId: "551234" });
+    expect(parseMarketRef("limitless:september-inflation-us-annual-1789462576803")).toEqual({ kind: "venue", platform: "limitless", externalId: "september-inflation-us-annual-1789462576803" });
+    // only the first colon splits: an external_id may itself hold one, or a slash (sent %2F-encoded in the path)
+    expect(parseMarketRef("custom:a:b/c")).toEqual({ kind: "venue", platform: "custom", externalId: "a:b/c" });
+    expect(parseMarketRef(`custom:${"x".repeat(200)}`)).toMatchObject({ kind: "venue" });
+  });
+  it("anything else is refused (never guessed): another platform, no external_id, one too long, a bare id", () => {
+    for (const bad of ["kalshi:123", "Polymarket:551234", "polymarket:", "polymarket", "551234", ":551234", `custom:${"x".repeat(201)}`, "not-a-uuid", "export"]) expect(parseMarketRef(bad), bad).toBeNull();
+  });
+  it("onlyMatch: exactly one row, else null (none, or two that would have to be guessed between)", () => {
+    expect(onlyMatch([{ id: "a" }])).toEqual({ id: "a" });
+    for (const rows of [[], [{ id: "a" }, { id: "b" }], null, undefined]) expect(onlyMatch(rows)).toBeNull();
   });
 });
 
@@ -326,6 +346,83 @@ describe("POST/DELETE /v1/markets/:id/follow, GET /v1/follows, GET /v1/shadow/:m
     const list = await call("GET", "/follows");
     expect(list.body.data).toMatchObject({ follows_counted: 51, follow_limit: 50 });
     expect(list.body.data.warning).toContain("only the 50 oldest receive early reveals");
+  });
+
+  describe("by venue id (plan §22.3 #4): only the one public shadow market with that id", () => {
+    const V = "33333333-3333-4333-8333-333333333333";
+    const venueMarkets = () => h.db.tables.markets!.push(
+      market(V, { external_id: "551234" }),
+      // the same venue id registered by a tenant (markets_unique_per_tenant allows it): never what a venue id names
+      market(uuid(21), { tenant_id: "t2", external_id: "551234" }),
+      market(uuid(22), { tenant_id: "t2", external_id: "t2-only" }),
+      market(uuid(23), { tenant_id: "t1", external_id: "mine-only" }),
+      market(uuid(24), { is_test: true, external_id: "test-only" }),
+      market(uuid(25), { deleted_at: "2026-09-01T00:00:00Z", external_id: "gone" }),
+      market(uuid(26), { platform: "limitless", external_id: "fed-oct-hold" }),
+      market(uuid(27), { status: "resolved", external_id: "settled-1" }),
+      // two public rows for one venue id cannot exist in the database (unique nulls not distinct); if they ever did,
+      // neither is guessed
+      market(uuid(28), { external_id: "twice" }), market(uuid(29), { external_id: "twice" }),
+    );
+
+    it("POST by venue id follows the public market: the same follow row as the uuid form, the market named in the answer", async () => {
+      venueMarkets();
+      const a = await call("POST", "/markets/polymarket:551234/follow");
+      expect(a.status).toBe(201);
+      expect(a.body.data).toMatchObject({ market_id: V, market: "polymarket:551234", read: `/v1/shadow/${V}` });
+      const b = await call("POST", `/markets/${V}/follow`);
+      expect(b.status).toBe(200);
+      expect(b.body.data).toMatchObject({ follow_id: a.body.data.follow_id, market_id: V, market: "polymarket:551234", already_following: true });
+      expect(h.db.tables.market_follows!.map((f) => f.market_id)).toEqual([V]); // never the tenant t2's market of the same id
+      expect((await call("POST", "/markets/limitless:fed-oct-hold/follow")).body.data).toMatchObject({ market_id: uuid(26), market: "limitless:fed-oct-hold" });
+      // percent-encoded in the path, as a client may send it
+      expect((await call("POST", "/markets/polymarket%3A551234/follow")).body.data.follow_id).toBe(a.body.data.follow_id);
+    });
+
+    it("another tenant's, the caller's own, a test, a deleted, a missing and a doubled venue id: 404, nothing recorded", async () => {
+      venueMarkets();
+      for (const id of ["polymarket:t2-only", "polymarket:mine-only", "polymarket:test-only", "polymarket:gone", "polymarket:nope", "limitless:551234", "polymarket:twice"]) {
+        const r = await call("POST", `/markets/${id}/follow`);
+        expect([r.status, r.body.error.code, r.body.error.message], id).toEqual([404, "not_found", "market not found"]);
+      }
+      expect(caps).toEqual([]);
+      expect(h.db.tables.market_follows).toHaveLength(0);
+      // a settled public market is found, and refused as settled (400), exactly as by uuid
+      expect((await call("POST", "/markets/polymarket:settled-1/follow")).body.error.message).toContain("market is resolved");
+      const bad = await call("POST", "/markets/kalshi:551234/follow");
+      expect([bad.status, bad.body.error.message]).toEqual([400, expect.stringContaining("uuid or a venue id <platform>:<external_id>")]);
+    });
+
+    it("GET /v1/shadow and DELETE the follow take the venue id too; one that names no public market is 404", async () => {
+      venueMarkets();
+      h.db.tables.bot_posts = [{ id: "c1", market_id: V, kind: "commit", commitment_sha256: "e".repeat(64), nonce: NONCE, created_at: "2026-10-02T12:30:41.000Z", channel: "telegram", telegram_date: "2026-10-02T12:30:42.000Z", payload: { committed: committed(), text: "t" } }];
+      expect((await call("GET", "/shadow/polymarket:551234")).status).toBe(404); // not following yet
+      await call("POST", "/markets/polymarket:551234/follow");
+      const r = await call("GET", "/shadow/polymarket:551234");
+      expect(r.status).toBe(200);
+      expect(r.body.data).toMatchObject({ market_id: V, market: "polymarket:551234", latest: { commitment_sha256: "e".repeat(64) } });
+      expect(JSON.stringify(r.body)).not.toContain(NONCE);
+      for (const id of ["polymarket:t2-only", "polymarket:mine-only", "polymarket:test-only", "polymarket:gone", "polymarket:twice"]) {
+        expect((await call("GET", `/shadow/${id}`)).body.error.message, id).toBe("market not found");
+        expect((await call("DELETE", `/markets/${id}/follow`)).status, id).toBe(404);
+      }
+      expect((await call("GET", "/shadow/kalshi:1")).status).toBe(400);
+      const del = await call("DELETE", "/markets/polymarket:551234/follow");
+      expect([del.status, del.body.data]).toEqual([200, { unfollowed: V }]);
+      expect((await call("GET", "/shadow/polymarket:551234")).status).toBe(404);
+      expect((await call("DELETE", "/markets/kalshi:1/follow")).status).toBe(400);
+    });
+
+    it("a market store error on the venue lookup is a 503, never a 404", async () => {
+      venueMarkets();
+      const from = h.db.client.from;
+      h.db.client.from = ((t: string) => (t === "markets" ? { select: () => { const q: any = { eq: () => q, is: () => q, limit: () => Promise.resolve({ data: null, error: { message: "timeout" } }) }; return q; } } : from(t))) as never;
+      for (const [method, path] of [["POST", "/markets/polymarket:551234/follow"], ["DELETE", "/markets/polymarket:551234/follow"], ["GET", "/shadow/polymarket:551234"]] as const) {
+        const r = await call(method, path);
+        expect([r.status, r.body.error.code], path).toEqual([503, "UPSTREAM_UNAVAILABLE"]);
+      }
+      expect(caps).toEqual([]);
+    });
   });
 
   it("a free tenant with no live key left reads nothing (a revoked key the 60 s auth cache still admits)", async () => {
