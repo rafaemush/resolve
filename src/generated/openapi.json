@@ -848,6 +848,82 @@
           }
         }
       },
+      "RevealAccess": {
+        "type": "object",
+        "description": "What a private early reveal cost and why it was released or locked (src/shadow/reveal.ts): a RESOLVED verdict costs 25 credits on the free and pay-as-you-go plans, once per tenant and market, at most 2000 per event; included in builder, growth, platform; free when not RESOLVED",
+        "required": [
+          "reason",
+          "credits_charged",
+          "replayed"
+        ],
+        "properties": {
+          "reason": {
+            "type": "string",
+            "enum": [
+              "included_plan",
+              "grandfathered",
+              "replay",
+              "event_cap_reached",
+              "charged",
+              "insufficient_credits",
+              "unknown_tenant",
+              "not_resolved",
+              "billing_unavailable"
+            ]
+          },
+          "credits_charged": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "replayed": {
+            "type": "boolean"
+          }
+        }
+      },
+      "LockedReveal": {
+        "type": "object",
+        "description": "A RESOLVED verdict the tenant has not received: insufficient_credits (the price of the leg, the balance and where to top up; nothing was charged, the next read after a top-up releases and charges it), billing_unavailable (billing could not be reached; nothing was charged) or account_unavailable",
+        "required": [
+          "reason",
+          "price_credits",
+          "balance",
+          "top_up",
+          "read",
+          "message"
+        ],
+        "properties": {
+          "reason": {
+            "type": "string",
+            "enum": [
+              "insufficient_credits",
+              "billing_unavailable",
+              "account_unavailable"
+            ]
+          },
+          "price_credits": {
+            "type": "integer"
+          },
+          "balance": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "top_up": {
+            "description": "The card rail while card checkout is offered, else support; never a USDC address. null unless insufficient_credits",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "read": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        }
+      },
       "ErrorEnvelope": {
         "type": "object",
         "required": [
@@ -1230,7 +1306,7 @@
     },
     "/v1/markets/{id}/follow": {
       "post": {
-        "summary": "Follow a public shadow market (open, not a test market) for the private early reveal: its committed verdicts at GET /v1/shadow/{market_id} and as shadow.committed / shadow.revealed webhooks, labeled \"private early reveal — excluded from the public record\". Idempotent. Follows of open markets per tenant: 50, Growth 500, Platform unlimited (read from the tenant's plan); a follow of a settled market does not count. A free-plan (evaluation) follow delivers only while the tenant holds a live key",
+        "summary": "Follow a public shadow market (open, not a test market) for the private early reveal: its committed verdicts at GET /v1/shadow/{market_id} and as shadow.committed / shadow.revealed webhooks, labeled \"private early reveal — excluded from the public record\". Idempotent. With the body {\"scope\":\"event\"} every open public leg of the market's event is followed in one transaction (an official release's legs on every venue, a Polymarket event's legs), all or nothing against the follow limit; without a body, or with {\"scope\":\"market\"}, the one market. Follows of open markets per tenant (read from the tenant's plan): free 50, payg 500, builder 50, growth 500, platform unlimited; a follow of a settled market does not count. A free-plan (evaluation) follow delivers only while the tenant holds a live key. A RESOLVED reveal costs 25 credits on the free and payg plans, once per market, at most 2000 per event (reveal_price states this account's terms)",
         "security": [
           {
             "bearerAuth": []
@@ -1250,9 +1326,30 @@
             }
           }
         ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "scope": {
+                    "type": "string",
+                    "enum": [
+                      "market",
+                      "event"
+                    ],
+                    "default": "market"
+                  }
+                }
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
-            "description": "already following: the same fields with already_following=true",
+            "description": "already following (scope market: already_following=true; scope event: followed=0): the same fields",
             "content": {
               "application/json": {
                 "schema": {
@@ -1262,7 +1359,7 @@
             }
           },
           "201": {
-            "description": "follow_id, market_id (the uuid), market (platform:external_id), following, already_following=false, follows_counted (follows of open markets, what the limit counts), follow_limit (null = unlimited), events, read, endpoints_subscribed (active endpoints that receive shadow.committed), warning (only when endpoints_subscribed is 0)",
+            "description": "scope market: follow_id, market_id (the uuid), market (platform:external_id), following, already_following=false, follows_counted (follows of open markets, what the limit counts), follow_limit (null = unlimited), events, read, endpoints_subscribed (active endpoints that receive shadow.committed), reveal_price {terms (pays | included_plan | grandfathered), credits_per_resolved_leg, event_cap_credits, note}, note, warning (only when endpoints_subscribed is 0). scope event (at least one leg followed): scope, event_key, market_id, market, following, legs (open public legs of the event), followed (followed now), already_following, follows_counted, follow_limit, events, read (/v1/shadow/export), endpoints_subscribed, reveal_price, note, warning",
             "content": {
               "application/json": {
                 "schema": {
@@ -1272,7 +1369,7 @@
             }
           },
           "400": {
-            "description": "validation_error: an id that is neither a uuid nor a venue id, the tenant's own market, or a market no longer open",
+            "description": "validation_error: an id that is neither a uuid nor a venue id, a body that is not {scope: market | event}, the tenant's own market, or a market no longer open",
             "content": {
               "application/json": {
                 "schema": {
@@ -1282,7 +1379,7 @@
             }
           },
           "403": {
-            "description": "validation_error: follow limit reached (follow_limit, follows_counted at top level)",
+            "description": "validation_error: follow limit reached (follow_limit, follows_counted at top level; scope event also legs, already_following and event_key, and nothing was followed)",
             "content": {
               "application/json": {
                 "schema": {
@@ -1415,7 +1512,7 @@
     },
     "/v1/shadow/export": {
       "get": {
-        "summary": "Export the followed markets this account is entitled to (the same rule as GET /v1/shadow/{market_id}: the plan's follow limit, and a live key on the free plan), one row per market, labeled \"private early reveal — excluded from the public record\": the latest commitment_sha256, committed_at, committed_status and committed_outcome, the evidence hashes, the number of commits, and once the platform resolves the market, official_outcome, official_at, official_at_source (gamma_closed_time is the platform's timestamp; limitless_api_poll and first_observed_poll are the first poll that saw the outcome, so lead_seconds is an upper bound), agreement and lead_seconds. Never the nonce or the preimage. The oldest 1000 follows are read (truncated says when there are more). format=csv answers RFC 4180 CSV with a header row (Content-Type text/csv; X-Resolve-Truncated); the default is the JSON envelope",
+        "summary": "Export the followed markets this account is entitled to (the same rule as GET /v1/shadow/{market_id}: the plan's follow limit, and a live key on the free plan), one row per market, labeled \"private early reveal — excluded from the public record\": the latest commitment_sha256, committed_at, committed_status and committed_outcome, the evidence hashes, the number of commits, and once the platform resolves the market, official_outcome, official_at, official_at_source (gamma_closed_time is the platform's timestamp; limitless_api_poll and first_observed_poll are the first poll that saw the outcome, so lead_seconds is an upper bound), agreement and lead_seconds. A RESOLVED latest verdict is priced like every reveal (25 credits on free and payg, once per market, at most 2000 per event, never refunded for a read): a row this account has not received is exported locked, with committed_status and committed_outcome empty; the reveal column says why each row is shown or locked (RevealAccess.reason, not_resolved, or empty without a commit). Never the nonce or the preimage. The oldest 1000 follows are read (truncated says when there are more). format=csv answers RFC 4180 CSV with a header row (Content-Type text/csv; X-Resolve-Truncated, X-Resolve-Credits-Charged, X-Resolve-Locked); the default is the JSON envelope. Never 402: locked rows answer 200 with top_up",
         "security": [
           {
             "bearerAuth": []
@@ -1460,7 +1557,7 @@
         ],
         "responses": {
           "200": {
-            "description": "JSON: rows[] (market_id, platform, external_id, event_key, venue_slug, status, committed_at, commitment_sha256, committed_status, committed_outcome, evidence_raw_sha256, evidence_canonical_sha256, n_commits, official_outcome, official_at, official_at_source, agreement, lead_seconds), count, columns, truncated, filters, label, note, disclaimer; or the same rows as CSV",
+            "description": "JSON: rows[] (market_id, platform, external_id, event_key, venue_slug, status, committed_at, commitment_sha256, committed_status, committed_outcome, evidence_raw_sha256, evidence_canonical_sha256, n_commits, official_outcome, official_at, official_at_source, agreement, lead_seconds, reveal), count, columns, truncated, filters, credits_charged, locked (rows locked), balance, top_up and locked_note (only when a row is locked for insufficient_credits), label, note, disclaimer; or the same rows as CSV",
             "content": {
               "application/json": {
                 "schema": {
@@ -1499,7 +1596,7 @@
     },
     "/v1/shadow/{market_id}": {
       "get": {
-        "summary": "Private early reveal of a followed market (\"private early reveal — excluded from the public record\"): every committed verdict, newest first, with its commitment_sha256, committed_at, posted state and evidence hashes. Never the nonce or the preimage: those appear only in the public reveal. 404 unless the tenant follows the market; 403 when the follow is above the plan's follow limit (after a plan change) or a free-plan tenant holds no live key",
+        "summary": "Private early reveal of a followed market (\"private early reveal — excluded from the public record\"): every committed verdict, newest first, with its commitment_sha256, committed_at, posted state and evidence hashes. Never the nonce or the preimage: those appear only in the public reveal. When a commit is RESOLVED the read is priced: 25 credits on the free and payg plans, once per tenant and market (every commit of it, every later read: free), at most 2000 per event, never refunded for a read; included in builder, growth, platform; a commit that is not RESOLVED is always shown. At a short balance every RESOLVED commit is answered locked (verdict null, locked true) with the locked object, 200 and never 402; the read after a top-up releases and charges it. 404 unless the tenant follows the market; 403 when the follow is above the plan's follow limit (after a plan change) or a free-plan tenant holds no live key",
         "security": [
           {
             "bearerAuth": []
@@ -1521,7 +1618,7 @@
         ],
         "responses": {
           "200": {
-            "description": "market_id, platform, external_id, market, status, deadline_utc, label, latest, commits[] (commitment_sha256, committed_at, posted, posted_at, verdict {resolution_status, winning_outcome, confidence_score, caveats, determination_basis, thresholds_version} or null for a pre-v2 commit, evidence {raw_sha256, canonical_sha256}), how_to_verify, disclaimer",
+            "description": "market_id, platform, external_id, market, status, deadline_utc, label, reveal (RevealAccess, null when no commit is RESOLVED), locked (LockedReveal or null), latest, commits[] (commitment_sha256, committed_at, posted, posted_at, verdict {resolution_status, winning_outcome, confidence_score, caveats, determination_basis, thresholds_version} or null for a pre-v2 commit or a locked one, locked (true when this RESOLVED commit is withheld), evidence {raw_sha256, canonical_sha256}), credits_charged (this read), balance (null when the read was not priced), how_to_verify, disclaimer",
             "content": {
               "application/json": {
                 "schema": {
@@ -2133,7 +2230,7 @@
     },
     "/v1/webhooks": {
       "post": {
-        "summary": "Register an https endpoint (secret shown once). events: a subset of market.resolved, market.unresolved_update, market.error, credits.low, payment.credited, shadow.committed, shadow.revealed (default: all). The first delivery attempt is made as the event happens (a few per event; the rest by the 5-minute queue drain); failed attempts retry on a backoff of 60 s, 5 min, 30 min, 2 h, 12 h, 24 h, then dead-letter",
+        "summary": "Register an https endpoint (secret shown once). events: a subset of market.resolved, market.unresolved_update, market.error, credits.low, payment.credited, shadow.committed, shadow.revealed (default: all). The first delivery attempt is made as the event happens (a few per event, early reveals the tenant paid for first; the rest by the 5-minute queue drain, in the same order); failed attempts retry on a backoff of 60 s, 5 min, 30 min, 2 h, 12 h, 24 h, then dead-letter. shadow.committed carries reveal (RevealAccess) and locked (LockedReveal or null): a locked one has verdict null and a venue object that proposes nothing. A paid shadow.committed that none of the tenant's endpoints received within 10 minutes of committed_at is refunded once",
         "security": [
           {
             "bearerAuth": []

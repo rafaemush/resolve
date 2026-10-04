@@ -12,6 +12,7 @@ import { botPageHtml } from "../src/api/bot";
 import { docsHtml, keyIssuedHtml, pricingHtml } from "../src/api/site";
 import { VERIFY_HINT, listSeries, scheduledAnswer } from "../src/api/prints";
 import { topUp, topUpText } from "../src/billing/top-up";
+import { REVEAL_EVENT_CAP_CREDITS, REVEAL_LATE_MINUTES, REVEAL_PRICE_CREDITS, REVEAL_PRICING_FROM } from "../src/shadow/reveal";
 import type { Env } from "../src/env";
 import { RESOLVE_BOT_UA } from "../src/ops/ua";
 
@@ -68,7 +69,7 @@ describe("customer-facing documents", () => {
     expect(texts["docs/templates/pilot-letter.md"]).toMatch(/no accuracy figure before 100 distinct events on your platform are reconciled/);
     expect(texts["docs/pricing.md"]).toMatch(/no lead-time guarantee before 100 reconciled distinct events/);
   });
-  it("the venue offers state that the account has no follow limit (a PAYG credit alone would cap follows at 50)", () => {
+  it("the venue offers state that the account has no follow limit (a PAYG credit alone would cap follows at 500 and pay per reveal)", () => {
     expect(texts["docs/pilot-pack.md"]).toMatch(/The pilot account has no follow limit/);
     expect(texts["docs/pilot-pack.md"]).toMatch(/The account has no follow limit, so every one of those markets can be followed/);
     expect(texts["docs/templates/pilot-letter.md"]).toMatch(/Account `<tenant id>` has no follow limit for this period/);
@@ -89,6 +90,23 @@ describe("customer-facing documents", () => {
     expect(t).toMatch(/USDC deposits are not offered/);
     expect(t).not.toMatch(/send USDC on Base from that wallet to the address/i);
     expect(t).not.toMatch(/lifetime/i);
+  });
+  it("docs/pricing.md prices the early reveal as the code charges it: 25 per RESOLVED leg, 2,000 per event, the plans that include it, the refund window, the locked answer, payg follows 500, the event follow, the cut-over", () => {
+    const t = texts["docs/pricing.md"]!;
+    expect(t).toContain(`| ${REVEAL_PRICE_CREDITS} |`);
+    expect(t).toContain(`at most ${REVEAL_EVENT_CAP_CREDITS.toLocaleString("en-US")} credits per event`);
+    expect(t).toMatch(/Included in Builder, Growth, Platform and the venue offers/);
+    expect(t).toContain(`within ${REVEAL_LATE_MINUTES} minutes of \`committed_at\``);
+    expect(t).toMatch(/A reveal charged by a read \(`GET \/v1\/shadow\/\{market_id\}` or the export\) is not refunded/);
+    expect(t).toMatch(/`verdict` is `null`, the `venue` object proposes nothing, and a `locked` object/);
+    expect(t).toMatch(/These reads answer 200, never 402/);
+    expect(t).toContain("| Pay as you go | packs from $20 (by card) | credits do not expire while the account is open | 5 | up to 500 | 60 |");
+    expect(t).toMatch(/an evaluation key may follow up to 50 shadow markets while it is valid, so the early reveal can be judged before buying; each RESOLVED reveal costs 25 of its 300 credits/i);
+    expect(t).toContain('`{"scope":"event"}`');
+    // the cut-over the docs state is the one the code sends to charge_reveals
+    expect(t).toContain(`An evaluation key issued before ${REVEAL_PRICING_FROM.slice(0, 10)} keeps free reveals until it expires`);
+    expect(t).toMatch(/## Status \(2026-10-05\)\n\nEarly reveals are priced from 2026-10-10/);
+    expect(t).not.toMatch(/Early reveals are not a Free feature/);
   });
   it("the pilot letter fits one page (under 650 words)", () => {
     expect(texts["docs/templates/pilot-letter.md"]!.split(/\s+/).filter(Boolean).length).toBeLessThan(650);
@@ -127,6 +145,14 @@ describe("the quickstart, the key page and the first-print answers", () => {
       expect(t, p).not.toMatch(/0x[0-9a-f]{40}/i);
     }
     for (const p of ["/docs", "/docs (card not open)", "the key page", "GET /v1/prints", "a scheduled print", "the verify hint", "the 402 top-up (card open)", "the 402 top-up (card not open)"]) expect(pages[p], p).not.toMatch(/usdc/i);
+  });
+  it("the quickstart and /pricing price the early reveal from the code's constants, never as a USDC payment", () => {
+    for (const p of ["/docs", "/docs (card not open)", "/pricing"]) {
+      expect(pages[p], p).toContain(`${REVEAL_PRICE_CREDITS} credits`);
+      expect(pages[p], p).toContain(`at most ${REVEAL_EVENT_CAP_CREDITS.toLocaleString("en-US")} credits per event`);
+      expect(pages[p], p).toContain(`within ${REVEAL_LATE_MINUTES} minutes is refunded`);
+    }
+    expect(pages["/docs"]).toContain("-d '{&quot;scope&quot;:&quot;event&quot;}'".replace(/&quot;/g, '"'));
   });
   it("the quickstart leads with the official-release product: a first print before any market, the GitHub example labelled an illustration", () => {
     const d = pages["/docs"]!;

@@ -29,7 +29,7 @@ vi.mock("../src/db/supabase", () => ({
 vi.mock("../src/ops/alerts", () => ({ alert: vi.fn(async () => ({ sent: true, deduped: false })), alertMany: vi.fn(async () => ({ sent: [], deduped: [] })) }));
 
 import { recorderCheckDue, recorderStaleAlert, runTick, tickAlerts, DISPATCH_LOOKBACK_MINUTES, RECORDER_STALE_MINUTES, type DispatchState } from "../src/jobs/tick";
-import { checkDispatchFailures, dbSizeAlert, dispatchCheckAlert, purgeAlert, DB_SIZE_ALERT_MB, DB_SIZE_UNREADABLE_DEDUP_MINUTES, DISPATCH_WINDOW_MINUTES, MB, PURGE_STALE_HOURS } from "../src/jobs/dispatch";
+import { checkDispatchFailures, dbSizeAlert, dispatchCheckAlert, purgeAlert, refundAlert, DB_SIZE_ALERT_MB, DB_SIZE_UNREADABLE_DEDUP_MINUTES, DISPATCH_WINDOW_MINUTES, MB, PURGE_STALE_HOURS, REFUND_STALE_MINUTES } from "../src/jobs/dispatch";
 import { alert, alertMany } from "../src/ops/alerts";
 
 const put = vi.fn(async () => undefined);
@@ -309,6 +309,37 @@ describe("storage check: the daily retention purge (a purge that stopped is hear
     vi.mocked(alertMany).mockClear();
     withStorage(storage(40 * MB, { scheduled: false }));
     expect(await checkDispatchFailures(env)).toMatchObject({ ok: false, retention: { scheduled: false, alert: "retention_purge_unscheduled" } });
+    expect(h.db.calls.filter((c) => c.table.startsWith("rpc:")).map((c) => c.table)).toEqual(["rpc:dispatch_failures", "rpc:storage_status"]);
+  });
+});
+
+describe("storage check: the refund rule of charged reveals (refund_late_reveals, migration 023, every 5 minutes)", () => {
+  beforeEach(() => { vi.mocked(alert).mockClear(); vi.mocked(alertMany).mockClear(); });
+  const NOW = Date.parse("2026-10-05T10:00:00Z");
+  const run = (minutesAgo: number, outcome = "no_op", error: string | null = null) => ({ started_at: new Date(NOW - minutesAgo * 60_000).toISOString(), outcome, error });
+  it("pure: quiet after a recent run (success or no_op), before the first run while scheduled, and where pg_cron is absent", () => {
+    expect(refundAlert({ refund_scheduled: true, last_refund: run(4) }, NOW)).toBeNull();
+    expect(refundAlert({ refund_scheduled: true, last_refund: run(REFUND_STALE_MINUTES, "success") }, NOW)).toBeNull();
+    expect(refundAlert({ refund_scheduled: true, last_refund: null }, NOW)).toBeNull();
+    expect(refundAlert({ refund_scheduled: null, last_refund: null }, NOW)).toBeNull();
+  });
+  it("pure: a failed run, a run older than 30 minutes, a missing cron job, or no refund keys at all (023 not applied) each alert, hourly", () => {
+    expect(REFUND_STALE_MINUTES).toBe(30);
+    const failed = refundAlert({ refund_scheduled: true, last_refund: run(4, "failure", "reveal:t:m: deadlock detected") }, NOW)!;
+    expect([failed.key, failed.dedupMinutes]).toEqual(["reveal_refund_failed", 60]);
+    expect(failed.text).toContain("deadlock detected");
+    const stale = refundAlert({ refund_scheduled: true, last_refund: run(REFUND_STALE_MINUTES + 1) }, NOW)!;
+    expect([stale.key, stale.text]).toEqual(["reveal_refund_stale", expect.stringContaining("select public.refund_late_reveals(10);")]);
+    expect(refundAlert({ refund_scheduled: true, last_refund: { started_at: "soon", outcome: "success", error: null } }, NOW)!.key).toBe("reveal_refund_stale");
+    const gone = refundAlert({ refund_scheduled: false, last_refund: run(1) }, NOW)!;
+    expect([gone.key, gone.text]).toEqual(["reveal_refund_unscheduled", expect.stringContaining("select cron.schedule('refund_late_reveals', '*/5 * * * *', 'select public.refund_late_reveals(10)');")]);
+    // "could not look" is never "fine": a storage_status() without the keys is its own alert
+    expect(refundAlert({}, NOW)!.key).toBe("reveal_refund_unobserved");
+  });
+  it("goes out in the same alertMany as the purge's, from the one storage_status read", async () => {
+    h.db = fakeDb({}, {}, { rpc: { dispatch_failures: async () => ({ data: 0, error: null }), storage_status: async () => ({ data: { ...storage(40 * MB), last_refund: { started_at: anHourAgo(), outcome: "no_op", error: null } }, error: null }) } });
+    expect(await checkDispatchFailures(env)).toMatchObject({ ok: false, refunds: { scheduled: true, alert: "reveal_refund_stale" }, retention: { alert: null } });
+    expect(vi.mocked(alertMany).mock.calls[0]![1].map((i) => [i.key, i.dedupMinutes])).toEqual([["reveal_refund_stale", 60]]);
     expect(h.db.calls.filter((c) => c.table.startsWith("rpc:")).map((c) => c.table)).toEqual(["rpc:dispatch_failures", "rpc:storage_status"]);
   });
 });

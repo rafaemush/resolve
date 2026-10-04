@@ -229,6 +229,9 @@ describe("pages", () => {
     h.db = sampleDb();
     const t = text(await (await app.request("/pricing", {}, env, ctx)).text());
     for (const s of ["$99 a month", "$399 a month", "$750 a month", "$1,000 for 30 days", "300 credits for 30 days", "5,000", "27,500", "120,000", "1 credit", "5 credits", "Invoiced in USD; ask us for payment options", "non-refundable prepayment for API services"]) expect(t).toContain(s);
+    // the plans table's follow limits come from followCap: pay as you go follows 500 since the priced reveal
+    expect(t).toMatch(/Pay as you go .*?up to 500/);
+    expect(t).toContain("25 credits , once per followed market, at most 2,000 credits per event");
     expect(t).not.toMatch(/0x[0-9a-f]{40}/i);
   });
 

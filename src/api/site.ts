@@ -30,6 +30,7 @@ import { alert } from "../ops/alerts";
 import { maskEmail } from "../ops/redact";
 import { EVALUATION_KEY_DAYS, EVALUATION_WATCH_LIMIT, FREE_EVALUATION_CREDITS } from "./keys";
 import { PRINT_PRICE_CREDITS } from "./prints";
+import { REVEAL_EVENT_CAP_CREDITS, REVEAL_LATE_MINUTES, REVEAL_PRICE_CREDITS } from "../shadow/reveal";
 import { issueEvaluationKey, type AutoKeyOutcome } from "./evaluation-key";
 import { CARD_PACKS, PACK_IDS, cardCheckoutOffered, isPackId, usd, whopConfig, type WhopConfig } from "../billing/whop";
 import { checkoutRefusal, startCheckout } from "./billing";
@@ -425,8 +426,8 @@ export const PUBLIC_PLANS: ReadonlyArray<{ plan: Plan | null; name: string; pric
   { plan: "free", name: "Free test key", price: "$0", contents: "300 credits for 30 days, structured verdicts only." },
   // the price without card checkout; pricingHtml adds the card-only packs while it is offered (paygPrice)
   { plan: "payg", name: "Pay as you go", price: paygPrice(false), contents: "Credits do not expire while the account is open." },
-  { plan: "builder", name: "Builder", price: "$99 a month", contents: "12,000 credits a month, 50 watches, webhooks and private early reveals." },
-  { plan: "growth", name: "Growth", price: "$399 a month", contents: "60,000 credits a month, 500 watches, a higher request rate." },
+  { plan: "builder", name: "Builder", price: "$99 a month", contents: "12,000 credits a month, 50 watches, webhooks and private early reveals, included." },
+  { plan: "growth", name: "Growth", price: "$399 a month", contents: "60,000 credits a month, 500 watches, a higher request rate, private early reveals included." },
   { plan: null, name: "Venue Design Partner", price: "$750 a month", contents: "Your venue's markets, webhooks in your venue's payload shape (including a proposed winning outcome index), and a weekly reconciliation report." },
   { plan: null, name: "Pilot pack", price: "$1,000 for 30 days", contents: "A shorter start for a venue: private early reveals for the markets you name, webhooks in your payload shape and a weekly reconciliation report." },
 ];
@@ -474,6 +475,7 @@ export function pricingHtml(o: { packs: PaygCredit[] | null; channel: string | n
 <li>A structured verdict (machine-readable sources such as official releases, GitHub objects, on-chain logs): <strong>1 credit</strong>.</li>
 <li>A web-evidence verdict (free-text evidence): <strong>5 credits</strong>.</li>
 <li>A first print (<code>GET /v1/prints/{series}/{period}</code>: an official number as first published, with its source and hash): <strong>${PRINT_PRICE_CREDITS} credit</strong>. The list of series, and a release not recorded yet: 0 credits.</li>
+<li>The private early reveal of a RESOLVED verdict on a free test key or pay as you go (the <code>shadow.committed</code> webhook, <code>GET /v1/shadow/{market_id}</code> or <code>GET /v1/shadow/export</code>): <strong>${REVEAL_PRICE_CREDITS} credits</strong>, once per followed market, at most ${int(REVEAL_EVENT_CAP_CREDITS)} credits per event. UNRESOLVED and ERROR verdicts, later commits and re-reads: 0 credits. Included in Builder, Growth and the venue offers. A webhook reveal not delivered within ${REVEAL_LATE_MINUTES} minutes is refunded; at a short balance the reveal is locked (the commitment and where to top up, no verdict) and nothing is charged.</li>
 <li>A request the pre-checks settle on their own, or a replay of the same <code>Idempotency-Key</code>: 0 credits.</li>
 <li>A verdict that fails because an upstream is unavailable is refunded in credits.</li>
 </ul>
@@ -605,8 +607,14 @@ ${o.card ? `<p>When the test credits run out, <a href="${PAY_BY_CARD_PATH}">pay 
   -H "Authorization: Bearer $RESOLVE_KEY" -H 'content-type: application/json' \\
   -d '{"url":"https://example.com/resolve-hook","events":["shadow.committed","shadow.revealed"]}'
 
-curl -X POST ${b}/v1/markets/polymarket:$EXTERNAL_ID/follow -H "Authorization: Bearer $RESOLVE_KEY"</pre>
-<p>A public market is named by its id exactly as the <a href="/record">record</a> and the home page's table of scheduled releases print it, <code>platform:external_id</code> (above, <code>$EXTERNAL_ID</code> is a placeholder, not a real market: copy an id from those pages), or by its uuid. <code>GET /v1/shadow/&lt;id&gt;</code> reads its committed verdicts with the same id. The endpoint's secret is shown once. Each delivery carries <code>X-Resolve-Signature: t=&lt;unix seconds&gt;,v1=&lt;hex&gt;</code>, where the hex is HMAC-SHA256 of <code>&lt;t&gt;.&lt;raw body&gt;</code> with that secret, and <code>X-Resolve-Event-Id</code>, by which you drop duplicates. Verify before you parse (Node):</p>
+curl -X POST ${b}/v1/markets/polymarket:$EXTERNAL_ID/follow -H "Authorization: Bearer $RESOLVE_KEY"
+
+curl -X POST ${b}/v1/markets/polymarket:$EXTERNAL_ID/follow \\
+  -H "Authorization: Bearer $RESOLVE_KEY" -H 'content-type: application/json' \\
+  -d '{"scope":"event"}'</pre>
+<p>A public market is named by its id exactly as the <a href="/record">record</a> and the home page's table of scheduled releases print it, <code>platform:external_id</code> (above, <code>$EXTERNAL_ID</code> is a placeholder, not a real market: copy an id from those pages), or by its uuid. <code>GET /v1/shadow/&lt;id&gt;</code> reads its committed verdicts with the same id. The second call follows every open leg of that market's event in one call (an official release's legs on every venue, a Polymarket event's legs), all or nothing against your follow limit; its answer says how many legs it followed.</p>
+<p>Each RESOLVED verdict revealed to a free test key or a pay-as-you-go account costs ${REVEAL_PRICE_CREDITS} credits, once per market, at most ${int(REVEAL_EVENT_CAP_CREDITS)} credits per event (<code>reveal.credits_charged</code> says what a reveal cost); UNRESOLVED and ERROR verdicts are free, and Builder, Growth and the venue offers include reveals. When the balance cannot pay, the webhook and <code>GET /v1/shadow/&lt;id&gt;</code> carry the commitment and the evidence hashes with <code>verdict: null</code> and a <code>locked</code> object (the price, the balance and <code>top_up</code>), and nothing is charged; the next read after a top-up releases the verdict. A webhook reveal not delivered within ${REVEAL_LATE_MINUTES} minutes is refunded.</p>
+<p>The endpoint's secret is shown once. Each delivery carries <code>X-Resolve-Signature: t=&lt;unix seconds&gt;,v1=&lt;hex&gt;</code>, where the hex is HMAC-SHA256 of <code>&lt;t&gt;.&lt;raw body&gt;</code> with that secret, and <code>X-Resolve-Event-Id</code>, by which you drop duplicates. Verify before you parse (Node):</p>
 <pre>import { createHmac, timingSafeEqual } from "node:crypto";
 
 function verify(rawBody, header, secret, toleranceSeconds = 300) {

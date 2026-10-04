@@ -42,6 +42,7 @@ import {
 import { followCap, PLANS } from "../src/shadow/follows";
 import { inlineCandidates } from "../src/webhooks/deliver";
 import { topUp } from "../src/billing/top-up";
+import { noteCrossings } from "../src/billing/events";
 import { alert, alertMany } from "../src/ops/alerts";
 import { COST } from "../src/ops/budget";
 import { __setRailsForMutationTesting } from "../src/resolve/rails";
@@ -510,6 +511,28 @@ describe("the refund rule: a charged reveal not delivered within 10 minutes of c
     h.db.tables.credit_ledger![0]!.created_at = new Date(Date.now() - 60 * 60_000).toISOString();
     expect((await refund()).data).toMatchObject({ refunded: 0 });
     expect(refunds()).toEqual([]);
+  });
+});
+
+// ---- credits.low after a read's charge ---------------------------------------------------------------------------------------
+
+describe("noteCrossings: credits.low for a crossing the reveal charge already claimed", () => {
+  const crossing = { tenantId: "t_new", plan: "free", balance: 275, threshold: 500, requestId: revealRequestId("t_new", M) };
+  it("queues credits.low (card top_up) and tells the operator once, in one alertMany", async () => {
+    h.db = fakeDb({ webhook_endpoints: [endpoint("e1", "t_new")], webhook_deliveries: [] });
+    await noteCrossings(env, [crossing], BASE);
+    expect(h.db.tables.webhook_deliveries!.map((d) => [d.event_type, d.payload.balance, d.payload.top_up.method])).toEqual([["credits.low", 275, "card"]]);
+    expect(sentKeys()).toEqual([`credits_low_t_new_${crossing.requestId}`]);
+  });
+  it("an event that cannot be queued gives the claim back and the crossing reaches the operator inside the failure alert", async () => {
+    const released: unknown[] = [];
+    h.db = fakeDb({ webhook_endpoints: [endpoint("e1", "t_new")] }, {}, { rpc: { release_low_credit_notice: async (_db, a) => { released.push(a.p_tenant); return { data: null, error: null }; } } });
+    const from = h.db.client.from;
+    h.db.client.from = ((t: string) => (t === "webhook_deliveries" ? { insert: () => ({ select: async () => ({ data: null, error: { message: "timeout" } }) }) } : from(t))) as never;
+    await noteCrossings(env, [crossing], BASE);
+    expect(released).toEqual(["t_new"]);
+    expect(sentKeys()).toEqual(["low_credit_event_failed_t_new"]);
+    expect(vi.mocked(alertMany).mock.calls[0]![1][0]!.text).toContain("Credits low: first paid use (free plan)");
   });
 });
 

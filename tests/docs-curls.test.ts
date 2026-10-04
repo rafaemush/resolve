@@ -163,8 +163,11 @@ describe("every curl on a customer page parses against the OpenAPI document", ()
     const ops = curlsOf(PAGES[0]![1]).map((cmd) => { const c = parseCurl(cmd); return `${c.method} ${c.url.pathname}`; });
     expect(ops).toEqual([
       "POST /v1/request-key", "GET /v1/prints/us_unemployment_rate/2026-09", "POST /v1/markets", "POST /v1/resolve", "POST /v1/resolve",
-      "POST /v1/webhooks", "POST /v1/markets/polymarket:$EXTERNAL_ID/follow", "GET /v1/track-record/verify", "POST /v1/billing/checkout",
+      "POST /v1/webhooks", "POST /v1/markets/polymarket:$EXTERNAL_ID/follow", "POST /v1/markets/polymarket:$EXTERNAL_ID/follow", "GET /v1/track-record/verify", "POST /v1/billing/checkout",
     ]);
+    // the second follow is the whole event: its body is the one the document declares
+    const event = curlsOf(PAGES[0]![1]).map(parseCurl).filter((c) => c.url.pathname.endsWith("/follow"))[1]!;
+    expect(JSON.parse(event.body!)).toEqual({ scope: "event" });
     expect(curlsOf(PAGES[2]![1]).map((cmd) => { const c = parseCurl(cmd); return `${c.method} ${c.url.pathname}`; })).toEqual(["GET /v1/prints"]);
   });
 
@@ -182,5 +185,8 @@ describe("every curl on a customer page parses against the OpenAPI document", ()
     expect(bad(`curl -X POST ${BASE}/v1/billing/checkout -H "Authorization: Bearer $K" -H 'content-type: application/json' -d '{"pack":"7"}'`)[0]).toContain("body does not fit");
     expect(bad(`curl '${BASE}/v1/track-record/verify?hash=nope'`)[0]).toContain("query parameter hash");
     expect(() => parseCurl(`curl -d '{"a":"it's"}' ${BASE}/v1/resolve`)).toThrow(/unterminated|operator/);
+    // the follow body is {scope: market | event} and nothing else
+    expect(bad(`curl -X POST ${BASE}/v1/markets/polymarket:1/follow -H "Authorization: Bearer $K" -H 'content-type: application/json' -d '{"scope":"world"}'`)[0]).toContain("body does not fit");
+    expect(bad(`curl -X POST ${BASE}/v1/markets/polymarket:1/follow -H "Authorization: Bearer $K" -H 'content-type: application/json' -d '{"scope":"event","all":true}'`)[0]).toContain("body does not fit");
   });
 });
