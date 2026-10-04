@@ -374,7 +374,7 @@ describe("GET /v1/shadow/export: locked rows hide committed_status and committed
     expect([shown.length, hidden.length]).toEqual([1, 1]);
     expect(hidden[0]).toMatchObject({ committed_outcome: null, reveal: "insufficient_credits", commitment_sha256: "e".repeat(64), evidence_raw_sha256: "a".repeat(64) });
     expect(shown[0]).toMatchObject({ committed_outcome: "OPTION_A", reveal: "charged" });
-    expect(r.body.data).toMatchObject({ credits_charged: 25, locked: 1, balance: 5, top_up: { method: "card" } });
+    expect(r.body.data).toMatchObject({ credits_charged: 25, locked_rows: 1, balance: 5, top_up: { method: "card" } });
     NO_USDC(JSON.stringify(r.body));
     expect(h.db.calls.filter((c) => c.table === "rpc:charge_reveals")).toHaveLength(1);
     const csv = await v1.request("/shadow/export?format=csv", { method: "GET" }, env, ctx);
@@ -391,7 +391,7 @@ describe("GET /v1/shadow/export: locked rows hide committed_status and committed
     h.db.tables.market_follows = legs.map((id, i) => ({ ...follow(`g${i}`, "t_pay", id), created_at: new Date(Date.parse("2026-10-21T00:00:00Z") + i).toISOString(), markets: { platform: "polymarket", status: "open", deleted_at: null } }));
     h.db.tables.v_venue_report = legs.map((id) => view(id, EVENT));
     const r = await call("GET", "/shadow/export");
-    expect(r.body.data).toMatchObject({ credits_charged: 2000, locked: 0, balance: 3000 });
+    expect(r.body.data).toMatchObject({ credits_charged: 2000, locked_rows: 0, balance: 3000 });
     const reasons = (r.body.data.rows as Row[]).map((x) => x.reveal);
     expect([reasons.filter((x) => x === "charged").length, reasons.filter((x) => x === "event_cap_reached").length]).toEqual([80, 1]);
     expect((r.body.data.rows as Row[]).every((x) => x.committed_status === "RESOLVED")).toBe(true);

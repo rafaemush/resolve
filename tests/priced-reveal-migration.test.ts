@@ -192,6 +192,12 @@ describe("scripts/selftest/reveal.ts (the rollback-only block for migration 023)
     expect(missing).toEqual([]);
     expect(Object.entries(REVEAL_EXPECT).filter(([, v]) => v === undefined)).toEqual([]);
   });
+  it("reads what a charge wrote in a statement of its own (the charge's statement sees its snapshot, from before)", () => {
+    expect(REVEAL_BLOCK).toMatch(/out := out \|\| jsonb_build_object\('first', \(select [^;]+ from charge_reveals\([^;]+\) c\)\);\s+out := out \|\| jsonb_build_object\('ledger_row', \(select [^;]+ from credit_ledger l [^;]+\)\);/);
+    expect(REVEAL_BLOCK).toMatch(/jsonb_build_object\('replay_read', \(select [^;]+\) c\)\);\s+out := out \|\| jsonb_build_object\('replay_rows'/);
+    // no statement both charges and reads the ledger or a balance
+    for (const stmt of REVEAL_BLOCK.split(";")) if (/from charge_reveals\(/.test(stmt)) expect(stmt, stmt.slice(0, 120)).not.toMatch(/from credit_ledger|credits_balance from tenants/);
+  });
   it("covers the charge once, the replay free from either source, the locked short balance, the cap net of refunds and the refund rule", () => {
     expect(REVEAL_EXPECT).toMatchObject({
       first: [true, false, 25, 35, "charged"], replay_read: [true, true, 0, 35, "replay"], replay_rows: 1, short: [false, 0, 25, 10, "insufficient_credits"], short_rows: 0,

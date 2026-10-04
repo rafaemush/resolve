@@ -1557,7 +1557,7 @@
         ],
         "responses": {
           "200": {
-            "description": "JSON: rows[] (market_id, platform, external_id, event_key, venue_slug, status, committed_at, commitment_sha256, committed_status, committed_outcome, evidence_raw_sha256, evidence_canonical_sha256, n_commits, official_outcome, official_at, official_at_source, agreement, lead_seconds, reveal), count, columns, truncated, filters, credits_charged, locked (rows locked), balance, top_up and locked_note (only when a row is locked for insufficient_credits), label, note, disclaimer; or the same rows as CSV",
+            "description": "JSON: rows[] (market_id, platform, external_id, event_key, venue_slug, status, committed_at, commitment_sha256, committed_status, committed_outcome, evidence_raw_sha256, evidence_canonical_sha256, n_commits, official_outcome, official_at, official_at_source, agreement, lead_seconds, reveal), count, columns, truncated, filters, credits_charged, locked_rows (rows exported locked), balance, top_up and locked_note (only when a row is locked for insufficient_credits), label, note, disclaimer; or the same rows as CSV",
             "content": {
               "application/json": {
                 "schema": {

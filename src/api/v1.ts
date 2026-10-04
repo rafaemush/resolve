@@ -530,7 +530,7 @@ v1.get("/shadow/export", async (c) => {
   }
   return ok(c, {
     rows, count: rows.length, columns: EXPORT_COLUMNS, truncated, filters: { platform: q.data.platform ?? null, since: q.data.since ?? null },
-    credits_charged: charged, locked: locked.length, balance,
+    credits_charged: charged, locked_rows: locked.length, balance,
     ...(top ? { top_up: top, locked_note: `${locked.length} RESOLVED verdict(s) are locked: each costs ${REVEAL_PRICE_CREDITS} credits (at most ${REVEAL_EVENT_CAP_CREDITS} per event) and the balance is ${balance ?? "unknown"}. Nothing was charged for them. ${topUpText(top)} Then export again: they are charged and released then.` } : {}),
     label: EARLY_REVEAL_LABEL,
     note: `One row per followed market you are entitled to (the oldest ${EXPORT_ROW_CAP} follows are read${truncated ? "; newer follows are not in this export" : ""}): the latest commitment, its verdict and evidence hashes, and once the platform resolves the market, the official outcome, its time and source, the agreement and lead_seconds. A RESOLVED verdict is charged ${REVEAL_PRICE_CREDITS} credits the first time it reaches you (by webhook, GET /v1/shadow/{market_id} or this export; never twice), unless your plan includes reveals; the reveal column says why each row is shown or locked. Never the nonce or the preimage: those appear only in the public reveal, and sha256(preimage) = commitment_sha256 at GET /v1/track-record/verify?hash=.`,

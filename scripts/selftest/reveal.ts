@@ -59,13 +59,15 @@ begin
   update markets set is_test = true where id = mtest;
 
   -- 1. charge_reveals --------------------------------------------------------------------------------------------------
-  out := out || jsonb_build_object('first', (select ${ROW} from ${CR("tp", "m1")} c),
-    'ledger_row', (select jsonb_build_array(l.delta, l.note, l.balance_after) from credit_ledger l where l.reason = 'charge' and l.request_id = 'reveal:' || tp || ':' || m1));
-  out := out || jsonb_build_object('replay_read', (select ${ROW} from ${CR("tp", "m1", "read")} c),
-    'replay_rows', (select count(*) from credit_ledger l where l.tenant_id = tp and l.reason = 'charge'));
-  out := out || jsonb_build_object('short', (select jsonb_build_array(c.entitled_full, c.charged, c.price, c.balance, c.reason) from ${CR("ts", "m1")} c),
-    'short_rows', (select count(*) from credit_ledger l where l.tenant_id = ts),
-    'included', (select ${ROW} from ${CR("tb", "m1")} c),
+  -- Every read of what a charge wrote is a statement of its own: read in the charge's statement it would see that
+  -- statement's snapshot, from before the charge (the 022 refund_balance lesson).
+  out := out || jsonb_build_object('first', (select ${ROW} from ${CR("tp", "m1")} c));
+  out := out || jsonb_build_object('ledger_row', (select jsonb_build_array(l.delta, l.note, l.balance_after) from credit_ledger l where l.reason = 'charge' and l.request_id = 'reveal:' || tp || ':' || m1));
+  out := out || jsonb_build_object('replay_read', (select ${ROW} from ${CR("tp", "m1", "read")} c));
+  out := out || jsonb_build_object('replay_rows', (select count(*) from credit_ledger l where l.tenant_id = tp and l.reason = 'charge'));
+  out := out || jsonb_build_object('short', (select jsonb_build_array(c.entitled_full, c.charged, c.price, c.balance, c.reason) from ${CR("ts", "m1")} c));
+  out := out || jsonb_build_object('short_rows', (select count(*) from credit_ledger l where l.tenant_id = ts));
+  out := out || jsonb_build_object('included', (select ${ROW} from ${CR("tb", "m1")} c),
     'grandfathered', (select ${ROW} from ${CR("tg", "m1")} c),
     'deleted_tenant', (select jsonb_build_array(c.entitled_full, c.charged, c.reason) from ${CR("td", "m1")} c));
   out := out || jsonb_build_object('after_cutover', (select jsonb_build_array(c.charged, c.reason, c.low_credit) from ${CR("tn", "m1")} c));
