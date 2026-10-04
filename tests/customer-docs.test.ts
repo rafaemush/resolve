@@ -105,7 +105,15 @@ describe("customer-facing documents", () => {
     expect(t).toContain('`{"scope":"event"}`');
     // the cut-over the docs state is the one the code sends to charge_reveals
     expect(t).toContain(`An evaluation key issued before ${REVEAL_PRICING_FROM.slice(0, 10)} keeps free reveals until it expires`);
-    expect(t).toMatch(/## Status \(2026-10-05\)\n\nEarly reveals are priced from 2026-10-10/);
+    // the dated status states no start date for pay as you go, which pays from the release that charges (only the free
+    // keys' grandfathering has a date: REVEAL_PRICING_FROM, compared with tenants.created_at)
+    expect(t).toMatch(/## Status \(2026-10-05\)\n\nEarly reveals are priced: 25 credits per RESOLVED leg on the Free and Pay as you go plans/);
+    expect(t).toContain("Pay as you go has no such date.");
+    expect(t).not.toMatch(/priced from \d{4}-\d{2}-\d{2}/);
+    // the refund is owed for Resolve's lateness, never for the endpoint's answer; a settled market is free
+    expect(t).toMatch(/if Resolve did not attempt to deliver it to any of your endpoints within 10 minutes of `committed_at`/);
+    expect(t).toMatch(/Once a delivery was attempted in time the charge stands, whatever your endpoint answered/);
+    expect(t).toMatch(/reading them is free on every plan, and `reveal.reason` \(the export's `reveal` column\) says `public`/);
     expect(t).not.toMatch(/Early reveals are not a Free feature/);
   });
   it("the pilot letter fits one page (under 650 words)", () => {
@@ -151,6 +159,9 @@ describe("the quickstart, the key page and the first-print answers", () => {
       expect(pages[p], p).toContain(`${REVEAL_PRICE_CREDITS} credits`);
       expect(pages[p], p).toContain(`at most ${REVEAL_EVENT_CAP_CREDITS.toLocaleString("en-US")} credits per event`);
       expect(pages[p], p).toContain(`within ${REVEAL_LATE_MINUTES} minutes is refunded`);
+      // the refund is for Resolve's lateness, and Platform includes reveals as docs/pricing.md and the code say
+      expect(pages[p], p).toContain("Resolve does not attempt within");
+      expect(pages[p], p).toContain("Builder, Growth, Platform and the venue offers");
     }
     expect(pages["/docs"]).toContain("-d '{&quot;scope&quot;:&quot;event&quot;}'".replace(/&quot;/g, '"'));
   });

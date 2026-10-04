@@ -21,7 +21,7 @@ import { mintKey, rotationExpiry } from "./keys";
 import { followBlock, followCap, followEntitlements, followEvent, followMarket, followRefusal, hasResolvedCommit, onlyMatch, parseMarketRef, FollowBody, Plan, shapeShadow, EARLY_REVEAL_LABEL, MARKET_REF_HINT, type FollowAnswer, type FollowEventAnswer, type FollowTarget, type MarketRef, type ShadowCommitRow, type ShadowMarket, type ShadowReveal } from "../shadow/follows";
 import { subscribes } from "../webhooks/deliver";
 import { chunks, entitledFollows, exportCsv, exportRows, pricedRow, selectRows, EXPORT_COLUMNS, EXPORT_ROW_CAP, EXPORT_VIEW_COLUMNS, ExportQuery, type ExportFollow, type ExportViewRow } from "../shadow/export";
-import { lockedReveal, revealAccess, revealEntitlements, revealReleased, revealRequestId, revealTerms, REVEAL_EVENT_CAP_CREDITS, REVEAL_PRICE_CREDITS, type RevealAnswer } from "../shadow/reveal";
+import { lockedReveal, revealAccess, revealEntitlements, revealIsPublic, revealReleased, revealRequestId, revealTerms, PUBLIC_ACCESS, REVEAL_EVENT_CAP_CREDITS, REVEAL_PRICE_CREDITS, type RevealAnswer } from "../shadow/reveal";
 import { DISCLAIMER } from "../bot/commit";
 import { noteCharge, noteCrossings, type Crossing } from "../billing/events";
 import { effectiveTiers, packQuotes, paygRate } from "../billing/tiers";
@@ -330,6 +330,16 @@ const crossingsOf = (answers: readonly RevealAnswer[]): Crossing[] => answers
   .map((a) => ({ tenantId: a.tenant_id, plan: a.plan, balance: a.balance!, threshold: a.low_credit_threshold!, requestId: revealRequestId(a.tenant_id, a.market_id) }));
 
 /**
+ * Hono routes HEAD to a GET route and drops the body of the answer: on the priced reveal reads that would be a charge
+ * for a verdict never delivered (and a read's charge is never refunded). Refused before anything is read or charged,
+ * as GET /v1/prints/{series}/{period} refuses it.
+ */
+function headRefused(c: Parameters<typeof ok>[0]) {
+  c.header("Allow", "GET");
+  return err(c, "method_not_allowed", "Use GET: a RESOLVED reveal is charged when it is served, and an answer to HEAD carries none. Nothing was charged.", 405);
+}
+
+/**
  * After a read's reveal charge: credits.low for a crossing it claimed, and the operator's alert when charge_reveals
  * failed (the reveal was answered locked, billing_unavailable) or could not claim the low-credit notice. Off the response
  * path when the request has waitUntil.
@@ -487,6 +497,7 @@ v1.get("/follows", async (c) => {
  * a 402. Subrequests: EXPORT_SUBREQUESTS (src/shadow/export.ts). CSV (RFC 4180, header row) or the JSON envelope.
  */
 v1.get("/shadow/export", async (c) => {
+  if (c.req.method !== "GET") return headRefused(c);
   const q = ExportQuery.safeParse({ platform: c.req.query("platform") || undefined, since: c.req.query("since") || undefined, format: c.req.query("format") || undefined });
   if (!q.success) return err(c, "validation_error", q.error.issues.map((i) => `${i.path.join(".") || "query"}: ${i.message}`).join("; ").slice(0, 400), 400);
   const auth = c.get("auth");
@@ -546,6 +557,7 @@ v1.get("/shadow/export", async (c) => {
  * 200, never a 402: the next read after a top-up releases and charges it.
  */
 v1.get("/shadow/:market_id", async (c) => {
+  if (c.req.method !== "GET") return headRefused(c);
   const ref = parseMarketRef(c.req.param("market_id"));
   if (!ref) return err(c, "validation_error", MARKET_REF_HINT, 400);
   const client = db(c.env);
@@ -574,7 +586,10 @@ v1.get("/shadow/:market_id", async (c) => {
   const rows = (commits ?? []) as ShadowCommitRow[];
   let reveal: ShadowReveal | null = null;
   let balance: number | null = null;
-  if (hasResolvedCommit(rows)) {
+  if (revealIsPublic(market.status)) {
+    // settled: every commit is public (track-record verify, shadow.revealed), so nothing is priced and no call is made
+    if (hasResolvedCommit(rows)) reveal = { access: PUBLIC_ACCESS, locked: null };
+  } else if (hasResolvedCommit(rows)) {
     const r = await revealEntitlements(client, [{ tenant_id: follow.tenant_id, market_id: id.id, plan: follow.plan }], { resolved: true, source: "read" });
     const a = r.answers[0]!;
     reveal = { access: revealAccess(a), locked: lockedReveal(a, topUp(c.env, publicBase(c.env, c.req.url)), id.id) };

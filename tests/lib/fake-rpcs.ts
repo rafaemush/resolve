@@ -120,8 +120,9 @@ export const FOLLOW_RPCS: NonNullable<FakeDbOptions["rpc"]> = { follow_market: f
 
 /**
  * Stand-in for migration 023's charge_reveals(), step for step in the SQL's order, over tenants (plan, credits_balance,
- * created_at, deleted_at, low_credit_notified_at), markets (event_key, tenant_id, is_test) and credit_ledger. Per pair, in
- * (tenant, event_key, market) order: unknown_tenant, included_plan, grandfathered, replay, event_cap_reached,
+ * created_at, deleted_at, low_credit_notified_at), markets (event_key, tenant_id, is_test, status), credit_ledger and
+ * reveal_reads. Per pair, in (tenant, event_key, market) order: unknown_tenant, public (a settled market), included_plan,
+ * grandfathered, replay (from source read, one reveal_reads row, on conflict nothing), event_cap_reached,
  * insufficient_credits, else one debit and one 'charge' row (note "reveal <source>") with the low-credit notice claimed
  * (threshold 500, as app_config's default). Errors exactly where the SQL raises.
  */
@@ -143,12 +144,15 @@ export async function chargeReveals(db: FakeDb, a: Record<string, any>): Promise
     const t = (db.tables.tenants ?? []).find((x) => x.id === p.t);
     if (!t || t.deleted_at) { out.push(row(p, { price: a.p_price, reason: "unknown_tenant" })); continue; }
     const bal = Number(t.credits_balance ?? 0);
+    if (["resolved", "void", "closed_unresolved"].includes(m.status)) { out.push(row(p, { plan: t.plan, entitled_full: true, balance: bal, reason: "public" })); continue; }
     if (a.p_included_plans.includes(t.plan)) { out.push(row(p, { plan: t.plan, entitled_full: true, balance: bal, reason: "included_plan" })); continue; }
     if (t.plan === "free" && t.created_at && Date.parse(t.created_at) < Date.parse(a.p_pricing_from)) { out.push(row(p, { plan: t.plan, entitled_full: true, balance: bal, reason: "grandfathered" })); continue; }
     const id = `reveal:${p.t}:${p.m}`;
     const prior = ledger.find((l) => l.reason === "charge" && l.request_id === id);
     if (prior) {
       if (prior.tenant_id !== p.t) return { data: null, error: { code: "RS003", message: "charge_reveals: this request id was charged to another tenant" } };
+      const reads = (db.tables.reveal_reads ??= []);
+      if (a.p_source === "read" && !reads.some((r) => r.request_id === id)) reads.push({ request_id: id, tenant_id: p.t, first_read_at: new Date().toISOString() });
       out.push(row(p, { plan: t.plan, entitled_full: true, replayed: true, balance: bal, reason: "replay" })); continue;
     }
     const legs = (db.tables.markets ?? []).filter((x) => x.event_key === m.event_key).map((x) => `reveal:${p.t}:${x.id}`);
@@ -180,7 +184,8 @@ export async function refundCredits(db: FakeDb, a: Record<string, any>): Promise
 /**
  * Stand-in for migration 023's refund_late_reveals(), in the SQL's order: every 'reveal webhook' charge not refunded yet,
  * past its deadline (its deliveries' reveal_due_at, else the charge time + p_late_minutes), none of whose deliveries was
- * delivered at or before reveal_due_at, refunded through refundCredits. Returns {refunded, credits, failed}.
+ * attempted (first_attempt_at) or delivered at or before reveal_due_at, and not read by the tenant (reveal_reads),
+ * refunded through refundCredits, in (tenant, charge time) order. Returns {refunded, credits, failed}.
  */
 export async function refundLateReveals(db: FakeDb, a: Record<string, any>): Promise<{ data: any; error: any }> {
   const late = a.p_late_minutes ?? 10;
@@ -188,12 +193,18 @@ export async function refundLateReveals(db: FakeDb, a: Record<string, any>): Pro
   const ledger = (db.tables.credit_ledger ??= []);
   const deliveries = db.tables.webhook_deliveries ?? [];
   let refunded = 0, credits = 0;
-  for (const c of ledger.filter((l) => l.reason === "charge" && l.note === "reveal webhook" && Date.parse(l.created_at) > now - 3 * 86_400_000)) {
+  const reads = db.tables.reveal_reads ?? [];
+  const charges = ledger.filter((l) => l.reason === "charge" && l.note === "reveal webhook" && Date.parse(l.created_at) > now - 3 * 86_400_000)
+    .sort((x, y) => (x.tenant_id < y.tenant_id ? -1 : x.tenant_id > y.tenant_id ? 1 : Date.parse(x.created_at) - Date.parse(y.created_at)));
+  for (const c of charges) {
     if (ledger.some((l) => l.reason === "refund" && l.request_id === c.request_id)) continue;
     const mine = deliveries.filter((d) => d.reveal_charge_id === c.request_id);
     const due = mine.length ? Math.min(...mine.map((d) => Date.parse(d.reveal_due_at))) : Date.parse(c.created_at) + late * 60_000;
     if (now < due) continue;
-    if (mine.some((d) => d.status === "delivered" && Date.parse(d.delivered_at) <= Date.parse(d.reveal_due_at))) continue;
+    const stamped = (at: unknown) => typeof at === "string" && at !== "";
+    if (mine.some((d) => (stamped(d.first_attempt_at) && Date.parse(d.first_attempt_at) <= Date.parse(d.reveal_due_at))
+      || (d.status === "delivered" && Date.parse(d.delivered_at) <= Date.parse(d.reveal_due_at)))) continue;
+    if (reads.some((r) => r.request_id === c.request_id)) continue;
     const r = await refundCredits(db, { p_request_id: c.request_id });
     if (r.data > 0) { refunded++; credits += r.data; }
   }

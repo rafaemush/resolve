@@ -1,10 +1,12 @@
 /**
  * Migration 023 (static lint; it is never applied from here: scripts/selftest/reveal.ts proves it on a database):
- * charge_reveals (the tenant rows locked first in id order, each replay found before anything is written, a short balance
- * refused with nothing written, the event cap net of refunds, one ledger charge per (tenant, market), no unique_violation
- * handler), refund_late_reveals (webhook charges only, past their deadline, none delivered in time; refund_credits, once),
- * claim_webhook_deliveries (priority first), follow_event (all or nothing under the tenant lock), the new columns and
- * indexes, storage_status's refund keys, the 5-minute cron job, and the conventions of 019-022 (one transaction, additive,
+ * charge_reveals (the tenant rows locked first in id order, a settled market public and free, each replay found before any
+ * money moves and a read's replay recorded in reveal_reads, a short balance refused with nothing written, the event cap
+ * net of refunds, one ledger charge per (tenant, market), no unique_violation handler), refund_late_reveals (webhook
+ * charges only, past their deadline, their tenants locked first in id order, none attempted or delivered in time and none
+ * read; refund_credits, once), claim_webhook_deliveries (priority first, then first attempts), follow_event (all or
+ * nothing under the tenant lock), the new columns, table and indexes, storage_status's refund keys, the 5-minute cron
+ * job, and the conventions of 019-022 (one transaction, additive,
  * SECURITY DEFINER with a pinned search_path, comments, revoked from public/anon/authenticated, granted to service_role).
  * Also the self-test block itself: every expected key is produced, it rolls back, and the concurrency probe races
  * charge_reveals.
@@ -61,9 +63,10 @@ describe("migration 023 (static lint; never applied from here)", () => {
     expect(body).toContain("alter table webhook_deliveries add column if not exists priority smallint not null default 0;");
     expect(body).toContain("alter table webhook_deliveries add column if not exists reveal_charge_id text;");
     expect(body).toContain("alter table webhook_deliveries add column if not exists reveal_due_at timestamptz;");
+    expect(body).toContain("alter table webhook_deliveries add column if not exists first_attempt_at timestamptz;");
     expect(flat(body)).toContain("check (priority between 0 and 3)");
     expect(flat(body)).toContain("(reveal_charge_id is null and reveal_due_at is null) or (reveal_charge_id ~ '^reveal:[0-9a-f-]{36}:[0-9a-f-]{36}$' and reveal_due_at is not null and event_type = 'shadow.committed')");
-    for (const c of ["priority", "reveal_charge_id", "reveal_due_at"]) expect(body, c).toContain(`comment on column webhook_deliveries.${c} is`);
+    for (const c of ["priority", "reveal_charge_id", "reveal_due_at", "first_attempt_at"]) expect(body, c).toContain(`comment on column webhook_deliveries.${c} is`);
     for (const i of ["idx_webhook_deliveries_claim", "idx_webhook_deliveries_reveal_charge", "idx_ledger_reveal_webhook", "idx_markets_event_key"]) {
       expect(body, i).toMatch(new RegExp(`create index if not exists ${i} on `));
       expect(body, i).toContain(`comment on index ${i} is`);
@@ -72,10 +75,22 @@ describe("migration 023 (static lint; never applied from here)", () => {
     expect(body).toContain("on credit_ledger (created_at) where reason = 'charge' and note = 'reveal webhook';");
   });
 
+  it("reveal_reads: one row per reveal charge read back, the charge's id as key, RLS applied, revoked from the API roles, every column commented", () => {
+    expect(flat(body)).toContain("create table if not exists reveal_reads ( request_id text primary key check (request_id ~ '^reveal:[0-9a-f-]{36}:[0-9a-f-]{36}$'), tenant_id uuid not null references tenants(id), first_read_at timestamptz not null default now() );");
+    expect(body).toContain("select apply_rls('reveal_reads');");
+    expect(body).toContain("revoke all on table reveal_reads from public, anon, authenticated;");
+    expect(body).toContain("comment on table reveal_reads is");
+    for (const c of ["request_id", "tenant_id", "first_read_at"]) expect(body, c).toContain(`comment on column reveal_reads.${c} is`);
+    // written by charge_reveals only, read by refund_late_reveals only
+    expect([...body.matchAll(/insert into reveal_reads/g)]).toHaveLength(1);
+    expect(fnBody("charge_reveals")).toContain("insert into reveal_reads");
+    expect(fnBody("refund_late_reveals")).toContain("from reveal_reads rr");
+  });
+
   describe("charge_reveals", () => {
     const f = fnBody("charge_reveals");
-    it("writes one tenants debit and one credit_ledger 'charge' row per charged pair, nothing else (the low-credit claim is claim_low_credit_notice's)", () => {
-      expect(writes(f)).toEqual([["update", "tenants"], ["insert into", "credit_ledger"]]);
+    it("writes one tenants debit and one credit_ledger 'charge' row per charged pair and a read's replay receipt, nothing else (the low-credit claim is claim_low_credit_notice's)", () => {
+      expect(writes(f)).toEqual([["insert into", "reveal_reads"], ["update", "tenants"], ["insert into", "credit_ledger"]]);
       expect(flat(f)).toContain("insert into credit_ledger (tenant_id, delta, reason, request_id, balance_after, note) values (v_pair.t, -v_due, 'charge', v_id, v_balance, 'reveal ' || p_source);");
       expect(f).toContain("v_id := 'reveal:' || v_pair.t::text || ':' || v_pair.m::text;");
       expect(raw).toMatch(/returns table \(tenant_id uuid, market_id uuid, plan text, entitled_full boolean, replayed boolean, charged integer,\s+price integer, balance integer, reason text, low_credit boolean, low_credit_threshold integer\)/);
@@ -91,15 +106,20 @@ describe("migration 023 (static lint; never applied from here)", () => {
     it("the rules in order: unknown tenant, included plan, grandfathered free key, replay, event cap, short balance, then the charge", () => {
       const at = (needle: string) => { const i = f.indexOf(needle); expect(i, needle).toBeGreaterThan(0); return i; };
       const order = [
-        at("'unknown_tenant'::text"), at("if v_ten.pl = any(p_included_plans) then"), at("if v_ten.pl = 'free' and v_ten.created < p_pricing_from then"),
+        at("'unknown_tenant'::text"), at("if v_pair.settled then"), at("if v_ten.pl = any(p_included_plans) then"), at("if v_ten.pl = 'free' and v_ten.created < p_pricing_from then"),
         at("where l.reason = 'charge' and l.request_id = v_id;"), at("v_due := least(p_price, greatest(p_event_cap - v_spent, 0));"),
         at("if v_ten.bal < v_due then"), at("update tenants t set credits_balance"),
       ];
       expect([...order].sort((a, b) => a - b)).toEqual(order);
     });
-    it("a replay is answered free before any debit (without the branch a replay at a short balance would be locked, a paid reveal withheld)", () => {
-      expect(flat(f)).toMatch(/select l\.tenant_id into v_owner from credit_ledger l where l\.reason = 'charge' and l\.request_id = v_id; if found then if v_owner is distinct from v_pair\.t then raise exception using errcode = 'RS003'[^;]*; end if; return query select v_pair\.t, v_pair\.m, v_ten\.pl, true, true, 0, 0, v_ten\.bal, 'replay'::text, null::boolean, null::integer; continue; end if;/);
+    it("a replay is answered free before any debit (without the branch a replay at a short balance would be locked, a paid reveal withheld); a read's replay leaves its receipt, nothing else", () => {
+      expect(flat(f)).toMatch(/select l\.tenant_id into v_owner from credit_ledger l where l\.reason = 'charge' and l\.request_id = v_id; if found then if v_owner is distinct from v_pair\.t then raise exception using errcode = 'RS003'[^;]*; end if; if p_source = 'read' then insert into reveal_reads \(request_id, tenant_id\) values \(v_id, v_pair\.t\) on conflict \(request_id\) do nothing; end if; return query select v_pair\.t, v_pair\.m, v_ten\.pl, true, true, 0, 0, v_ten\.bal, 'replay'::text, null::boolean, null::integer; continue; end if;/);
       expect(f.indexOf("'replay'::text")).toBeLessThan(f.indexOf("if v_ten.bal < v_due then"));
+    });
+    it("a settled market (resolved, void, closed_unresolved) is public: free and entitled, before any plan rule or ledger read", () => {
+      expect(flat(f)).toContain("mk.status in ('resolved', 'void', 'closed_unresolved') as settled");
+      expect(flat(f)).toContain("if v_pair.settled then return query select v_pair.t, v_pair.m, v_ten.pl, true, false, 0, 0, v_ten.bal, 'public'::text, null::boolean, null::integer; continue; end if;");
+      expect(f.indexOf("if v_pair.settled then")).toBeLessThan(f.indexOf("where l.reason = 'charge' and l.request_id = v_id;"));
     });
     it("the event cap sums what this tenant paid for the event's legs, net of refunds, by the ledger's unique ids", () => {
       expect(flat(f)).toContain("select coalesce(sum(-c.delta - coalesce(r.delta, 0)), 0)::integer into v_spent from markets mk join credit_ledger c on c.reason = 'charge' and c.request_id = 'reveal:' || v_pair.t::text || ':' || mk.id::text left join credit_ledger r on r.reason = 'refund' and r.request_id = c.request_id where mk.event_key = v_pair.ek;");
@@ -132,13 +152,30 @@ describe("migration 023 (static lint; never applied from here)", () => {
       expect(f).toContain("v_amount := refund_credits(v_charge.request_id);");
       expect(f).toContain("'reveal_refund'");
     });
-    it("webhook charges only (a read's charge is never refunded), not refunded yet, past their deadline, none delivered by it", () => {
+    it("webhook charges only (a read's charge is never refunded), not refunded yet, past their deadline", () => {
       const q = flat(f);
       expect(q).toContain("where c.reason = 'charge' and c.note = 'reveal webhook' and c.created_at > now() - interval '3 days'");
       expect(q).toContain("and not exists (select 1 from credit_ledger x where x.reason = 'refund' and x.request_id = c.request_id)");
       expect(q).toContain("and now() >= coalesce((select min(d.reveal_due_at) from webhook_deliveries d where d.reveal_charge_id = c.request_id), c.created_at + make_interval(mins => p_late_minutes))");
-      expect(q).toContain("and not exists (select 1 from webhook_deliveries d where d.reveal_charge_id = c.request_id and d.status = 'delivered' and d.delivered_at <= d.reveal_due_at)");
       expect(f).not.toContain("reveal read");
+    });
+    it("owed only when no delivery was attempted or delivered by the deadline and the tenant did not read it (an attempt in time stands, whatever the endpoint answered)", () => {
+      const q = flat(f);
+      expect(q).toContain("and not exists (select 1 from webhook_deliveries d where d.reveal_charge_id = c.request_id and (d.first_attempt_at <= d.reveal_due_at or (d.status = 'delivered' and d.delivered_at <= d.reveal_due_at)))");
+      expect(q).toContain("and not exists (select 1 from reveal_reads rr where rr.request_id = c.request_id)");
+      // the receiver's answer (dlq, last_status_code) is never what decides it
+      expect(f).not.toMatch(/status = 'dlq'|last_status_code/);
+    });
+    it("locks every tenant of its charges first, in id order (as charge_reveals), and decides after the lock: it cannot deadlock with a publish", () => {
+      const q = flat(f);
+      const lock = q.indexOf("perform 1 from tenants t where t.id in (select c.tenant_id from credit_ledger c where c.reason = 'charge' and c.request_id = any(v_ids)) order by t.id for update;");
+      expect(lock).toBeGreaterThan(0);
+      expect(lock).toBeLessThan(q.indexOf("for v_charge in"));
+      expect(lock).toBeLessThan(q.indexOf("refund_credits("));
+      expect(q).toContain("order by c.tenant_id, c.created_at loop");
+      // the owed conditions are read after the lock
+      expect(q.indexOf("from reveal_reads rr")).toBeGreaterThan(lock);
+      expect(q.indexOf("d.first_attempt_at <= d.reveal_due_at")).toBeGreaterThan(lock);
     });
     it("a refund that fails is reported and the others stand; an error outside them rolls the run back and is recorded", () => {
       expect(flat(f)).toMatch(/begin v_amount := refund_credits\(v_charge\.request_id\);[^]*?exception when others then v_failed := v_failed \+ 1;/);
@@ -150,10 +187,11 @@ describe("migration 023 (static lint; never applied from here)", () => {
     });
   });
 
-  it("claim_webhook_deliveries: the same signature and lease, highest priority first, then the oldest due", () => {
+  it("claim_webhook_deliveries: the same signature and lease, highest priority first, then first attempts before retries, then the oldest due", () => {
     const f = flat(fnBody("claim_webhook_deliveries"));
     expect(raw).toMatch(/create or replace function public\.claim_webhook_deliveries\(p_max integer default 10\)\s+returns setof webhook_deliveries language sql security definer set search_path = public as/);
-    expect(f).toContain("where status = 'pending' and next_attempt_at <= now() and (lease_until is null or lease_until < now()) order by priority desc, next_attempt_at limit p_max for update skip locked");
+    expect(f).toContain("where status = 'pending' and next_attempt_at <= now() and (lease_until is null or lease_until < now()) order by priority desc, attempt, next_attempt_at, id limit p_max for update skip locked");
+    expect(body).toContain("create index if not exists idx_webhook_deliveries_claim on webhook_deliveries (priority desc, attempt, next_attempt_at) where status = 'pending';");
     expect(f).toContain("set status = 'delivering', lease_until = now() + interval '60 seconds'");
   });
 
@@ -198,11 +236,17 @@ describe("scripts/selftest/reveal.ts (the rollback-only block for migration 023)
     // no statement both charges and reads the ledger or a balance
     for (const stmt of REVEAL_BLOCK.split(";")) if (/from charge_reveals\(/.test(stmt)) expect(stmt, stmt.slice(0, 120)).not.toMatch(/from credit_ledger|credits_balance from tenants/);
   });
-  it("covers the charge once, the replay free from either source, the locked short balance, the cap net of refunds and the refund rule", () => {
+  it("covers the charge once, the replay free from either source, the locked short balance, a settled market public, the cap net of refunds and the refund rule", () => {
     expect(REVEAL_EXPECT).toMatchObject({
       first: [true, false, 25, 35, "charged"], replay_read: [true, true, 0, 35, "replay"], replay_rows: 1, short: [false, 0, 25, 10, "insufficient_credits"], short_rows: 0,
-      event_cap: [[25, "charged"], [0, "event_cap_reached"]], cap_after_refund: [25, "charged"], refunded: [1, 0, 1, 0, 0],
+      settled_public: [true, false, 0, 10, "public"], settled_rows: 0,
+      event_cap: [[25, "charged"], [0, "event_cap_reached"]], cap_after_refund: [25, "charged"], claim_first_attempt_first: true, read_receipt: 1,
+      // dlq without an attempt, delivered in time, attempted and delivered late, not due, a read's charge, attempted in time then dlq, read back
+      refunded: [1, 0, 1, 0, 0, 0, 0], reveal_reads_rls: true, reveal_reads_anon: false,
     });
+    // the attempted-in-time row carries first_attempt_at before its deadline; the read-back charge is read in a statement of its own
+    expect(flat(REVEAL_BLOCK)).toContain("(ep, tr, 'shadow.committed', '{}', 'dlq', now() - interval '3 minutes', 'reveal:' || tr || ':' || rp6, now() - interval '1 minute')");
+    expect(REVEAL_BLOCK).toMatch(/c;\s+-- the tenant reads rp7 back: a replay\s+out := out \|\| jsonb_build_object\('read_receipt'/);
   });
   it("the persisting staging probe races charge_reveals: 10 parallel calls for one pair at the last 25 credits, one charge and nine replays", () => {
     const probe = readFileSync(resolve(import.meta.dirname, "../scripts/selftest-db.ts"), "utf8");

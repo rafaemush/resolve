@@ -5,8 +5,9 @@
  * (one charge_reveals() call per publish, paid reveals delivered first, a failed charge locked as billing_unavailable with
  * one alert and never released free, a verdict that is not RESOLVED never charged, credits.low with the event), the pull
  * paths (GET /v1/shadow/:market_id and GET /v1/shadow/export answer 200 with locked items, release and charge after a
- * top-up, replay free), following a whole event in one call (all or nothing at the cap, idempotent), and the refund rule
- * as the deliveries record it. charge_reveals(), follow_event() and refund_late_reveals() run as their stand-ins
+ * top-up, replay free, HEAD refused before any charge, a settled market public and free), following a whole event in one
+ * call (all or nothing at the cap, idempotent), and the refund rule as the deliveries record it (owed only when Resolve did
+ * not attempt a delivery in time and the tenant did not read it: an endpoint's 500 or timeout never earns a refund). charge_reveals(), follow_event() and refund_late_reveals() run as their stand-ins
  * (tests/lib/fake-rpcs.ts); the SQL is linted in tests/priced-reveal-migration.test.ts and proven by
  * scripts/selftest/reveal.ts. Also: the rails are load-bearing (evals/reveal.ts red without each, controls green).
  */
@@ -36,7 +37,7 @@ vi.mock("../src/ops/alerts", () => ({ alert: vi.fn(async () => ({ sent: true, de
 import { v1 } from "../src/api/v1";
 import { publishShadowCommitted, revealItems, shadowCommittedPayload, COMMITTED_QUEUE_SUBREQUESTS, QUEUE_SUBREQUESTS } from "../src/shadow/events";
 import {
-  billingUnavailable, lockedReveal, revealCharge, revealDueAt, revealPriority, revealRequestId, revealTerms,
+  billingUnavailable, lockedReveal, revealCharge, revealDueAt, revealIsPublic, revealPriority, revealRequestId, revealTerms,
   REVEAL_EVENT_CAP_CREDITS, REVEAL_INCLUDED_PLANS, REVEAL_LATE_MINUTES, REVEAL_PRICE_CREDITS, REVEAL_PRICING_FROM, type RevealAnswer,
 } from "../src/shadow/reveal";
 import { followCap, PLANS } from "../src/shadow/follows";
@@ -100,6 +101,10 @@ describe("who pays and how much (pure)", () => {
     expect(id).toBe(`reveal:${uuid(1)}:${M}`);
     expect(id).toMatch(/^[a-z_]+:.+/);
     expect(id.length).toBeLessThanOrEqual(300);
+  });
+  it("public: a settled market (resolved, void, closed_unresolved) is public; open and unsupported_source are not", () => {
+    expect(["resolved", "void", "closed_unresolved", "open", "unsupported_source", null].map(revealIsPublic)).toEqual([true, true, true, false, false, false]);
+    expect(revealPriority(answer({ reason: "public", charged: 0 }))).toBe(1);
   });
   it("delivery priority: paid reveals 3, included plans 2, grandfathered 1, locked 0", () => {
     expect(revealPriority(answer())).toBe(3);
@@ -211,8 +216,18 @@ describe("publishShadowCommitted: one charge_reveals() call per publish, paid re
     await publishShadowCommitted(env, MARKET, COMMIT as never);
     expect(posts.sort()).toEqual(["https://hooks.example/e_t_new", "https://hooks.example/e_t_pay"]);
     expect(Object.fromEntries(shadowRows().map((d) => [d.tenant_id, d.priority]))).toEqual({ t_pay: 3, t_new: 3, t_builder: 2, t_old: 1, t_short: 0 });
-    const pending = deliveries().filter((d) => d.status === "pending");
-    expect(inlineCandidates(pending, 10).map((d) => d.tenant_id).filter((t, i, a) => a.indexOf(t) === i)).toEqual(["t_builder", "t_old", "t_new", "t_short"]);
+    // the shadow.committed rows left for the drain, by priority alone (t_new's credits.low row shares priority 0 with
+    // t_short's locked reveal, and the order between those two is their ids, not a rule)
+    const pending = deliveries().filter((d) => d.status === "pending" && d.event_type === "shadow.committed");
+    expect(inlineCandidates(pending, 10).map((d) => d.tenant_id)).toEqual(["t_builder", "t_old", "t_short"]);
+  });
+
+  it("the claim order: highest priority, then first attempts before retries, then the oldest due, then id (claim_webhook_deliveries')", () => {
+    const row = (id: string, priority: number, attempt: number, due: string): Row => ({ id, status: "pending", priority, attempt, next_attempt_at: due });
+    const rows = [row("r1", 3, 2, "2026-10-21T12:00:00Z"), row("r3", 3, 0, "2026-10-21T12:09:00Z"), row("r2", 3, 0, "2026-10-21T12:09:00Z"), row("r0", 0, 0, "2026-10-21T11:00:00Z"), row("r4", 3, 0, "2026-10-21T12:05:00Z")];
+    expect(inlineCandidates(rows, 10).map((r) => r.id)).toEqual(["r4", "r2", "r3", "r1", "r0"]);
+    // the same rows in any input order come out the same (no tie left to insertion time)
+    expect(inlineCandidates([...rows].reverse(), 10).map((r) => r.id)).toEqual(["r4", "r2", "r3", "r1", "r0"]);
   });
 
   it("a crossing of the low-credit threshold: credits.low in the same insert and the operator alert in the one alertMany", async () => {
@@ -223,6 +238,23 @@ describe("publishShadowCommitted: one charge_reveals() call per publish, paid re
     expect(low[0]!.payload.top_up).toMatchObject({ method: "card" });
     expect(vi.mocked(alertMany)).toHaveBeenCalledTimes(1);
     expect(sentKeys()).toEqual([`credits_low_t_new_${revealRequestId("t_new", M)}`]);
+  });
+
+  it("the publish's alerts ride in the inline attempt's one alertMany: a crossing and a dead endpoint cost one alert call between them", async () => {
+    h.db = pushDb();
+    h.db.tables.webhook_endpoints = h.db.tables.webhook_endpoints!.map((e) => (e.tenant_id === "t_pay" ? { ...e, url: "https://hooks.example/dead" } : e));
+    // t_pay's endpoint is at its last attempt: this one dead-letters it, and the inline attempt alerts the dlq
+    const insert = h.db.client.from;
+    h.db.client.from = ((t: string) => {
+      const q = insert(t);
+      if (t !== "webhook_deliveries") return q;
+      const ins = q.insert.bind(q);
+      return Object.assign(q, { insert: (rows: Row[]) => ins(rows.map((r) => (r.tenant_id === "t_pay" ? { ...r, attempt: 6 } : r))) });
+    }) as never;
+    vi.stubGlobal("fetch", async (url: string) => { posts.push(String(url)); return new Response(url.endsWith("/dead") ? "down" : "ok", { status: url.endsWith("/dead") ? 500 : 200 }); });
+    await publishShadowCommitted(env, MARKET, COMMIT as never);
+    expect(vi.mocked(alertMany)).toHaveBeenCalledTimes(1);
+    expect(sentKeys()).toEqual([`credits_low_t_new_${revealRequestId("t_new", M)}`, "webhook_dlq_e_t_pay"]);
   });
 
   it("a verdict that is not RESOLVED: no charge_reveals call, every follower gets it in full, nothing charged", async () => {
@@ -343,6 +375,30 @@ describe("GET /v1/shadow/:market_id: 200 with a locked verdict at a short balanc
     expect(h.db.calls.some((c) => c.table === "rpc:charge_reveals")).toBe(false);
   });
 
+  it("HEAD (curl -I, an uptime monitor) is refused with 405 and Allow: GET before anything is read or charged: its answer would carry no verdict", async () => {
+    h.db = pullDb(1000);
+    for (const path of [`/shadow/${M}`, "/shadow/export", "/shadow/export?format=csv"]) {
+      const r = await v1.request(path, { method: "HEAD" }, env, ctx);
+      expect([r.status, r.headers.get("allow")], path).toEqual([405, "GET"]);
+    }
+    expect(h.db.calls.some((c) => c.table === "rpc:charge_reveals")).toBe(false);
+    expect(h.db.calls).toEqual([]);
+    expect(h.db.tables.credit_ledger).toEqual([]);
+    expect(h.db.tables.tenants![0]!.credits_balance).toBe(1000);
+    // GET still serves and charges
+    expect((await call("GET", `/shadow/${M}`)).body.data).toMatchObject({ credits_charged: 25 });
+  });
+
+  it("a settled market's commits are public: read in full at any balance, reason public, no charge_reveals call and no charge", async () => {
+    h.db = pullDb(0);
+    h.db.tables.markets![0]!.status = "resolved";
+    const r = await call("GET", `/shadow/${M}`);
+    expect(r.status).toBe(200);
+    expect(r.body.data).toMatchObject({ credits_charged: 0, reveal: { reason: "public", credits_charged: 0 }, locked: null, latest: { verdict: { winning_outcome: "OPTION_A" }, locked: false } });
+    expect(h.db.calls.some((c) => c.table === "rpc:charge_reveals")).toBe(false);
+    expect(h.db.tables.credit_ledger).toEqual([]);
+  });
+
   it("an included plan reads it free; billing that fails locks a paying plan's read (200, billing_unavailable) and alerts", async () => {
     h.db = pullDb(0, "growth");
     expect((await call("GET", `/shadow/${M}`)).body.data).toMatchObject({ reveal: { reason: "included_plan", credits_charged: 0 }, latest: { verdict: { winning_outcome: "OPTION_A" } } });
@@ -382,6 +438,20 @@ describe("GET /v1/shadow/export: locked rows hide committed_status and committed
     const text = await csv.text();
     expect(text.split("\r\n").filter((l) => l.includes(",OPTION_A,")).length).toBe(1); // the locked row's outcome never reaches the CSV
     expect(h.db.tables.credit_ledger).toHaveLength(1);
+  });
+
+  it("a settled market is not priced: its RESOLVED row is shown in full (reveal public) at a zero balance, and only open markets go to charge_reveals", async () => {
+    h.db = pullDb(0);
+    h.db.tables.market_follows = h.db.tables.market_follows!.map((f) => ({ ...f, markets: { platform: "polymarket", status: "open", deleted_at: null } }));
+    h.db.tables.v_venue_report = [{ ...view(M, EVENT), status: "resolved", official_outcome: "OPTION_A", agreement: "agree", reconciled_at: "2026-10-22T00:00:00.000Z" }, view(uuid(2), "polymarket:event:2")];
+    const r = await call("GET", "/shadow/export");
+    const byId = Object.fromEntries((r.body.data.rows as Row[]).map((x) => [x.market_id, x]));
+    expect(byId[M]).toMatchObject({ committed_status: "RESOLVED", committed_outcome: "OPTION_A", reveal: "public" });
+    expect(byId[uuid(2)]).toMatchObject({ committed_status: null, committed_outcome: null, reveal: "insufficient_credits" });
+    expect(r.body.data).toMatchObject({ credits_charged: 0, locked_rows: 1 });
+    const call0 = h.db.calls.findIndex((c) => c.table === "rpc:charge_reveals");
+    expect(call0).toBeGreaterThanOrEqual(0);
+    expect(h.db.tables.credit_ledger).toEqual([]);
   });
 
   it("the event cap: 81 RESOLVED legs of one event cost 2,000 credits; the 81st is free (event_cap_reached) and shown", async () => {
@@ -466,51 +536,160 @@ describe("POST /v1/markets/:id/follow {\"scope\":\"event\"}: every open public l
 
 // ---- the refund rule ------------------------------------------------------------------------------------------------------
 
-describe("the refund rule: a charged reveal not delivered within 10 minutes of committed_at is refunded once; a read's charge never", () => {
-  const ELEVEN_MIN_AGO = () => new Date(Date.now() - 11 * 60_000).toISOString();
+describe("the refund rule: a charged reveal Resolve did not attempt within 10 minutes of committed_at, and the tenant did not read, is refunded once; a read's charge never", () => {
+  const MIN = 60_000;
   const refund = () => h.db.client.rpc("refund_late_reveals", { p_late_minutes: REVEAL_LATE_MINUTES });
   const refunds = () => h.db.tables.credit_ledger!.filter((l) => l.reason === "refund");
-  async function charged(): Promise<Row[]> {
+  const refunded = () => refunds().map((l) => l.request_id).sort();
+  const at = (ms: number) => vi.setSystemTime(new Date(ms));
+  /** A publish whose endpoints answer `status` (the inline attempts of t_pay and t_new happen at publish time). */
+  async function publishAt(committedAt: number, status = 500): Promise<void> {
     h.db = pushDb();
-    vi.stubGlobal("fetch", async () => new Response("down", { status: 500 })); // the inline attempts fail: rows stay pending
-    await publishShadowCommitted(env, MARKET, commitAt(ELEVEN_MIN_AGO()) as never);
-    return shadowRows().filter((d) => d.tenant_id === "t_pay");
+    vi.stubGlobal("fetch", async () => new Response(status === 200 ? "ok" : "down", { status }));
+    await publishShadowCommitted(env, MARKET, commitAt(new Date(committedAt).toISOString()) as never);
   }
+  beforeEach(() => { vi.useFakeTimers({ toFake: ["Date"] }); at(Date.parse("2026-10-21T12:00:00.000Z")); });
 
-  it("every delivery dead-lettered: refunded once; the next run refunds nothing", async () => {
-    for (const d of await charged()) d.status = "dlq";
+  it("attempted in time, the endpoint answering 500 (it had the body) and dead-lettering later: never refunded", async () => {
+    const t0 = Date.now();
+    await publishAt(t0, 500);
+    const pay = of("t_pay");
+    expect([pay.status, pay.attempt, Date.parse(pay.first_attempt_at)]).toEqual(["pending", 1, t0]);
+    // every retry fails until the delivery dead-letters, long after the deadline
+    for (const d of shadowRows()) if (d.reveal_charge_id) d.status = "dlq";
+    at(t0 + 40 * 60 * MIN);
+    expect((await refund()).data).toMatchObject({ refunded: 0 });
+    expect(refunds()).toEqual([]);
+    expect(h.db.tables.tenants!.find((t) => t.id === "t_pay")!.credits_balance).toBe(975);
+  });
+
+  it("attempted in time, delivered only on a retry after the deadline: not refunded (the receiver's answers decide nothing)", async () => {
+    const t0 = Date.now();
+    await publishAt(t0, 500);
+    at(t0 + 30 * MIN);
+    for (const d of shadowRows()) if (d.reveal_charge_id) Object.assign(d, { status: "delivered", delivered_at: new Date().toISOString() });
+    expect((await refund()).data).toMatchObject({ refunded: 0 });
+  });
+
+  it("first attempted after the deadline (the queue was behind) and delivered: refunded once; the next run refunds nothing", async () => {
+    at(Date.parse("2026-10-21T12:11:00.000Z"));
+    await publishAt(Date.parse("2026-10-21T12:00:00.000Z"), 200); // the inline attempts are the first, 11 minutes after committed_at
+    expect(shadowRows().filter((d) => d.reveal_charge_id).map((d) => d.status)).toEqual(["delivered", "delivered"]);
     expect((await refund()).data).toMatchObject({ refunded: 2 }); // t_pay and t_new
-    expect(refunds().map((l) => l.request_id).sort()).toEqual([revealRequestId("t_new", M), revealRequestId("t_pay", M)].sort());
+    expect(refunded()).toEqual([revealRequestId("t_new", M), revealRequestId("t_pay", M)].sort());
     expect(h.db.tables.tenants!.find((t) => t.id === "t_pay")!.credits_balance).toBe(1000);
     expect((await refund()).data).toMatchObject({ refunded: 0 });
     expect(refunds()).toHaveLength(2);
   });
 
-  it("the first successful delivery more than 10 minutes after committed_at: refunded; delivered in time: not", async () => {
-    const [d] = await charged();
-    Object.assign(d!, { status: "delivered", delivered_at: new Date(Date.parse(d!.reveal_due_at) + 60_000).toISOString() });
-    const other = shadowRows().find((x) => x.tenant_id === "t_new")!;
-    Object.assign(other, { status: "delivered", delivered_at: new Date(Date.parse(other.reveal_due_at) - 60_000).toISOString() });
-    await refund();
-    expect(refunds().map((l) => l.request_id)).toEqual([revealRequestId("t_pay", M)]);
+  it("never attempted: still pending at the deadline, or dead-lettered without a POST (the endpoint deactivated): refunded; before the deadline: nothing yet", async () => {
+    const t0 = Date.now();
+    await publishAt(t0, 500);
+    // as if the inline attempts never ran (the run went over its budget): no POST, nothing recorded
+    for (const d of shadowRows()) if (d.reveal_charge_id) Object.assign(d, { status: "pending", attempt: 0, first_attempt_at: null });
+    of("t_new").status = "dlq"; // deliver.ts dead-letters a delivery to an inactive endpoint without a POST
+    at(t0 + 9 * MIN);
+    expect((await refund()).data).toMatchObject({ refunded: 0 });
+    at(t0 + 10 * MIN);
+    expect((await refund()).data).toMatchObject({ refunded: 2 });
   });
 
-  it("still retrying at the deadline: refunded (it can only be late or dead-lettered); before the deadline: nothing yet", async () => {
+  it("two endpoints: one attempted in time is enough (no refund); neither attempted: one refund for the charge, not one per endpoint", async () => {
+    const t0 = Date.now();
     h.db = pushDb();
+    h.db.tables.webhook_endpoints!.push(endpoint("e_t_pay_2", "t_pay"));
     vi.stubGlobal("fetch", async () => new Response("down", { status: 500 }));
-    await publishShadowCommitted(env, MARKET, commitAt(new Date().toISOString()) as never);
+    await publishShadowCommitted(env, MARKET, commitAt(new Date(t0).toISOString()) as never);
+    const mine = shadowRows().filter((d) => d.tenant_id === "t_pay");
+    expect(mine.map((d) => d.reveal_charge_id)).toEqual([revealRequestId("t_pay", M), revealRequestId("t_pay", M)]);
+    // one endpoint attempted in time (it answered 500), the other dead-lettered without a POST
+    expect(mine.every((d) => Date.parse(d.first_attempt_at) === t0)).toBe(true);
+    Object.assign(mine[1]!, { status: "dlq", first_attempt_at: null });
+    at(t0 + 11 * MIN);
+    await refund();
+    expect(refunded()).not.toContain(revealRequestId("t_pay", M));
+    // the same, with neither endpoint attempted
+    h.db.tables.credit_ledger = h.db.tables.credit_ledger!.filter((l) => l.reason !== "refund");
+    for (const d of mine) Object.assign(d, { status: "dlq", first_attempt_at: null });
+    await refund();
+    expect(refunds().filter((l) => l.request_id === revealRequestId("t_pay", M))).toHaveLength(1);
+  });
+
+  it("the deliveries could not be inserted after the charge (none carries it): refunded once the charge is 10 minutes old", async () => {
+    const t0 = Date.now();
+    h.db = pushDb();
+    const from = h.db.client.from;
+    h.db.client.from = ((t: string) => (t === "webhook_deliveries" ? { insert: () => ({ select: async () => ({ data: null, error: { message: "timeout" } }) }) } : from(t))) as never;
+    const r = await publishShadowCommitted(env, MARKET, commitAt(new Date(t0).toISOString()) as never);
+    expect([r.charged, r.rows.length]).toEqual([50, 0]);
+    expect(sentKeys()).toContain("webhook_enqueue_failed");
+    h.db.client.from = from;
+    at(t0 + 9 * MIN);
     expect((await refund()).data).toMatchObject({ refunded: 0 });
-    for (const d of shadowRows()) if (d.reveal_due_at) d.reveal_due_at = new Date(Date.now() - 1000).toISOString();
+    at(t0 + 10 * MIN);
     expect((await refund()).data).toMatchObject({ refunded: 2 });
+    expect((await refund()).data).toMatchObject({ refunded: 0 });
+  });
+
+  it("a webhook charge the tenant read back (GET /v1/shadow, a replay) before the deadline is never refunded, attempted or not", async () => {
+    const t0 = Date.now();
+    h.tenant = "t_pay"; h.plan = "payg";
+    await publishAt(t0, 500);
+    for (const d of shadowRows()) if (d.reveal_charge_id) Object.assign(d, { status: "pending", attempt: 0, first_attempt_at: null });
+    h.db.tables.bot_posts = [commitRow("a1", M, new Date(t0).toISOString())];
+    h.db.tables.api_request_log = [];
+    const read = await call("GET", `/shadow/${M}`);
+    expect(read.body.data).toMatchObject({ credits_charged: 0, reveal: { reason: "replay" }, latest: { verdict: { winning_outcome: "OPTION_A" } } });
+    expect(h.db.tables.reveal_reads!.map((r) => r.request_id)).toEqual([revealRequestId("t_pay", M)]);
+    at(t0 + 11 * MIN);
+    await refund();
+    expect(refunded()).toEqual([revealRequestId("t_new", M)]); // t_new did not read it
   });
 
   it("a charge taken by a read (GET /v1/shadow) is never refunded", async () => {
     h.tenant = "t_pay"; h.plan = "payg";
     h.db = pullDb(1000);
     await call("GET", `/shadow/${M}`);
-    h.db.tables.credit_ledger![0]!.created_at = new Date(Date.now() - 60 * 60_000).toISOString();
+    at(Date.now() + 60 * MIN);
     expect((await refund()).data).toMatchObject({ refunded: 0 });
     expect(refunds()).toEqual([]);
+  });
+
+  it("a refunded leg no longer counts toward its event's cap: the next leg of the event is charged again", async () => {
+    const legs = Array.from({ length: 81 }, (_, i) => uuid(300 + i));
+    h.db = fakeDb({
+      tenants: [tenant("t_pay", "payg", 5000)], markets: legs.map((id, i) => ({ ...MARKET, id, external_id: `leg-${i}`, event_key: EVENT })), credit_ledger: [],
+    }, {}, { rpc: REVEAL_RPCS });
+    const charge = (m: string) => h.db.client.rpc("charge_reveals", { p_tenants: ["t_pay"], p_markets: [m], p_price: REVEAL_PRICE_CREDITS, p_event_cap: REVEAL_EVENT_CAP_CREDITS, p_pricing_from: REVEAL_PRICING_FROM, p_included_plans: [...REVEAL_INCLUDED_PLANS], p_source: "webhook" });
+    for (const m of legs.slice(0, 80)) await charge(m);
+    expect(((await charge(legs[80]!)).data as Row[])[0]).toMatchObject({ reason: "event_cap_reached", charged: 0 });
+    await h.db.client.rpc("refund_credits", { p_request_id: revealRequestId("t_pay", legs[0]!) });
+    const extra = uuid(400);
+    h.db.tables.markets!.push({ ...MARKET, id: extra, external_id: "leg-x", event_key: EVENT });
+    expect(((await charge(extra)).data as Row[])[0]).toMatchObject({ reason: "charged", charged: 25 });
+  });
+});
+
+describe("deliver.ts records the first attempt of a delivery that carries a reveal charge, whatever the endpoint answers", () => {
+  it("written with the first outcome (500 or 200), never by a later attempt, never for a dlq without a POST, never on other deliveries", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-10-21T12:00:00.000Z"));
+    h.db = pushDb();
+    vi.stubGlobal("fetch", async () => new Response("down", { status: 500 }));
+    await publishShadowCommitted(env, MARKET, COMMIT as never);
+    expect(of("t_pay").first_attempt_at).toBe("2026-10-21T12:00:00.000Z");
+    expect(shadowRows().filter((d) => !d.reveal_charge_id).every((d) => d.first_attempt_at === undefined)).toBe(true);
+    // a retry keeps the first time
+    vi.setSystemTime(new Date("2026-10-21T12:01:00.000Z"));
+    const { deliverOne } = await import("../src/webhooks/deliver");
+    await deliverOne(h.db.client as never, { ...of("t_pay") });
+    expect(of("t_pay").first_attempt_at).toBe("2026-10-21T12:00:00.000Z");
+    // an inactive endpoint dead-letters without a POST: nothing recorded
+    const fresh = { ...of("t_pay"), id: "x1", first_attempt_at: null, endpoint_id: "e_t_pay" };
+    h.db.tables.webhook_deliveries!.push(fresh);
+    h.db.tables.webhook_endpoints!.find((e) => e.id === "e_t_pay")!.active = false;
+    await deliverOne(h.db.client as never, { ...fresh });
+    expect(h.db.tables.webhook_deliveries!.find((d) => d.id === "x1")).toMatchObject({ status: "dlq", first_attempt_at: null });
   });
 });
 

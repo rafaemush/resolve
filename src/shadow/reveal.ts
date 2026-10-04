@@ -31,9 +31,11 @@ export const REVEAL_PRICE_CREDITS = 25;
 /** At most this many credits per event (markets.event_key) per tenant: $20, the smallest card pack. */
 export const REVEAL_EVENT_CAP_CREDITS = 2000;
 /**
- * A charged reveal whose shadow.committed was not delivered to any of the tenant's endpoints within this many minutes of
- * committed_at is refunded once (refund_late_reveals(), migration 023, every 5 minutes): every delivery dead-lettered,
- * delivered late, or none queued. A charge taken by a read is never refunded.
+ * A charged reveal whose shadow.committed Resolve did not attempt to deliver to any of the tenant's endpoints within this
+ * many minutes of committed_at (none queued, the queue behind, an endpoint deactivated before its attempt), and that the
+ * tenant did not read meanwhile, is refunded once (refund_late_reveals(), migration 023, every 5 minutes). An attempt
+ * made in time stands whatever the endpoint answered: its body carried the verdict, so a receiver that answers 500 or
+ * hangs cannot turn a paid reveal into a free one. A charge taken by a read is never refunded.
  */
 export const REVEAL_LATE_MINUTES = 10;
 /**
@@ -47,11 +49,23 @@ export const REVEAL_INCLUDED_PLANS = ["builder", "growth", "platform"] as const 
 
 export const includedPlan = (p: Plan | null): boolean => p !== null && (REVEAL_INCLUDED_PLANS as readonly string[]).includes(p);
 
-/** What charge_reveals() answers per pair (migration 023). */
-export const SQL_REASONS = ["included_plan", "grandfathered", "replay", "event_cap_reached", "charged", "insufficient_credits", "unknown_tenant"] as const;
+/** What charge_reveals() answers per pair (migration 023). public: the market settled, so its commits are public (free). */
+export const SQL_REASONS = ["public", "included_plan", "grandfathered", "replay", "event_cap_reached", "charged", "insufficient_credits", "unknown_tenant"] as const;
 /** Every reason a tenant can see: the SQL's, plus the two decided here (a verdict that is not RESOLVED, billing that could not be reached). */
 export const REVEAL_REASONS = [...SQL_REASONS, "not_resolved", "billing_unavailable"] as const;
 export type RevealReason = (typeof REVEAL_REASONS)[number];
+
+/** Market statuses after settle_market() (migration 012), which records the public reveal of every commit with the status. */
+export const SETTLED_STATUSES = ["resolved", "void", "closed_unresolved"] as const;
+/**
+ * Pure. Whether a market's commits are public: it settled, and its reveals (verdict and preimage) went out to everyone
+ * (GET /v1/track-record/verify, shadow.revealed to every follower, unpriced). Nothing private is left to sell, so a read
+ * is not priced (reason public); charge_reveals() answers the same for such a market.
+ */
+export const revealIsPublic = (status: unknown): boolean => (SETTLED_STATUSES as readonly unknown[]).includes(status);
+
+/** The reveal access of a market whose commits are public: shown in full, free, no call. */
+export const PUBLIC_ACCESS: RevealAccess = { reason: "public", credits_charged: 0, replayed: false };
 
 /** One row of charge_reveals() (RETURNS TABLE, so PostgREST answers an array of these). */
 export const ChargeRevealRow = z.object({
@@ -198,7 +212,7 @@ export function revealPriority(a: RevealAnswer): 0 | 1 | 2 | 3 {
   switch (a.reason) {
     case "charged": case "replay": case "event_cap_reached": return 3;
     case "included_plan": return 2;
-    case "grandfathered": return 1;
+    case "grandfathered": case "public": return 1;
     case "not_resolved": return includedPlan(a.plan) ? 2 : 1;
     case "insufficient_credits": case "billing_unavailable": case "unknown_tenant": return 0;
     default: { const never: never = a.reason; throw new Error(`unhandled reveal reason ${String(never)}`); }

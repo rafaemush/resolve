@@ -48,6 +48,9 @@ export const DLQ_DEDUP_MINUTES = 360;
 /**
  * Inline first attempts per publish; queued rows beyond them wait for the drain (at most 5 minutes). Both take the
  * highest priority first, so a reveal a tenant paid for is among the inline attempts before any free or locked one.
+ * With DRAIN_MAX that is a ceiling: about 2 + 5 paid reveals of one commit are attempted within the refund rule's
+ * REVEAL_LATE_MINUTES (10), and the drain at the next boundary takes 5 more only when it falls inside the window; the
+ * rest are attempted later and refunded (docs/runbooks/venue-pilot.md states it for the operator).
  */
 export const INLINE_MAX = 2;
 /** claim_webhook_deliveries()'s lease (migration 009): an inline claim holds a row exactly as long as the drain's would. */
@@ -259,6 +262,9 @@ async function attempt(client: Db, d: Row, r: DeliveryResult, state: { settled: 
   // A market.* or shadow.* payload queued before the public names keeps its stored form (stored values never change): it
   // is sent, and re-sent on every retry and replay, in the public shape (src/api/public-names.ts). Idempotent for newer rows.
   const body = JSON.stringify({ id: d.event_id, type: d.event_type, created_at: d.created_at, data: publicEventPayload(String(d.event_type), d.payload) });
+  // A delivery carrying a reveal charge records when its first POST went out, with that attempt's outcome whatever the
+  // endpoint answers: the refund rule (refund_late_reveals(), migration 023) refunds only a reveal not attempted in time.
+  const first = d.reveal_charge_id && !d.first_attempt_at ? { first_attempt_at: new Date().toISOString() } : {};
   const t = Math.floor(Date.now() / 1000);
   const sig = await hmacHex(ep.secret as string, `${t}.${body}`);
   let status: number | null = null, err: string | null = null;
@@ -270,17 +276,17 @@ async function attempt(client: Db, d: Row, r: DeliveryResult, state: { settled: 
   state.settled = true;
   if (!err) {
     r.outcome = "delivered";
-    await write(r, `delivery ${id} delivered`, client.from("webhook_deliveries").update({ status: "delivered", attempt: attemptNo, last_status_code: status, last_error: null, delivered_at: new Date().toISOString(), lease_until: null }).eq("id", id));
+    await write(r, `delivery ${id} delivered`, client.from("webhook_deliveries").update({ status: "delivered", attempt: attemptNo, last_status_code: status, last_error: null, delivered_at: new Date().toISOString(), lease_until: null, ...first }).eq("id", id));
     await write(r, `endpoint ${endpointId} reset`, client.from("webhook_endpoints").update({ consecutive_failures: 0 }).eq("id", endpointId));
   } else if (attemptNo >= MAX_ATTEMPTS) {
     r.outcome = "dlq";
     r.dlq = { endpoint: endpointId, tenant: String(d.tenant_id), delivery: id, reason: `${MAX_ATTEMPTS} attempts failed, last: ${err}` };
-    await write(r, `delivery ${id} dlq`, client.from("webhook_deliveries").update({ status: "dlq", attempt: attemptNo, last_status_code: status, last_error: err, lease_until: null }).eq("id", id));
+    await write(r, `delivery ${id} dlq`, client.from("webhook_deliveries").update({ status: "dlq", attempt: attemptNo, last_status_code: status, last_error: err, lease_until: null, ...first }).eq("id", id));
     await write(r, `endpoint ${endpointId} failures`, client.from("webhook_endpoints").update({ consecutive_failures: Number(ep.consecutive_failures) + 1 }).eq("id", endpointId));
   } else {
     r.outcome = "retry";
     const next = new Date(Date.now() + (BACKOFF_S[attemptNo] ?? 86400) * 1000).toISOString();
-    await write(r, `delivery ${id} retry`, client.from("webhook_deliveries").update({ status: "pending", attempt: attemptNo, last_status_code: status, last_error: err, next_attempt_at: next, lease_until: null }).eq("id", id));
+    await write(r, `delivery ${id} retry`, client.from("webhook_deliveries").update({ status: "pending", attempt: attemptNo, last_status_code: status, last_error: err, next_attempt_at: next, lease_until: null, ...first }).eq("id", id));
     await write(r, `endpoint ${endpointId} failures`, client.from("webhook_endpoints").update({ consecutive_failures: Number(ep.consecutive_failures) + 1 }).eq("id", endpointId));
   }
 }
@@ -293,15 +299,17 @@ export function claimPatch(nowMs: number): { status: "delivering"; lease_until: 
 }
 
 /**
- * Pure: the queued rows an inline attempt takes: still 'pending', highest priority first (migration 023: a paid reveal
- * before an included plan, a grandfathered key and a locked reveal), then in queue order (created_at, then id), at most
- * max: claim_webhook_deliveries()'s order. The rows of one insert share created_at, so without the priority the order
- * among followers would be their random ids.
+ * Pure: the queued rows an inline attempt takes, at most max, in claim_webhook_deliveries()'s order (migration 023):
+ * still 'pending', highest priority first (a paid reveal before an included plan, a grandfathered key and a locked
+ * reveal), then first attempts before retries, then the oldest next_attempt_at, then id. The rows of one insert share
+ * next_attempt_at, so among them the order is the priority, then their ids.
  */
 export function inlineCandidates(rows: Row[], max: number): Row[] {
+  const s = (v: unknown) => (v === null || v === undefined ? "" : String(v));
   return rows
     .filter((r) => r.status === "pending")
-    .sort((a, b) => Number(b.priority ?? 0) - Number(a.priority ?? 0) || String(a.created_at ?? "").localeCompare(String(b.created_at ?? "")) || String(a.id).localeCompare(String(b.id)))
+    .sort((a, b) => Number(b.priority ?? 0) - Number(a.priority ?? 0) || Number(a.attempt ?? 0) - Number(b.attempt ?? 0)
+      || Date.parse(s(a.next_attempt_at) || "0") - Date.parse(s(b.next_attempt_at) || "0") || (s(a.id) < s(b.id) ? -1 : s(a.id) > s(b.id) ? 1 : 0))
     .slice(0, Math.max(0, max));
 }
 
@@ -318,13 +326,20 @@ export interface InlineSummary { queued: number; attempted: number; delivered: n
  * First attempt for rows this invocation just queued, inside the budget (claim + DELIVERY_COST per row + one alert). The
  * claim is claim_webhook_deliveries()'s, row by id: only a row still 'pending' is taken (one that the drain claimed first
  * is left to it), and a claimed row is invisible to the drain's claim until its outcome is written. Rows not taken, and
- * failed attempts (back to 'pending' at the next backoff step), are the drain's. Never throws.
+ * failed attempts (back to 'pending' at the next backoff step), are the drain's. `alerts` are the publisher's own (its
+ * billing and low-credit alerts): they ride in this attempt's one alertMany(), so a publish and its inline attempt spend
+ * one alert between them. Never throws.
  */
-export async function attemptInline(env: Env, rows: Row[], budget: Budget, max = INLINE_MAX): Promise<InlineSummary> {
+export async function attemptInline(env: Env, rows: Row[], budget: Budget, max = INLINE_MAX, alerts: readonly AlertItem[] = []): Promise<InlineSummary> {
   const out: InlineSummary = { queued: rows.length, attempted: 0, delivered: 0, failed: 0, dlq: 0, left_for_drain: rows.length, errors: 0, alerts: [] };
   const fixed = COST.db + COST.alert;
   const n = Math.min(inlineCandidates(rows, max).length, Math.floor((budget.left - fixed) / DELIVERY_COST));
-  if (n < 1 || !budget.take(fixed + n * DELIVERY_COST)) return out;
+  if (n < 1 || !budget.take(fixed + n * DELIVERY_COST)) {
+    // no attempt fits (or none is pending): the publisher's alerts still go out, on the alert this budget holds
+    if (alerts.length && budget.take(COST.alert)) { await alertMany(env, [...alerts]); out.alerts = alerts.map((i) => i.key); }
+    else if (alerts.length) console.error(JSON.stringify({ level: "error", job: "webhook_inline", unsent_alerts: alerts.map((i) => ({ key: i.key, text: i.text.slice(0, 300) })) }));
+    return out;
+  }
   const pick = inlineCandidates(rows, n);
   const client = db(env);
   const t = newTally();
@@ -340,7 +355,7 @@ export async function attemptInline(env: Env, rows: Row[], budget: Budget, max =
   }));
   for (const r of results.flat()) count(t, r);
   Object.assign(out, { delivered: t.delivered, failed: t.failed, dlq: t.dlq, errors: t.errors, left_for_drain: rows.length - t.delivered - t.dlq });
-  const items = dlqAlerts(t.dlqs);
+  const items = [...alerts, ...dlqAlerts(t.dlqs)];
   if (t.problems.length) items.push({ key: "webhook_inline_errors", dedupMinutes: 60, text: `${t.problems.length} inline webhook step(s) failed; the rows stay queued for the drain (a row left 'delivering' is requeued ${STALE_DELIVERING_MINUTES} min after its lease). ${t.problems.slice(0, 5).join("; ")}` });
   if (items.length) { await alertMany(env, items); out.alerts = items.map((i) => i.key); }
   else budget.release(COST.alert);
@@ -357,12 +372,16 @@ export async function settleWithin(p: Promise<unknown>, ms: number): Promise<"se
 
 /**
  * Give queued rows their inline first attempt: under waitUntil when the caller has one, else awaited for at most
- * INLINE_AWAIT_MS (an attempt cut short leaves its rows 'delivering'; the drain's stale sweep requeues them).
+ * INLINE_AWAIT_MS (an attempt cut short leaves its rows 'delivering'; the drain's stale sweep requeues them). `alerts`
+ * (the publisher's) go out in the attempt's one alertMany(), or on their own when no row was queued; never lost.
  */
-export async function deliverInline(env: Env, rows: Row[], opts: { waitUntil?: WaitUntil; budget?: Budget } = {}): Promise<void> {
-  if (!rows.length) return;
-  const run = attemptInline(env, rows, opts.budget ?? new Budget(inlineSubrequests(INLINE_MAX))).catch(async (e) => {
-    await alert(env, "webhook_inline_errors", `inline webhook attempt threw; the rows stay queued for the drain: ${redact(String(e)).slice(0, 300)}`, { dedupMinutes: 60 });
+export async function deliverInline(env: Env, rows: Row[], opts: { waitUntil?: WaitUntil; budget?: Budget; alerts?: readonly AlertItem[] } = {}): Promise<void> {
+  const alerts = opts.alerts ?? [];
+  if (!rows.length) { if (alerts.length) await alertMany(env, [...alerts]); return; }
+  const run = attemptInline(env, rows, opts.budget ?? new Budget(inlineSubrequests(INLINE_MAX)), INLINE_MAX, alerts).catch(async (e) => {
+    const text = `inline webhook attempt threw; the rows stay queued for the drain: ${redact(String(e)).slice(0, 300)}`;
+    if (alerts.length) await alertMany(env, [...alerts, { key: "webhook_inline_errors", dedupMinutes: 60, text }]);
+    else await alert(env, "webhook_inline_errors", text, { dedupMinutes: 60 });
   });
   if (opts.waitUntil) opts.waitUntil(run);
   else await settleWithin(run, INLINE_AWAIT_MS);

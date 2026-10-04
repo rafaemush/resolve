@@ -17,27 +17,42 @@
 --     reveal:<tenant uuid>:<market uuid>: a later commit of the same market, a re-read and a retry find it and are free.
 --     The low-credit notice is claimed in the same call (claim_low_credit_notice(), 020), so the Worker queues
 --     credits.low with the event itself instead of spending one RPC per charged follower.
---   * The refund rule: a reveal charged for a queued shadow.committed (ledger note 'reveal webhook') none of whose
---     deliveries was delivered by its reveal_due_at (committed_at + REVEAL_LATE_MINUTES = 10) is refunded once:
---     every delivery dead-lettered, still retrying at that time (it can only be late or dead-lettered), delivered
---     late, or none queued at all (the insert failed after the charge). refund_late_reveals() runs every 5 minutes from
---     pg_cron and refunds through refund_credits() (004: once per request id). A charge taken by a read (note 'reveal
---     read') is never refunded: the verdict was in the answer. storage_status() (022) also reports the newest refund
---     run and its cron job, so the Worker's 10-minute check alerts when it fails or stops, in the same one RPC.
+--     A verdict that is already public (the market settled: resolved, void or closed_unresolved; settle_market(), 012,
+--     records its reveals in the same transaction) is not a private early reveal: charge_reveals() answers it 'public',
+--     free, whoever asks.
+--   * The refund rule: a reveal charged for a queued shadow.committed (ledger note 'reveal webhook') is refunded once
+--     when Resolve did not put it in front of the tenant in time: no delivery of it was attempted (its POST sent,
+--     webhook_deliveries.first_attempt_at) by its reveal_due_at (committed_at + REVEAL_LATE_MINUTES = 10), none was
+--     delivered by then, and the tenant did not read the verdict at GET /v1/shadow/:market_id or the export in the
+--     meantime (reveal_reads). That covers no delivery queued at all (the insert failed after the charge), a queue
+--     that was behind, and an endpoint deactivated before its attempt (dead-lettered without a POST). Once an attempt
+--     was made in time the charge stands, whatever the endpoint answered: the body of that POST carried the verdict
+--     (a receiver that answers 500, or hangs past the timeout, has read it), so a rule keyed on the receiver's answer
+--     would let any tenant take every reveal for nothing; the verdict also stays readable, free, at GET
+--     /v1/shadow/:market_id. refund_late_reveals() runs every 5 minutes from pg_cron and refunds through
+--     refund_credits() (004: once per request id). A charge taken by a read (note 'reveal read') is never refunded: the
+--     verdict was in the answer. storage_status() (022) also reports the newest refund run and its cron job, so the
+--     Worker's 10-minute check alerts when it fails or stops, in the same one RPC.
 --   * Paid reveals first: webhook_deliveries.priority (3 a paid reveal, 2 an included plan, 1 grandfathered or a
 --     verdict that is not RESOLVED, 0 everything else); claim_webhook_deliveries() (009) claims the highest priority
---     first, and the Worker's inline first attempt takes the same order (src/webhooks/deliver.ts inlineCandidates).
+--     first, first attempts before retries within a priority (a retry to an endpoint that failed cannot hold back a
+--     paid reveal's first attempt, the one the refund rule reads), and the Worker's inline first attempt takes the same
+--     order (src/webhooks/deliver.ts inlineCandidates). The ceiling stays INLINE_MAX (2) inline attempts per publish
+--     and DRAIN_MAX (5) per 5-minute drain: past about 7 paying followers with an endpoint on one commit, the rest are
+--     attempted after the 10 minutes and refunded (docs/runbooks/venue-pilot.md).
 --   * follow_event(): POST /v1/markets/:id/follow {"scope":"event"} follows every open public leg of the market's event
 --     (an official release's legs on every venue, a Polymarket event's legs) in one transaction, all or nothing against
 --     the plan's follow limit (a Québec event has 135 legs; pay as you go now follows up to 500).
 --
 -- Compatibility with the Worker deployed before this migration (889e9a4; it keeps running until the new one ships):
---   * Additive: three columns on webhook_deliveries (priority defaults to 0, the two reveal columns are nullable), four
---     indexes, four new functions, one pg_cron job. claim_webhook_deliveries keeps its signature and return type; only
---     its order changes (priority first, then next_attempt_at as before), and every row the old Worker queues has
---     priority 0, so it claims them exactly as before. storage_status keeps its three keys and adds two, which the old
---     Worker's parse drops. The old Worker never calls charge_reveals, follow_event or refund_late_reveals: its reveals
---     stay free, and refund_late_reveals finds no 'reveal webhook' charge to refund, until the new Worker ships.
+--   * Additive: four columns on webhook_deliveries (priority defaults to 0, the three reveal columns are nullable), one
+--     new table (reveal_reads, written only by charge_reveals), four indexes, four new functions, one pg_cron job.
+--     claim_webhook_deliveries keeps its signature and return type; only its order changes (priority first, then first
+--     attempts before retries, then next_attempt_at as before), and every row the old Worker queues has priority 0, so
+--     among them only a fresh row now goes before an older retry, which a drain of 5 a run reaches either way.
+--     storage_status keeps its three keys and adds two, which the old Worker's parse drops. The old Worker never calls
+--     charge_reveals, follow_event or refund_late_reveals: its reveals stay free, and refund_late_reveals finds no
+--     'reveal webhook' charge to refund, until the new Worker ships.
 -- Idempotent (if not exists / create or replace / a cron job rescheduled by name). Nothing here is reachable by anon or
 -- authenticated (migration 010 explains why revoking from public alone is not enough on Supabase).
 begin;
@@ -46,6 +61,7 @@ begin;
 alter table webhook_deliveries add column if not exists priority smallint not null default 0;
 alter table webhook_deliveries add column if not exists reveal_charge_id text;
 alter table webhook_deliveries add column if not exists reveal_due_at timestamptz;
+alter table webhook_deliveries add column if not exists first_attempt_at timestamptz;
 alter table webhook_deliveries drop constraint if exists webhook_deliveries_priority_check;
 alter table webhook_deliveries add constraint webhook_deliveries_priority_check check (priority between 0 and 3);
 -- A delivery carries a reveal charge with its deadline, or neither: the refund rule reads both together.
@@ -58,9 +74,11 @@ comment on column webhook_deliveries.priority is
 comment on column webhook_deliveries.reveal_charge_id is
   'The credit_ledger request id (reveal:<tenant>:<market>) of the reveal charge taken when this shadow.committed was queued; null for every other delivery (a replayed or included reveal, a locked one, another event). Every endpoint''s delivery of that event carries it. refund_late_reveals() refunds the charge when none of them was delivered by reveal_due_at.';
 comment on column webhook_deliveries.reveal_due_at is
-  'committed_at + REVEAL_LATE_MINUTES (10) of the commit this charged shadow.committed carries: delivered later than this on every endpoint, or never, and refund_late_reveals() refunds reveal_charge_id. Set exactly when reveal_charge_id is.';
-create index if not exists idx_webhook_deliveries_claim on webhook_deliveries (priority desc, next_attempt_at) where status = 'pending';
-comment on index idx_webhook_deliveries_claim is 'claim_webhook_deliveries(): due pending rows, highest priority first, then oldest due first.';
+  'committed_at + REVEAL_LATE_MINUTES (10) of the commit this charged shadow.committed carries: no delivery of it attempted (first_attempt_at) or delivered by then, and no read of it (reveal_reads), and refund_late_reveals() refunds reveal_charge_id. Set exactly when reveal_charge_id is.';
+comment on column webhook_deliveries.first_attempt_at is
+  'When the first POST of a delivery that carries a reveal charge (reveal_charge_id) was sent, written with the outcome of that attempt whatever the endpoint answered (src/webhooks/deliver.ts); null until then, never set for a delivery dead-lettered without a POST (the endpoint inactive) and null on every other delivery. refund_late_reveals() reads it: a reveal attempted by reveal_due_at was put in front of the tenant and is not refunded.';
+create index if not exists idx_webhook_deliveries_claim on webhook_deliveries (priority desc, attempt, next_attempt_at) where status = 'pending';
+comment on index idx_webhook_deliveries_claim is 'claim_webhook_deliveries(): due pending rows, highest priority first, then first attempts before retries, then oldest due first.';
 create index if not exists idx_webhook_deliveries_reveal_charge on webhook_deliveries (reveal_charge_id) where reveal_charge_id is not null;
 comment on index idx_webhook_deliveries_reveal_charge is 'refund_late_reveals(): the deliveries of one reveal charge.';
 create index if not exists idx_ledger_reveal_webhook on credit_ledger (created_at) where reason = 'charge' and note = 'reveal webhook';
@@ -69,7 +87,21 @@ create index if not exists idx_markets_event_key on markets (event_key);
 comment on index idx_markets_event_key is 'Every leg of an event, settled ones included: charge_reveals() sums what a tenant paid for the event''s reveals (idx_markets_event_key_open, 017, covers open legs only).';
 
 comment on table webhook_deliveries is
-  'At-least-once outbound queue. Retry schedule: 0s, 60s, 5m, 30m, 2h, 12h, 24h then dlq. event_id is the idempotency key handed to the receiver. priority orders the claim (paid reveals first, migration 023); reveal_charge_id and reveal_due_at tie a charged shadow.committed to its refund rule.';
+  'At-least-once outbound queue. Retry schedule: 0s, 60s, 5m, 30m, 2h, 12h, 24h then dlq. event_id is the idempotency key handed to the receiver. priority orders the claim (paid reveals first, migration 023); reveal_charge_id, reveal_due_at and first_attempt_at tie a charged shadow.committed to its refund rule.';
+
+-- reveal_reads: a webhook charge whose verdict the tenant also read, which is then never refunded
+create table if not exists reveal_reads (
+  request_id    text primary key check (request_id ~ '^reveal:[0-9a-f-]{36}:[0-9a-f-]{36}$'),
+  tenant_id     uuid not null references tenants(id),
+  first_read_at timestamptz not null default now()
+);
+comment on table reveal_reads is
+  'Migration 023: one row per reveal charge (credit_ledger request id reveal:<tenant>:<market>) whose RESOLVED verdict the tenant then read at GET /v1/shadow/:market_id or GET /v1/shadow/export as a replay of that charge. Written only by charge_reveals() (a replay from source read, insert on conflict do nothing); read only by refund_late_reveals(), which never refunds a charge listed here: the tenant received the verdict in the answer, so a late or missing webhook cost it nothing. Append-only. Service role only (RLS).';
+comment on column reveal_reads.request_id is 'The reveal charge''s credit_ledger request id: reveal:<tenant uuid>:<market uuid>.';
+comment on column reveal_reads.tenant_id is 'The tenant that read it (the charge''s tenant).';
+comment on column reveal_reads.first_read_at is 'The first read that replayed the charge (database clock); later reads leave it as it is.';
+select apply_rls('reveal_reads');
+revoke all on table reveal_reads from public, anon, authenticated;
 
 -- 2. the claim: highest priority first ---------------------------------------------------------------------------------
 create or replace function public.claim_webhook_deliveries(p_max integer default 10)
@@ -77,13 +109,13 @@ returns setof webhook_deliveries language sql security definer set search_path =
   with due as (
     select id from webhook_deliveries
      where status = 'pending' and next_attempt_at <= now() and (lease_until is null or lease_until < now())
-     order by priority desc, next_attempt_at limit p_max for update skip locked)
+     order by priority desc, attempt, next_attempt_at, id limit p_max for update skip locked)
   update webhook_deliveries d set status = 'delivering', lease_until = now() + interval '60 seconds'
     from due where d.id = due.id
   returning d.*;
 $$;
 comment on function public.claim_webhook_deliveries(integer) is
-  'Lease up to p_max due deliveries for one drain run (status delivering, a 60 s lease), skipping rows another run holds: highest priority first (migration 023: paid reveals, then included plans, then the rest), then the oldest next_attempt_at. A row whose lease is still running is not due.';
+  'Lease up to p_max due deliveries for one drain run (status delivering, a 60 s lease), skipping rows another run holds: highest priority first (migration 023: paid reveals, then included plans, then the rest), then first attempts before retries (attempt ascending: a paid reveal''s first attempt, which its refund rule reads, is never held back by retries to an endpoint that failed), then the oldest next_attempt_at, then id (a stable order for rows of one insert). A row whose lease is still running is not due.';
 revoke all on function public.claim_webhook_deliveries(integer) from public, anon, authenticated;
 grant execute on function public.claim_webhook_deliveries(integer) to service_role;
 
@@ -126,7 +158,8 @@ begin
   -- total below are statements of their own, so after a wait they see the charges the other call made.
   perform 1 from tenants t where t.id = any(p_tenants) order by t.id for update;
   for v_pair in
-    select distinct x.t, x.m, mk.event_key as ek, (mk.id is not null and mk.tenant_id is null and not mk.is_test) as public_market
+    select distinct x.t, x.m, mk.event_key as ek, (mk.id is not null and mk.tenant_id is null and not mk.is_test) as public_market,
+           mk.status in ('resolved', 'void', 'closed_unresolved') as settled
       from unnest(p_tenants, p_markets) as x(t, m) left join markets mk on mk.id = x.m
      order by x.t, ek, x.m
   loop
@@ -143,6 +176,12 @@ begin
       return query select v_pair.t, v_pair.m, v_ten.pl, false, false, 0, p_price, 0, 'unknown_tenant'::text, null::boolean, null::integer;
       continue;
     end if;
+    -- A settled market's commits are public (settle_market() recorded their reveals with the status): nothing private
+    -- is left to sell, whatever the plan.
+    if v_pair.settled then
+      return query select v_pair.t, v_pair.m, v_ten.pl, true, false, 0, 0, v_ten.bal, 'public'::text, null::boolean, null::integer;
+      continue;
+    end if;
     if v_ten.pl = any(p_included_plans) then
       return query select v_pair.t, v_pair.m, v_ten.pl, true, false, 0, 0, v_ten.bal, 'included_plan'::text, null::boolean, null::integer;
       continue;
@@ -154,11 +193,16 @@ begin
       continue;
     end if;
     v_id := 'reveal:' || v_pair.t::text || ':' || v_pair.m::text;
-    -- A replay: this tenant's charge for this market already stands (any commit of it, any source). Nothing is written.
+    -- A replay: this tenant's charge for this market already stands (any commit of it, any source). No money moves; a
+    -- read records that the verdict reached the tenant in the answer (reveal_reads), so a webhook charge it replays is
+    -- never refunded.
     select l.tenant_id into v_owner from credit_ledger l where l.reason = 'charge' and l.request_id = v_id;
     if found then
       if v_owner is distinct from v_pair.t then
         raise exception using errcode = 'RS003', message = 'charge_reveals: this request id was charged to another tenant';
+      end if;
+      if p_source = 'read' then
+        insert into reveal_reads (request_id, tenant_id) values (v_id, v_pair.t) on conflict (request_id) do nothing;
       end if;
       return query select v_pair.t, v_pair.m, v_ten.pl, true, true, 0, 0, v_ten.bal, 'replay'::text, null::boolean, null::integer;
       continue;
@@ -196,18 +240,19 @@ begin
   end loop;
 end $$;
 comment on function public.charge_reveals(uuid[], uuid[], integer, integer, timestamptz, text[], text) is
-  'The private early reveal of a RESOLVED verdict, decided and charged for (tenant, market) pairs (p_tenants[i], p_markets[i], at most 1000) in one transaction: every tenant row locked first in id order; then per pair, in (tenant, event_key, market) order: a deleted or unknown tenant -> unknown_tenant (not entitled); a plan in p_included_plans -> included_plan; plan free and tenants.created_at before p_pricing_from -> grandfathered; a credit_ledger charge with request id reveal:<tenant>:<market> -> replay (free, nothing written; the same id charged to another tenant raises RS003); else the charge is least(p_price, p_event_cap minus what the tenant paid, net of refunds, for reveals of markets with the same event_key): 0 -> event_cap_reached (free), more than the balance -> insufficient_credits (not entitled, nothing written), else a debit of tenants.credits_balance and one credit_ledger row (reason charge, request id reveal:<tenant>:<market>, note ''reveal webhook'' or ''reveal read'' from p_source) -> charged, with the low-credit notice claimed (low_credit true at the crossing, null when the claim failed). Returns one row per pair: tenant_id, market_id, plan, entitled_full, replayed, charged, price (what the leg costs now; 0 when free), balance (after the call), reason, low_credit, low_credit_threshold. Raises 22023 on a bad price, cap, source or pair and on a market that is not a public shadow market. The Worker calls it only for a RESOLVED verdict (src/shadow/reveal.ts). service_role only.';
+  'The private early reveal of a RESOLVED verdict, decided and charged for (tenant, market) pairs (p_tenants[i], p_markets[i], at most 1000) in one transaction: every tenant row locked first in id order; then per pair, in (tenant, event_key, market) order: a deleted or unknown tenant -> unknown_tenant (not entitled); a settled market (resolved, void, closed_unresolved: its commits are public) -> public (free); a plan in p_included_plans -> included_plan; plan free and tenants.created_at before p_pricing_from -> grandfathered; a credit_ledger charge with request id reveal:<tenant>:<market> -> replay (free, no money moves; from source read, one reveal_reads row, on conflict nothing, so refund_late_reveals() never refunds that charge; the same id charged to another tenant raises RS003); else the charge is least(p_price, p_event_cap minus what the tenant paid, net of refunds, for reveals of markets with the same event_key): 0 -> event_cap_reached (free), more than the balance -> insufficient_credits (not entitled, nothing written), else a debit of tenants.credits_balance and one credit_ledger row (reason charge, request id reveal:<tenant>:<market>, note ''reveal webhook'' or ''reveal read'' from p_source) -> charged, with the low-credit notice claimed (low_credit true at the crossing, null when the claim failed). Returns one row per pair: tenant_id, market_id, plan, entitled_full, replayed, charged, price (what the leg costs now; 0 when free), balance (after the call), reason, low_credit, low_credit_threshold. Raises 22023 on a bad price, cap, source or pair and on a market that is not a public shadow market. The Worker calls it only for a RESOLVED verdict (src/shadow/reveal.ts). service_role only.';
 revoke all on function public.charge_reveals(uuid[], uuid[], integer, integer, timestamptz, text[], text) from public, anon, authenticated;
 grant execute on function public.charge_reveals(uuid[], uuid[], integer, integer, timestamptz, text[], text) to service_role;
 
 comment on table credit_ledger is
-  'Append-only. 1 credit = $0.01. UNIQUE(reason, request_id) makes charge/refund idempotent per request; UNIQUE(tx_hash, log_index) makes purchases idempotent per on-chain transfer. Charge rows come from begin_resolution (request_id = the resolution id), charge_read (request_id "<kind>:<id>", note read: a served first print) and charge_reveals (request_id reveal:<tenant>:<market>, note ''reveal webhook'' when taken for a queued shadow.committed, which refund_late_reveals refunds when it was not delivered in time, or ''reveal read'' when taken by a read, never refunded).';
+  'Append-only. 1 credit = $0.01. UNIQUE(reason, request_id) makes charge/refund idempotent per request; UNIQUE(tx_hash, log_index) makes purchases idempotent per on-chain transfer. Charge rows come from begin_resolution (request_id = the resolution id), charge_read (request_id "<kind>:<id>", note read: a served first print) and charge_reveals (request_id reveal:<tenant>:<market>, note ''reveal webhook'' when taken for a queued shadow.committed, which refund_late_reveals refunds when no delivery of it was attempted in time and the tenant did not read it, or ''reveal read'' when taken by a read, never refunded).';
 
 -- 4. refund_late_reveals: the refund rule, every 5 minutes -----------------------------------------------------------------
 create or replace function public.refund_late_reveals(p_late_minutes integer default 10)
 returns jsonb language plpgsql security definer set search_path = public as $$
 declare
   v_start   timestamptz := clock_timestamp();
+  v_ids     text[];
   v_charge  record;
   v_amount  integer;
   v_n       integer := 0;
@@ -220,19 +265,34 @@ begin
   if p_late_minutes is null or p_late_minutes < 1 then
     raise exception using errcode = '22023', message = format('refund_late_reveals: p_late_minutes must be >= 1, got %s', p_late_minutes);
   end if;
-  -- A charge is decided once its deadline has passed: delivered by then on some endpoint (no refund), or not (refund).
-  -- Charges older than 3 days were decided by earlier runs; a cron that stopped for longer is alerted within 30 minutes
-  -- (the Worker's dispatch check reads storage_status()).
+  -- A charge is decided once its deadline has passed. Charges older than 3 days were decided by earlier runs; a cron
+  -- that stopped for longer is alerted within 30 minutes (the Worker's dispatch check reads storage_status()).
+  select coalesce(array_agg(c.request_id), '{}') into v_ids
+    from credit_ledger c
+   where c.reason = 'charge' and c.note = 'reveal webhook' and c.created_at > now() - interval '3 days'
+     and not exists (select 1 from credit_ledger x where x.reason = 'refund' and x.request_id = c.request_id)
+     and now() >= coalesce((select min(d.reveal_due_at) from webhook_deliveries d where d.reveal_charge_id = c.request_id),
+                           c.created_at + make_interval(mins => p_late_minutes));
+  -- Every tenant row of those charges first, in id order, as charge_reveals() locks them: refund_credits() updates each
+  -- tenant row and this run is one transaction, so locking them one refund at a time (in charge order) could hold one
+  -- tenant while a publish's charge_reveals() holds another, and deadlock.
+  perform 1 from tenants t
+   where t.id in (select c.tenant_id from credit_ledger c where c.reason = 'charge' and c.request_id = any(v_ids))
+   order by t.id for update;
+  -- Decided after the lock, in a statement of its own (a read or a delivery that committed while this run waited
+  -- counts): owed only when Resolve did not put the verdict in front of the tenant in time. No delivery of it was
+  -- attempted (first_attempt_at) or delivered by its reveal_due_at, and the tenant did not read it (reveal_reads). An
+  -- attempt made in time stands whatever the endpoint answered: its body carried the verdict.
   for v_charge in
     select c.request_id
       from credit_ledger c
-     where c.reason = 'charge' and c.note = 'reveal webhook' and c.created_at > now() - interval '3 days'
+     where c.reason = 'charge' and c.request_id = any(v_ids)
        and not exists (select 1 from credit_ledger x where x.reason = 'refund' and x.request_id = c.request_id)
-       and now() >= coalesce((select min(d.reveal_due_at) from webhook_deliveries d where d.reveal_charge_id = c.request_id),
-                             c.created_at + make_interval(mins => p_late_minutes))
        and not exists (select 1 from webhook_deliveries d
-                        where d.reveal_charge_id = c.request_id and d.status = 'delivered' and d.delivered_at <= d.reveal_due_at)
-     order by c.created_at
+                        where d.reveal_charge_id = c.request_id
+                          and (d.first_attempt_at <= d.reveal_due_at or (d.status = 'delivered' and d.delivered_at <= d.reveal_due_at)))
+       and not exists (select 1 from reveal_reads rr where rr.request_id = c.request_id)
+     order by c.tenant_id, c.created_at
   loop
     -- one refund at a time: a refund that fails is reported and the others still go through
     begin
@@ -257,7 +317,7 @@ exception when others then
   return jsonb_build_object('error', left(v_msg, 500), 'sqlstate', v_state);
 end $$;
 comment on function public.refund_late_reveals(integer) is
-  'The refund rule of the priced reveal (docs/pricing.md), run every 5 minutes by pg_cron (job refund_late_reveals): every credit_ledger charge with note ''reveal webhook'' from the last 3 days that is not refunded yet, whose deadline has passed (the reveal_due_at of its deliveries, committed_at + p_late_minutes; with no delivery at all, the charge time + p_late_minutes), and none of whose deliveries (webhook_deliveries.reveal_charge_id) was delivered at or before reveal_due_at, is refunded through refund_credits() (once per request id). A charge with note ''reveal read'' is never refunded. One loop_runs row per run (loop_name reveal_refund): success (rows_written = charges refunded), no_op, or failure with the error text (a refund that fails is reported and the others stand; an error outside them rolls the run back). Returns refunded, credits and failed as jsonb.';
+  'The refund rule of the priced reveal (docs/pricing.md), run every 5 minutes by pg_cron (job refund_late_reveals): the credit_ledger charges with note ''reveal webhook'' from the last 3 days that are not refunded yet and whose deadline has passed (the reveal_due_at of their deliveries, committed_at + p_late_minutes; with no delivery at all, the charge time + p_late_minutes) have their tenant rows locked in id order (as charge_reveals() locks them: no deadlock with a publish); then each one is refunded through refund_credits() (once per request id) when, read after the lock, none of its deliveries (webhook_deliveries.reveal_charge_id) was attempted (first_attempt_at) or delivered at or before reveal_due_at and the tenant did not read the verdict (reveal_reads). An attempt made in time is never refunded, whatever the endpoint answered: the POST carried the verdict. A charge with note ''reveal read'' is never refunded. One loop_runs row per run (loop_name reveal_refund): success (rows_written = charges refunded), no_op, or failure with the error text (a refund that fails is reported and the others stand; an error outside them rolls the run back). Returns refunded, credits and failed as jsonb.';
 revoke all on function public.refund_late_reveals(integer) from public, anon, authenticated;
 grant execute on function public.refund_late_reveals(integer) to service_role;
 

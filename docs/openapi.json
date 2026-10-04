@@ -860,6 +860,7 @@
           "reason": {
             "type": "string",
             "enum": [
+              "public",
               "included_plan",
               "grandfathered",
               "replay",
@@ -1512,7 +1513,7 @@
     },
     "/v1/shadow/export": {
       "get": {
-        "summary": "Export the followed markets this account is entitled to (the same rule as GET /v1/shadow/{market_id}: the plan's follow limit, and a live key on the free plan), one row per market, labeled \"private early reveal — excluded from the public record\": the latest commitment_sha256, committed_at, committed_status and committed_outcome, the evidence hashes, the number of commits, and once the platform resolves the market, official_outcome, official_at, official_at_source (gamma_closed_time is the platform's timestamp; limitless_api_poll and first_observed_poll are the first poll that saw the outcome, so lead_seconds is an upper bound), agreement and lead_seconds. A RESOLVED latest verdict is priced like every reveal (25 credits on free and payg, once per market, at most 2000 per event, never refunded for a read): a row this account has not received is exported locked, with committed_status and committed_outcome empty; the reveal column says why each row is shown or locked (RevealAccess.reason, not_resolved, or empty without a commit). Never the nonce or the preimage. The oldest 1000 follows are read (truncated says when there are more). format=csv answers RFC 4180 CSV with a header row (Content-Type text/csv; X-Resolve-Truncated, X-Resolve-Credits-Charged, X-Resolve-Locked); the default is the JSON envelope. Never 402: locked rows answer 200 with top_up",
+        "summary": "Export the followed markets this account is entitled to (the same rule as GET /v1/shadow/{market_id}: the plan's follow limit, and a live key on the free plan), one row per market, labeled \"private early reveal — excluded from the public record\": the latest commitment_sha256, committed_at, committed_status and committed_outcome, the evidence hashes, the number of commits, and once the platform resolves the market, official_outcome, official_at, official_at_source (gamma_closed_time is the platform's timestamp; limitless_api_poll and first_observed_poll are the first poll that saw the outcome, so lead_seconds is an upper bound), agreement and lead_seconds. A RESOLVED latest verdict is priced like every reveal (25 credits on free and payg, once per market, at most 2000 per event, never refunded for a read): a row this account has not received is exported locked, with committed_status and committed_outcome empty; the reveal column says why each row is shown or locked (RevealAccess.reason, not_resolved, or empty without a commit); a settled market's row is never priced (reveal public). Never the nonce or the preimage. The oldest 1000 follows are read (truncated says when there are more). format=csv answers RFC 4180 CSV with a header row (Content-Type text/csv; X-Resolve-Truncated, X-Resolve-Credits-Charged, X-Resolve-Locked); the default is the JSON envelope. Never 402: locked rows answer 200 with top_up",
         "security": [
           {
             "bearerAuth": []
@@ -1581,6 +1582,16 @@
               }
             }
           },
+          "405": {
+            "description": "method_not_allowed: HEAD is refused (Allow: GET) before anything is read or charged: an answer to HEAD carries no rows",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
           "503": {
             "description": "UPSTREAM_UNAVAILABLE: the follows or the report view could not be read (never an empty export)",
             "content": {
@@ -1596,7 +1607,7 @@
     },
     "/v1/shadow/{market_id}": {
       "get": {
-        "summary": "Private early reveal of a followed market (\"private early reveal — excluded from the public record\"): every committed verdict, newest first, with its commitment_sha256, committed_at, posted state and evidence hashes. Never the nonce or the preimage: those appear only in the public reveal. When a commit is RESOLVED the read is priced: 25 credits on the free and payg plans, once per tenant and market (every commit of it, every later read: free), at most 2000 per event, never refunded for a read; included in builder, growth, platform; a commit that is not RESOLVED is always shown. At a short balance every RESOLVED commit is answered locked (verdict null, locked true) with the locked object, 200 and never 402; the read after a top-up releases and charges it. 404 unless the tenant follows the market; 403 when the follow is above the plan's follow limit (after a plan change) or a free-plan tenant holds no live key",
+        "summary": "Private early reveal of a followed market (\"private early reveal — excluded from the public record\"): every committed verdict, newest first, with its commitment_sha256, committed_at, posted state and evidence hashes. Never the nonce or the preimage: those appear only in the public reveal. When a commit is RESOLVED the read is priced: 25 credits on the free and payg plans, once per tenant and market (every commit of it, every later read: free), at most 2000 per event, never refunded for a read; included in builder, growth, platform; a commit that is not RESOLVED is always shown, and so is every commit of a settled market (public by then: reveal.reason public, never priced). At a short balance every RESOLVED commit is answered locked (verdict null, locked true) with the locked object, 200 and never 402; the read after a top-up releases and charges it. 404 unless the tenant follows the market; 403 when the follow is above the plan's follow limit (after a plan change) or a free-plan tenant holds no live key",
         "security": [
           {
             "bearerAuth": []
@@ -1649,6 +1660,16 @@
           },
           "404": {
             "description": "not_found: not following this market",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "405": {
+            "description": "method_not_allowed: HEAD is refused (Allow: GET) before anything is read or charged: an answer to HEAD carries no verdict",
             "content": {
               "application/json": {
                 "schema": {
@@ -2230,7 +2251,7 @@
     },
     "/v1/webhooks": {
       "post": {
-        "summary": "Register an https endpoint (secret shown once). events: a subset of market.resolved, market.unresolved_update, market.error, credits.low, payment.credited, shadow.committed, shadow.revealed (default: all). The first delivery attempt is made as the event happens (a few per event, early reveals the tenant paid for first; the rest by the 5-minute queue drain, in the same order); failed attempts retry on a backoff of 60 s, 5 min, 30 min, 2 h, 12 h, 24 h, then dead-letter. shadow.committed carries reveal (RevealAccess) and locked (LockedReveal or null): a locked one has verdict null and a venue object that proposes nothing. A paid shadow.committed that none of the tenant's endpoints received within 10 minutes of committed_at is refunded once",
+        "summary": "Register an https endpoint (secret shown once). events: a subset of market.resolved, market.unresolved_update, market.error, credits.low, payment.credited, shadow.committed, shadow.revealed (default: all). The first delivery attempt is made as the event happens (a few per event, early reveals the tenant paid for first; the rest by the 5-minute queue drain, in the same order); failed attempts retry on a backoff of 60 s, 5 min, 30 min, 2 h, 12 h, 24 h, then dead-letter. shadow.committed carries reveal (RevealAccess) and locked (LockedReveal or null): a locked one has verdict null and a venue object that proposes nothing. A paid shadow.committed that Resolve did not attempt to deliver to any of the tenant's endpoints within 10 minutes of committed_at, and that the tenant did not read meanwhile, is refunded once; an attempt made in time stands, whatever the endpoint answered",
         "security": [
           {
             "bearerAuth": []

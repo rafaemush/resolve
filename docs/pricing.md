@@ -15,7 +15,7 @@ One credit is $0.01.
 | A request the deterministic pre-checks settle on their own (for example unsafe input, or no anchor in the evidence) | 0 |
 | A replay of the same `Idempotency-Key` | 0 (never charged twice) |
 | The private early reveal of a RESOLVED verdict, on the Free and Pay as you go plans: charged once per followed market, the first time the verdict reaches you (a `shadow.committed` webhook, `GET /v1/shadow/{market_id}` or `GET /v1/shadow/export`), at most 2,000 credits per event. Included in Builder, Growth, Platform and the venue offers (the pilot pack and Design Partner) | 25 |
-| An early reveal of an UNRESOLVED or ERROR verdict, a later commit of a market already revealed to you, a re-read, a retry | 0 |
+| An early reveal of an UNRESOLVED or ERROR verdict, a later commit of a market already revealed to you, a re-read, a retry, any commit of a market that has settled (public by then) | 0 |
 
 A verdict that cannot be produced because an upstream is unavailable (`error_code: UPSTREAM_UNAVAILABLE`) is refunded to your account in full.
 
@@ -71,7 +71,8 @@ Follow a public shadow market with `POST /v1/markets/{id}/follow` (open, non-tes
 **The price of a reveal.** On the Free and Pay as you go plans a RESOLVED verdict costs 25 credits, charged once per followed market the first time it reaches you (by webhook, `GET /v1/shadow/{market_id}` or the export, whichever comes first), at most 2,000 credits per event (the legs of one event share the cap). Later commits of the same market, re-reads and retries are free, and so are UNRESOLVED and ERROR verdicts. Builder, Growth, Platform and the venue offers include reveals. Every reveal says what it cost (`reveal.credits_charged`), and the charge is one ledger entry (`GET /v1/usage`).
 
 - **Locked.** When the balance cannot pay for a leg, the webhook and `GET /v1/shadow/{market_id}` still carry the market, the `commitment_sha256`, when it was committed and the evidence hashes, but `verdict` is `null`, the `venue` object proposes nothing, and a `locked` object gives the reason (`insufficient_credits`), the price, the balance and `top_up` (where to buy credits). Nothing is charged. These reads answer 200, never 402. After a top-up, the next read (or the next commit's webhook) releases the verdict and charges it then. In the export a locked row has empty `committed_status` and `committed_outcome`, and its `reveal` column says why.
-- **Refund.** A reveal charged for a `shadow.committed` webhook is refunded once, automatically, if none of your endpoints received it within 10 minutes of `committed_at` (every delivery failed, or the first one arrived later). A reveal charged by a read (`GET /v1/shadow/{market_id}` or the export) is not refunded: the verdict was in the answer.
+- **Refund.** A reveal charged for a `shadow.committed` webhook is refunded once, automatically, if Resolve did not attempt to deliver it to any of your endpoints within 10 minutes of `committed_at` (it could not be queued, the queue was behind, or the endpoint was deactivated before the attempt) and you did not read it in the meantime. Once a delivery was attempted in time the charge stands, whatever your endpoint answered: the request carried the verdict, and it stays readable, free, at `GET /v1/shadow/{market_id}`. A reveal charged by a read (`GET /v1/shadow/{market_id}` or the export) is not refunded: the verdict was in the answer.
+- **Settled markets.** Once a market settles, its commitments are public (`GET /v1/track-record/verify`, the `shadow.revealed` webhook): reading them is free on every plan, and `reveal.reason` (the export's `reveal` column) says `public`.
 - **Delivery order.** Webhooks of reveals you paid for are delivered first, then those of plans that include reveals, then the rest.
 
 Early reveals are labeled "private early reveal — excluded from the public record". They never include the nonce or the preimage before the public reveal, so every commitment stays checkable by anyone: `sha256(preimage) = commitment_sha256` at `GET /v1/track-record/verify?hash=`.
@@ -84,7 +85,7 @@ Early reveals are labeled "private early reveal — excluded from the public rec
 
 ## Status (2026-10-05)
 
-Early reveals are priced from 2026-10-10: 25 credits per RESOLVED leg on the Free and Pay as you go plans, at most 2,000 credits per event, refunded when the webhook is not delivered within 10 minutes; included in Builder, Growth, Platform and the venue offers. An evaluation key issued before 2026-10-10 keeps free reveals until it expires. Pay as you go follows up to 500 open markets, and `{"scope":"event"}` follows every open leg of an event in one call.
+Early reveals are priced: 25 credits per RESOLVED leg on the Free and Pay as you go plans, at most 2,000 credits per event, refunded when Resolve does not attempt the webhook within 10 minutes; included in Builder, Growth, Platform and the venue offers; free once the market settles. An evaluation key issued before 2026-10-10 keeps free reveals until it expires; Pay as you go has no such date. Pay as you go follows up to 500 open markets, and `{"scope":"event"}` follows every open leg of an event in one call.
 
 ## Status (2026-10-01)
 

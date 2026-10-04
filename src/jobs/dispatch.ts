@@ -136,7 +136,7 @@ export function refundAlert(s: Pick<StorageStatus, "refund_scheduled" | "last_re
     return { ...base, key: "reveal_refund_unobserved", text: "storage_status() carries no refund status: migration 023 (priced reveal) is not applied, or storage_status() was replaced. The refund rule of charged reveals (refund_late_reveals) cannot be observed. Apply 023: npx tsx scripts/migrate.ts" };
   }
   if (s.refund_scheduled === false) {
-    return { ...base, key: "reveal_refund_unscheduled", text: "The pg_cron job refund_late_reveals (migration 023) is missing or inactive: charged reveals whose webhook was not delivered within 10 minutes are no longer refunded. Schedule it again: select cron.schedule('refund_late_reveals', '*/5 * * * *', 'select public.refund_late_reveals(10)');" };
+    return { ...base, key: "reveal_refund_unscheduled", text: "The pg_cron job refund_late_reveals (migration 023) is missing or inactive: charged reveals whose webhook Resolve did not attempt within 10 minutes are no longer refunded. Schedule it again: select cron.schedule('refund_late_reveals', '*/5 * * * *', 'select public.refund_late_reveals(10)');" };
   }
   const r = s.last_refund;
   if (!r) return null; // scheduled, no run yet: the first runs within 5 minutes of the migration

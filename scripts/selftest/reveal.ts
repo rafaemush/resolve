@@ -6,14 +6,18 @@
  *     replay (charged 0, no second row); a short balance is locked with nothing written; an included plan and a free
  *     tenant created before the cut-over are free; a free tenant after it pays and its first charge below the threshold
  *     claims the low-credit notice (once); in one call two legs of one event under a 50-credit cap: one charged, the
- *     other free past the cap; after a refund the cap reopens (net of refunds); a deleted tenant is unknown_tenant; another
+ *     other free past the cap; after a refund the cap reopens (net of refunds); a settled market is public (free at any
+ *     balance, nothing written); a deleted tenant is unknown_tenant; another
  *     tenant's id raises RS003; a bad price, cap, source, pair list, a tenant market and a test market raise 22023. A
  *     concurrent duplicate needs a second session: scripts/selftest-db.ts --concurrency-probe races it on staging;
- *   - claim_webhook_deliveries(): a due priority-3 row is claimed before an older due priority-0 row (every other due
- *     row is moved out of the way inside the block, and that is rolled back with the rest);
- *   - refund_late_reveals(): a webhook charge whose every delivery dead-lettered, and one first delivered after its
- *     deadline, are refunded once (a second run refunds nothing more); one delivered in time, one whose deadline has
- *     not passed, and a read's charge are not; the run writes its loop_runs row and storage_status() reports it;
+ *   - claim_webhook_deliveries(): a due priority-3 row is claimed before an older due priority-0 row, and a first
+ *     attempt before an older retry of the same priority (every other due row is moved out of the way inside the block,
+ *     and that is rolled back with the rest);
+ *   - refund_late_reveals(): a webhook charge whose every delivery dead-lettered without an attempt, and one first
+ *     attempted and delivered after its deadline, are refunded once (a second run refunds nothing more); one delivered in
+ *     time, one attempted in time that then dead-lettered (the endpoint had the body), one whose deadline has not passed,
+ *     one the tenant read back (a read's replay leaves a reveal_reads row), and a read's charge are not; the run writes
+ *     its loop_runs row and storage_status() reports it;
  *   - follow_event(): every open public leg once (settled, test, tenant and deleted legs left out), again idempotent,
  *     all or nothing at the cap, not_followable for a test market, a negative cap and an unknown tenant refused;
  *   - least privilege: anon cannot execute the new functions, PUBLIC holds no EXECUTE, service_role can; each is
@@ -39,7 +43,8 @@ declare
   out jsonb := '{}'::jsonb;
   tp uuid; ts uuid; tb uuid; tg uuid; tn uuid; td uuid; tf uuid; tc uuid; tr uuid;
   m1 uuid; m2 uuid; m3 uuid; mx uuid; mten uuid; mtest uuid; e1 uuid; e2 uuid; e3 uuid; ex uuid; esettled uuid; etest uuid;
-  ep uuid; d0 uuid; d3 uuid; claimed uuid; rp1 uuid; rp2 uuid; rp3 uuid; rp4 uuid; rp5 uuid; v_res jsonb; v_res2 jsonb; st jsonb; v_bool boolean;
+  ep uuid; d0 uuid; d3 uuid; dr uuid; claimed uuid; rp1 uuid; rp2 uuid; rp3 uuid; rp4 uuid; rp5 uuid; rp6 uuid; rp7 uuid; msettled uuid;
+  v_res jsonb; v_res2 jsonb; st jsonb; v_bool boolean;
   r record; v_paid uuid; v_free uuid;
   mk constant text := 'insert into markets (platform, external_id, condition, event_statement, option_a, option_b, positive_option, open_at, deadline_utc, tenant_id, status, event_key) values (''custom'', $1, ''selftest condition'', ''selftest statement'', ''Yes'', ''No'', ''OPTION_A'', now() - interval ''3 days'', now() + interval ''2 days'', $2, $3, $4) returning id';
 begin
@@ -102,6 +107,10 @@ begin
   begin perform 1 from charge_reveals(array[tp, ts], array[m1], 25, 2000, now(), array['builder'], 'read') c; out := out || '{"unpaired":"allowed"}';
   exception when others then out := out || jsonb_build_object('unpaired', sqlstate); end;
   out := out || jsonb_build_object('empty', (select count(*) from charge_reveals('{}'::uuid[], '{}'::uuid[], 25, 2000, now(), array['builder'], 'read')));
+  -- a settled market's commits are public: free at a short balance, nothing written
+  execute mk into msettled using '__selftest_reveal_ms__', null::uuid, 'resolved', '__selftest_reveal_settled__';
+  out := out || jsonb_build_object('settled_public', (select ${ROW} from ${CR("ts", "msettled")} c));
+  out := out || jsonb_build_object('settled_rows', (select count(*) from credit_ledger l where l.tenant_id = ts));
 
   -- 2. claim_webhook_deliveries: priority first -------------------------------------------------------------------------
   insert into webhook_endpoints (tenant_id, url, secret, events) values (tp, 'https://example.org/__selftest_reveal__', 's', '{shadow.committed}') returning id into ep;
@@ -111,6 +120,11 @@ begin
   insert into webhook_deliveries (endpoint_id, tenant_id, event_type, payload, next_attempt_at, priority) values (ep, tp, 'shadow.committed', '{}', now() - interval '1 minute', 3) returning id into d3;
   select d.id into claimed from claim_webhook_deliveries(1) d;
   out := out || jsonb_build_object('claim_priority_first', claimed = d3, 'claim_old_still_pending', (select status from webhook_deliveries where id = d0));
+  -- within one priority a first attempt goes before an older retry (the retry of an endpoint that failed waits)
+  insert into webhook_deliveries (endpoint_id, tenant_id, event_type, payload, next_attempt_at, priority, attempt) values (ep, tp, 'shadow.committed', '{}', now() - interval '9 minutes', 3, 2) returning id into dr;
+  insert into webhook_deliveries (endpoint_id, tenant_id, event_type, payload, next_attempt_at, priority) values (ep, tp, 'shadow.committed', '{}', now() - interval '1 minute', 3) returning id into d3;
+  select d.id into claimed from claim_webhook_deliveries(1) d;
+  out := out || jsonb_build_object('claim_first_attempt_first', claimed = d3);
   begin insert into webhook_deliveries (endpoint_id, tenant_id, event_type, payload, priority) values (ep, tp, 'shadow.committed', '{}', 7); out := out || '{"priority_7":"allowed"}';
   exception when check_violation then out := out || '{"priority_7":"refused"}'; end;
   begin insert into webhook_deliveries (endpoint_id, tenant_id, event_type, payload, reveal_charge_id) values (ep, tp, 'shadow.committed', '{}', 'reveal:' || tp || ':' || m1); out := out || '{"charge_without_due":"allowed"}';
@@ -123,22 +137,32 @@ begin
   execute mk into rp3 using '__selftest_reveal_r3__', null::uuid, 'open', '__selftest_reveal_r3__';
   execute mk into rp4 using '__selftest_reveal_r4__', null::uuid, 'open', '__selftest_reveal_r4__';
   execute mk into rp5 using '__selftest_reveal_r5__', null::uuid, 'open', '__selftest_reveal_r5__';
-  perform 1 from ${CR("tr, tr, tr, tr", "rp1, rp2, rp3, rp4")} c;   -- four webhook charges
-  perform 1 from ${CR("tr", "rp5", "read")} c;                        -- a read's charge
+  execute mk into rp6 using '__selftest_reveal_r6__', null::uuid, 'open', '__selftest_reveal_r6__';
+  execute mk into rp7 using '__selftest_reveal_r7__', null::uuid, 'open', '__selftest_reveal_r7__';
+  perform 1 from ${CR("tr, tr, tr, tr, tr, tr", "rp1, rp2, rp3, rp4, rp6, rp7")} c;   -- six webhook charges
+  perform 1 from ${CR("tr", "rp5", "read")} c;                                         -- a read's charge
+  perform 1 from ${CR("tr", "rp7", "read")} c;                                         -- the tenant reads rp7 back: a replay
+  out := out || jsonb_build_object('read_receipt', (select count(*) from reveal_reads rr where rr.request_id = 'reveal:' || tr || ':' || rp7));
   insert into webhook_deliveries (endpoint_id, tenant_id, event_type, payload, status, reveal_charge_id, reveal_due_at) values
-    -- rp1: every delivery dead-lettered, past its deadline
+    -- rp1: every delivery dead-lettered without an attempt (the endpoint inactive), past its deadline
     (ep, tr, 'shadow.committed', '{}', 'dlq', 'reveal:' || tr || ':' || rp1, now() - interval '1 minute'),
     (ep, tr, 'shadow.committed', '{}', 'dlq', 'reveal:' || tr || ':' || rp1, now() - interval '1 minute'),
     -- rp4: not past its deadline yet (still retrying)
     (ep, tr, 'shadow.committed', '{}', 'pending', 'reveal:' || tr || ':' || rp4, now() + interval '5 minutes'),
     -- rp5 (a read's charge): dead-lettered past a deadline, still never refunded
-    (ep, tr, 'shadow.committed', '{}', 'dlq', 'reveal:' || tr || ':' || rp5, now() - interval '1 minute');
+    (ep, tr, 'shadow.committed', '{}', 'dlq', 'reveal:' || tr || ':' || rp5, now() - interval '1 minute'),
+    -- rp7: never attempted, but the tenant read it back
+    (ep, tr, 'shadow.committed', '{}', 'dlq', 'reveal:' || tr || ':' || rp7, now() - interval '1 minute');
+  insert into webhook_deliveries (endpoint_id, tenant_id, event_type, payload, status, first_attempt_at, reveal_charge_id, reveal_due_at) values
+    -- rp6: attempted two minutes before its deadline (the endpoint answered 500 and dead-lettered later): it had the body
+    (ep, tr, 'shadow.committed', '{}', 'dlq', now() - interval '3 minutes', 'reveal:' || tr || ':' || rp6, now() - interval '1 minute');
   insert into webhook_deliveries (endpoint_id, tenant_id, event_type, payload, status, delivered_at, reveal_charge_id, reveal_due_at) values
     -- rp2: delivered one minute before its deadline (one endpoint is enough)
     (ep, tr, 'shadow.committed', '{}', 'delivered', now() - interval '2 minutes', 'reveal:' || tr || ':' || rp2, now() - interval '1 minute'),
     (ep, tr, 'shadow.committed', '{}', 'dlq', null, 'reveal:' || tr || ':' || rp2, now() - interval '1 minute'),
-    -- rp3: first delivered one minute after its deadline
+    -- rp3: first attempted and delivered one minute after its deadline (the queue was behind)
     (ep, tr, 'shadow.committed', '{}', 'delivered', now(), 'reveal:' || tr || ':' || rp3, now() - interval '1 minute');
+  update webhook_deliveries set first_attempt_at = delivered_at where reveal_charge_id = 'reveal:' || tr || ':' || rp3;
   v_res := refund_late_reveals(10);
   v_res2 := refund_late_reveals(10);
   out := out || jsonb_build_object('refund_error', v_res ? 'error',
@@ -147,7 +171,9 @@ begin
       (select count(*) from credit_ledger l where l.reason = 'refund' and l.request_id = 'reveal:' || tr || ':' || rp2),
       (select count(*) from credit_ledger l where l.reason = 'refund' and l.request_id = 'reveal:' || tr || ':' || rp3),
       (select count(*) from credit_ledger l where l.reason = 'refund' and l.request_id = 'reveal:' || tr || ':' || rp4),
-      (select count(*) from credit_ledger l where l.reason = 'refund' and l.request_id = 'reveal:' || tr || ':' || rp5)),
+      (select count(*) from credit_ledger l where l.reason = 'refund' and l.request_id = 'reveal:' || tr || ':' || rp5),
+      (select count(*) from credit_ledger l where l.reason = 'refund' and l.request_id = 'reveal:' || tr || ':' || rp6),
+      (select count(*) from credit_ledger l where l.reason = 'refund' and l.request_id = 'reveal:' || tr || ':' || rp7)),
     'refund_balance', (select credits_balance from tenants where id = tr),
     'refund_run_row', (select jsonb_build_array(l.outcome = any(array['success', 'no_op']), l.meta ? 'refunded', (l.meta->>'late_minutes')::int) from loop_runs l
                          where l.loop_name = 'reveal_refund' order by l.id desc limit 1));
@@ -202,7 +228,11 @@ begin
       and (f.proacl is null or exists (select 1 from aclexplode(f.proacl) a where a.grantee = 0))),
     'definer_search_path', (select bool_and(f.prosecdef and exists (select 1 from unnest(f.proconfig) c where c like 'search_path=%')) from pg_proc f where f.oid in (${FNS})),
     'uncommented', (select count(*) from pg_proc f where f.oid in (${FNS}) and obj_description(f.oid, 'pg_proc') is null)
-      + (select count(*) from pg_attribute a where a.attrelid = 'public.webhook_deliveries'::regclass and a.attname in ('priority', 'reveal_charge_id', 'reveal_due_at') and col_description(a.attrelid, a.attnum) is null));
+      + (select count(*) from pg_attribute a where a.attrelid = 'public.webhook_deliveries'::regclass and a.attname in ('priority', 'reveal_charge_id', 'reveal_due_at', 'first_attempt_at') and col_description(a.attrelid, a.attnum) is null)
+      + (select count(*) from pg_attribute a where a.attrelid = 'public.reveal_reads'::regclass and a.attnum > 0 and not a.attisdropped and col_description(a.attrelid, a.attnum) is null)
+      + (case when obj_description('public.reveal_reads'::regclass, 'pg_class') is null then 1 else 0 end),
+    'reveal_reads_rls', (select c.relrowsecurity and c.relforcerowsecurity from pg_class c where c.oid = 'public.reveal_reads'::regclass),
+    'reveal_reads_anon', has_table_privilege('anon', 'public.reveal_reads', 'select'));
   if exists (select 1 from pg_extension where extname = 'pg_cron') then
     execute $c$select exists (select 1 from cron.job where jobname = 'refund_late_reveals' and schedule = '*/5 * * * *' and active
       and command = 'select public.refund_late_reveals(10)')$c$ into v_bool;
@@ -222,14 +252,17 @@ export const REVEAL_EXPECT: Record<string, unknown> = {
   event_cap: [[25, "charged"], [0, "event_cap_reached"]], event_cap_balance: 10, event_cap_rows: 2,
   cap_after_refund: [25, "charged"],
   other_tenant: "RS003", tenant_market: "22023", test_market: "22023", zero_price: "22023", cap_below_price: "22023", bad_source: "22023", unpaired: "22023", empty: 0,
-  claim_priority_first: true, claim_old_still_pending: "pending", priority_7: "refused", charge_without_due: "refused",
-  refund_error: false, refunded: [1, 0, 1, 0, 0], refund_balance: 1000 - 5 * 25 + 2 * 25, refund_run_row: [true, true, 10],
+  settled_public: [true, false, 0, 10, "public"], settled_rows: 0,
+  claim_priority_first: true, claim_old_still_pending: "pending", claim_first_attempt_first: true, priority_7: "refused", charge_without_due: "refused",
+  read_receipt: 1,
+  // rp1 .. rp7: dlq without an attempt, delivered in time, attempted and delivered late, not due yet, a read's charge, attempted in time then dlq, read back
+  refund_error: false, refunded: [1, 0, 1, 0, 0, 0, 0], refund_balance: 1000 - 7 * 25 + 2 * 25, refund_run_row: [true, true, 10],
   storage_refund: true, storage_keys: ["database_bytes", "last_purge", "last_refund", "purge_scheduled", "refund_scheduled"],
   event_follow: ["followed", 3, 3, 0], event_follow_rows: [true, true, true], event_follow_again: ["followed", 0, 3],
   follow_event_cap: ["cap_reached", 3, 2], follow_event_cap_rows: 0,
   event_test_market: "not_followable", event_settled_market: "market is resolved", event_negative_cap: "refused", event_unknown_tenant: "refused",
   anon_charge: "denied", anon_refund: "denied", anon_follow_event: "denied", service_charge: "replay",
-  public_execute: 0, definer_search_path: true, uncommented: 0, cron_job: true,
+  public_execute: 0, definer_search_path: true, uncommented: 0, reveal_reads_rls: true, reveal_reads_anon: false, cron_job: true,
 };
 
 async function main(): Promise<number> {

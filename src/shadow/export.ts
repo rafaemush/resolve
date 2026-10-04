@@ -8,12 +8,14 @@
  * Since migration 023 a RESOLVED latest verdict is priced like every other reveal (src/shadow/reveal.ts): the export asks
  * charge_reveals() once for every exported market whose latest commit is RESOLVED (source read: charged once per tenant
  * and market, a replay free, never refunded), and a market the tenant has not received is exported locked: its commitment,
- * times and hashes, with committed_status and committed_outcome empty and the reveal column naming why.
+ * times and hashes, with committed_status and committed_outcome empty and the reveal column naming why. A settled market
+ * is not priced (reveal public): its commits are public by then, and its official_outcome and agreement columns would
+ * tell a locked row's outcome anyway.
  * The rules and shapes here are pure; the route (src/api/v1.ts) does the reads.
  */
 import { z } from "zod";
 import { followBlock, type Plan } from "./follows";
-import { revealReleased, type RevealAnswer } from "./reveal";
+import { revealIsPublic, revealReleased, type RevealAnswer } from "./reveal";
 import { toCsv, type CsvValue } from "../ops/csv";
 import { COST } from "../ops/budget";
 
@@ -92,14 +94,19 @@ export const EXPORT_COLUMNS = [
 ] as const;
 export type ExportRow = Record<(typeof EXPORT_COLUMNS)[number], CsvValue>;
 
-/** Pure. Whether the latest commit is RESOLVED: only such a row is priced (charge_reveals()). */
-export const pricedRow = (v: Pick<ExportViewRow, "committed_status">): boolean => v.committed_status === "RESOLVED";
+/**
+ * Pure. Whether a row is priced (charge_reveals()): its latest commit is RESOLVED and the market has not settled. A settled
+ * market's commits are public (revealIsPublic), and its official_outcome and agreement would give a locked row's outcome
+ * away in any case.
+ */
+export const pricedRow = (v: Pick<ExportViewRow, "committed_status" | "status">): boolean => v.committed_status === "RESOLVED" && !revealIsPublic(v.status);
 
 /**
  * Pure. One export row: the latest commit (the verdict the market stands on) and the final reconciliation. A RESOLVED
  * latest verdict shows only when `reveal` releases it to this tenant; otherwise (locked, or no answer at all: never
  * released by default) committed_status and committed_outcome are empty and `reveal` names why. reveal is the answer's
- * reason for a RESOLVED row, not_resolved for a commit that is not, empty for a market with no commit yet.
+ * reason for a priced row, public for a RESOLVED row of a settled market (shown, never priced), not_resolved for a commit
+ * that is not RESOLVED, empty for a market with no commit yet.
  */
 export function exportRow(v: ExportViewRow, reveal: RevealAnswer | null = null): ExportRow {
   const priced = pricedRow(v);
@@ -111,7 +118,7 @@ export function exportRow(v: ExportViewRow, reveal: RevealAnswer | null = null):
     evidence_raw_sha256: v.evidence_raw_sha256, evidence_canonical_sha256: v.evidence_canonical_sha256, n_commits: v.n_commits,
     official_outcome: v.official_outcome, official_at: v.official_at, official_at_source: v.official_at_source, agreement: v.agreement,
     lead_seconds: v.lead_seconds === null || v.lead_seconds === undefined ? null : Number(v.lead_seconds),
-    reveal: priced ? (reveal?.reason ?? "billing_unavailable") : v.latest_commitment_sha256 ? "not_resolved" : null,
+    reveal: priced ? (reveal?.reason ?? "billing_unavailable") : v.committed_status === "RESOLVED" ? "public" : v.latest_commitment_sha256 ? "not_resolved" : null,
   };
 }
 

@@ -39,13 +39,17 @@ export const QUEUE_SUBREQUESTS = 3 * COST.db + COST.alert;
  * every such follower whatever their number (none for a verdict that is not RESOLVED), the insert (the events, with the
  * credits.low of every crossing the charge claimed), and one alertMany() that carries every alert of the publish (the
  * followers or endpoints unreadable, billing unavailable, the insert failed, each credits.low crossing for the operator).
- * On the watch path this and the inline half add at most 4 + 14 = 18 before the alert to a run that, by count of
+ * When rows were queued, those alerts ride in the inline attempt's own alertMany() (deliverInline's alerts): the publish
+ * and its inline half spend at most 4 + inlineSubrequests(INLINE_MAX) = 4 + 1 + 2 x 4 + 5 = 18 together, alerts
+ * included; when nothing was queued, 4 + 5 = 9. On the watch path that is added to a run that, by count of
  * src/ingest/watch.ts, src/resolve/runtime.ts and src/bot/commit.ts, makes at most 26 subrequests on a web + Jev path
  * before its alerts (each alert 5 more; since migration 017 the commit takes 8: commit_context, insert, lease claim, send
- * 3, receipt, release, and 2 more after a dedup collision; 5 more when the page redirects WEB_MAX_REDIRECTS times,
- * src/ingest/web.ts, each hop a request of its own); a run that still hits Workers Free's 50 leaves its claimed rows
- * 'delivering', and the drain's stale sweep requeues them. The charge itself is one transaction: it stands or nothing is
- * charged, and a charge whose delivery never happened is refunded by refund_late_reveals().
+ * 3, receipt, release, and 2 more after a dedup collision), and 31 when the page redirects WEB_MAX_REDIRECTS times
+ * (src/ingest/web.ts, each hop a request of its own): 31 + 18 = 49 of Workers Free's 50, with no room for an alert of
+ * the run's own. A run that still goes over fails its last subrequests (the inline attempts under waitUntil): a claimed
+ * row stays 'delivering' until the drain's stale sweep requeues it, and a paid reveal not attempted within
+ * REVEAL_LATE_MINUTES is refunded by refund_late_reveals(). The charge itself is one transaction: it stands or nothing
+ * is charged.
  */
 export const COMMITTED_QUEUE_SUBREQUESTS = 4 * COST.db + COST.alert;
 
@@ -195,14 +199,16 @@ export async function publishShadowCommitted(env: Env, market: MarketRow, commit
       alerts.push({ key: "webhook_enqueue_failed", dedupMinutes: 60, meta: { market_id: market.id, event_type: "shadow.committed", charged: out.charged }, text: `shadow.committed for ${marketRef(market)} (commitment ${commit.commitment_sha256}) was not queued for ${hooked.length} follower(s): ${q.error}. ${out.charged > 0 ? `${out.charged} credit(s) were charged; refund_late_reveals refunds them ${REVEAL_REFUND_NOTE}. ` : ""}Followers still read it at GET /v1/shadow/${market.id}.${crossings.length ? ` The low-credit notice of ${crossings.length} tenant(s) stays claimed (no credits.low until their next purchase or grant).` : ""}` });
     } else alerts.push(...low.alerts);
     out.rows = q.rows;
-    await deliverInline(env, q.rows, { waitUntil: opts.waitUntil });
+    // the publish's alerts ride in the inline attempt's one alertMany() (sent on their own when nothing was queued)
+    const handed = alerts.splice(0);
+    await deliverInline(env, q.rows, { waitUntil: opts.waitUntil, alerts: handed });
     return out;
   } catch (e) {
     const error = redact(String(e)).slice(0, 200);
     alerts.push({ key: "shadow_followers_unreadable", dedupMinutes: 60, meta: { market_id: market.id }, text: `shadow.committed for ${marketRef(market)} (commitment ${commit.commitment_sha256}) threw before it was queued: ${error}. Followers still read it at GET /v1/shadow/${market.id}. A charge it took stands in the ledger and is refunded by refund_late_reveals ${REVEAL_REFUND_NOTE}.` });
     return { ...out, rows: [], error };
   } finally {
-    // alertMany never throws; one call carries every alert of the publish
+    // alertMany never throws; one call carries every alert of the publish not handed to the inline attempt
     if (alerts.length) await alertMany(env, alerts);
   }
 }
