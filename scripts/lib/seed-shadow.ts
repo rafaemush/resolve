@@ -11,6 +11,19 @@ import { registrationPolicyIssues, webRenderRefusal } from "../../src/markets/po
 
 /** Plan §16.4 P5 step 3: shadow markets stay in the long tail (gamma volume_num_max, the same cap as candidates.ts). */
 export const SHADOW_VOLUME_CAP_USD = 50_000;
+/**
+ * Official-release series whose legs are registered whatever their volume (founder decision 2026-10-05, revenue plan
+ * item 4): the Fed, ECB and Bank of England rate decisions are decided by the deterministic rail from the bank's own
+ * statement, and their Polymarket events run to eight figures ($25.19M for the Fed of 2026-10-28), so the long-tail cap
+ * kept every one of their legs out. Every other series, every election leg and every model-routed market keeps the cap.
+ */
+export const CAP_EXEMPT_SERIES: ReadonlySet<string> = new Set(["fomc_upper_bound", "ecb_dfr", "boe_bank_rate"]);
+
+/** Pure. Whether a market's volume is checked against SHADOW_VOLUME_CAP_USD: no only for an official_release leg of a CAP_EXEMPT_SERIES. */
+export function volumeCapApplies(market: Pick<MarketRegistration, "resolver">): boolean {
+  const r = market.resolver;
+  return !(r?.kind === "official_release" && CAP_EXEMPT_SERIES.has(r.series));
+}
 
 export type SeedMode = "check" | "dry-run" | "apply";
 /** acceptConsensusReading: --accept-consensus-reading, the founder's call to register entries marked consensus_reporting. */
@@ -203,7 +216,9 @@ function checkEntry(e: CandidateEntry, index: number, platform: CandidatePlatfor
     if (platform === "polymarket" && !meta.meta.condition_id) errors.push("meta.condition_id is required for Polymarket (on-chain corroboration of the official outcome)");
     if (platform === "limitless") errors.push(...limitlessMetaProblems(meta.meta, m.success ? m.data : null));
   }
-  if (e.volume_usd > SHADOW_VOLUME_CAP_USD) errors.push(`volume $${e.volume_usd} is over the $${SHADOW_VOLUME_CAP_USD} shadow cap`);
+  // The cap is lifted only for a market that parsed as an official_release leg of an exempt series; an entry that did not
+  // parse keeps the cap (its other errors already block it).
+  if (e.volume_usd > SHADOW_VOLUME_CAP_USD && !(m.success && !volumeCapApplies(m.data))) errors.push(`volume $${e.volume_usd} is over the $${SHADOW_VOLUME_CAP_USD} shadow cap`);
   if (e.registration.is_test !== false) errors.push("is_test must be false for a shadow market on the public record");
   if (e.approved && e.needs_review.length) errors.push(`approved while needs_review still lists ${e.needs_review.join(", ")} (edit those fields, then empty the list)`);
   const key = `${platform}:${externalId}`;

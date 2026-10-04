@@ -7,7 +7,7 @@
  * watches with what was sent.
  */
 import { describe, expect, it } from "vitest";
-import { checkCandidateFile, eventStatementProblem, parseSeedArgs, registrationPlan, selectForRegistration, UsageError, verifyRow } from "../scripts/lib/seed-shadow";
+import { checkCandidateFile, eventStatementProblem, parseSeedArgs, registrationPlan, selectForRegistration, UsageError, verifyRow, volumeCapApplies } from "../scripts/lib/seed-shadow";
 
 const NOW = new Date("2026-09-24T12:00:00Z");
 const CID = `0x${"cd".repeat(32)}`;
@@ -64,6 +64,33 @@ describe("seed-shadow --check", () => {
     expect(errorsOf(entry({ is_test: true }))).toEqual([expect.stringContaining("is_test must be false")]);
     expect(errorsOf(entry({ market: { deadline_utc: "2026-09-24T11:59:59Z", open_at: "2026-09-01T00:00:00Z" } }))).toEqual([expect.stringContaining("is not in the future")]);
     expect(errorsOf(entry({ market: { sources: [{ kind: "web_fetch", ref: "http://www.bls.gov/cpi/" }] } }))).toEqual([expect.stringContaining("is not https")]);
+  });
+
+  it("lifts the cap only for official_release legs of the Fed, ECB and Bank of England (founder decision 2026-10-05)", () => {
+    // The ECB leg as scripts/official-legs.ts builds it (private/shadow-markets/seed-official-polymarket-2026-09-27.json, polymarket:3081963).
+    const ecb = (series: string, period: string, volume_usd: number) => entry({
+      volume_usd,
+      market: {
+        external_id: "3081963", condition: "Leg \"50+ bps decrease\": resolves Yes iff the first print of the rate decision for the meeting falls in this bucket; otherwise No.",
+        event_statement: `${series} for ${period} is in the bucket "50+ bps decrease"`, anchors: [series],
+        sources: [{ kind: "official_release", ref: `official:${series}:${period}` }], open_at: "2026-07-24T16:03:07.850Z", deadline_utc: "2026-10-30T03:59:00.000Z", grace_seconds: 3600,
+        resolver: { kind: "official_release", series, period, release_at: "2026-10-29T13:15:00Z", prior_level: 2.5, bucket: { label: "50+ bps decrease", hi: -50, hi_inclusive: true, lo_inclusive: true }, rounding: "bps_nearest_25_min_25" },
+        allow_prerelease: false,
+      },
+    });
+    expect(errorsOf(ecb("ecb_dfr", "2026-10-29", 12_271.63))).toEqual([]);
+    // $104,616 of volume (the ECB October event's three Polymarket legs, MEASURED 2026-10-04): no longer refused
+    expect(errorsOf(ecb("ecb_dfr", "2026-10-29", 104_616))).toEqual([]);
+    expect(volumeCapApplies({ resolver: { kind: "official_release", series: "fomc_upper_bound" } } as never)).toBe(false);
+    expect(volumeCapApplies({ resolver: { kind: "official_release", series: "boe_bank_rate" } } as never)).toBe(false);
+    // every other series, an unparsed entry and a non-official market keep the cap
+    expect(volumeCapApplies({ resolver: { kind: "official_release", series: "bok_base_rate" } } as never)).toBe(true);
+    expect(volumeCapApplies({ resolver: { kind: "official_release", series: "us_cpi_u_nsa_yoy" } } as never)).toBe(true);
+    expect(volumeCapApplies({ resolver: { kind: "official_release", series: "br_pres_r1_winner" } } as never)).toBe(true);
+    expect(volumeCapApplies({ resolver: undefined } as never)).toBe(true);
+    expect(errorsOf(entry({ volume_usd: 50_000.01 }))).toEqual([expect.stringContaining("over the $50000 shadow cap")]);
+    expect(errorsOf({ ...ecb("ecb_dfr", "2026-10-29", 104_616), registration: { ...ecb("ecb_dfr", "2026-10-29", 104_616).registration, market: { ...ecb("ecb_dfr", "2026-10-29", 104_616).registration.market, resolver: { kind: "official_release", series: "ecb_dfr" } } } }))
+      .toEqual(expect.arrayContaining([expect.stringContaining("over the $50000 shadow cap")]));
   });
 
   it("runs the Worker's registration policy offline: what the Worker would refuse blocks --apply", () => {
