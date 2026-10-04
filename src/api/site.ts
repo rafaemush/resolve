@@ -32,8 +32,8 @@ import { EVALUATION_KEY_DAYS, EVALUATION_WATCH_LIMIT, FREE_EVALUATION_CREDITS } 
 import { PRINT_PRICE_CREDITS } from "./prints";
 import { REVEAL_EVENT_CAP_CREDITS, REVEAL_LATE_MINUTES, REVEAL_PRICE_CREDITS } from "../shadow/reveal";
 import { issueEvaluationKey, type AutoKeyOutcome } from "./evaluation-key";
-import { CARD_PACKS, PACK_IDS, cardCheckoutOffered, isPackId, usd, whopConfig, type WhopConfig } from "../billing/whop";
-import { checkoutRefusal, startCheckout } from "./billing";
+import { CARD_PACKS, CORE_PACK_IDS, PACK_IDS, cardCheckoutOffered, isPackId, offeredPacks, usd, whopConfig, type PackId, type WhopConfig } from "../billing/whop";
+import { checkoutRefusal, packRefusal, startCheckout } from "./billing";
 import { PAY_BY_CARD_PATH } from "../billing/top-up";
 
 type Vars = { requestId: string; schemaVersion: string };
@@ -408,7 +408,8 @@ site.get("/record", (c) => cached(c, "/record?site=1", async () => {
 
 // ---- GET /pricing --------------------------------------------------------------------------------------------------
 
-const dollars = (cents: number) => usd(cents).replace(/\.00$/, "");
+/** Whole dollars grouped ("$1,000"), cents only when there are some. */
+const dollars = (cents: number) => (cents % 100 === 0 ? `$${int(cents / 100)}` : usd(cents));
 /** "a", "a and b", "a, b and c" (or "or"). */
 const listed = (items: string[], last = "and") => (items.length < 2 ? items.join("") : `${items.slice(0, -1).join(", ")} ${last} ${items[items.length - 1]}`);
 /** The card packs that are sold by card only (not among the invoiced packs, PACKS_USDC): the $20 pack. */
@@ -435,10 +436,11 @@ export const PUBLIC_PLANS: ReadonlyArray<{ plan: Plan | null; name: string; pric
 /**
  * The "Pay by card" section of /pricing (and of a refused form answer): what a card pack is, the form that opens a Whop
  * checkout, and the same from code. Shown only when card checkout is offered (src/billing/whop.ts cardCheckoutOffered).
- * The key field is never filled in: no answer repeats a key.
+ * The form lists `packs`, the packs offered (offeredPacks: a pack whose plan id is empty, the dark $1,000 pack, is never
+ * an option); without them, the core packs. The key field is never filled in: no answer repeats a key.
  */
-export function payByCardHtml(o: { base: string }): string {
-  const options = PACK_IDS.map((p) => `<option value="${p}">${esc(dollars(CARD_PACKS[p].priceCents))}: ${esc(int(CARD_PACKS[p].credits))} credits</option>`).join("");
+export function payByCardHtml(o: { base: string; packs?: readonly PackId[] }): string {
+  const options = (o.packs ?? CORE_PACK_IDS).map((p) => `<option value="${p}">${esc(dollars(CARD_PACKS[p].priceCents))}: ${esc(int(CARD_PACKS[p].credits))} credits</option>`).join("");
   return `<h2 id="pay-by-card">Pay by card</h2>
 <p>Buy a credit pack for the Resolve developer data API by card. Whop processes the payment as the merchant of record. The credits are added to the account of the key you enter once Whop confirms the payment, usually within a minute.</p>
 <ul>
@@ -458,7 +460,9 @@ export function payByCardHtml(o: { base: string }): string {
   -d '{"pack":"50"}'</pre>`;
 }
 
-export function pricingHtml(o: { packs: PaygCredit[] | null; channel: string | null; card?: { base: string } | null }): string {
+export function pricingHtml(o: { packs: PaygCredit[] | null; channel: string | null; card?: { base: string; packs?: readonly PackId[] } | null }): string {
+  const cardPacks = o.card?.packs ?? CORE_PACK_IDS;
+  const cardOnly = CARD_ONLY.filter((k) => cardPacks.includes(k));
   const limits = (p: Plan | null) => {
     if (!p) return `<td class="muted">no follow limit</td><td class="muted">by agreement</td>`;
     const cap = followCap(p);
@@ -487,8 +491,8 @@ export function pricingHtml(o: { packs: PaygCredit[] | null; channel: string | n
 <p class="muted">Monthly plans and venue offers are set up by agreement; the figures above are what the plan includes.</p>
 <h2>Pay-as-you-go packs</h2>
 ${packs}
-${o.card ? payByCardHtml({ base: o.card.base }) + "\n" : ""}<h2>Payment</h2>
-<p>Invoiced in USD; ask us for payment options.${o.card ? ` The ${esc(listed(PACK_IDS.map((k) => dollars(CARD_PACKS[k].priceCents))))} packs can be paid by card (above)${CARD_ONLY.length ? `; the ${esc(listed(CARD_ONLY.map((k) => `${dollars(CARD_PACKS[k].priceCents)} pack (${int(CARD_PACKS[k].credits)} credits)`)))} ${CARD_ONLY.length === 1 ? "is" : "are"} sold by card only` : ""}.` : ""} For the Design Partner offer or the pilot pack, name the markets and a start date and we send an invoice to review before anything is paid.</p>
+${o.card ? payByCardHtml({ base: o.card.base, packs: cardPacks }) + "\n" : ""}<h2>Payment</h2>
+<p>Invoiced in USD; ask us for payment options.${o.card ? ` The ${esc(listed(cardPacks.map((k) => dollars(CARD_PACKS[k].priceCents))))} packs can be paid by card (above)${cardOnly.length ? `; the ${esc(listed(cardOnly.map((k) => `${dollars(CARD_PACKS[k].priceCents)} pack (${int(CARD_PACKS[k].credits)} credits)`)))} ${cardOnly.length === 1 ? "is" : "are"} sold by card only` : ""}.` : ""} For the Design Partner offer or the pilot pack, name the markets and a start date and we send an invoice to review before anything is paid.</p>
 <p><strong>Credits are a non-refundable prepayment for API services.</strong> They cannot be withdrawn, transferred, or exchanged for money or crypto.</p>
 <h2>What we do not claim</h2>
 <ul>
@@ -513,7 +517,7 @@ site.get("/pricing", (c) => cached(c, "/pricing?site=1", async () => {
       if ("tiers" in eff) packs = packQuotes(eff.tiers);
     }
   } catch { packs = null; }
-  return page(c, pricingHtml({ packs, channel: channelUrl(c.env), card: card ? { base: baseUrl(c) } : null }), 200, packs !== null, card ? cardFormCsp(cfg) : SITE_CSP);
+  return page(c, pricingHtml({ packs, channel: channelUrl(c.env), card: card ? { base: baseUrl(c), packs: offeredPacks(cfg) } : null }), 200, packs !== null, card ? cardFormCsp(cfg) : SITE_CSP);
 }));
 
 // ---- GET /docs -----------------------------------------------------------------------------------------------------
@@ -568,7 +572,8 @@ export const DOCS_INLINE_EVIDENCE_EXAMPLE = {
   observed_at: "2026-09-21T10:00:00Z",
 } as const;
 
-export function docsHtml(o: { base: string; channel: string | null; card?: boolean }): string {
+/** /docs; `packs` are the card packs offered (offeredPacks), the core packs when not given: a dark pack is never named. */
+export function docsHtml(o: { base: string; channel: string | null; card?: boolean; packs?: readonly PackId[] }): string {
   const b = esc(o.base);
   const q = QUICKSTART_PRINT;
   const official = esc(JSON.stringify(DOCS_OFFICIAL_MARKET_EXAMPLE, null, 2));
@@ -631,7 +636,7 @@ function verify(rawBody, header, secret, toleranceSeconds = 300) {
 <pre>printf '%s' "$PREIMAGE" | shasum -a 256</pre>
 <p>The output must equal <code>commitment_sha256</code>. The whole record is at <a href="/record">/record</a>.</p>
 <h2 id="pay-by-card">7. Pay by card</h2>
-<p>Resolve is a developer data API, paid for in credits. The ${esc(listed(PACK_IDS.map((k) => `${dollars(CARD_PACKS[k].priceCents)} (${int(CARD_PACKS[k].credits)} credits)`)))} packs can be paid by card through Whop, which processes the payment as the merchant of record. Open a checkout for the account of your key:</p>
+<p>Resolve is a developer data API, paid for in credits. The ${esc(listed((o.packs?.length ? o.packs : CORE_PACK_IDS).map((k) => `${dollars(CARD_PACKS[k].priceCents)} (${int(CARD_PACKS[k].credits)} credits)`)))} packs can be paid by card through Whop, which processes the payment as the merchant of record. Open a checkout for the account of your key:</p>
 <pre>curl -X POST ${b}/v1/billing/checkout \\
   -H "Authorization: Bearer $RESOLVE_KEY" -H 'content-type: application/json' \\
   -d '{"pack":"50"}'</pre>
@@ -643,7 +648,10 @@ ${o.card ? "" : `<p class="note">Card checkout is not open yet: until it is, <co
 
 const baseUrl = (c: Context<{ Bindings: Env; Variables: Vars }>) => (c.env.RESOLVE_PUBLIC_URL?.replace(/\/+$/, "") || new URL(c.req.url).origin);
 
-site.get("/docs", (c) => page(c, docsHtml({ base: baseUrl(c), channel: channelUrl(c.env), card: cardCheckoutOffered(whopConfig(c.env)) })));
+site.get("/docs", (c) => {
+  const cfg = whopConfig(c.env);
+  return page(c, docsHtml({ base: baseUrl(c), channel: channelUrl(c.env), card: cardCheckoutOffered(cfg), packs: offeredPacks(cfg) }));
+});
 
 // ---- GET /terms ----------------------------------------------------------------------------------------------------
 
@@ -861,7 +869,7 @@ site.post("/billing/checkout", async (c) => {
   const channel = channelUrl(c.env);
   const answer = (status: 400 | 401 | 429 | 503, title: string, text: string) => {
     const form = cardCheckoutOffered(cfg);
-    const body = `<h1>${esc(title)}</h1><p>${esc(text)}</p>${form ? payByCardHtml({ base: baseUrl(c) }) : `<p><a href="/pricing">Back to pricing</a></p>`}`;
+    const body = `<h1>${esc(title)}</h1><p>${esc(text)}</p>${form ? payByCardHtml({ base: baseUrl(c), packs: offeredPacks(cfg) }) : `<p><a href="/pricing">Back to pricing</a></p>`}`;
     return page(c, layout({ title: `${title} · Resolve`, path: "/billing/checkout", description: title, channel, body }), status, false, form ? cardFormCsp(cfg) : SITE_CSP);
   };
   const refused = await checkoutRefusal(c.env, cfg, "POST /billing/checkout");
@@ -872,7 +880,10 @@ site.post("/billing/checkout", async (c) => {
   if (text.length > CHECKOUT_FORM_MAX) return answer(400, "Request too large", "The request body is too large.");
   const f = new URLSearchParams(text);
   const pack = f.get("pack");
-  if (!isPackId(pack)) return answer(400, "Please choose a pack", `Choose one of the packs: ${listed(PACK_IDS.map((k) => dollars(CARD_PACKS[k].priceCents)), "or")}.`);
+  if (!isPackId(pack)) return answer(400, "Please choose a pack", `Choose one of the packs: ${listed(offeredPacks(cfg).map((k) => dollars(CARD_PACKS[k].priceCents)), "or")}.`);
+  // a pack that is not offered (the dark $1,000 pack while its plan id is empty) is refused before the key is read
+  const notOffered = await packRefusal(c.env, cfg, pack, "POST /billing/checkout");
+  if (notOffered) return answer(notOffered.status, notOffered.status === 400 ? "Pack not offered" : "Card checkout unavailable", notOffered.message);
   const a = await authenticateKey(c, f.get("key")?.trim() || null);
   if (!a.ok) {
     // The refusal's own message (auth.ts): it names the problem, never the key.

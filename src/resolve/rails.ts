@@ -89,6 +89,13 @@ const rails = {
    * any request that claims to be from Whop is believed, so anyone could grant credits with a forged payment).
    */
   whop_signature: true,
+  /**
+   * A card pack is listed (the /pricing form, the 402 and credits.low top_up) and opens a checkout only while its Whop
+   * plan id is set, well-formed and its own (src/billing/whop.ts offeredPacks, packOffer). Off: every pack in CARD_PACKS
+   * is offered whatever its plan id, so the dark $1,000 pack, whose plan does not exist yet, would be sold to a buyer
+   * whose checkout can only fail.
+   */
+  card_pack_plan_set: true,
   // Priced reveal rails (src/shadow/reveal.ts). Off = the failure each one exists for; evals/reveal.ts proves both.
   /**
    * A RESOLVED verdict reaches a free or pay-as-you-go follower only through charge_reveals()'s answer, one ledger charge

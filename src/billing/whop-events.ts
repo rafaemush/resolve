@@ -13,6 +13,8 @@
  *   - a payment on a plan that is no pack while a plan variable is unset answers 503 (Whop retries once it is set) only
  *     when it names a Resolve tenant in its metadata, i.e. came from a checkout Resolve opened; a test event from the
  *     Whop dashboard or a sale of another product is answered 200, so the webhook is never failed into being disabled.
+ *     The dark $1,000 pack's empty plan id is not "unset" (that pack is simply not offered): a payment on a plan no pack
+ *     holds while only it is empty is answered 200, grants nothing and is alerted with the call that credits it by hand.
  *   - a refund (status succeeded) or a formal dispute that holds or took the money (DISPUTE_REVERSES):
  *     grant_credits(tenant, -n, note, "whop-refund|whop-dispute:<payment id>:<id>"), n its share of what the payment
  *     granted less what earlier reversals of the payment took, and at most the balance: a shortfall is alerted, never
@@ -110,9 +112,14 @@ async function onPayment(env: Env, cfg: WhopConfig, ev: WhopEnvelope, now: numbe
     const fromResolve = p.metadata?.[TENANT_METADATA_KEY] !== undefined;
     if (d.configIncomplete && fromResolve) return configMissing(env, cfg.planMissing, `Whop payment ${p.id} (plan ${p.plan_id ?? "none"}, from a checkout Resolve opened)`);
     const packs = Object.entries(cfg.planOf).map(([k, v]) => `$${k}: ${v}`).join(", ") || "none set";
+    // A dark pack (its plan id empty: not offered, src/billing/whop.ts) is never "missing", so its payment lands here.
+    const dark = cfg.dark.length ? `; not offered, plan id empty: ${cfg.dark.join(", ")}` : "";
+    const byHand = `grant_credits('<tenant id>', <credits>, 'Whop ${p.id} matched by hand: <why>', '${grantRequestIdFor(p.id)}')`;
     const text = d.configIncomplete
-      ? `Whop payment ${p.id} is on plan ${p.plan_id ?? "none"}, which is not a configured Resolve credit pack (${packs}; unset or invalid: ${cfg.planMissing.join(", ")}), and it names no Resolve tenant, so it is not a checkout Resolve opened: no credits were granted. Nothing to do for a test event from the Whop dashboard or another product. A pack bought through a plain Whop link is credited by hand once its tenant is known: grant_credits('<tenant id>', <credits>, 'Whop ${p.id} matched by hand: <why>', '${grantRequestIdFor(p.id)}').`
-      : `Whop payment ${p.id} is on plan ${p.plan_id ?? "none"}, which is not a Resolve credit pack (${packs}): no credits were granted. Nothing to do when it is another product.`;
+      ? `Whop payment ${p.id} is on plan ${p.plan_id ?? "none"}, which is not a configured Resolve credit pack (${packs}; unset or invalid: ${cfg.planMissing.join(", ")}${dark}), and it names no Resolve tenant, so it is not a checkout Resolve opened: no credits were granted. Nothing to do for a test event from the Whop dashboard or another product. A pack bought through a plain Whop link is credited by hand once its tenant is known: ${byHand}.`
+      : fromResolve
+        ? `Whop payment ${p.id} is on plan ${p.plan_id ?? "none"}, which is not a Resolve credit pack (${packs}${dark}), but its metadata names a Resolve tenant (a checkout Resolve opened): no credits were granted. Resolve opens checkouts only for the plans above, so check in Whop whether a pack's plan id was changed or emptied after this checkout opened; if the buyer paid for a pack, credit it by hand under the automatic grant's request_id: ${byHand}, else refund it in Whop.`
+        : `Whop payment ${p.id} is on plan ${p.plan_id ?? "none"}, which is not a Resolve credit pack (${packs}${dark}): no credits were granted. Nothing to do when it is another product.`;
     await alert(env, `whop_unknown_plan_${p.id}`, text, { dedupMinutes: ONCE, meta: { ...ids, config_incomplete: d.configIncomplete } });
     return { status: 200, result: "ignored_plan", detail: ids };
   }

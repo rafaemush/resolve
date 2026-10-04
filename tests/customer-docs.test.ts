@@ -91,6 +91,20 @@ describe("customer-facing documents", () => {
     expect(t).not.toMatch(/send USDC on Base from that wallet to the address/i);
     expect(t).not.toMatch(/lifetime/i);
   });
+  it("docs/pricing.md: the $1,000 pack can be paid by card once offered, never stated as offered now; the card conditions stay", () => {
+    const t = texts["docs/pricing.md"]!;
+    expect(t).toContain("The $1,000 pack (120,000 credits) can be paid by card once it is offered");
+    expect(t).toMatch(/until then that request answers `400` \(the pack is not offered by card\)/);
+    // the packs card checkout sells today are still the three; the $1,000 pack is never listed among them
+    expect(t).toMatch(/The \$20, \$50 and \$250 packs can be paid by card through Whop/);
+    expect(t).not.toMatch(/\$250 and \$1,000 packs can be paid by card|\$1,000 packs? (is|are) (now )?(offered|sold|available) by card/);
+    expect(t).toContain("| $1,000 | 120,000 | 20 % |");
+    const card = t.slice(t.indexOf("**Pay by card.**"), t.indexOf("**Self-serve USDC deposits"));
+    expect(card).toMatch(/merchant of record/);
+    expect(card).toMatch(/A card refund or chargeback removes the credits that payment bought/);
+    expect(t).toMatch(/non-refundable prepayment for API services/);
+    expect(card).not.toMatch(/lifetime|wallet|\bbet|betting|wager|scrap|\bmarkets?\b/i);
+  });
   it("docs/pricing.md prices the early reveal as the code charges it: 25 per RESOLVED leg, 2,000 per event, the plans that include it, the refund window, the locked answer, payg follows 500, the event follow, the cut-over", () => {
     const t = texts["docs/pricing.md"]!;
     expect(t).toContain(`| ${REVEAL_PRICE_CREDITS} |`);

@@ -4,12 +4,14 @@
  * the routes require a valid key and send Whop the tenant id only (metadata resolve_tenant_id) for the pack's plan;
  * the form answers a 303 to Whop's checkout and its page may post there (form-action); the key never appears in an
  * alert, a log line, a table, the Whop request (URL, headers, body, metadata) or any answer; every answer is no-store;
- * /docs and /terms explain paying by card; no page names the model or its vendor.
+ * /docs and /terms explain paying by card; no page names the model or its vendor; the $1,000 pack is built dark: absent
+ * from the form and refused (400, the key never read, nothing alerted) while WHOP_PLAN_ID_1000 is empty, offered and
+ * checkout-able once it is set, and a malformed value refuses that pack alone (503, alerted by name).
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
 import { fakeDb, type FakeDb, type Row } from "./lib/fake-db";
-import { PLAN_20, PLAN_250, PLAN_50, WHOP_RPCS, WHOP_SECRET } from "./lib/fake-whop";
+import { PLAN_1000, PLAN_20, PLAN_250, PLAN_50, WHOP_RPCS, WHOP_SECRET } from "./lib/fake-whop";
 
 const h = vi.hoisted(() => ({
   db: null as unknown as FakeDb,
@@ -306,7 +308,9 @@ describe("the /pricing form", () => {
     const res = await formCheckout({ key: KEY, pack: "1000" });
     expect(res.status).toBe(400);
     const refused = await res.clone().text();
-    expect(text(refused)).toContain("Choose one of the packs: $20, $50 or $250.");
+    expect(text(refused)).toContain("The $1,000 pack is not offered by card. Choose one of the packs offered: $20, $50 or $250.");
+    expect(h.db.calls).toEqual([]);
+    expect(text(await (await formCheckout({ key: KEY, pack: "5" })).text())).toContain("Choose one of the packs: $20, $50 or $250.");
     expect(res.headers.get("cache-control")).toBe("no-store");
     const json = await app.request("/billing/checkout", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ key: KEY, pack: "50" }) }, on, ctx);
     expect(json.status).toBe(400);
@@ -336,6 +340,75 @@ describe("the /pricing form", () => {
     expect(res.status).toBe(503);
     expect(res.headers.get("location")).toBeNull();
     expect(text(await res.text())).toContain("Nothing was charged");
+  });
+});
+
+describe("the $1,000 pack, built dark (WHOP_PLAN_ID_1000)", () => {
+  const with1000 = { ...on, WHOP_PLAN_ID_1000: PLAN_1000 } as unknown as Env;
+  it("unset (as wrangler.toml ships it): /pricing has no $1,000 option and still sells the other three", async () => {
+    for (const e of [on, { ...on, WHOP_PLAN_ID_1000: "" } as unknown as Env]) {
+      const html = await (await app.request("/pricing", {}, e, ctx)).text();
+      expect(html).toContain('action="/billing/checkout"');
+      expect(html).not.toContain('<option value="1000">');
+      expect(html).toContain('<option value="250">$250: 27,500 credits</option>');
+      expect(text(html)).toContain("The $20, $50 and $250 packs can be paid by card (above)");
+      expect(text(await (await app.request("/docs", {}, e, ctx)).text())).toContain("$20 (2,000 credits), $50 (5,000 credits) and $250 (27,500 credits) packs can be paid by card");
+    }
+    expect(h.alerts).toEqual([]);
+  });
+  it("unset: POST /v1/billing/checkout refuses \"1000\" and 1000 with a 400 that says it is not offered; nothing asked of Whop, nothing alerted", async () => {
+    for (const pack of ["1000", 1000]) {
+      const res = await apiCheckout({ pack });
+      expect(res.status).toBe(400);
+      expect(res.headers.get("cache-control")).toBe("no-store");
+      expect(((await res.json()) as any).error).toEqual({ code: "validation_error", message: "The $1,000 pack is not offered by card. Choose one of the packs offered: $20, $50 or $250." });
+    }
+    const bad = await apiCheckout({ pack: "7" });
+    expect(((await bad.json()) as any).error.message).toBe('pack must be one of "20", "50", "250"');
+    expect(whopCalls).toEqual([]);
+    expect(h.alerts).toEqual([]);
+    // the other packs still open
+    expect((await apiCheckout({ pack: "250" })).status).toBe(200);
+  });
+  it("unset: the form refuses it with the key never read, and shows the form again without it", async () => {
+    const res = await formCheckout({ key: KEY, pack: "1000" });
+    expect(res.status).toBe(400);
+    const html = await res.text();
+    expect(text(html)).toContain("Pack not offered");
+    expect(html).not.toContain('<option value="1000">');
+    expect(h.db.calls).toEqual([]);
+    expect(whopCalls).toEqual([]);
+    await expectKeyNowhere(html);
+  });
+  it("set: listed on /pricing and checkout-able by API and form, on its own plan, for 120,000 credits", async () => {
+    const html = await (await app.request("/pricing", {}, with1000, ctx)).text();
+    expect(html).toContain('<option value="1000">$1,000: 120,000 credits</option>');
+    expect(text(html)).toContain("The $20, $50, $250 and $1,000 packs can be paid by card (above); the $20 pack (2,000 credits) is sold by card only.");
+    expect(text(html)).not.toMatch(/lifetime|wallet|bet\b|betting|scrap/i);
+    whopAnswer = () => new Response(JSON.stringify({ id: "ch_T1000", purchase_url: "https://whop.com/checkout/ch_T1000/", plan: { id: PLAN_1000 } }), { status: 200 });
+    const res = await apiCheckout({ pack: "1000" }, with1000);
+    expect(res.status).toBe(200);
+    const answer = await res.text();
+    expect(JSON.parse(answer).data).toMatchObject({ checkout_url: "https://whop.com/checkout/ch_T1000/", pack: "1000", price: "1000.00", currency: "usd", credits: 120000, merchant_of_record: "Whop" });
+    expect(JSON.parse(String(whopCalls[0]!.init.body))).toEqual({ plan_id: PLAN_1000, mode: "payment", metadata: { resolve_tenant_id: TENANT }, redirect_url: "https://resolve.example.com/billing/done" });
+    expect((await apiCheckout({ pack: 1000 }, with1000)).status).toBe(200);
+    const form = await formCheckout({ key: KEY, pack: "1000" }, with1000);
+    expect(form.status).toBe(303);
+    expect(form.headers.get("location")).toBe("https://whop.com/checkout/ch_T1000/");
+    expect(JSON.parse(String(whopCalls[2]!.init.body)).plan_id).toBe(PLAN_1000);
+    expect(text(await (await app.request("/docs", {}, with1000, ctx)).text())).toContain("$250 (27,500 credits) and $1,000 (120,000 credits) packs can be paid by card");
+    await expectKeyNowhere(answer, form.headers.get("location") ?? "");
+  });
+  it("malformed: that pack alone is refused with 503 and alerted by name; the other packs open and the form omits it", async () => {
+    const bad = { ...on, WHOP_PLAN_ID_1000: "prod_x" } as unknown as Env;
+    const res = await apiCheckout({ pack: "1000" }, bad);
+    expect(res.status).toBe(503);
+    expect(((await res.json()) as any).error.message).toBe("The $1,000 pack cannot be paid by card right now. Nothing was charged.");
+    expect(h.alerts.map((a) => a.key)).toEqual(["whop_config_missing"]);
+    expect(h.alerts[0]!.text).toContain("WHOP_PLAN_ID_1000 (not a plan_ id)");
+    expect(whopCalls).toEqual([]);
+    expect((await apiCheckout({ pack: "50" }, bad)).status).toBe(200);
+    expect(await (await app.request("/pricing", {}, bad, ctx)).text()).not.toContain('<option value="1000">');
   });
 });
 

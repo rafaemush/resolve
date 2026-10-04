@@ -32,6 +32,7 @@ export interface Env {
   WHOP_PLAN_ID_20?: string;           // the Whop plan (plan_...) of the $20 pack: 2,000 credits, card only
   WHOP_PLAN_ID_50?: string;           // the Whop plan (plan_...) of the $50 pack: 5,000 credits
   WHOP_PLAN_ID_250?: string;          // the Whop plan (plan_...) of the $250 pack: 27,500 credits
+  WHOP_PLAN_ID_1000?: string;         // the Whop plan (plan_...) of the $1,000 pack: 120,000 credits; empty = that pack is not offered (built dark)
   WHOP_SANDBOX?: string;              // "1" = Whop's sandbox (sandbox-api.whop.com, sandbox.whop.com); anything else = production
   // only "1" lets GET /v1/payments/address answer the USDC receiving address (src/billing/top-up.ts); anything else, the
   // default, answers 503: no customer surface solicits third-party USDC. The deposit scan reads USDC_RECEIVING_ADDRESS either way.

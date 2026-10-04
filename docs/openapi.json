@@ -2503,7 +2503,7 @@
     },
     "/v1/billing/checkout": {
       "post": {
-        "summary": "Open a card checkout (Whop, the merchant of record) for a credit pack for this key's account: \"20\": $20 for 2,000 credits, \"50\": $50 for 5,000 credits, \"250\": $250 for 27,500 credits. Whop receives this account's id, never the key. The credits are added when Whop confirms the payment (usually within a minute; GET /v1/account shows the balance); a free test key's account moves to pay as you go and its key stops expiring. Credits are a non-refundable prepayment for API services and do not expire while the account is open; a card refund or chargeback removes them. Never cached",
+        "summary": "Open a card checkout (Whop, the merchant of record) for a credit pack for this key's account: \"20\": $20 for 2,000 credits, \"50\": $50 for 5,000 credits, \"250\": $250 for 27,500 credits, \"1000\": $1000 for 120,000 credits (only once offered; until then 400, not offered). Whop receives this account's id, never the key. The credits are added when Whop confirms the payment (usually within a minute; GET /v1/account shows the balance); a free test key's account moves to pay as you go and its key stops expiring. Credits are a non-refundable prepayment for API services and do not expire while the account is open; a card refund or chargeback removes them. Never cached",
         "security": [
           {
             "bearerAuth": []
@@ -2526,7 +2526,8 @@
                     "enum": [
                       "20",
                       "50",
-                      "250"
+                      "250",
+                      "1000"
                     ]
                   }
                 }
@@ -2546,7 +2547,7 @@
             }
           },
           "400": {
-            "description": "validation_error: pack is not one of the packs",
+            "description": "validation_error: pack is not one of the packs, or that pack is not offered by card (the 402 top_up.packs lists the packs offered)",
             "content": {
               "application/json": {
                 "schema": {
@@ -2576,7 +2577,7 @@
             }
           },
           "503": {
-            "description": "UPSTREAM_UNAVAILABLE: card checkout not yet available, not configured, or Whop did not open the checkout; nothing was charged",
+            "description": "UPSTREAM_UNAVAILABLE: card checkout not yet available, not configured (the pack's plan included), or Whop did not open the checkout; nothing was charged",
             "content": {
               "application/json": {
                 "schema": {
@@ -2609,7 +2610,8 @@
                     "enum": [
                       "20",
                       "50",
-                      "250"
+                      "250",
+                      "1000"
                     ]
                   }
                 }
@@ -2622,7 +2624,7 @@
             "description": "Location: the Whop checkout"
           },
           "400": {
-            "description": "the form was not complete",
+            "description": "the form was not complete, or the pack is not offered by card",
             "content": {
               "text/html": {
                 "schema": {

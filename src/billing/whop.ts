@@ -9,8 +9,11 @@
  *     <raw body>" keyed by the literal bytes of WHOP_WEBHOOK_SECRET, compared in constant time, with a timestamp within
  *     5 minutes either way (rail whop_signature; evals/whop.ts proves the rail and evals/mutate.ts switches it off);
  *   - a pack is found by the payment's PLAN ID in a server-side map (WHOP_PLAN_ID_20, WHOP_PLAN_ID_50,
- *     WHOP_PLAN_ID_250), never by the amount or the metadata; the amount paid (the total less any tax added on top) and
- *     the currency must then equal the pack's price exactly, or nothing is granted;
+ *     WHOP_PLAN_ID_250, WHOP_PLAN_ID_1000), never by the amount or the metadata; the amount paid (the total less any tax
+ *     added on top) and the currency must then equal the pack's price exactly, or nothing is granted;
+ *   - a pack is offered (listed, checkout-able) only while its plan id is set, well-formed and its own (rail
+ *     card_pack_plan_set): the $1,000 pack is built dark, its empty plan id means "not offered", never "missing", so it
+ *     neither closes the other packs nor alerts, and a payment on a plan no pack holds grants nothing;
  *   - the tenant comes from the checkout's metadata, which Resolve set when it opened the checkout (resolve_tenant_id:
  *     the tenant id, never the key); nothing else in a payment names a tenant;
  *   - a refund or dispute takes back its share of the credits one payment granted: proportional to the amount when the
@@ -93,15 +96,23 @@ import { redact } from "../ops/redact";
  * The packs sold by card (docs/pricing.md, plan §11, §22.3 #5): price in US cents and the credits it buys. The $20 pack is
  * card only (the invoiced and USDC packs, PACKS_USDC in src/billing/tiers.ts, start at $50), at the base rate of
  * payg_tiers (100 credits a dollar); the others are the plan §11 packs at their tier's rate.
+ *
+ * `optional`: the pack is built dark (plan item 6, 2026-10-05). Its plan id may stay empty: the pack is then not offered,
+ * and the card checkout of the other packs stays open. The three packs without it must all be set before checkout opens.
  */
 export const CARD_PACKS = {
   "20": { priceCents: 2_000, credits: 2_000, planVar: "WHOP_PLAN_ID_20" },
   "50": { priceCents: 5_000, credits: 5_000, planVar: "WHOP_PLAN_ID_50" },
   "250": { priceCents: 25_000, credits: 27_500, planVar: "WHOP_PLAN_ID_250" },
-} as const satisfies Record<string, { priceCents: number; credits: number; planVar: keyof Env }>;
+  "1000": { priceCents: 100_000, credits: 120_000, planVar: "WHOP_PLAN_ID_1000", optional: true },
+} as const satisfies Record<string, { priceCents: number; credits: number; planVar: keyof Env; optional?: true }>;
 export type PackId = keyof typeof CARD_PACKS;
 export const PACK_IDS = Object.keys(CARD_PACKS) as PackId[];
 export const isPackId = (v: unknown): v is PackId => typeof v === "string" && Object.hasOwn(CARD_PACKS, v);
+/** Pure. Whether the pack is built dark: an empty plan id means it is not offered, never that checkout is misconfigured. */
+export const isOptionalPack = (p: PackId): boolean => "optional" in CARD_PACKS[p];
+/** The packs every open card checkout sells (each one's plan id set): what a page lists when it is not told which are offered. */
+export const CORE_PACK_IDS: readonly PackId[] = PACK_IDS.filter((p) => !isOptionalPack(p));
 export const CARD_CURRENCY = "usd";
 /** The dated API version checkouts are created at and the webhook is pinned to ([W4], [W5]). */
 export const WHOP_API_VERSION_DATE = "2026-09-29";
@@ -132,10 +143,17 @@ export interface WhopConfig {
   /** plan id -> pack, for plan ids that are set and well-formed. */
   plans: Map<string, PackId>;
   planOf: Partial<Record<PackId, string>>;
-  /** Names (never values) of what opening a checkout needs and lacks. */
+  /** The packs whose plan id is set, well-formed and their own, in CARD_PACKS order: the only ones that may be offered. */
+  withPlan: PackId[];
+  /** Names (never values) of what opening a checkout needs and lacks: the API key and the core packs' plan ids. */
   checkoutMissing: string[];
-  /** Names of the plan variables unset or invalid: a payment on an unknown plan may be one of those packs. */
+  /**
+   * Names of the plan variables unset or invalid: a payment on an unknown plan may be one of those packs. An optional
+   * pack's plan left EMPTY is not here (it is dark, see `dark`); one set to something malformed or shared is.
+   */
   planMissing: string[];
+  /** Names of the optional packs' plan variables left empty: those packs are deliberately not offered. */
+  dark: string[];
   webhookSecret: string | null;
   apiKey: string | null;
 }
@@ -146,14 +164,18 @@ export function whopConfig(env: Env): WhopConfig {
   const plans = new Map<string, PackId>();
   const planOf: Partial<Record<PackId, string>> = {};
   const planMissing: string[] = [];
+  const coreMissing: string[] = [];
+  const dark: string[] = [];
   const seen = new Map<string, PackId>();
+  const miss = (core: boolean, ...names: string[]) => { planMissing.push(...names); if (core) coreMissing.push(...names); };
   for (const pack of PACK_IDS) {
     const name = CARD_PACKS[pack].planVar;
     const v = (env[name] as string | undefined)?.trim() ?? "";
-    if (!v) { planMissing.push(name); continue; }
-    if (!PLAN_ID.test(v)) { planMissing.push(`${name} (not a plan_ id)`); continue; }
+    if (!v) { if (isOptionalPack(pack)) dark.push(name); else miss(true, name); continue; }
+    if (!PLAN_ID.test(v)) { miss(!isOptionalPack(pack), `${name} (not a plan_ id)`); continue; }
     const other = seen.get(v);
-    if (other) { planMissing.push(`${name} (the same plan as ${CARD_PACKS[other].planVar})`, CARD_PACKS[other].planVar); plans.delete(v); delete planOf[other]; continue; }
+    // Both packs that share a plan are dropped, never guessed; a core pack among them closes the checkout.
+    if (other) { miss(!isOptionalPack(pack) || !isOptionalPack(other), `${name} (the same plan as ${CARD_PACKS[other].planVar})`, CARD_PACKS[other].planVar); plans.delete(v); delete planOf[other]; continue; }
     seen.set(v, pack);
     plans.set(v, pack);
     planOf[pack] = v;
@@ -164,14 +186,49 @@ export function whopConfig(env: Env): WhopConfig {
     checkoutEnabled: env.WHOP_CHECKOUT_ENABLED === "1", sandbox,
     apiBase: sandbox ? "https://sandbox-api.whop.com/api/v1" : "https://api.whop.com/api/v1",
     checkoutOrigin: sandbox ? "https://sandbox.whop.com" : "https://whop.com",
-    plans, planOf, planMissing,
-    checkoutMissing: [...(apiKey ? [] : ["WHOP_API_KEY"]), ...planMissing],
+    plans, planOf, withPlan: PACK_IDS.filter((p) => planOf[p] !== undefined), planMissing, dark,
+    checkoutMissing: [...(apiKey ? [] : ["WHOP_API_KEY"]), ...coreMissing],
     webhookSecret, apiKey,
   };
 }
 
 /** Pure. Card checkout is offered (the /pricing form, the /docs section) only when switched on and fully configured. */
 export const cardCheckoutOffered = (cfg: WhopConfig): boolean => cfg.checkoutEnabled && cfg.checkoutMissing.length === 0;
+
+/**
+ * Pure. The packs a buyer is offered, in price order: none while card checkout is not offered, else each pack whose plan
+ * id is set, well-formed and its own (rail card_pack_plan_set; off: every pack in CARD_PACKS). The /pricing form, the
+ * 402 and credits.low top_up, and both checkout routes read this list and nothing else.
+ */
+export function offeredPacks(cfg: WhopConfig): PackId[] {
+  if (!cardCheckoutOffered(cfg)) return [];
+  return railEnabled("card_pack_plan_set") ? [...cfg.withPlan] : [...PACK_IDS];
+}
+
+/** "$1,000" (whole dollars, thousands grouped): how a pack is named to a buyer. */
+export const packLabel = (p: PackId): string => `$${(CARD_PACKS[p].priceCents / 100).toLocaleString("en-US")}`;
+
+export type PackOffer =
+  | { ok: true }
+  /** The pack is dark (its plan id empty) or not offered: nothing to fix, the buyer picks another pack. */
+  | { ok: false; status: 400; message: string }
+  /** Its plan id is set but malformed or shared: alerted by name (`missing`); nothing was charged. */
+  | { ok: false; status: 503; message: string; missing: string[] };
+
+/**
+ * Pure. Whether a checkout may be opened for `pack`, called once checkoutRefusal has let the checkout through: yes only
+ * when it is among offeredPacks. A dark pack answers 400 "not offered" naming the packs that are; a plan id set but
+ * malformed or shared answers 503 with its name for the alert. Never a checkout for a plan Resolve cannot credit.
+ */
+export function packOffer(cfg: WhopConfig, pack: PackId): PackOffer {
+  const offered = offeredPacks(cfg);
+  if (offered.includes(pack)) return { ok: true };
+  const name = CARD_PACKS[pack].planVar;
+  const missing = cfg.planMissing.filter((m) => m === name || m.startsWith(`${name} `));
+  if (missing.length) return { ok: false, status: 503, missing, message: `The ${packLabel(pack)} pack cannot be paid by card right now. Nothing was charged.` };
+  const list = offered.map(packLabel);
+  return { ok: false, status: 400, message: `The ${packLabel(pack)} pack is not offered by card. Choose one of the packs offered: ${list.length < 2 ? list.join("") : `${list.slice(0, -1).join(", ")} or ${list[list.length - 1]}`}.` };
+}
 
 // ---- the webhook signature ([W1]-[W3]) ------------------------------------------------------------------------------
 
@@ -411,7 +468,7 @@ const CheckoutAnswer = z.object({
  */
 export async function createWhopCheckout(cfg: WhopConfig, o: { pack: PackId; tenantId: string; redirectUrl: string; idempotencyKey: string }): Promise<CheckoutResult> {
   const planId = cfg.planOf[o.pack];
-  if (!cfg.apiKey || !planId) return { ok: false, status: null, detail: `not configured: ${cfg.checkoutMissing.join(", ")}` };
+  if (!cfg.apiKey || !planId) return { ok: false, status: null, detail: `not configured: ${[...(cfg.apiKey ? [] : ["WHOP_API_KEY"]), ...(planId ? [] : [CARD_PACKS[o.pack].planVar])].join(", ")}` };
   const scrub = (s: string) => redact(s.split(cfg.apiKey!).join("[redacted]")).slice(0, 300);
   let res: Response;
   try {

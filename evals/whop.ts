@@ -1,18 +1,26 @@
 /**
- * The Whop webhook signature rail (rail whop_signature, src/billing/whop.ts verifyWhopSignature): authored cases over a
- * fixed secret and a fixed clock, graded by equality on accept or refuse, first on the verifier and then on POST
- * /webhooks/whop itself (an event type the route ignores, so no case needs a database). No network, no credentials.
+ * The card checkout rails, as authored cases graded by equality on accept or refuse. No network, no credentials, no
+ * database.
+ *   - signature (rail whop_signature, src/billing/whop.ts verifyWhopSignature): over a fixed secret and a fixed clock,
+ *     first on the verifier and then on POST /webhooks/whop itself (an event type the route ignores);
+ *   - pack_offer (rail card_pack_plan_set, src/billing/whop.ts offeredPacks and packOffer): whether a pack is offered
+ *     (the list every surface reads, the checkout decision, the 402 top_up, the /pricing form's options) for a fixed
+ *     configuration; "accept" = offered. The dark $1,000 pack with an empty, blank or malformed plan id is refused.
  *   npx tsx evals/whop.ts     run the cases (exit 1 on any failure)
- * Group: signature. evals/mutate.ts switches the rail off and requires the group to go red while the same group with
- * every rail on stays green; the control cases (a genuine signature) are accepted either way.
+ * evals/mutate.ts switches each rail off and requires its group to go red while the same group with every rail on stays
+ * green; the control cases (a genuine signature; a core pack, or the $1,000 pack with its plan set) pass either way.
  */
 import type { Env } from "../src/env";
-import { verifyWhopSignature, whopSignature, WHOP_SIGNATURE_TOLERANCE_S } from "../src/billing/whop";
+import { offeredPacks, packOffer, verifyWhopSignature, whopConfig, whopSignature, WHOP_SIGNATURE_TOLERANCE_S, type PackId } from "../src/billing/whop";
 import { whopWebhook } from "../src/api/billing";
+import { topUp } from "../src/billing/top-up";
+import { payByCardHtml } from "../src/api/site";
 
-export type WhopGroup = "signature";
+export type WhopGroup = "signature" | "pack_offer";
 interface Headers3 { id?: string; timestamp?: string; signature?: string }
-export interface WhopCase { id: string; group: WhopGroup; control: boolean; title: string; via: "verifier" | "route"; secret: string; headers: Headers3; body: string; expect: "accept" | "refuse"; env?: Record<string, string> }
+/** pack_offer: which surface is asked whether `pack` is offered under `env`. */
+interface OfferAsk { surface: "list" | "checkout" | "top_up" | "form"; pack: PackId; env: Record<string, string> }
+export interface WhopCase { id: string; group: WhopGroup; control: boolean; title: string; via: "verifier" | "route" | "offer"; secret: string; headers: Headers3; body: string; expect: "accept" | "refuse"; env?: Record<string, string>; offer?: OfferAsk }
 interface Outcome { id: string; group: WhopGroup; control: boolean; result: "pass" | "grader_fail" | "harness_error"; failures: string[] }
 export interface WhopSummary { cases: number; passed: number; grader_fail: number; harness_error: number; skipped: number; outcomes: Outcome[]; label?: string }
 
@@ -65,12 +73,52 @@ async function authorCases(): Promise<WhopCase[]> {
     c("WH-110", false, "a timestamp with a leading zero (the text signed must be the number checked)", h({ timestamp: `0${T}`, signature: `v1,${await whopSignature(SECRET, MSG, `0${T}`, BODY)}` }), "refuse"),
     c("WH-111", false, "the route refuses a forged payment.succeeded with 401 before reading it", h({ signature: `v1,${"B".repeat(43)}=` }), "refuse", FORGED_PAYMENT, "route"),
     { ...c("WH-112", false, "the route refuses a forged $20-pack payment (plan_PNgCSGmXG38KW, 2,000 credits) with 401 while the $20 plan is configured", h({ signature: `v1,${"C".repeat(43)}=` }), "refuse", PAYMENT_20, "route"), env: { WHOP_PLAN_ID_20: PLAN_20 } },
+    ...offerCases(),
   ];
+}
+
+/** Card checkout switched on with the core packs' plans as wrangler.toml ships them; WHOP_PLAN_ID_1000 as each case sets it. */
+const SHIPPED = { WHOP_CHECKOUT_ENABLED: "1", WHOP_API_KEY: "whop_api_key_eval", WHOP_PLAN_ID_20: PLAN_20, WHOP_PLAN_ID_50: "plan_XsiHbMZVNGoca", WHOP_PLAN_ID_250: "plan_NHZHY3hkYrT2J", WHOP_PLAN_ID_1000: "" };
+const PLAN_1000 = "plan_Pack1000Eval0001";
+
+function offerCases(): WhopCase[] {
+  const o = (id: string, control: boolean, title: string, surface: OfferAsk["surface"], pack: PackId, plan1000: string, expect: WhopCase["expect"]): WhopCase =>
+    ({ id, group: "pack_offer", control, title, via: "offer", secret: "", headers: {}, body: "", expect, offer: { surface, pack, env: { ...SHIPPED, WHOP_PLAN_ID_1000: plan1000 } } });
+  return [
+    // --- controls: a core pack, or the $1,000 pack once its plan is set, is offered with the rail on or off ---------------
+    o("WH-201", true, "the $250 pack is listed while the $1,000 plan id is empty (the dark pack never closes the others)", "list", "250", "", "accept"),
+    o("WH-202", true, "the $50 pack opens a checkout while the $1,000 plan id is empty", "checkout", "50", "", "accept"),
+    o("WH-203", true, "the 402 top_up names the $20 pack while the $1,000 plan id is empty", "top_up", "20", "", "accept"),
+    o("WH-204", true, "the $1,000 pack is listed once its plan id is set", "list", "1000", PLAN_1000, "accept"),
+    o("WH-205", true, "the $1,000 pack opens a checkout once its plan id is set", "checkout", "1000", PLAN_1000, "accept"),
+    o("WH-206", true, "the /pricing form offers the $1,000 pack once its plan id is set", "form", "1000", PLAN_1000, "accept"),
+    // --- refused only with the rail on (red when it is off) --------------------------------------------------------------
+    o("WH-301", false, "an empty WHOP_PLAN_ID_1000 (as wrangler.toml ships it): the $1,000 pack is not listed", "list", "1000", "", "refuse"),
+    o("WH-302", false, "an empty WHOP_PLAN_ID_1000: no checkout is opened for the $1,000 pack", "checkout", "1000", "", "refuse"),
+    o("WH-303", false, "an empty WHOP_PLAN_ID_1000: the 402 top_up does not name the $1,000 pack", "top_up", "1000", "", "refuse"),
+    o("WH-304", false, "an empty WHOP_PLAN_ID_1000: the /pricing form has no $1,000 option", "form", "1000", "", "refuse"),
+    o("WH-305", false, "a blank WHOP_PLAN_ID_1000 (spaces only) is empty: not listed", "list", "1000", "   ", "refuse"),
+    o("WH-306", false, "a malformed WHOP_PLAN_ID_1000 (not a plan_ id): not listed", "list", "1000", "prod_NotAPlan", "refuse"),
+    o("WH-307", false, "a malformed WHOP_PLAN_ID_1000: no checkout is opened for the $1,000 pack", "checkout", "1000", "prod_NotAPlan", "refuse"),
+  ];
+}
+
+/** Whether the asked surface offers the pack under the case's configuration (the routes pass offeredPacks to the form). */
+function offered(a: OfferAsk): boolean {
+  const env = a.env as unknown as Env;
+  const cfg = whopConfig(env);
+  if (a.surface === "list") return offeredPacks(cfg).includes(a.pack);
+  if (a.surface === "checkout") return packOffer(cfg, a.pack).ok;
+  if (a.surface === "top_up") { const t = topUp(env, "https://resolve.example.com"); return t.method === "card" && t.packs.some((p) => p.pack === a.pack); }
+  return payByCardHtml({ base: "https://resolve.example.com", packs: offeredPacks(cfg) }).includes(`<option value="${a.pack}">`);
 }
 
 async function runCase(k: WhopCase): Promise<string[]> {
   let accepted: boolean;
-  if (k.via === "verifier") {
+  if (k.via === "offer") {
+    if (!k.offer) return ["an offer case without its question"];
+    accepted = offered(k.offer);
+  } else if (k.via === "verifier") {
     accepted = (await verifyWhopSignature(k.secret, k.headers, k.body, NOW)).ok;
   } else {
     const env = { WHOP_WEBHOOK_SECRET: k.secret, ...k.env } as unknown as Env;

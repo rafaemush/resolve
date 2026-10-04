@@ -6,12 +6,14 @@
  * unknown plan, a missing or deleted tenant grant nothing and alert; refunds and disputes take back their share once,
  * never more than the payment granted and never below a zero balance (the shortfall is alerted, never thrown); a refund
  * or formal dispute processed before its payment is credited stops the automatic grant; unknown event types are ignored
- * and logged without the body; every answer is no-store; no alert carries the buyer's full email address.
+ * and logged without the body; every answer is no-store; no alert carries the buyer's full email address; the $1,000
+ * pack grants 120,000 credits once for its own plan, and while its plan id is empty (built dark) a payment on that plan
+ * is an unknown plan: 200, nothing granted, alerted with the call that credits it by hand.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
 import { fakeDb, type FakeDb, type Row } from "./lib/fake-db";
-import { PLAN_20, PLAN_250, PLAN_50, WHOP_RPCS, WHOP_SECRET, disputeEvent, envelope, nativeRefundEvent, paymentSucceeded, refundEvent, whopMoney, whopRequest } from "./lib/fake-whop";
+import { PLAN_1000, PLAN_20, PLAN_250, PLAN_50, WHOP_RPCS, WHOP_SECRET, disputeEvent, envelope, nativeRefundEvent, paymentSucceeded, refundEvent, whopMoney, whopRequest } from "./lib/fake-whop";
 
 const h = vi.hoisted(() => ({
   db: null as unknown as FakeDb,
@@ -290,6 +292,54 @@ describe("the $20 pack (plan §22.3 #5): 2,000 credits for its own plan and noth
     expect(ledger()).toEqual([]);
     expect(h.alerts.map((a) => a.key)).toEqual(["whop_config_missing"]);
     expect(h.alerts[0]!.text).toContain("WHOP_PLAN_ID_20");
+  });
+});
+
+describe("the $1,000 pack (built dark): 120,000 credits once for its own plan, nothing while its plan id is empty", () => {
+  const with1000 = { ...env, WHOP_PLAN_ID_1000: PLAN_1000 } as Env;
+  const pay1000 = (tenantId: string | null, data: Record<string, unknown> = {}) => paymentSucceeded(tenantId, { id: "pay_t1000", plan_id: PLAN_1000, total: whopMoney("1000.00"), subtotal: whopMoney("1000.00"), usd_total: whopMoney("1000.00"), ...data });
+
+  it("its plan grants 120,000 once under whop:<payment id>; a replay and a redelivery grant nothing more", async () => {
+    const body = await expectAnswer(await send(pay1000(PAYG), { id: "msg_t1000" }, with1000), 200, "credited");
+    expect(body.data).toMatchObject({ payment_id: "pay_t1000", tenant_id: PAYG, credits: 120000, balance: 120100 });
+    expect(ledger()).toEqual([expect.objectContaining({ tenant_id: PAYG, delta: 120000, reason: "grant", request_id: "whop:pay_t1000", balance_after: 120100 })]);
+    expect(h.alerts[0]!.text).toContain("Card payment credited (Whop): $1000.00 pack, 120000 credits");
+    expect(h.alerts[0]!.meta).toMatchObject({ pack: "1000", credits: 120000 });
+    await expectAnswer(await send(pay1000(PAYG), { id: "msg_t1000" }, with1000), 200, "already_processed");
+    await expectAnswer(await send(paymentSucceeded(PAYG, { id: "pay_t1000", plan_id: PLAN_1000, total: whopMoney("1000.00") }, "msg_other1000"), {}, with1000), 200, "already_processed");
+    expect(ledger()).toHaveLength(1);
+    expect(tenant(PAYG).credits_balance).toBe(120100);
+  });
+
+  it("a refund of $250 of it takes back its share of the $1,000 price: 30,000 credits", async () => {
+    await expectAnswer(await send(pay1000(PAYG), {}, with1000), 200, "credited");
+    await expectAnswer(await send(refundEvent("refund.created", { id: "ref_t1000", paymentId: "pay_t1000", amount: 250, total: 1000 }), {}, with1000), 200, "reversed");
+    expect(ledger().filter((l) => l.reason === "adjustment").map((l) => l.delta)).toEqual([-30000]);
+  });
+
+  it("$1,000 on its plan for another amount, or $1,000 on another pack's plan: nothing granted", async () => {
+    await expectAnswer(await send(pay1000(FREE, { total: whopMoney("250.00") }), {}, with1000), 200, "amount_mismatch");
+    await expectAnswer(await send(paymentSucceeded(FREE, { id: "pay_x1000", plan_id: PLAN_250, total: whopMoney("1000.00") }), {}, with1000), 200, "amount_mismatch");
+    expect(ledger()).toEqual([]);
+  });
+
+  it("WHOP_PLAN_ID_1000 empty (as shipped): a payment on that plan, even from a checkout Resolve opened, is 200 ignored_plan, never granted, alerted with the hand-credit call", async () => {
+    for (const e of [env, { ...env, WHOP_PLAN_ID_1000: "" } as Env]) {
+      h.alerts = [];
+      await expectAnswer(await send(pay1000(FREE), {}, e), 200, "ignored_plan");
+      expect(ledger()).toEqual([]);
+      expect(h.db.calls.filter((c) => c.table === "rpc:grant_credits")).toEqual([]);
+      expect(h.alerts.map((a) => a.key)).toEqual(["whop_unknown_plan_pay_t1000"]);
+      for (const s of [`plan ${PLAN_1000}`, "not a Resolve credit pack", "names a Resolve tenant", "'whop:pay_t1000'", "refund it in Whop"]) expect(h.alerts[0]!.text).toContain(s);
+      // the dark pack is never reported as a missing configuration (no daily whop_config_missing, no 503 for 3 days)
+      expect(h.alerts[0]!.meta).toMatchObject({ config_incomplete: false });
+    }
+    expect(h.alerts[0]!.text).toContain("not offered, plan id empty: WHOP_PLAN_ID_1000");
+    // a payment that names no tenant (a dashboard test event, another product) is answered the same, nothing to do
+    h.alerts = [];
+    await expectAnswer(await send(pay1000(null), {}, env), 200, "ignored_plan");
+    expect(h.alerts[0]!.text).toContain("Nothing to do when it is another product");
+    expect(tenant(FREE)).toMatchObject({ plan: "free", credits_balance: 300 });
   });
 });
 

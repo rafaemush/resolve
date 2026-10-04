@@ -4,8 +4,9 @@
  *                              that fails the signature or timestamp check answers 401 and nothing is stored. Verified
  *                              events move credits through src/billing/whop-events.ts whether or not checkout is
  *                              switched on, so a test event from the Whop dashboard is answered and recorded.
- *   POST /v1/billing/checkout  authenticated (the v1 key middleware): {pack: "20" | "50" | "250"} opens a Whop checkout
- *                              for the calling tenant and answers its URL. 503 while WHOP_CHECKOUT_ENABLED is not "1".
+ *   POST /v1/billing/checkout  authenticated (the v1 key middleware): {pack: "20" | "50" | "250" | "1000"} opens a Whop
+ *                              checkout for the calling tenant and answers its URL. 503 while WHOP_CHECKOUT_ENABLED is
+ *                              not "1"; 400 "not offered" for a pack whose plan id is empty (the dark $1,000 pack).
  *   POST /billing/checkout     the /pricing form (src/api/site.ts): the same with the key in the form body, answered with
  *                              a 303 to Whop.
  * The key is never logged, echoed, alerted, cached, sent to Whop or put in a URL: Whop receives the tenant id only, and
@@ -17,7 +18,7 @@ import type { Env } from "../env";
 import { ok, err, requestId } from "./envelope";
 import type { AuthContext } from "./auth";
 import { alert } from "../ops/alerts";
-import { CARD_PACKS, CARD_CURRENCY, HANDLED_EVENTS, PACK_IDS, WhopEnvelope, createWhopCheckout, usd, verifyWhopSignature, whopConfig, type CheckoutResult, type PackId, type WhopConfig } from "../billing/whop";
+import { CARD_PACKS, CARD_CURRENCY, HANDLED_EVENTS, PACK_IDS, WhopEnvelope, createWhopCheckout, offeredPacks, packLabel, packOffer, usd, verifyWhopSignature, whopConfig, type CheckoutResult, type PackId, type WhopConfig } from "../billing/whop";
 import { configMissing, handleWhopEvent } from "../billing/whop-events";
 
 type Vars = { requestId: string; schemaVersion: string };
@@ -86,6 +87,18 @@ export async function checkoutRefusal(env: Env, cfg: WhopConfig, route: string):
   return null;
 }
 
+/**
+ * Why a checkout cannot be opened for this pack once checkoutRefusal let the checkout through (src/billing/whop.ts
+ * packOffer), or null: 400 for a pack that is not offered (the dark $1,000 pack while WHOP_PLAN_ID_1000 is empty: nothing
+ * to fix, no alert), 503 for a plan id set but malformed or shared (alerted once a day by name). Nothing is asked of Whop.
+ */
+export async function packRefusal(env: Env, cfg: WhopConfig, pack: PackId, route: string): Promise<{ status: 400 | 503; message: string } | null> {
+  const o = packOffer(cfg, pack);
+  if (o.ok) return null;
+  if (o.status === 503) await configMissing(env, o.missing, `A checkout of the ${packLabel(pack)} pack (${route})`);
+  return { status: o.status, message: o.message };
+}
+
 /** Where Whop sends the buyer after paying: a static page that trusts no query parameter (GET /billing/done). */
 export function doneUrl(env: Env, reqUrl: string): string {
   return `${env.RESOLVE_PUBLIC_URL?.replace(/\/+$/, "") || new URL(reqUrl).origin}/billing/done`;
@@ -106,7 +119,7 @@ export async function startCheckout<E extends { Bindings: Env }>(c: Context<E>, 
   return r;
 }
 
-const CheckoutBody = z.object({ pack: z.union([z.enum(PACK_IDS as [PackId, ...PackId[]]), z.literal(20).transform(() => "20" as const), z.literal(50).transform(() => "50" as const), z.literal(250).transform(() => "250" as const)]) });
+const CheckoutBody = z.object({ pack: z.union([z.enum(PACK_IDS as [PackId, ...PackId[]]), z.literal(20).transform(() => "20" as const), z.literal(50).transform(() => "50" as const), z.literal(250).transform(() => "250" as const), z.literal(1000).transform(() => "1000" as const)]) });
 
 export const billingV1 = new Hono<{ Bindings: Env; Variables: Vars & { auth: AuthContext } }>();
 
@@ -116,8 +129,10 @@ billingV1.post("/checkout", async (c) => {
   const refused = await checkoutRefusal(c.env, cfg, "POST /v1/billing/checkout");
   if (refused) return err(c, "UPSTREAM_UNAVAILABLE", refused.message, refused.status);
   const b = CheckoutBody.safeParse(await c.req.json().catch(() => null));
-  if (!b.success) return err(c, "validation_error", `pack must be one of ${PACK_IDS.map((p) => `"${p}"`).join(", ")}`, 400);
+  if (!b.success) return err(c, "validation_error", `pack must be one of ${offeredPacks(cfg).map((p) => `"${p}"`).join(", ")}`, 400);
   const pack = b.data.pack;
+  const notOffered = await packRefusal(c.env, cfg, pack, "POST /v1/billing/checkout");
+  if (notOffered) return notOffered.status === 400 ? err(c, "validation_error", notOffered.message, 400) : err(c, "UPSTREAM_UNAVAILABLE", notOffered.message, 503);
   const r = await startCheckout(c, cfg, c.get("auth"), pack);
   if (!r.ok) return err(c, "UPSTREAM_UNAVAILABLE", "The checkout could not be opened right now. Nothing was charged; try again in a few minutes.", 503);
   return ok(c, {

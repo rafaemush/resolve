@@ -2,22 +2,25 @@
  * The pure rules of the Whop card checkout (src/billing/whop.ts): the webhook signature as Whop documents it (checked
  * against node:crypto, not against the code's own signer), the configuration (names, never values; a malformed plan id is
  * missing, never guessed), what a payment grants (the pack from the plan id alone; amount, currency, tax, refunds and the
- * tenant checked after), what a refund or dispute takes back, which checkout URL a buyer may be sent to, and the rail's
- * mutation (evals/whop.ts goes red with the rail off while its controls stay green).
+ * tenant checked after), what a refund or dispute takes back, which checkout URL a buyer may be sent to, the $1,000 pack
+ * built dark (an empty plan id: not offered anywhere, never "missing"), and the rails' mutations (evals/whop.ts goes red
+ * with each rail off while its controls stay green).
  */
 import { afterEach, describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import type { Env } from "../src/env";
 import {
-  CARD_PACKS, PACK_IDS, checkoutUrlAllowed, decideGrant, floatCents, grantRequestIdFor, moneyCents, packPriceFor, paidCents, readRefund, reversalCredits,
+  CARD_PACKS, CORE_PACK_IDS, PACK_IDS, checkoutUrlAllowed, decideGrant, floatCents, grantRequestIdFor, moneyCents, offeredPacks, packOffer, packPriceFor, paidCents, readRefund, reversalCredits,
   reversalRequestIdFor, usdCents, verifyWhopSignature, whopConfig, whopSignature, WhopPayment, cardCheckoutOffered,
 } from "../src/billing/whop";
+import { topUp } from "../src/billing/top-up";
+import { docsHtml, payByCardHtml, pricingHtml } from "../src/api/site";
 import { effectiveTiers, packQuotes, paygCredits } from "../src/billing/tiers";
 import { __setRailsForMutationTesting } from "../src/resolve/rails";
 import { runWhopSuite } from "../evals/whop";
 import { MIGRATION_020_CONFIG } from "./lib/fake-money";
-import { PLAN_20, PLAN_250, PLAN_50, WHOP_SECRET, nativeRefundEvent, paymentSucceeded, refundEvent, whopMoney, whopSign } from "./lib/fake-whop";
+import { PLAN_1000, PLAN_20, PLAN_250, PLAN_50, WHOP_SECRET, nativeRefundEvent, paymentSucceeded, refundEvent, whopMoney, whopSign } from "./lib/fake-whop";
 
 const NOW = Date.parse("2026-09-30T12:00:00Z");
 const T = String(NOW / 1000);
@@ -105,16 +108,19 @@ describe("configuration: names, never values; a malformed value is missing", () 
     expect(same.planMissing).toEqual(expect.arrayContaining(["WHOP_PLAN_ID_50", `WHOP_PLAN_ID_250 (the same plan as WHOP_PLAN_ID_50)`]));
     expect(JSON.stringify(whopConfig(env({ WHOP_API_KEY: "" })).checkoutMissing)).not.toContain(WHOP_SECRET);
   });
-  it("three card packs, each at the rate migration 020's USDC tiers credit its price: $20 = 2,000 (card only), $50 = 5,000, $250 = 27,500", () => {
+  it("four card packs, each at the rate migration 020's USDC tiers credit its price: $20 = 2,000 (card only), $50 = 5,000, $250 = 27,500, $1,000 = 120,000 (built dark)", () => {
     const eff = effectiveTiers(MIGRATION_020_CONFIG[0]!.value, 100);
     if (!("tiers" in eff)) throw new Error(eff.error);
     for (const p of PACK_IDS) expect(paygCredits((CARD_PACKS[p].priceCents / 100).toFixed(2), eff.tiers).credits, p).toBe(CARD_PACKS[p].credits);
-    expect(PACK_IDS).toEqual(["20", "50", "250"]);
+    expect(PACK_IDS).toEqual(["20", "50", "250", "1000"]);
+    // the three packs sold since 2026-09-30 are unchanged; only the $1,000 pack is optional
     expect(CARD_PACKS).toEqual({
       "20": { priceCents: 2000, credits: 2000, planVar: "WHOP_PLAN_ID_20" },
       "50": { priceCents: 5000, credits: 5000, planVar: "WHOP_PLAN_ID_50" },
       "250": { priceCents: 25000, credits: 27500, planVar: "WHOP_PLAN_ID_250" },
+      "1000": { priceCents: 100000, credits: 120000, planVar: "WHOP_PLAN_ID_1000", optional: true },
     });
+    expect(CORE_PACK_IDS).toEqual(["20", "50", "250"]);
     // the invoiced and USDC packs are unchanged: $20 is a card pack only
     expect(packQuotes(eff.tiers).map((q) => q.usdc)).toEqual(["50", "250", "1000"]);
   });
@@ -127,9 +133,107 @@ describe("configuration: names, never values; a malformed value is missing", () 
     // absolute links in alerts, payloads and the pinned channel post; the channel link the site shows
     expect(v("RESOLVE_PUBLIC_URL")).toBe("https://resolve.rafaemush.workers.dev");
     expect(v("PUBLIC_CHANNEL_URL")).toBe("https://t.me/resolvefeed");
-    const shipped = whopConfig({ WHOP_PLAN_ID_20: v("WHOP_PLAN_ID_20"), WHOP_PLAN_ID_50: v("WHOP_PLAN_ID_50"), WHOP_PLAN_ID_250: v("WHOP_PLAN_ID_250") } as unknown as Env);
+    const shipped = whopConfig({ WHOP_PLAN_ID_20: v("WHOP_PLAN_ID_20"), WHOP_PLAN_ID_50: v("WHOP_PLAN_ID_50"), WHOP_PLAN_ID_250: v("WHOP_PLAN_ID_250"), WHOP_PLAN_ID_1000: v("WHOP_PLAN_ID_1000") } as unknown as Env);
     expect([...shipped.plans.values()]).toEqual(["20", "50", "250"]);
     expect(shipped.planMissing).toEqual([]);
+    // the $1,000 pack ships dark: its plan id is present and empty until the founder creates the Whop plan
+    expect(v("WHOP_PLAN_ID_1000")).toBe("");
+    expect(shipped.dark).toEqual(["WHOP_PLAN_ID_1000"]);
+    expect(offeredPacks(whopConfig({ ...env(), WHOP_PLAN_ID_1000: v("WHOP_PLAN_ID_1000") } as unknown as Env))).toEqual(["20", "50", "250"]);
+  });
+});
+
+describe("the $1,000 pack, built dark: offered only once its plan id is set", () => {
+  it("unset: not offered, not missing, the other packs stay open, and a checkout of it is a 400 that names the packs offered", () => {
+    for (const e of [env(), env({ WHOP_PLAN_ID_1000: "" }), env({ WHOP_PLAN_ID_1000: "   " })]) {
+      const c = whopConfig(e);
+      expect(c).toMatchObject({ checkoutMissing: [], planMissing: [], dark: ["WHOP_PLAN_ID_1000"], withPlan: ["20", "50", "250"] });
+      expect(cardCheckoutOffered(c)).toBe(true);
+      expect(offeredPacks(c)).toEqual(["20", "50", "250"]);
+      expect(packOffer(c, "1000")).toEqual({ ok: false, status: 400, message: "The $1,000 pack is not offered by card. Choose one of the packs offered: $20, $50 or $250." });
+      for (const p of CORE_PACK_IDS) expect(packOffer(c, p), p).toEqual({ ok: true });
+      const t = topUp(e, "https://resolve.example.com");
+      expect(t.method === "card" && t.packs.map((p) => p.pack)).toEqual(["20", "50", "250"]);
+    }
+  });
+  it("set: offered everywhere, in price order, for 120,000 credits", () => {
+    const e = env({ WHOP_PLAN_ID_1000: PLAN_1000 });
+    const c = whopConfig(e);
+    expect(c).toMatchObject({ checkoutMissing: [], planMissing: [], dark: [] });
+    expect(c.plans.get(PLAN_1000)).toBe("1000");
+    expect(offeredPacks(c)).toEqual(["20", "50", "250", "1000"]);
+    expect(packOffer(c, "1000")).toEqual({ ok: true });
+    const t = topUp(e, "https://resolve.example.com");
+    expect(t.method === "card" && t.packs.at(-1)).toEqual({ pack: "1000", price: "1000.00", currency: "usd", credits: 120000 });
+  });
+  it("malformed: not offered, named for the alert (503 on a checkout of it), while the other packs stay open", () => {
+    const c = whopConfig(env({ WHOP_PLAN_ID_1000: "prod_x" }));
+    expect(c).toMatchObject({ checkoutMissing: [], planMissing: ["WHOP_PLAN_ID_1000 (not a plan_ id)"], dark: [] });
+    expect(offeredPacks(c)).toEqual(["20", "50", "250"]);
+    expect(packOffer(c, "1000")).toMatchObject({ ok: false, status: 503, missing: ["WHOP_PLAN_ID_1000 (not a plan_ id)"] });
+    // a payment on an unknown plan may then be the $1,000 pack: a checkout Resolve opened is retried (src/billing/whop-events.ts)
+    expect(decideGrant(pay({ plan_id: "plan_x" }), c)).toEqual({ result: "unknown_plan", configIncomplete: true });
+  });
+  it("the same plan as a core pack: both dropped, never guessed, and the card checkout closes", () => {
+    const c = whopConfig(env({ WHOP_PLAN_ID_1000: PLAN_250 }));
+    expect(c.planMissing).toEqual(["WHOP_PLAN_ID_1000 (the same plan as WHOP_PLAN_ID_250)", "WHOP_PLAN_ID_250"]);
+    expect(c.checkoutMissing).toEqual(c.planMissing);
+    expect([cardCheckoutOffered(c), offeredPacks(c)]).toEqual([false, []]);
+    expect(c.plans.has(PLAN_250)).toBe(false);
+  });
+  it("the $1,000 plan grants 120,000 credits for exactly $1,000; while unset its payment is an unknown plan that grants nothing", () => {
+    const set = whopConfig(env({ WHOP_PLAN_ID_1000: PLAN_1000 }));
+    expect(decideGrant(pay({ plan_id: PLAN_1000, total: whopMoney("1000.00") }), set)).toEqual({ result: "grant", pack: "1000", credits: 120000, tenantId: TENANT });
+    expect(decideGrant(pay({ plan_id: PLAN_1000, total: whopMoney("250.00") }), set)).toMatchObject({ result: "amount_mismatch", pack: "1000" });
+    // $1,000 on the $250 plan is the $250 pack's price checked, never a $1,000 grant
+    expect(decideGrant(pay({ plan_id: PLAN_250, total: whopMoney("1000.00") }), set)).toMatchObject({ result: "amount_mismatch", pack: "250" });
+    // unset: the dark pack is not "missing", so nothing suggests the plan may be a pack (answered 200 and alerted)
+    expect(decideGrant(pay({ plan_id: PLAN_1000, total: whopMoney("1000.00") }), whopConfig(env()))).toEqual({ result: "unknown_plan", configIncomplete: false });
+    expect(packPriceFor(120000)).toBe(100000);
+    expect(reversalCredits(120000, 25000, packPriceFor(120000))).toEqual({ credits: 30000, proportional: true });
+  });
+});
+
+describe("guard: a pack with an empty plan id is never offered (rail card_pack_plan_set)", () => {
+  const BASE = "https://resolve.example.com";
+  /** Every surface a buyer sees a pack on, for one configuration. */
+  const surfaces = (e: Env) => {
+    const c = whopConfig(e);
+    const t = topUp(e, BASE);
+    return {
+      list: offeredPacks(c),
+      checkout: PACK_IDS.filter((p) => packOffer(c, p).ok),
+      top_up: t.method === "card" ? t.packs.map((p) => p.pack) : [],
+      form: PACK_IDS.filter((p) => payByCardHtml({ base: BASE, packs: offeredPacks(c) }).includes(`<option value="${p}">`)),
+      pricing: PACK_IDS.filter((p) => pricingHtml({ packs: null, channel: null, card: { base: BASE, packs: offeredPacks(c) } }).includes(`<option value="${p}">`)),
+    };
+  };
+  it("for each pack, an empty, blank or absent plan id keeps it off every surface (the core packs then close the checkout)", () => {
+    for (const p of PACK_IDS) {
+      for (const empty of ["", "  ", undefined]) {
+        const e = env({ WHOP_PLAN_ID_1000: PLAN_1000 }) as unknown as Record<string, string | undefined>;
+        e[CARD_PACKS[p].planVar] = empty;
+        for (const [where, packs] of Object.entries(surfaces(e as unknown as Env))) expect(packs, `${p} ${JSON.stringify(empty)} ${where}`).not.toContain(p);
+      }
+    }
+  });
+  it("the pages that name the card packs without a configuration name only the core packs", () => {
+    expect(payByCardHtml({ base: BASE })).not.toContain('value="1000"');
+    expect(pricingHtml({ packs: null, channel: null, card: { base: BASE } })).not.toContain('value="1000"');
+    expect(docsHtml({ base: BASE, channel: null, card: true })).toContain("$20 (2,000 credits), $50 (5,000 credits) and $250 (27,500 credits) packs can be paid by card");
+    expect(docsHtml({ base: BASE, channel: null, card: true, packs: ["20", "50", "250", "1000"] })).toContain("$250 (27,500 credits) and $1,000 (120,000 credits) packs can be paid by card");
+  });
+  it("switched off, the rail is load-bearing: the dark pack reaches every surface and evals/whop.ts pack_offer goes red, its controls green", async () => {
+    const on = await runWhopSuite({ groups: ["pack_offer"], quiet: true });
+    expect(on).toMatchObject({ grader_fail: 0, harness_error: 0 });
+    expect(on.cases).toBeGreaterThanOrEqual(10);
+    __setRailsForMutationTesting(["card_pack_plan_set"]);
+    const leaked = surfaces(env());
+    for (const where of ["list", "checkout", "top_up", "form", "pricing"] as const) expect(leaked[where], where).toContain("1000");
+    const off = await runWhopSuite({ groups: ["pack_offer"], quiet: true });
+    expect(off.harness_error).toBe(0);
+    expect(off.grader_fail).toBeGreaterThanOrEqual(7);
+    expect(off.outcomes.filter((o) => o.control).every((o) => o.result === "pass")).toBe(true);
   });
 });
 

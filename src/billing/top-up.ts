@@ -2,11 +2,12 @@
  * Where a tenant is told to top up (plan §22.3 #1): the 402 of POST /v1/resolve, the credits.low event, the operator's
  * credits.low alert and the refusal of GET /v1/payments/address. While card checkout is offered (switched on and
  * configured, src/billing/whop.ts cardCheckoutOffered) the pointer is the card rail: POST /v1/billing/checkout and the
- * /pricing form; otherwise it says to contact support. It never names the USDC receiving address: no third-party USDC
- * is solicited, and GET /v1/payments/address answers only while USDC_DEPOSITS_OFFERED is exactly "1". Pure.
+ * /pricing form, with the packs offered (offeredPacks: never a dark pack); otherwise it says to contact support. It
+ * never names the USDC receiving address: no third-party USDC is solicited, and GET /v1/payments/address answers only
+ * while USDC_DEPOSITS_OFFERED is exactly "1". Pure.
  */
 import type { Env } from "../env";
-import { CARD_CURRENCY, CARD_PACKS, PACK_IDS, cardCheckoutOffered, whopConfig, type PackId } from "./whop";
+import { CARD_CURRENCY, CARD_PACKS, cardCheckoutOffered, offeredPacks, whopConfig, type PackId } from "./whop";
 
 /** The card form on the pricing page (src/api/site.ts payByCardHtml). */
 export const PAY_BY_CARD_PATH = "/pricing#pay-by-card";
@@ -34,10 +35,12 @@ export function publicBase(env: Pick<Env, "RESOLVE_PUBLIC_URL">, reqUrl?: string
 /** The pointer for this Worker's configuration: the card rail while it is offered, else support. */
 export function topUp(env: Env, base: string | null): TopUp {
   const at = (path: string) => `${base ?? ""}${path}`;
-  if (!cardCheckoutOffered(whopConfig(env))) return { method: "contact_support", page: at(CONTACT_PATH) };
+  const cfg = whopConfig(env);
+  if (!cardCheckoutOffered(cfg)) return { method: "contact_support", page: at(CONTACT_PATH) };
+  // the packs offered: a dark pack (its plan id empty, src/billing/whop.ts offeredPacks) is never named here
   return {
     method: "card", checkout: CHECKOUT_ROUTE, page: at(PAY_BY_CARD_PATH),
-    packs: PACK_IDS.map((pack) => ({ pack, price: (CARD_PACKS[pack].priceCents / 100).toFixed(2), currency: CARD_CURRENCY, credits: CARD_PACKS[pack].credits })),
+    packs: offeredPacks(cfg).map((pack) => ({ pack, price: (CARD_PACKS[pack].priceCents / 100).toFixed(2), currency: CARD_CURRENCY, credits: CARD_PACKS[pack].credits })),
   };
 }
 

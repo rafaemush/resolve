@@ -16,6 +16,8 @@ export const WHOP_SECRET = `ws_${"0123456789abcdef".repeat(4)}`;
 export const PLAN_20 = "plan_PNgCSGmXG38KW";
 export const PLAN_50 = "plan_Pack50xxxxxxxx";
 export const PLAN_250 = "plan_Pack250xxxxxxx";
+/** The $1,000 pack's plan once the founder creates it (wrangler.toml ships WHOP_PLAN_ID_1000 empty: the pack built dark). */
+export const PLAN_1000 = "plan_Pack1000xxxxxx";
 export const WHOP_RPCS: NonNullable<FakeDbOptions["rpc"]> = { grant_credits: grantCredits, rate_limit_hit: rateLimitHit };
 
 export const whopSign = (secret: string, id: string, ts: string, body: string): string => createHmac("sha256", secret).update(`${id}.${ts}.${body}`).digest("base64");

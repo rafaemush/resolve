@@ -82,6 +82,11 @@ WHOP_CHECKOUT_ENABLED = "1"
 WHOP_PLAN_ID_20 = "plan_PNgCSGmXG38KW"
 WHOP_PLAN_ID_50 = "plan_XsiHbMZVNGoca"
 WHOP_PLAN_ID_250 = "plan_NHZHY3hkYrT2J"
+# The $1,000 pack (120,000 credits) is built dark: this stays EMPTY until the founder creates its Whop plan. Empty means
+# the pack is not offered (not in the /pricing form or the 402 top_up, and {"pack":"1000"} answers 400 "not offered"),
+# and, unlike the three plan ids above, it never closes the other packs or alerts. To sell it: create the $1,000 plan in
+# Whop, put its plan_ id here, deploy. A malformed value keeps the pack off and is alerted by name when it is asked for.
+WHOP_PLAN_ID_1000 = ""
 WHOP_SANDBOX = "0"
 # Only "1" lets GET /v1/payments/address answer the USDC receiving address. Anything else answers 503 "USDC deposits are
 # not offered", and no answer (the 402 of POST /v1/resolve, the credits.low event) ever points a tenant to that address:

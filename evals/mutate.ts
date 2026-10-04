@@ -6,7 +6,8 @@
  * (evals/ingest.ts), official_release rails the frozen official cases (evals/official.ts) and the registration rail the
  * frozen registration cases (evals/registration.ts), where `classes` names their groups; each of those groups carries
  * control cases that resolve the same way with the rail on or off. The Whop webhook signature rail runs its authored
- * cases (evals/whop.ts), whose controls are genuine deliveries accepted either way, the priced reveal rails theirs
+ * cases (evals/whop.ts), whose controls are genuine deliveries accepted either way, the card pack rail its pack_offer
+ * group (controls: a core pack, or the $1,000 pack with its plan set, offered either way), and the priced reveal rails theirs
  * (evals/reveal.ts), whose controls (an included plan, a verdict that is not RESOLVED, a grandfathered key) come out the
  * same either way, and the inline commit window its own (evals/inline.ts), whose controls (a first print inside the
  * window, one this capture did not insert) come out the same either way.
@@ -59,6 +60,9 @@ const M: Mutation[] = [
   { name: "14_registration_policy_off", suite: "registration", rails: ["registration_policy"], classes: ["policy"] },
   // POST /webhooks/whop believes any request that claims to come from Whop: a forged payment would grant credits
   { name: "25_whop_signature_off", suite: "whop", rails: ["whop_signature"], classes: ["signature"] },
+  // every card pack is offered whatever its plan id: the dark $1,000 pack (WHOP_PLAN_ID_1000 empty) is listed, put in the
+  // 402 top_up and sent to a checkout that can only fail
+  { name: "29_card_pack_plan_off", suite: "whop", rails: ["card_pack_plan_set"], classes: ["pack_offer"] },
   // a reveal whose charge was refused (a short balance, billing unavailable) goes out with the verdict: an unpaid reveal
   { name: "26_reveal_lock_off", suite: "reveal", rails: ["reveal_lock"], classes: ["lock"] },
   // a RESOLVED verdict reaches a paying follower without charge_reveals: a paid reveal released with no ledger charge
