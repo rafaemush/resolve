@@ -582,16 +582,58 @@ describe("the refund rule: a charged reveal Resolve did not attempt within 10 mi
     expect(refunds()).toHaveLength(2);
   });
 
-  it("never attempted: still pending at the deadline, or dead-lettered without a POST (the endpoint deactivated): refunded; before the deadline: nothing yet", async () => {
+  it("never attempted: still pending at the deadline, or dead-lettered with nothing recorded: refunded; before the deadline: nothing yet", async () => {
     const t0 = Date.now();
     await publishAt(t0, 500);
     // as if the inline attempts never ran (the run went over its budget): no POST, nothing recorded
     for (const d of shadowRows()) if (d.reveal_charge_id) Object.assign(d, { status: "pending", attempt: 0, first_attempt_at: null });
-    of("t_new").status = "dlq"; // deliver.ts dead-letters a delivery to an inactive endpoint without a POST
+    of("t_new").status = "dlq";
     at(t0 + 9 * MIN);
     expect((await refund()).data).toMatchObject({ refunded: 0 });
     at(t0 + 10 * MIN);
     expect((await refund()).data).toMatchObject({ refunded: 2 });
+  });
+
+  it("an endpoint the tenant removed: before the publish no webhook charge is taken (the first read pays); between the queue and the attempt the dlq records first_attempt_at, never refunded", async () => {
+    const t0 = Date.now();
+    // removed before the publish: the queue reads active endpoints only, so t_pay is not charged by the webhook path
+    h.db = pushDb();
+    Object.assign(h.db.tables.webhook_endpoints!.find((e) => e.id === "e_t_pay")!, { active: false, deleted_at: new Date(t0).toISOString() });
+    await publishShadowCommitted(env, MARKET, commitAt(new Date(t0).toISOString()) as never);
+    expect(shadowRows().filter((d) => d.tenant_id === "t_pay")).toEqual([]);
+    expect(h.db.tables.credit_ledger!.filter((l) => l.request_id === revealRequestId("t_pay", M))).toEqual([]);
+    // removed after the queue, before the inline attempt reads the endpoint: the dlq counts as Resolve's attempt on time
+    h.db = pushDb();
+    const from = h.db.client.from;
+    let removed = false;
+    h.db.client.from = ((t: string) => {
+      if (t === "webhook_endpoints" && !removed && h.db.tables.webhook_deliveries!.some((d) => d.tenant_id === "t_pay")) {
+        removed = true;
+        Object.assign(h.db.tables.webhook_endpoints!.find((e) => e.id === "e_t_pay")!, { active: false, deleted_at: new Date(t0).toISOString() });
+      }
+      return from(t);
+    }) as never;
+    await publishShadowCommitted(env, MARKET, commitAt(new Date(t0).toISOString()) as never);
+    h.db.client.from = from;
+    expect([of("t_pay").status, Date.parse(of("t_pay").first_attempt_at)]).toEqual(["dlq", t0]);
+    at(t0 + 11 * MIN);
+    await refund();
+    expect(refunded()).not.toContain(revealRequestId("t_pay", M));
+  });
+
+  it("a delivery still in flight under a live lease at the deadline defers the decision to the next run", async () => {
+    const t0 = Date.now();
+    await publishAt(t0, 500);
+    for (const d of shadowRows()) if (d.reveal_charge_id) Object.assign(d, { status: "pending", attempt: 0, first_attempt_at: null });
+    // a drain claimed t_pay's delivery at the deadline: its POST may be out, first_attempt_at not written yet
+    at(t0 + 10 * MIN);
+    Object.assign(of("t_pay"), { status: "delivering", lease_until: new Date(t0 + 11 * MIN).toISOString() });
+    expect((await refund()).data).toMatchObject({ refunded: 1 }); // t_new only
+    expect(refunded()).toEqual([revealRequestId("t_new", M)]);
+    // the attempt finished after the deadline with nothing written (the outcome write failed) and the lease expired: owed
+    at(t0 + 12 * MIN);
+    expect((await refund()).data).toMatchObject({ refunded: 1 });
+    expect(refunded()).toEqual([revealRequestId("t_new", M), revealRequestId("t_pay", M)].sort());
   });
 
   it("two endpoints: one attempted in time is enough (no refund); neither attempted: one refund for the charge, not one per endpoint", async () => {
@@ -671,7 +713,7 @@ describe("the refund rule: a charged reveal Resolve did not attempt within 10 mi
 });
 
 describe("deliver.ts records the first attempt of a delivery that carries a reveal charge, whatever the endpoint answers", () => {
-  it("written with the first outcome (500 or 200), never by a later attempt, never for a dlq without a POST, never on other deliveries", async () => {
+  it("written with the first outcome (500 or 200), never by a later attempt, at a dlq to an endpoint the tenant removed, never on other deliveries", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date("2026-10-21T12:00:00.000Z"));
     h.db = pushDb();
@@ -684,12 +726,19 @@ describe("deliver.ts records the first attempt of a delivery that carries a reve
     const { deliverOne } = await import("../src/webhooks/deliver");
     await deliverOne(h.db.client as never, { ...of("t_pay") });
     expect(of("t_pay").first_attempt_at).toBe("2026-10-21T12:00:00.000Z");
-    // an inactive endpoint dead-letters without a POST: nothing recorded
+    // an endpoint the tenant removed dead-letters without a POST, and counts as attempted now: only the tenant removes an
+    // endpoint, so a refund here would pay a tenant for deleting its endpoint and then reading the verdict free
+    vi.setSystemTime(new Date("2026-10-21T12:02:00.000Z"));
     const fresh = { ...of("t_pay"), id: "x1", first_attempt_at: null, endpoint_id: "e_t_pay" };
     h.db.tables.webhook_deliveries!.push(fresh);
     h.db.tables.webhook_endpoints!.find((e) => e.id === "e_t_pay")!.active = false;
     await deliverOne(h.db.client as never, { ...fresh });
-    expect(h.db.tables.webhook_deliveries!.find((d) => d.id === "x1")).toMatchObject({ status: "dlq", first_attempt_at: null });
+    expect(h.db.tables.webhook_deliveries!.find((d) => d.id === "x1")).toMatchObject({ status: "dlq", first_attempt_at: "2026-10-21T12:02:00.000Z" });
+    // a delivery that carries no reveal charge records nothing there either way
+    const plain = { ...of("t_pay"), id: "x2", first_attempt_at: undefined, reveal_charge_id: null, endpoint_id: "e_t_pay" };
+    h.db.tables.webhook_deliveries!.push(plain);
+    await deliverOne(h.db.client as never, { ...plain });
+    expect(h.db.tables.webhook_deliveries!.find((d) => d.id === "x2")!.first_attempt_at).toBeUndefined();
   });
 });
 

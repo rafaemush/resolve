@@ -184,8 +184,9 @@ export async function refundCredits(db: FakeDb, a: Record<string, any>): Promise
 /**
  * Stand-in for migration 023's refund_late_reveals(), in the SQL's order: every 'reveal webhook' charge not refunded yet,
  * past its deadline (its deliveries' reveal_due_at, else the charge time + p_late_minutes), none of whose deliveries was
- * attempted (first_attempt_at) or delivered at or before reveal_due_at, and not read by the tenant (reveal_reads),
- * refunded through refundCredits, in (tenant, charge time) order. Returns {refunded, credits, failed}.
+ * attempted (first_attempt_at) or delivered at or before reveal_due_at, none still 'delivering' under a live lease (its
+ * POST may be out already), and not read by the tenant (reveal_reads), refunded through refundCredits, in (tenant,
+ * charge time) order. Returns {refunded, credits, failed}.
  */
 export async function refundLateReveals(db: FakeDb, a: Record<string, any>): Promise<{ data: any; error: any }> {
   const late = a.p_late_minutes ?? 10;
@@ -204,6 +205,7 @@ export async function refundLateReveals(db: FakeDb, a: Record<string, any>): Pro
     const stamped = (at: unknown) => typeof at === "string" && at !== "";
     if (mine.some((d) => (stamped(d.first_attempt_at) && Date.parse(d.first_attempt_at) <= Date.parse(d.reveal_due_at))
       || (d.status === "delivered" && Date.parse(d.delivered_at) <= Date.parse(d.reveal_due_at)))) continue;
+    if (mine.some((d) => d.status === "delivering" && stamped(d.lease_until) && Date.parse(d.lease_until) > now)) continue;
     if (reads.some((r) => r.request_id === c.request_id)) continue;
     const r = await refundCredits(db, { p_request_id: c.request_id });
     if (r.data > 0) { refunded++; credits += r.data; }

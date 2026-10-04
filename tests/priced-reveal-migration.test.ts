@@ -163,6 +163,8 @@ describe("migration 023 (static lint; never applied from here)", () => {
       const q = flat(f);
       expect(q).toContain("and not exists (select 1 from webhook_deliveries d where d.reveal_charge_id = c.request_id and (d.first_attempt_at <= d.reveal_due_at or (d.status = 'delivered' and d.delivered_at <= d.reveal_due_at)))");
       expect(q).toContain("and not exists (select 1 from reveal_reads rr where rr.request_id = c.request_id)");
+      // a delivery in flight under a live lease may have POSTed (first_attempt_at is written with its outcome): decided next run
+      expect(q).toContain("and not exists (select 1 from webhook_deliveries d where d.reveal_charge_id = c.request_id and d.status = 'delivering' and d.lease_until > now())");
       // the receiver's answer (dlq, last_status_code) is never what decides it
       expect(f).not.toMatch(/status = 'dlq'|last_status_code/);
     });

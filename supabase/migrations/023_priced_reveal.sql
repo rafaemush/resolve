@@ -76,7 +76,7 @@ comment on column webhook_deliveries.reveal_charge_id is
 comment on column webhook_deliveries.reveal_due_at is
   'committed_at + REVEAL_LATE_MINUTES (10) of the commit this charged shadow.committed carries: no delivery of it attempted (first_attempt_at) or delivered by then, and no read of it (reveal_reads), and refund_late_reveals() refunds reveal_charge_id. Set exactly when reveal_charge_id is.';
 comment on column webhook_deliveries.first_attempt_at is
-  'When the first POST of a delivery that carries a reveal charge (reveal_charge_id) was sent, written with the outcome of that attempt whatever the endpoint answered (src/webhooks/deliver.ts); null until then, never set for a delivery dead-lettered without a POST (the endpoint inactive) and null on every other delivery. refund_late_reveals() reads it: a reveal attempted by reveal_due_at was put in front of the tenant and is not refunded.';
+  'When the first POST of a delivery that carries a reveal charge (reveal_charge_id) was sent, written with the outcome of that attempt whatever the endpoint answered (src/webhooks/deliver.ts); null until then and on every other delivery. A delivery dead-lettered without a POST because the tenant removed its endpoint (only DELETE /v1/webhooks/:id deactivates one) records it at that moment: the tenant's own removal is not Resolve's lateness. refund_late_reveals() reads it: a reveal attempted by reveal_due_at was put in front of the tenant and is not refunded.';
 create index if not exists idx_webhook_deliveries_claim on webhook_deliveries (priority desc, attempt, next_attempt_at) where status = 'pending';
 comment on index idx_webhook_deliveries_claim is 'claim_webhook_deliveries(): due pending rows, highest priority first, then first attempts before retries, then oldest due first.';
 create index if not exists idx_webhook_deliveries_reveal_charge on webhook_deliveries (reveal_charge_id) where reveal_charge_id is not null;
@@ -291,6 +291,10 @@ begin
        and not exists (select 1 from webhook_deliveries d
                         where d.reveal_charge_id = c.request_id
                           and (d.first_attempt_at <= d.reveal_due_at or (d.status = 'delivered' and d.delivered_at <= d.reveal_due_at)))
+       -- A delivery still in flight under a live lease may have POSTed already: deliver.ts writes first_attempt_at with
+       -- the attempt's outcome, up to its 10 s timeout later. Such a charge is decided by the next run, never refunded now.
+       and not exists (select 1 from webhook_deliveries d
+                        where d.reveal_charge_id = c.request_id and d.status = 'delivering' and d.lease_until > now())
        and not exists (select 1 from reveal_reads rr where rr.request_id = c.request_id)
      order by c.tenant_id, c.created_at
   loop

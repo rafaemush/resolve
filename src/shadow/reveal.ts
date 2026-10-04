@@ -43,7 +43,7 @@ export const REVEAL_LATE_MINUTES = 10;
  * earlier than the deploy of the Worker that charges (a tenant created before that deploy signed up under free reveals);
  * a later value only grandfathers more keys. Pay as you go is never grandfathered.
  */
-export const REVEAL_PRICING_FROM = "2026-10-10T00:00:00.000Z";
+export const REVEAL_PRICING_FROM = "2026-10-06T00:00:00.000Z";
 /** Plans whose reveals are included, as docs/pricing.md publishes them (the pilot and Design Partner accounts are platform). */
 export const REVEAL_INCLUDED_PLANS = ["builder", "growth", "platform"] as const satisfies readonly Plan[];
 

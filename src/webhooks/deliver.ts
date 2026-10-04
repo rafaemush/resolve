@@ -256,7 +256,11 @@ async function attempt(client: Db, d: Row, r: DeliveryResult, state: { settled: 
     state.settled = true;
     r.outcome = "dlq";
     r.dlq = { endpoint: endpointId, tenant: String(d.tenant_id), delivery: id, reason: "endpoint inactive or deleted" };
-    await write(r, `delivery ${id} dlq`, client.from("webhook_deliveries").update({ status: "dlq", attempt: attemptNo, last_error: "endpoint inactive", lease_until: null }).eq("id", id));
+    // Only the tenant removes an endpoint (DELETE /v1/webhooks/:id; nothing here deactivates one), so a reveal that finds
+    // its endpoint gone was attempted on time as far as the refund rule goes: it records first_attempt_at as a POST would,
+    // or a tenant could delete its endpoint after the charge and be refunded for a verdict it can then read free.
+    const removed = d.reveal_charge_id && !d.first_attempt_at ? { first_attempt_at: new Date().toISOString() } : {};
+    await write(r, `delivery ${id} dlq`, client.from("webhook_deliveries").update({ status: "dlq", attempt: attemptNo, last_error: "endpoint inactive", lease_until: null, ...removed }).eq("id", id));
     return;
   }
   // A market.* or shadow.* payload queued before the public names keeps its stored form (stored values never change): it

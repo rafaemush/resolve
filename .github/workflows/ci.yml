@@ -39,6 +39,8 @@ jobs:
         run: pnpm eval:official --check && pnpm eval:official
       - name: frozen registration cases match the authored cases and pass (policy + source checks, stubbed upstreams, no network)
         run: pnpm eval:registration --check && pnpm eval:registration
+      - name: priced early reveal cases pass (the lock and the charge, stand-in RPCs, no network)
+        run: pnpm eval:reveal
       - name: failure-injection suite (replay; a missing Jev fixture is a harness error)
         run: pnpm eval --mode replay
       - name: mutation harness (every deterministic rail must turn the suite red; any green mutation fails the build)
