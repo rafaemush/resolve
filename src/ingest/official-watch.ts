@@ -12,10 +12,20 @@
  *     holder's own number, a "-" cell, or when the holder's part of the page drifted), so the page is fetched once
  *     per release. A Retry-After extends that lease, so every ladder on the page backs off, not one leg.
  * (c) The holder's capture runs in waitUntil whenever the route has an ExecutionContext, and the poll returns at
- *     once (legs resolve from the stored row on their next poll): pg_net waits 30 s at most. Inside the release
- *     minute it is the scheduled burst (plan §18.1): every 3 s for at most 25 s and at most 10 upstream requests,
- *     stopping at the first observation. Without an ExecutionContext the capture runs as bounded awaits: at most
- *     12 s including corroboration outside the release minute (every request's timeout is clamped to that).
+ *     once: pg_net waits 30 s at most. Inside the release minute it is the scheduled burst (plan §18.1): every 3 s for
+ *     at most 25 s and at most 10 upstream requests, stopping at the first observation. A first print the burst
+ *     inserts within INLINE_COMMIT_WINDOW_S (15 s) of release_at commits the holder's own leg in the same invocation
+ *     (holderCapture: runWatch of that watch again, dispatch inline_commit, so the same store, resolve, commitVerdict
+ *     and publishShadowCommitted as every poll) and starts every other open leg of the event at once
+ *     (redispatch_official_legs, migration 024: one signed pg_net POST per leg, each its own invocation), before the
+ *     siblings are recorded; the poll keeps the holder's lease until a second before its next minute poll, so no other
+ *     run of that leg starts beside the inline commit, and commitVerdict's dedup against the market's latest commit
+ *     holds even if one did. A first print recorded later, or outside the release minute, resolves every leg from the
+ *     stored row on its next minute poll, as before (MEASURED 2026-10-02: first print +8 s, commit rows +61 s; the 53 s
+ *     were that wait). "Commit" is the bot_posts row's created_at (/record: release to commit); the Telegram post is
+ *     the channel poster's, a separate and paced step. Without an ExecutionContext (no production route) the capture
+ *     runs as bounded awaits: at most 12 s including corroboration outside the release minute (every request's
+ *     timeout is clamped to that), and nothing commits inline.
  * (d) Not observed by release + 6 h: one UNRESOLVED observation (release_not_observed) per leg plus an alert, then a
  *     poll every 15 minutes until the market text's fallback window ends (the next scheduled release or meeting,
  *     45 days at most), daily for 7 more days, then the watch stops with one alert. Never an older period: the
@@ -25,16 +35,40 @@
  * (e) Change detection projects series|period|first print|corroboration status (src/ingest/projection.ts): later
  *     polls are no_op, and an audited re-check of the corroboration (recheck_official_corroboration) re-resolves.
  *
- * Subrequests per invocation (Workers Free allows 50), worst case = the slot holder in the release minute with no
- * waitUntil: watch load 1 + official_observations read 1 + claim_official_fetch 1 + burst <= 10 upstream (a Fed or
- * ECB attempt is feed + document, and each redirect hop, all counted in the 10) + extend_official_fetch 1 +
- * corroboration 1 + R2 put of the upstream body 1 + record_official_observation 1 + revision/disagreement/prior-level
- * alerts <= 3 x 3 (dedup read, insert, Telegram) = 26, then runWatch stores and resolves: R2 put 1 + evidence insert
- * 1 + check_gates 1 + resolutions insert 1 + evidence update 1 + commit 3 (bot_posts read, Telegram, insert) +
- * watches update 1 + loop_runs insert 1 = 10. Total 36 (no siblings are recorded inline). With waitUntil: the request
- * makes 5 (load, read, claim, watches update, loop_runs) and the capture task <= 23 for its own series plus, for a
- * fetch group, 1 read of the siblings' rows and per missing sibling (3 at most, the CPI group) corroboration 1 +
- * record 1 + one alert 3 (a sibling is either inserted, and alerted on a disagreement, or a revision) = 16: 44.
+ * Subrequests per invocation (Workers Free allows 50, src/ops/budget.ts; an alert is COST.alert = 5: dedup read, insert,
+ * a Telegram DM of up to 3 attempts). The slot holder in the release minute, counted from the route's
+ * claim_watch_dispatch:
+ *   - With waitUntil (every production route): the request makes HOLDER_REQUEST_SUBREQUESTS = 6 (the claim, watch
+ *     load, official_observations read, claim_official_fetch, watches update, loop_runs insert). The capture: burst <= 10
+ *     upstream (a Fed or ECB attempt is feed + document, and each redirect hop, all counted in the 10) + corroboration 1 +
+ *     R2 put of the upstream body 1 + record_official_observation 1 = 13, and at most 2 alerts (an R2 failure; a revision
+ *     or a disagreement) = 10. For a fetch group, the siblings: 1 read of their rows + per missing sibling (3 at most, the
+ *     CPI group) corroboration 1 + record 1 + one alert (a sibling is either inserted, and alerted on a disagreement, or a
+ *     revision) = 1 + 3 x 7.
+ *     Not inline (recorded after the window, another leg's print, or no first print): 6 + 13 + 7 = 26 before alerts, 51
+ *     in the theoretical worst case with every alert at once (R2 down and all four CPI series disagreeing): the last
+ *     sibling's alert would be the subrequest that fails (alert() never throws; the record stands). A capture that is
+ *     pending or drifted while the page states siblings: 6 + 10 + its alert 5 + R2 1 (+5) + the siblings 22, + the
+ *     lease extension 1 = 50 at most.
+ *     Inline: 6 + what the capture spent (Capture.subrequests, counted as it runs) + what inlinePlan reserves before
+ *     anything starts: the redispatch 1 + the inline poll INLINE_RUN_SUBREQUESTS 24 (its commit counted at 10, an inline
+ *     post; a ladder's is 2) + the deferred siblings and their redispatch (siblingSubrequests: 8 for the CPI page, 4 for
+ *     the Employment Situation) + one alert 5, within INVOCATION_SUBREQUESTS or not inline at all; the publish's webhook
+ *     first attempts get what is left (attemptInline fits whole deliveries of 4 into it). A CPI page read on its first
+ *     fetch: 6 + 4 + 38 = 48 reserved, nothing left for a webhook attempt (the drain delivers within 5 minutes, inside the
+ *     refund rule's 10); measured 34 (tests/official-inline-commit.test.ts). A release without siblings: 6 + 4 + 30 = 40,
+ *     two webhook first attempts. Not reserved, as on every watch run: the alerts the inline poll and the siblings raise
+ *     themselves (a prior-level mismatch, an R2 failure, a resolution or a commit not recorded, a sibling's disagreement
+ *     or revision; 5 each). Past 50 the last subrequests fail: the sibling records and their redispatch (those siblings
+ *     are recorded by the next minute's holder, as before 024) or a webhook attempt in flight (requeued by the drain's
+ *     stale sweep). Over the reservation: the siblings as before and one redispatch of every leg, the holder's own
+ *     included: 27 before alerts.
+ *   - Without waitUntil (tests and local runs only): the request runs the capture (17 with the claim, 3 alerts at most:
+ *     an R2 failure, a revision or a disagreement, a prior-level mismatch) and runWatch stores and resolves: R2 put 1 +
+ *     evidence insert 1 (+1 re-read) + check_gates 1 + resolutions insert 1 + evidence update 1 + commit 10 + publish 18
+ *     (queueing 4 + its inline webhook attempt inlineSubrequests(INLINE_MAX) 14, alerts included) + watches update 1 +
+ *     loop_runs insert 1 = 36: 53 before its alerts, over Workers Free's 50 (the webhook attempts would fail, left to the
+ *     drain). No siblings are recorded and nothing commits inline on this path.
  *
  * Election series (src/resolve/election.ts) poll differently: no burst (a count is final hours after polls close, never
  * in the first minute), the fetch lease of a contest is extended to ELECTION_REFETCH_S after every pending or failed
@@ -71,7 +105,10 @@ import {
   type OfficialObservationDoc, type OfficialMissingDoc, type OfficialResolver, type OfficialSeriesId,
 } from "../resolve/official";
 import { ELECTION_SERIES, canonicalSnapshot, isElectionSeries } from "../resolve/election";
+import { railEnabled } from "../resolve/rails";
 import { alert } from "../ops/alerts";
+import { Budget as SubrequestBudget, COST, INVOCATION_SUBREQUESTS } from "../ops/budget";
+import { z } from "zod";
 
 export const BURST_INTERVAL_MS = 3000;
 export const BURST_WINDOW_MS = 25_000;
@@ -135,8 +172,79 @@ async function confirmRead(env: Env, slot: string, period: string, c: ConfirmRea
   return { kind: "wait", detail: `first read of this final count (as of ${c.as_of}${kept ? "; the counts differ from the read kept at " + kept.first_read_at : ""}); it is recorded once a read at or after ${iso(nowMs + EQ_STABLE_MS)} shows the same counts` };
 }
 
-export interface OfficialDeps { now(): number; sleep(ms: number): Promise<void>; waitUntil?: (p: Promise<unknown>) => void }
+/**
+ * The release-minute capture commits the holder's own leg in its own invocation when the first print it recorded was
+ * recorded (official_observations.observed_at, the database's clock) at most this long after release_at (rail
+ * inline_commit_window). Later in the burst, the inline poll and the deferred siblings after it (their corroboration
+ * alone may take 8 s) might not finish inside waitUntil's 30 s after the response, so those legs are left to their next
+ * minute poll, as before.
+ */
+export const INLINE_COMMIT_WINDOW_S = 15;
+/**
+ * The holder's request before its waitUntil task: claim_watch_dispatch (POST /internal/watch/:id), the watch load, the
+ * official_observations read, claim_official_fetch, then runWatch's watches update and loop_runs insert.
+ */
+export const HOLDER_REQUEST_SUBREQUESTS = 6 * COST.db;
+/** One redispatch_official_legs() call (migration 024): every other open leg of the series given, dispatched now. */
+export const REDISPATCH_SUBREQUESTS = COST.db;
+/**
+ * The inline poll of the holder's own leg (runWatch, dispatch inline_commit) without its webhook first attempts: the
+ * watch load 1, the official_observations read 1, R2 put 1, evidence insert 1 (+1 re-read after a duplicate), the
+ * runtime 2 (check_gates, the resolutions insert), the evidence update 1, the commit 10 at most (commit_context, the
+ * bot_posts insert, both again after a dedup collision, and an inline post's lease claim, send 3, receipt and release; a
+ * ladder's legs are batched for the channel poster: 2), the publish's queueing 4 (follows, endpoints, charge_reveals,
+ * insert: COMMITTED_QUEUE_SUBREQUESTS without its alert), the watches update 1 and the loop_runs insert 1 = 24. A tenant
+ * market costs less (a plan read more in the runtime, no commit, its event queued in 2). Its alerts are not in it (see
+ * the header: they are the run's own).
+ */
+export const INLINE_RUN_SUBREQUESTS = 24 * COST.db;
+/** Recording n deferred siblings after the inline commit: the read of their rows, corroboration and record per sibling, and their legs' redispatch. */
+export const siblingSubrequests = (n: number): number => (n > 0 ? COST.db + n * (COST.http + COST.db) + REDISPATCH_SUBREQUESTS : 0);
+/** The longest the inline commit waits for the holder's request to write its own bookkeeping (it is long done by then). */
+export const REQUEST_DONE_WAIT_MS = 5000;
+
+/**
+ * What runWatch hands the official adapter so the slot holder can commit its own leg in the invocation that recorded the
+ * first print: the same runWatch (store, resolve, commitVerdict, publishShadowCommitted), never a copy of it.
+ */
+export interface InlineCommit {
+  /** runWatch of the holder's own watch, dispatch inline_commit, its webhook first attempts held to `webhooks`. */
+  run(webhooks: SubrequestBudget): Promise<{ outcome: string; detail: string; verdict?: string }>;
+  /** Settles once the holder's request has written its watches update and loop_runs row. */
+  requestDone: Promise<void>;
+}
+export interface OfficialDeps { now(): number; sleep(ms: number): Promise<void>; waitUntil?: (p: Promise<unknown>) => void; inline?: InlineCommit }
 const REAL: Pick<OfficialDeps, "now" | "sleep"> = { now: () => Date.now(), sleep: (ms) => new Promise((r) => setTimeout(r, ms)) };
+
+/**
+ * Pure: does this capture commit the holder's own leg in its own invocation? Only a first print this capture inserted
+ * (not one another leg stored first), as this market's own capture, recorded at or after release_at and at most
+ * INLINE_COMMIT_WINDOW_S after it. With the rail inline_commit_window off: any first print the burst inserts.
+ */
+export function inlineCommitDue(c: { inserted: boolean; ownCapture: boolean; observedAt: string }, releaseAtMs: number): boolean {
+  if (!c.inserted || !c.ownCapture) return false;
+  const after = Date.parse(c.observedAt) - releaseAtMs;
+  if (!Number.isFinite(after) || after < 0) return false;
+  return !railEnabled("inline_commit_window") || after <= INLINE_COMMIT_WINDOW_S * 1000;
+}
+
+export type InlinePlan = { fits: true; spent: number; reserved: number; webhooks: number } | { fits: false; spent: number; reserved: number };
+/**
+ * Pure: the inline commit's budget, out of the invocation's INVOCATION_SUBREQUESTS (Workers Free). Spent: the holder's
+ * request and its capture as counted (Capture.subrequests). Reserved before anything starts: the redispatch, the inline
+ * poll (INLINE_RUN_SUBREQUESTS), the deferred siblings and their redispatch, and one alert (the publish's alerts, which
+ * ride in its webhook attempt's alertMany or go out on their own when nothing was queued, or a failed redispatch's). The
+ * publish's webhook first attempts get what is left plus that alert (attemptInline fits as many deliveries as it can,
+ * none below one delivery's worth, and the drain takes the rest within 5 minutes). When the reservation does not fit,
+ * the leg is not committed inline: it is redispatched with the others.
+ */
+export function inlinePlan(captureSubrequests: number, siblings: number): InlinePlan {
+  const b = new SubrequestBudget(INVOCATION_SUBREQUESTS);
+  const spent = HOLDER_REQUEST_SUBREQUESTS + captureSubrequests;
+  const reserved = REDISPATCH_SUBREQUESTS + INLINE_RUN_SUBREQUESTS + siblingSubrequests(siblings) + COST.alert;
+  if (!b.take(spent) || !b.take(reserved)) return { fits: false, spent, reserved };
+  return { fits: true, spent, reserved, webhooks: b.left + COST.alert };
+}
 
 const MIN = 60_000;
 const DAY = 86_400_000;
@@ -227,8 +335,16 @@ async function safeAlert(env: Env, key: string, text: string, dedupMinutes: numb
   catch (e) { console.error(JSON.stringify({ level: "error", job: "official_alert", key, error: String(e).slice(0, 200) })); }
 }
 
+/** Siblings a capture left for its caller to record after the inline commit (mode.deferSiblings): how many, and the call that records them. */
+export interface DeferredSiblings { count: number; record(): Promise<SiblingsRecorded> }
+export interface SiblingsRecorded { notes: string[]; inserted: OfficialSeriesId[] }
+
 export type Capture =
-  | { kind: "recorded"; stored: OfficialObservationDoc; fetched: OfficialObservationDoc; inserted: boolean; revision: boolean; ownCapture: boolean; requests: number; siblings: string[] }
+  /**
+   * subrequests: what the capture spent as counted (upstream requests, corroboration 1, R2 put 1, the record 1, COST.alert
+   * per alert it raised), for the inline commit's budget (inlinePlan). later: the siblings left to the caller.
+   */
+  | { kind: "recorded"; stored: OfficialObservationDoc; fetched: OfficialObservationDoc; inserted: boolean; revision: boolean; ownCapture: boolean; requests: number; siblings: string[]; subrequests: number; later?: DeferredSiblings }
   | { kind: "pending"; detail: string; requests: number; siblings?: string[] }
   | { kind: "error"; error: string; retryable: boolean; drift: boolean; httpStatus?: number; deferSeconds?: number; requests: number; siblings?: string[] };
 
@@ -256,23 +372,26 @@ const corroborate = async (obs: FetchedObservation, period: string, deps: Pick<O
 
 /**
  * The other series of the fetch group that the holder's page states for the period: each one not yet stored gets its
- * own corroboration and first print from the same bytes (already in R2). Never throws; returns one note per sibling.
+ * own corroboration and first print from the same bytes (already in R2). Never throws; returns one note per sibling and
+ * the series whose first print this call inserted.
  */
-async function recordSiblings(env: Env, r: OfficialResolver, marketId: string, siblings: FetchedObservation[], upstream: number, deps: Pick<OfficialDeps, "now">, hardStop: number, extraMeta: Record<string, unknown> = {}): Promise<string[]> {
-  if (!siblings.length) return [];
+async function recordSiblings(env: Env, r: OfficialResolver, marketId: string, siblings: FetchedObservation[], upstream: number, deps: Pick<OfficialDeps, "now">, hardStop: number, extraMeta: Record<string, unknown> = {}): Promise<SiblingsRecorded> {
+  if (!siblings.length) return { notes: [], inserted: [] };
   const { data, error } = await db(env).from("official_observations").select("series").eq("period", r.period).in("series", siblings.map((s) => s.series));
-  if (error) return siblings.map((s) => `${s.series}: not recorded (official_observations read: ${error.message.slice(0, 120)})`);
+  if (error) return { notes: siblings.map((s) => `${s.series}: not recorded (official_observations read: ${error.message.slice(0, 120)})`), inserted: [] };
   const stored = new Set(((data ?? []) as Array<{ series: string }>).map((x) => x.series));
   const todo = siblings.filter((s) => !stored.has(s.series));
   const notes = siblings.filter((s) => stored.has(s.series)).map((s) => `${s.series}: already stored`);
+  const inserted: OfficialSeriesId[] = [];
   const corr = await Promise.all(todo.map((s) => corroborate(s, r.period, deps, hardStop)));
   for (const [i, s] of todo.entries()) {
     try {
       const row = await recordObservation(env, s, r.period, corr[i]!, { upstream_requests: upstream + 1, captured_by_market: marketId, sibling_of: r.series, ...extraMeta });
+      if (row.inserted) inserted.push(s.series);
       notes.push(`${s.series}: ${row.inserted ? "recorded" : "already stored"} ${row.value_text}`);
     } catch (e) { notes.push(`${s.series}: record_official_observation: ${String(e).slice(0, 160)}`); }
   }
-  return notes;
+  return { notes, inserted };
 }
 
 /**
@@ -285,7 +404,7 @@ async function recordPageSiblings(env: Env, r: OfficialResolver, marketId: strin
   const body = siblings[0]!;
   try { await env.RAW.put(`raw/${body.raw_sha256}`, body.raw, { httpMetadata: { contentType: "application/octet-stream" } }); }
   catch (e) { await safeAlert(env, "r2_put_failed", `R2 put raw/${body.raw_sha256} (${r.series} ${r.period} upstream body) failed: ${String(e).slice(0, 200)}`, 60, { series: r.series, period: r.period }); }
-  return [...await recordSiblings(env, r, marketId, siblings, upstream, deps, hardStop), ...(res.siblingNotes ?? [])];
+  return [...(await recordSiblings(env, r, marketId, siblings, upstream, deps, hardStop)).notes, ...(res.siblingNotes ?? [])];
 }
 
 /**
@@ -293,9 +412,11 @@ async function recordPageSiblings(env: Env, r: OfficialResolver, marketId: strin
  * to R2, and record_official_observation (first print wins; a different later value comes back as revision_differs).
  * marketId is recorded as the capturer: for events outside KNOWN_RELEASES only a market's own capture is held to
  * its own release_at (src/resolve/official.ts gate 1). With mode.siblings (a capture in waitUntil) the other series
- * of the fetch group that the same page states are recorded too (recordSiblings).
+ * of the fetch group that the same page states are recorded too (recordSiblings); with mode.deferSiblings as well, a
+ * capture that recorded the holder's own series leaves them to the caller (Capture.later), who records them after its
+ * inline commit. Every other outcome records them here, as without it.
  */
-export async function captureOfficial(env: Env, r: OfficialResolver, marketId: string, mode: { burst: boolean; siblings?: boolean }, deps: Pick<OfficialDeps, "now" | "sleep">): Promise<Capture> {
+export async function captureOfficial(env: Env, r: OfficialResolver, marketId: string, mode: { burst: boolean; siblings?: boolean; deferSiblings?: boolean }, deps: Pick<OfficialDeps, "now" | "sleep">): Promise<Capture> {
   const start = deps.now();
   const hardStop = start + (mode.burst ? BURST_HARD_STOP_MS : SINGLE_HARD_STOP_MS);
   const b = mode.burst ? budget(deps.now, BURST_WINDOW_MS, BURST_MAX_REQUESTS) : budget(deps.now, 0, SINGLE_MAX_REQUESTS, hardStop);
@@ -347,18 +468,122 @@ export async function captureOfficial(env: Env, r: OfficialResolver, marketId: s
     return { kind: "error", error: `${res.error} (${b.used} upstream requests)`, retryable: res.retryable, drift: res.drift, httpStatus: res.httpStatus, deferSeconds: res.deferSeconds, requests: b.used, ...(siblings ? { siblings } : {}) };
   }
   const obs = res.obs;
+  const pageSiblings = res.siblings ?? [];
+  const siblingNotes = res.siblingNotes ?? [];
   const corroboration = await corroborate(obs, r.period, deps, hardStop);
+  let alerts = 0;
   // The upstream body first: a first print names bytes that exist (the evidence rows follow the same rule).
   try { await env.RAW.put(`raw/${obs.raw_sha256}`, obs.raw, { httpMetadata: { contentType: "application/octet-stream" } }); }
-  catch (e) { await safeAlert(env, "r2_put_failed", `R2 put raw/${obs.raw_sha256} (${r.series} ${r.period} upstream body) failed: ${String(e).slice(0, 200)}`, 60, meta); }
+  catch (e) { alerts++; await safeAlert(env, "r2_put_failed", `R2 put raw/${obs.raw_sha256} (${r.series} ${r.period} upstream body) failed: ${String(e).slice(0, 200)}`, 60, meta); }
   let row: StoredRow;
   try { row = await recordObservation(env, obs, r.period, corroboration, { upstream_requests: b.used + 1, captured_by_market: marketId, ...confirmedMeta }); }
   catch (e) { return { kind: "error", error: `record_official_observation: ${String(e).slice(0, 200)}`, retryable: true, drift: false, requests: b.used }; }
+  // recordObservation alerted a revision, or a disagreement on the row it inserted (each one alert)
+  if (row.revision_differs) alerts++;
+  if (row.inserted && corroboration.status === "disagree") alerts++;
+  const subrequests = b.used + COST.http + COST.db + COST.db + alerts * COST.alert;
   const stored = docFromRow(row);
   const fetched = docFromFetch(obs, corroboration);
-  const siblings = mode.siblings ? await recordSiblings(env, r, marketId, res.siblings ?? [], b.used, deps, hardStop, confirmedMeta) : [];
-  if (mode.siblings) siblings.push(...(res.siblingNotes ?? []));
-  return { kind: "recorded", stored, fetched, inserted: row.inserted === true, revision: row.revision_differs === true, ownCapture: row.meta?.captured_by_market === marketId, requests: b.used, siblings };
+  const base = { kind: "recorded" as const, stored, fetched, inserted: row.inserted === true, revision: row.revision_differs === true, ownCapture: row.meta?.captured_by_market === marketId, requests: b.used, subrequests };
+  const recordAll = async (): Promise<SiblingsRecorded> => {
+    const done = await recordSiblings(env, r, marketId, pageSiblings, b.used, deps, hardStop, confirmedMeta);
+    return { notes: [...done.notes, ...siblingNotes], inserted: done.inserted };
+  };
+  if (mode.siblings && mode.deferSiblings) return { ...base, siblings: [], later: { count: pageSiblings.length, record: recordAll } };
+  return { ...base, siblings: mode.siblings ? (await recordAll()).notes : [] };
+}
+
+/** Resolves when p settles or after ms, whichever comes first (a real timer, cleared: the burst's injected sleep is not used). */
+async function settleWithin(p: Promise<unknown>, ms: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try { await Promise.race([p.catch(() => undefined), new Promise<void>((r) => { timer = setTimeout(r, ms); })]); }
+  finally { clearTimeout(timer); }
+}
+
+/** redispatch_official_legs()'s answer (migration 024, jsonb). */
+const RedispatchAnswer = z.object({
+  outcome: z.enum(["dispatched", "skipped", "failure"]),
+  dispatched: z.number().int().nonnegative(),
+  legs: z.number().int().nonnegative().optional(),
+  busy: z.number().int().nonnegative().optional(),
+  reason: z.string().optional(),
+  error: z.string().optional(),
+});
+export interface Redispatched { ok: boolean; dispatched: number; busy: number; detail: string; alerted: boolean }
+
+/**
+ * One redispatch_official_legs() call: every open leg of `series` for the period dispatched now (the holder skipped, or
+ * with holderToo handed over). Never throws. A call that did not dispatch (refused, skipped, failed, an answer of
+ * another shape, the function missing before migration 024) alerts once: those legs resolve on their next minute poll,
+ * and "could not dispatch" never reads as "nothing to dispatch". 1 subrequest, and COST.alert when it alerts.
+ */
+async function redispatchLegs(env: Env, r: OfficialResolver, series: readonly string[], holder: string, holderToo: boolean): Promise<Redispatched> {
+  let why: string;
+  try {
+    const raw = await rpc<unknown>(db(env), "redispatch_official_legs", { p_series: [...series], p_period: r.period, p_holder: holder, p_holder_too: holderToo });
+    const a = RedispatchAnswer.safeParse(raw);
+    if (a.success && a.data.outcome === "dispatched") return { ok: true, dispatched: a.data.dispatched, busy: a.data.busy ?? 0, detail: `${a.data.dispatched} leg(s) dispatched, ${a.data.busy ?? 0} busy`, alerted: false };
+    why = a.success ? `${a.data.outcome}: ${a.data.reason ?? a.data.error ?? "no reason given"}` : `unexpected answer ${JSON.stringify(raw).slice(0, 160)}`;
+  } catch (e) { why = String(e).slice(0, 200); }
+  await safeAlert(env, `official_redispatch_${r.series}_${r.period}`, `${r.series} ${r.period}: the first print is recorded, but the open legs of ${series.join(", ")} could not be dispatched at once (${why}); they resolve on their next minute poll. Check that migration 024 is applied (npx tsx scripts/migrate.ts), app_config worker_base_url and the vault secret internal_hmac_secret (select_due_watches signs with the same), and watch_daily_cap.`, 60, { series: r.series, period: r.period, legs: [...series] });
+  return { ok: false, dispatched: 0, busy: 0, detail: `not dispatched: ${why}`, alerted: true };
+}
+
+/**
+ * The slot holder's waitUntil task. Captures (the burst in the release minute) and, when the first print it inserted
+ * was recorded within INLINE_COMMIT_WINDOW_S of release_at (inlineCommitDue) and the invocation's budget holds the rest
+ * (inlinePlan):
+ *   1. redispatch_official_legs() for the holder's series, holder skipped: every other leg of the event runs within
+ *      seconds, in its own invocation;
+ *   2. once the holder's request has written its own bookkeeping, runWatch of the holder's own watch (InlineCommit.run:
+ *      store, resolve, commitVerdict, publishShadowCommitted, the poll path itself), its webhook first attempts held to
+ *      what the budget leaves;
+ *   3. then the siblings the page states (deferred by captureOfficial), and one redispatch for the series it inserted.
+ * Over budget: the siblings first, then one redispatch of every leg of the holder's series and the inserted siblings,
+ * the holder's own included (it hands its lease over). Outside the window, or with no first print inserted: exactly the
+ * capture as before (siblings recorded, every leg resolves on its next minute poll). Logs one line.
+ */
+async function holderCapture(env: Env, r: OfficialResolver, market: MarketRow, watchId: string, s: OfficialSchedule, burst: boolean, inline: InlineCommit | undefined, deps: OfficialDeps): Promise<void> {
+  const c = await captureOfficial(env, r, market.id, { burst, siblings: true, deferSiblings: inline !== undefined }, deps);
+  const line: Record<string, unknown> = { job: "official_capture", series: r.series, period: r.period, burst, outcome: c.kind, requests: c.requests, detail: c.kind === "recorded" ? c.stored.value_text : c.kind === "pending" ? c.detail : c.error };
+  const log = () => console.log(JSON.stringify(line));
+  if (c.kind !== "recorded" || !c.later || !inline) {
+    if (c.siblings?.length) line.siblings = c.siblings;
+    return log();
+  }
+  const later = c.later;
+  if (!inlineCommitDue({ inserted: c.inserted, ownCapture: c.ownCapture, observedAt: c.stored.observed_at }, s.releaseAtMs)) {
+    const sib = await later.record();
+    if (sib.notes.length) line.siblings = sib.notes;
+    return log();
+  }
+  const plan = inlinePlan(c.subrequests, later.count);
+  line.inline = { after_release_ms: Date.parse(c.stored.observed_at) - s.releaseAtMs, spent: plan.spent, reserved: plan.reserved, fits: plan.fits };
+  if (!plan.fits) {
+    const sib = await later.record();
+    if (sib.notes.length) line.siblings = sib.notes;
+    // the holder's lease is handed over once its request has written it (it is long done by then)
+    await settleWithin(inline.requestDone, REQUEST_DONE_WAIT_MS);
+    line.redispatch = (await redispatchLegs(env, r, [r.series, ...sib.inserted], watchId, true)).detail;
+    return log();
+  }
+  const rd = redispatchLegs(env, r, [r.series], watchId, false);
+  // the request's own watches update and loop_runs row land first (the inline poll's bookkeeping is the last word)
+  await settleWithin(inline.requestDone, REQUEST_DONE_WAIT_MS);
+  const first = await rd;
+  line.redispatch = first.detail;
+  try {
+    const run = await inline.run(new SubrequestBudget(plan.webhooks - (first.alerted ? COST.alert : 0)));
+    line.inline = { ...(line.inline as object), outcome: run.outcome, verdict: run.verdict ?? null, detail: run.detail.slice(0, 300) };
+  } catch (e) {
+    // runWatch records every failure itself; a throw past it is alerted here, and the leg resolves on its next poll
+    line.inline = { ...(line.inline as object), outcome: "threw", detail: String(e).slice(0, 300) };
+    await safeAlert(env, `official_inline_commit_${r.series}_${r.period}`, `${r.series} ${r.period}: the inline commit of market ${market.id} threw (${String(e).slice(0, 200)}); the leg resolves from the stored first print on its next minute poll.`, 60, { series: r.series, period: r.period, market_id: market.id });
+  }
+  const sib = await later.record();
+  if (sib.notes.length) line.siblings = sib.notes;
+  if (sib.inserted.length) line.redispatch_siblings = (await redispatchLegs(env, r, sib.inserted, watchId, false)).detail;
+  return log();
 }
 
 async function observedOutcome(env: Env, r: OfficialResolver, stored: OfficialObservationDoc, fetched: OfficialObservationDoc | null, ownCapture: boolean, nowMs: number, s: OfficialSchedule, note: string): Promise<FetchOutcome> {
@@ -422,13 +647,24 @@ async function pollOfficial(env: Env, watch: WatchRow, market: MarketRow, deps: 
   // an election count is never final in the first minute after polls close: no burst for election contests
   const burst = !missing && !s.election && inReleaseMinute(now, s.releaseAtMs);
   if (deps.waitUntil) {
-    // pg_net stops waiting after 30 s: the capture never runs inside the request when it can run after it.
-    const task = captureOfficial(env, r, market.id, { burst, siblings: true }, deps)
-      .then((c) => console.log(JSON.stringify({ job: "official_capture", series: r.series, period: r.period, burst, outcome: c.kind, requests: c.requests, detail: c.kind === "recorded" ? c.stored.value_text : c.kind === "pending" ? c.detail : c.error, ...(c.siblings?.length ? { siblings: c.siblings } : {}) })))
+    // pg_net stops waiting after 30 s: the capture never runs inside the request when it can run after it. Only the
+    // release-minute burst can commit inline (holderCapture): then the poll keeps this watch's lease until its next
+    // minute poll, so no other run of this leg (a tenant fetch, a redispatch) starts beside the inline commit, and the
+    // lease ends exactly when the leg is due again, so a task that dies holding it delays nothing.
+    const inline = burst ? deps.inline : undefined;
+    const next = s.election ? officialIdleNextPoll(now, s, "awaiting", { holder: true }) : iso(minuteStart(now) + MIN);
+    // a second before the next minute start: pg_cron's select_due_watches() then finds the lease expired (lease_until < now())
+    const leaseUntil = iso(Date.parse(next) - 1000);
+    const task = holderCapture(env, r, market, watch.id, s, burst, inline, deps)
       .catch((e) => safeAlert(env, upstreamAlertKey(r), `${r.series} ${r.period}: the capture threw: ${String(e).slice(0, 200)}`, 60, { series: r.series, period: r.period }));
     deps.waitUntil(task);
     if (missing) return missingOutcome(env, r, now, s, "the capture continues in waitUntil");
-    return { notModified: true, nextPollAt: s.election ? officialIdleNextPoll(now, s, "awaiting", { holder: true }) : iso(minuteStart(now) + MIN), note: `${burst ? "release minute: the capture burst" : "the capture"} continues in waitUntil; every leg resolves from the stored first print on its next poll` };
+    return {
+      notModified: true, nextPollAt: next, ...(inline ? { leaseUntil } : {}),
+      note: burst
+        ? `release minute: the capture burst continues in waitUntil; ${inline ? `a first print recorded within ${INLINE_COMMIT_WINDOW_S} s of release_at commits this leg in this invocation and dispatches the event's other legs at once, else ` : ""}every leg resolves from the stored first print on its next poll`
+        : "the capture continues in waitUntil; every leg resolves from the stored first print on its next poll",
+    };
   }
 
   const c = await captureOfficial(env, r, market.id, { burst }, deps);

@@ -14,7 +14,7 @@ const h = vi.hoisted(() => {
   const state = {
     watch: {} as Row, evidence: [] as Row[], resolutions: [] as Row[], loopRuns: [] as Row[],
     obs: new Map<string, Row>(), slots: new Map<string, number>(), extends: [] as number[], hideObsFromSelect: false, nowMs: undefined as number | undefined, rpcCalls: [] as string[], seq: 0, obsReads: [] as string[],
-    appConfig: new Map<string, string>(),
+    appConfig: new Map<string, string>(), redispatches: [] as Row[],
   };
   const now = () => state.nowMs ?? Date.now();
   class Q implements PromiseLike<{ data: unknown; error: unknown; count?: number }> {
@@ -76,6 +76,10 @@ const h = vi.hoisted(() => {
       const until = Math.max(state.slots.get(k) ?? 0, now() + Number(a.p_seconds) * 1000);
       state.slots.set(k, until);
       return new Date(until).toISOString();
+    }
+    if (fn === "redispatch_official_legs") {
+      state.redispatches.push(a);
+      return { outcome: "dispatched", dispatched: 0, legs: 0, busy: 0 };
     }
     if (fn === "record_official_observation") {
       const existing = state.obs.get(k);
@@ -176,7 +180,7 @@ function clock(startIso: string) {
 }
 
 beforeEach(() => {
-  Object.assign(h.state, { evidence: [], resolutions: [], loopRuns: [], obs: new Map(), slots: new Map(), extends: [], hideObsFromSelect: false, nowMs: undefined, rpcCalls: [], seq: 0, obsReads: [], appConfig: new Map() });
+  Object.assign(h.state, { evidence: [], resolutions: [], loopRuns: [], obs: new Map(), slots: new Map(), extends: [], hideObsFromSelect: false, nowMs: undefined, rpcCalls: [], seq: 0, obsReads: [], appConfig: new Map(), redispatches: [] });
   __resetElectionMemo();
   put = vi.fn(async () => ({}));
   vi.mocked(alert).mockClear();
@@ -547,21 +551,27 @@ describe("runWatch with an official_release source", () => {
     expect(h.state.resolutions[1]!.verdict).toMatchObject({ resolution_status: "RESOLVED", winning_outcome: "OPTION_A" });
   });
 
-  it("in the release minute with an ExecutionContext, the burst runs in waitUntil and the legs resolve from its first print", async () => {
+  it("in the release minute with an ExecutionContext, the burst runs in waitUntil; a first print recorded at +5 s commits the holder's leg in the same invocation", async () => {
     const m = market(cpiGroup("2026-10-14T12:30:00Z"), "3.4%"); // dispatched at 12:30:05, inside the release minute
     setWatch(m);
     serve(cpiRouter(1));
     const pending: Array<Promise<unknown>> = [];
-    const s = await runWatch(env(), cfg, WATCH_ID, { waitUntil: (p) => pending.push(p) });
+    const s = await runWatch(env(), cfg, WATCH_ID, { waitUntil: (p) => pending.push(p), dispatch: "pg_net" });
     expect(s.outcome).toBe("no_op");
     expect(s.detail).toMatch(/waitUntil/);
-    expect(pending).toHaveLength(1);
+    expect(h.state.watch.lease_until).toBe("2026-10-14T12:30:59.000Z"); // kept for the inline commit, ends before the next minute poll
     await Promise.all(pending);
     expect(h.state.obs.get("us_cpi_u_nsa_yoy|2026-09")).toMatchObject({ value_text: "3.4" });
-    expect(h.state.resolutions).toHaveLength(0);
-    const s2 = await runWatch(env(), cfg, WATCH_ID);
-    expect(s2.outcome).toBe("success");
+    // the inline poll (dispatch inline_commit) resolved the leg; the other legs of the event were dispatched at once
+    expect(h.state.resolutions).toHaveLength(1);
     expect(h.state.resolutions[0]!.verdict).toMatchObject({ resolution_status: "RESOLVED", winning_outcome: "OPTION_A" });
+    expect(h.state.loopRuns.map((r) => (r.meta as Row).dispatch ?? null)).toEqual(["pg_net", "inline_commit"]);
+    expect(h.state.redispatches).toEqual([{ p_series: ["us_cpi_u_nsa_yoy"], p_period: "2026-09", p_holder: WATCH_ID, p_holder_too: false }]);
+    expect(h.state.watch.lease_until).toBeNull();
+    // the next poll finds nothing new: one resolution
+    const s2 = await runWatch(env(), cfg, WATCH_ID);
+    expect(s2.outcome).toBe("no_op");
+    expect(h.state.resolutions).toHaveLength(1);
   });
 });
 

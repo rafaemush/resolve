@@ -19,6 +19,7 @@ import { toPublicVerdict } from "../api/public-names";
 import { publishShadowCommitted } from "../shadow/events";
 import { noteCharge } from "../billing/events";
 import { alert } from "../ops/alerts";
+import type { Budget } from "../ops/budget";
 
 export interface WatchRunSummary {
   watch_id: string; outcome: "success" | "no_op" | "failure" | "skipped"; rows_written: number; detail: string; verdict?: string; resolution_id?: string;
@@ -147,10 +148,18 @@ export interface WatchRunOptions {
   waitUntil?: WaitUntil;
   /**
    * Who started the run, recorded in its loop_runs row: the signed pg_net dispatch (lease and single-use signature
-   * checked by POST /internal/watch/:id), an admin manual run (neither checked), or a tenant's /v1/resolve fetch (the
-   * lease taken first by lease_watch_now). The run releases the lease when it records its outcome.
+   * checked by POST /internal/watch/:id; a redispatch of an official release's legs, migration 024, is one too), an admin
+   * manual run (neither checked), a tenant's /v1/resolve fetch (the lease taken first by lease_watch_now), or the inline
+   * commit of an official release's slot holder (src/ingest/official-watch.ts holderCapture: the same watch polled again
+   * in the invocation that recorded its first print, under the lease that invocation's poll kept). The run releases the
+   * lease when it records its outcome.
    */
-  dispatch?: "pg_net" | "admin" | "tenant_fetch";
+  dispatch?: "pg_net" | "admin" | "tenant_fetch" | "inline_commit";
+  /**
+   * The subrequests this run's webhook first attempts may spend (the inline commit's share of its invocation, inlinePlan
+   * in src/ingest/official-watch.ts); without it a publish's inline attempt has its own inlineSubrequests(INLINE_MAX).
+   */
+  webhooks?: Budget;
   /**
    * The site's public origin for the credits.low pointers of a charge this run makes (src/billing/top-up.ts publicBase
    * of the request that started it: RESOLVE_PUBLIC_URL, else that request's origin, which for a pg_net dispatch is
@@ -164,10 +173,15 @@ export async function runWatch(env: Env, cfg: Config, watchId: string, opts: Wat
   const client = db(env);
   const summary: WatchRunSummary = { watch_id: watchId, outcome: "skipped", rows_written: 0, detail: "" };
   let unsaved = false;
+  // Settles when this run's own bookkeeping is written: an inline commit started by this run's poll waits for it.
+  let markDone: () => void = () => {};
+  const requestDone = new Promise<void>((r) => { markDone = r; });
   const finish = async (s: WatchRunSummary, meta: Record<string, unknown> = {}) => {
-    const { error: le } = await client.from("loop_runs").insert({ loop_name: "watch", outcome: s.outcome, rows_written: s.rows_written, duration_ms: Date.now() - started, error: s.outcome === "failure" ? s.detail.slice(0, 500) : null, meta: { watch_id: watchId, ...(opts.dispatch ? { dispatch: opts.dispatch } : {}), ...meta, verdict: s.verdict ?? null, detail: s.detail.slice(0, 200) } });
-    s.recorded = !le && !unsaved;
-    return s;
+    try {
+      const { error: le } = await client.from("loop_runs").insert({ loop_name: "watch", outcome: s.outcome, rows_written: s.rows_written, duration_ms: Date.now() - started, error: s.outcome === "failure" ? s.detail.slice(0, 500) : null, meta: { watch_id: watchId, ...(opts.dispatch ? { dispatch: opts.dispatch } : {}), ...meta, verdict: s.verdict ?? null, detail: s.detail.slice(0, 200) } });
+      s.recorded = !le && !unsaved;
+      return s;
+    } finally { markDone(); }
   };
   const { data: w, error } = await client.from("watches").select("*, markets(*)").eq("id", watchId).single();
   if (error || !w) {
@@ -193,7 +207,17 @@ export async function runWatch(env: Env, cfg: Config, watchId: string, opts: Wat
     case "base_log": out = await fetchBaseLogs(env, watch, resolver); break;
     case "solana_log": out = await fetchSolanaSignatures(env, watch, resolver); break;
     case "web_fetch": out = await fetchWeb(env, watch, cfg.botUa); break;
-    case "official_release": out = await fetchOfficial(env, watch, market, { waitUntil: opts.waitUntil }); break;
+    case "official_release": {
+      // The slot holder may commit this leg in this invocation once its capture records the first print: the same
+      // runWatch, polled again as dispatch inline_commit (which never offers it again). Only a pg_net dispatch or an admin
+      // run: their request's subrequests are the ones the inline budget counts (HOLDER_REQUEST_SUBREQUESTS); a tenant's
+      // /v1/resolve fetch spends its own on authentication first, so it captures as before.
+      const inline = opts.waitUntil && (opts.dispatch === "pg_net" || opts.dispatch === "admin")
+        ? { requestDone, run: (webhooks: Budget) => runWatch(env, cfg, watchId, { waitUntil: opts.waitUntil, base: opts.base, dispatch: "inline_commit", webhooks }) }
+        : undefined;
+      out = await fetchOfficial(env, watch, market, { waitUntil: opts.waitUntil, ...(inline ? { inline } : {}) });
+      break;
+    }
     default: out = { error: `${watch.source_kind} not implemented yet` };
   }
   const nowIso = new Date().toISOString();
@@ -202,7 +226,8 @@ export async function runWatch(env: Env, cfg: Config, watchId: string, opts: Wat
   const meta = { market_id: market.id, source_kind: watch.source_kind, platform: market.platform };
   const alertMeta = { watch_id: watchId, ...meta, external_id: market.external_id };
 
-  const update: Record<string, unknown> = { lease_until: null, last_polled_at: nowIso, coverage, cursor: out.cursor ?? watch.cursor, backlog: out.backlog ?? false };
+  // The lease is released, unless work of this poll continues after it (an official holder's capture, out.leaseUntil).
+  const update: Record<string, unknown> = { lease_until: out.leaseUntil ?? null, last_polled_at: nowIso, coverage, cursor: out.cursor ?? watch.cursor, backlog: out.backlog ?? false };
   if (out.etag !== undefined) update.etag = out.etag;
   if (out.httpStatus !== undefined) update.last_http_status = out.httpStatus;
   const deferred = deferredNextPoll(Date.now(), out.deferSeconds, watch.next_poll_at);
@@ -346,13 +371,13 @@ export async function runWatch(env: Env, cfg: Config, watchId: string, opts: Wat
       // The private early reveal: followers get the committed verdict as soon as the commitment exists (priced since
       // migration 023: locked payloads carry the card pointer at the public origin of the request that started this run).
       if (cm.commit) {
-        const f = await publishShadowCommitted(env, market, cm.commit, { waitUntil: opts.waitUntil, base: opts.base });
+        const f = await publishShadowCommitted(env, market, cm.commit, { waitUntil: opts.waitUntil, base: opts.base, ...(opts.webhooks ? { budget: opts.webhooks } : {}) });
         if (f.rows.length) summary.detail += ` | shadow.committed queued for ${f.rows.length} endpoint(s) of ${f.followers} follower(s)${f.charged > 0 ? `, ${f.charged} credit(s) charged` : ""}${f.locked > 0 ? `, ${f.locked} locked` : ""}`;
       }
     } else if (market.tenant_id) {
       const type = v.resolution_status === "RESOLVED" ? "market.resolved" : v.resolution_status === "ERROR" ? "market.error" : "market.unresolved_update";
       // The tenant's verdict in its public shape (engine_version, web_evidence; src/api/public-names.ts).
-      await publishEvent(env, market.tenant_id, type, { market_id: market.id, external_id: market.external_id, request_id: rt.resolutionId, verdict: toPublicVerdict(v) }, { waitUntil: opts.waitUntil });
+      await publishEvent(env, market.tenant_id, type, { market_id: market.id, external_id: market.external_id, request_id: rt.resolutionId, verdict: toPublicVerdict(v) }, { waitUntil: opts.waitUntil, ...(opts.webhooks ? { budget: opts.webhooks } : {}) });
     }
     // A charge that looked stands (only a could-not-look verdict is refunded): credits.low (its pointers at the public
     // origin of the request that started this run) and the operator's alert once per crossing. noteCharge never throws;

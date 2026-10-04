@@ -12,7 +12,7 @@ import { db } from "../db/supabase";
 import { DISCLAIMER, marketRef, type Agreement, type CommittedFields, type CommittedVerdict, type OfficialRecord, type RecordedCommit } from "../bot/commit";
 import type { MarketRow } from "../ingest/types";
 import { alert, alertMany, type AlertItem } from "../ops/alerts";
-import { COST } from "../ops/budget";
+import { COST, type Budget } from "../ops/budget";
 import { redact } from "../ops/redact";
 import { crossingItems, type Crossing } from "../billing/events";
 import { publicBase, topUp, type TopUp } from "../billing/top-up";
@@ -153,9 +153,11 @@ export interface PublishResult extends QueueResult { charged: number; locked: nu
  * verdict, every other follower a locked payload with reason billing_unavailable, and the operator one alert. A
  * follower without a subscribed endpoint is not charged here: its first read is. Test markets and tenant markets have no
  * followers by construction and are skipped without a read. At most COMMITTED_QUEUE_SUBREQUESTS before the inline
- * attempt. Never throws.
+ * attempt, which runs on opts.budget when given (the inline commit of an official release: what its invocation's
+ * reservation leaves, src/ingest/official-watch.ts inlinePlan; whole deliveries only, the rest left to the drain), else
+ * on its own inlineSubrequests(INLINE_MAX). Never throws.
  */
-export async function publishShadowCommitted(env: Env, market: MarketRow, commit: RecordedCommit, opts: { waitUntil?: WaitUntil; base?: string | null } = {}): Promise<PublishResult> {
+export async function publishShadowCommitted(env: Env, market: MarketRow, commit: RecordedCommit, opts: { waitUntil?: WaitUntil; base?: string | null; budget?: Budget } = {}): Promise<PublishResult> {
   const none: PublishResult = { followers: 0, rows: [], error: null, charged: 0, locked: 0 };
   if (market.is_test === true || market.tenant_id !== null) return none;
   const alerts: AlertItem[] = [];
@@ -201,7 +203,7 @@ export async function publishShadowCommitted(env: Env, market: MarketRow, commit
     out.rows = q.rows;
     // the publish's alerts ride in the inline attempt's one alertMany() (sent on their own when nothing was queued)
     const handed = alerts.splice(0);
-    await deliverInline(env, q.rows, { waitUntil: opts.waitUntil, alerts: handed });
+    await deliverInline(env, q.rows, { waitUntil: opts.waitUntil, alerts: handed, ...(opts.budget ? { budget: opts.budget } : {}) });
     return out;
   } catch (e) {
     const error = redact(String(e)).slice(0, 200);

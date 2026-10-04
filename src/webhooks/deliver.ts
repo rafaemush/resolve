@@ -396,7 +396,7 @@ export async function deliverInline(env: Env, rows: Row[], opts: { waitUntil?: W
  * is awaited in every case: a queued row is the durable part, delivered by the drain whatever happens to the inline
  * attempt. Never throws (a queueing failure is alerted by enqueueEvent).
  */
-export async function publishEvent(env: Env, tenants: string | readonly string[], eventType: WebhookEvent, payload: Record<string, unknown>, opts: { waitUntil?: WaitUntil } = {}): Promise<{ queued: number }> {
+export async function publishEvent(env: Env, tenants: string | readonly string[], eventType: WebhookEvent, payload: Record<string, unknown>, opts: { waitUntil?: WaitUntil; budget?: Budget } = {}): Promise<{ queued: number }> {
   let rows: Row[] = [];
   try { rows = await enqueueEvent(env, tenants, eventType, payload); }
   catch (e) {

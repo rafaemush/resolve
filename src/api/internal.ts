@@ -33,12 +33,13 @@ export const internal = new Hono<{ Bindings: Env; Variables: Vars }>();
 const isAdmin = (c: { req: { header: (n: string) => string | undefined }; env: Env }) => { const k = bearer(c as never); return !!k && safeEqual(k, c.env.ADMIN_API_KEY); };
 
 /**
- * A pg_net dispatch signed for `id` (src/api/dispatch-auth.ts: HMAC over "<id>|<minute>", +-3 min), or the admin bearer
- * for a manual run. null = authorized; otherwise the 403 to answer.
+ * A pg_net dispatch signed for `id` (src/api/dispatch-auth.ts: HMAC over "<id>|<minute>", +-3 min; with opts.seconds a
+ * redispatch's stamp to the second is accepted too, migration 024), or the admin bearer for a manual run. null =
+ * authorized; otherwise the 403 to answer.
  */
-async function dispatchDenied(c: Context<{ Bindings: Env; Variables: Vars }>, id: string): Promise<Response | null> {
+async function dispatchDenied(c: Context<{ Bindings: Env; Variables: Vars }>, id: string, opts: { seconds?: boolean } = {}): Promise<Response | null> {
   if (isAdmin(c)) return null;
-  const v = await verifyDispatchSignature(c.env.INTERNAL_HMAC_SECRET, id, c.req.header("x-internal-signature"), c.req.header("x-internal-minute"));
+  const v = await verifyDispatchSignature(c.env.INTERNAL_HMAC_SECRET, id, c.req.header("x-internal-signature"), c.req.header("x-internal-minute"), Date.now(), opts);
   if (v.ok) return null;
   return err(c, "forbidden", v.reason === "invalid" ? "invalid internal signature" : "bad or stale internal signature", 403);
 }
@@ -55,22 +56,24 @@ const DISPATCH_REFUSAL: Record<Exclude<z.infer<typeof DispatchClaim>, "claimed">
 
 /**
  * pg_net -> one watch poll. The signature is checked by dispatchDenied (HMAC over "<watch_id>|<YYYY-MM-DDTHH:MM>", +-3 min
- * tolerance). A valid signature is then claimed once (claim_watch_dispatch, migration 019): the (watch_id, minute) row
- * is inserted first, before any work, so a replayed or duplicated request is refused (409) and two runs of one dispatch
- * can never both resolve or charge; and the watch must hold the lease select_due_watches() took for it in the signed
- * minute (null = already polled or never leased, past = the request came too late, taken after that minute = a later
- * dispatch or a tenant fetch is the current run); a claim holds the lease for the run. Refusals answer >= 400, so
- * dispatch_failures() (migration 013) counts them and the 10-minute job alerts. An admin bearer runs the poll by hand,
+ * tolerance; a redispatch of an official release's legs, redispatch_official_legs in migration 024, signs a stamp to the
+ * second, "<watch_id>|<YYYY-MM-DDTHH:MM:SS>"). A valid signature is then claimed once (claim_watch_dispatch, migrations
+ * 019/024): the (watch_id, stamp) row is inserted first, before any work, so a replayed or duplicated request is refused
+ * (409) and two runs of one dispatch can never both resolve or charge; and the watch must hold the lease its dispatch
+ * took at the signed time (null = already polled or never leased, past = the request came too late, taken after that =
+ * a later dispatch or a tenant fetch is the current run); a claim holds the lease for the run. Refusals answer >= 400,
+ * so dispatch_failures() (migration 013) counts them and the 10-minute job alerts. An admin bearer runs the poll by hand,
  * bypassing both checks; that run is marked dispatch=admin in its loop_runs row.
- * Subrequests: the claim is one on top of runWatch's worst case (36 for an official_release slot holder without
- * waitUntil; 44 with it, when the holder's capture also records the other series of a BLS fetch group,
- * src/ingest/official-watch.ts): at most 45 of Workers Free's 50.
+ * Subrequests: the claim is one of the invocation's 50 (Workers Free), counted in the official_release slot holder's
+ * worst case (src/ingest/official-watch.ts, "Subrequests per invocation"): with this route's waitUntil, 26 before alerts
+ * (51 in the theoretical worst case of every alert of a CPI capture at once, the last alert being the one that fails),
+ * and an inline commit reserves its share inside INVOCATION_SUBREQUESTS before it starts (inlinePlan) or does not run.
  */
 internal.post("/watch/:id", async (c) => {
   const id = c.req.param("id");
   const admin = isAdmin(c);
   if (!admin) {
-    const denied = await dispatchDenied(c, id);
+    const denied = await dispatchDenied(c, id, { seconds: true });
     if (denied) return denied;
     const minute = c.req.header("x-internal-minute") ?? "";
     // Only select_due_watches() signs, and it signs real watch ids; anything else never reaches the database.

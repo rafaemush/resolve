@@ -23,6 +23,14 @@ const rails = {
   official_release_gate: true,
   /** the stored first print decides; a later (revised) read of the same period never replaces it. */
   first_print_lock: true,
+  /**
+   * the release-minute capture commits the holder's own leg in its own invocation only when it recorded the first print
+   * within INLINE_COMMIT_WINDOW_S of release_at (src/ingest/official-watch.ts inlineCommitDue). Off = the failure it
+   * exists for: any first print the burst records commits inline, also one recorded late in the burst, whose inline poll
+   * and deferred siblings might not finish inside waitUntil's 30 s after the response (evals/inline.ts and
+   * tests/official-inline-commit.test.ts go red).
+   */
+  inline_commit_window: true,
   // election series of the official_release rail (src/resolve/election.ts). Off = the failure each one exists for.
   /** only the authority's own final count decides (TSE tf=s, and=f, every section totalized; Élections Québec every riding final). */
   election_final_count: true,

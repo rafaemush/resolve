@@ -150,7 +150,12 @@ export function commitDedupKey(marketId: string, latestCommitId: string | null):
   return `commit:${marketId}:after:${latestCommitId ?? "none"}`;
 }
 
-/** A commit row as recorded: what the private early reveal (src/shadow/events.ts) sends to followers. */
+/**
+ * A commit row as recorded: what the private early reveal (src/shadow/events.ts) sends to followers. committed_at is the
+ * bot_posts row's created_at, the database's clock at the insert: what "commit" means everywhere (shadow.committed,
+ * v_venue_report.committed_at, /record's "release to commit"). The Telegram post is a separate step (posted_at, filled by
+ * the inline post or the channel poster, paced), so a commit can precede its post by minutes.
+ */
 export interface RecordedCommit { id: string; commitment_sha256: string; committed_at: string; committed: CommittedVerdict }
 
 export interface CommitResult { committed: boolean; posted: boolean; reason: string; commit?: RecordedCommit }

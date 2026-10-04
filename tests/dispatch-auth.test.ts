@@ -2,7 +2,8 @@
  * The pg_net dispatch signature (src/api/dispatch-auth.ts), shared by POST /internal/watch/:id (select_due_watches,
  * signed with the watch id) and POST /internal/limitless/record (dispatch_internal, signed with limitless_record): the
  * same verifier behind both routes, the id inside the MAC so neither signature opens the other route, the ±3 minute
- * window, and the admin bearer for manual runs.
+ * window, a redispatch's stamp to the second (redispatch_official_legs, migration 024) on the watch route only, and the
+ * admin bearer for manual runs.
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createHmac } from "node:crypto";
@@ -44,6 +45,21 @@ describe("verifyDispatchSignature", () => {
     expect(await verifyDispatchSignature(SECRET, "x", sign("x", minute), minute, t + threeMin + 1)).toEqual({ ok: false, reason: "stale" });
     expect(await verifyDispatchSignature(SECRET, "x", sign("x", minute), minute, t - threeMin - 1)).toEqual({ ok: false, reason: "stale" });
     expect(await verifyDispatchSignature(SECRET, "x", sign("x", "garbage"), "garbage", now)).toEqual({ ok: false, reason: "stale" });
+  });
+  it("a redispatch's stamp to the second (migration 024) opens only a verifier asked for it, within the same ±3 minutes", async () => {
+    const second = "2026-10-20T12:00:09";
+    const t = Date.parse(second + "Z");
+    expect(await verifyDispatchSignature(SECRET, "w", sign("w", second), second, now)).toEqual({ ok: false, reason: "stale" });
+    expect(await verifyDispatchSignature(SECRET, "w", sign("w", second), second, now, { seconds: true })).toEqual({ ok: true });
+    expect(await verifyDispatchSignature(SECRET, "w", sign("w", second), second, t + 180_000, { seconds: true })).toEqual({ ok: true });
+    expect(await verifyDispatchSignature(SECRET, "w", sign("w", second), second, t + 180_001, { seconds: true })).toEqual({ ok: false, reason: "stale" });
+    // the stamp is inside the MAC: the minute's signature does not open the second's stamp, nor the reverse
+    expect(await verifyDispatchSignature(SECRET, "w", sign("w", minute), second, now, { seconds: true })).toEqual({ ok: false, reason: "invalid" });
+    expect(await verifyDispatchSignature(SECRET, "w", sign("w", second), minute, now, { seconds: true })).toEqual({ ok: false, reason: "invalid" });
+    // anything else is not a stamp
+    for (const bad of ["2026-10-20T12:00:9", "2026-10-20T12:00:09Z", "2026-10-20T12:00:09.000", "2026-10-20 12:00"]) {
+      expect(await verifyDispatchSignature(SECRET, "w", sign("w", bad), bad, now, { seconds: true }), bad).toEqual({ ok: false, reason: "stale" });
+    }
   });
   it("missing headers, or no secret configured, never pass", async () => {
     expect(await verifyDispatchSignature(SECRET, "x", undefined, minute, now)).toEqual({ ok: false, reason: "missing" });
@@ -91,6 +107,16 @@ describe("signed internal routes", () => {
       });
     });
   }
+
+  it("a redispatch signed to the second runs the watch route, never the recorder route", async () => {
+    const second = new Date().toISOString().slice(0, 19);
+    const headers = (id: string) => ({ "x-internal-signature": sign(id, second), "x-internal-minute": second });
+    expect((await post(`/watch/${WATCH}`, headers(WATCH))).status).toBe(200);
+    expect(vi.mocked(runWatch)).toHaveBeenCalledTimes(1);
+    const r = await post("/limitless/record", headers(LIMITLESS_RECORD_ID));
+    expect(r.status).toBe(403);
+    expect(vi.mocked(runLimitlessRecorder)).not.toHaveBeenCalled();
+  });
 
   it("the recorder run gets the invocation's waitUntil, so its alert goes out after the answer", async () => {
     const waitUntil = vi.fn();

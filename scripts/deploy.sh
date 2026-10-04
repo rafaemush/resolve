@@ -13,7 +13,8 @@
 # run the migrations gate: Actions holds no Supabase credentials):
 #   typecheck, vitest, frozen eval suite = authored cases, eval replay (no --skip-missing: a missing Jev fixture is red),
 #   ingestion suite frozen + run, official_release suite frozen + run, registration-policy suite frozen + run, the priced
-#   reveal suite (evals/reveal.ts: stand-in RPCs, no network) (all seven read files and write nothing, so the tree check below stays meaningful), mutation harness --strict (a mutation that stays green is red), OpenAPI
+#   reveal suite (evals/reveal.ts: stand-in RPCs, no network), the inline commit window cases (evals/inline.ts: pure, no
+#   network) (all eight read files and write nothing, so the tree check below stays meaningful), mutation harness --strict (a mutation that stays green is red), OpenAPI
 #   document = contract, every migration applied (scripts/migrate.ts --require-applied: reads the ledger only; the Worker
 #   shipped may read what a pending migration creates, so pending, drifted or missing files are red; it prints the
 #   project it read and is red on a ledger that may not be production's: STAGING_SUPABASE_PROJECT_REF, a shell
@@ -169,6 +170,7 @@ run_gate "official suite" npx tsx evals/official.ts
 run_gate "registration frozen" npx tsx evals/registration.ts --check
 run_gate "registration suite" npx tsx evals/registration.ts
 run_gate "reveal suite" npx tsx evals/reveal.ts
+run_gate "inline window suite" npx tsx evals/inline.ts
 run_gate "mutations strict" npx tsx evals/mutate.ts --strict
 run_gate "openapi" npx tsx scripts/openapi.ts --check
 run_gate "migrations applied" migrations_applied

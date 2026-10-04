@@ -70,6 +70,12 @@ export interface FetchOutcome {
   note?: string;
   /** official_release: nothing further can change; deactivate the watch when this poll ends as a no_op (the reason). */
   stop?: string;
+  /**
+   * official_release: keep this watch's lease until then instead of releasing it, because work of this poll continues in
+   * waitUntil (the release-minute capture that may commit this leg inline, src/ingest/official-watch.ts). Always before
+   * the poll's nextPollAt, so the leg is never kept from its next scheduled poll.
+   */
+  leaseUntil?: string;
 }
 
 /** Append a window, extending the previous one when contiguous and same status. Keeps jsonb small. */
