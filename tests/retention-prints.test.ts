@@ -129,7 +129,7 @@ describe("scripts/selftest/prints.ts (the rollback-only block for migration 022)
   });
   it("the persisting staging probe races charge_read: 10 parallel calls with one id at the last credit, one charge and nine replays", () => {
     const probe = readFileSync(resolve(import.meta.dirname, "../scripts/selftest-db.ts"), "utf8");
-    expect(probe).toMatch(/if \(argv\.includes\("--concurrency-probe"\)\) bad \+= await concurrencyProbe\(\) \+ await chargeReadProbe\(\);/);
+    expect(probe).toMatch(/if \(argv\.includes\("--concurrency-probe"\)\) bad \+= await concurrencyProbe\(\) \+ await chargeReadProbe\(\)( \+ await \w+\(\))*;/);
     const fn = probe.slice(probe.indexOf("async function chargeReadProbe()"));
     expect(fn).toContain("credits_balance) values ('__selftest_concurrency_read__', 1)");
     expect(fn).toMatch(/Array\.from\(\{ length: 10 \}, \(\) => sql<[^>]+>\(`select \* from charge_read\('\$\{tid\}'::uuid, 1, '\$\{id\}'\)`\)\)/);

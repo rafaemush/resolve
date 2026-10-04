@@ -217,7 +217,9 @@ describe("dispatch_failures check", () => {
 const anHourAgo = () => new Date(Date.now() - 3_600_000).toISOString();
 /** storage_status()'s answer: the size, the purge's cron job in place, its last run an hour ago and successful. */
 function storage(bytes: number, o: { scheduled?: boolean | null; last?: { started_at: string; outcome: string; error: string | null } | null } = {}): Record<string, unknown> {
-  return { database_bytes: bytes, purge_scheduled: o.scheduled === undefined ? true : o.scheduled, last_purge: o.last === undefined ? { started_at: anHourAgo(), outcome: "success", error: null } : o.last };
+  // since migration 023 also the refund rule's cron job and its newest run, 5 minutes ago and successful
+  return { database_bytes: bytes, purge_scheduled: o.scheduled === undefined ? true : o.scheduled, last_purge: o.last === undefined ? { started_at: anHourAgo(), outcome: "success", error: null } : o.last,
+    refund_scheduled: true, last_refund: { started_at: new Date(Date.now() - 300_000).toISOString(), outcome: "no_op", error: null } };
 }
 
 describe("storage check (migration 022's storage_status): the database size", () => {

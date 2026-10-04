@@ -6,7 +6,9 @@
  * (evals/ingest.ts), official_release rails the frozen official cases (evals/official.ts) and the registration rail the
  * frozen registration cases (evals/registration.ts), where `classes` names their groups; each of those groups carries
  * control cases that resolve the same way with the rail on or off. The Whop webhook signature rail runs its authored
- * cases (evals/whop.ts), whose controls are genuine deliveries accepted either way.
+ * cases (evals/whop.ts), whose controls are genuine deliveries accepted either way, and the priced reveal rails theirs
+ * (evals/reveal.ts), whose controls (an included plan, a verdict that is not RESOLVED, a grandfathered key) come out the
+ * same either way.
  *   pnpm eval:mutate [--strict]
  */
 import { runSuite, type Summary, type StubKind } from "./run";
@@ -14,10 +16,11 @@ import { runIngestSuite } from "./ingest";
 import { runOfficialSuite } from "./official";
 import { runRegistrationSuite } from "./registration";
 import { runWhopSuite } from "./whop";
+import { runRevealSuite } from "./reveal";
 import { __setRailsForMutationTesting, type Rail } from "../src/resolve/rails";
 import type { EvalCase } from "./lib/cases";
 
-interface Mutation { name: string; suite?: "resolve" | "ingest" | "official" | "registration" | "whop"; env?: Record<string, string>; rails?: Rail[]; classes: string[]; mutateExpect?: (k: EvalCase) => EvalCase; stub?: StubKind; stubAlways?: boolean }
+interface Mutation { name: string; suite?: "resolve" | "ingest" | "official" | "registration" | "whop" | "reveal"; env?: Record<string, string>; rails?: Rail[]; classes: string[]; mutateExpect?: (k: EvalCase) => EvalCase; stub?: StubKind; stubAlways?: boolean }
 type SuiteSummary = Pick<Summary, "cases" | "grader_fail" | "harness_error" | "skipped"> & { outcomes: Array<{ id: string; result: string; failures: string[] }> };
 const M: Mutation[] = [
   { name: "1_resolve_threshold_zero", env: { RESOLVE_MIN_P: "0", RESOLVE_ND_MAX: "1" }, classes: ["E"], stub: "hedging", stubAlways: true },
@@ -54,6 +57,10 @@ const M: Mutation[] = [
   { name: "14_registration_policy_off", suite: "registration", rails: ["registration_policy"], classes: ["policy"] },
   // POST /webhooks/whop believes any request that claims to come from Whop: a forged payment would grant credits
   { name: "25_whop_signature_off", suite: "whop", rails: ["whop_signature"], classes: ["signature"] },
+  // a reveal whose charge was refused (a short balance, billing unavailable) goes out with the verdict: an unpaid reveal
+  { name: "26_reveal_lock_off", suite: "reveal", rails: ["reveal_lock"], classes: ["lock"] },
+  // a RESOLVED verdict reaches a paying follower without charge_reveals: a paid reveal released with no ledger charge
+  { name: "27_reveal_charge_off", suite: "reveal", rails: ["reveal_charge"], classes: ["charge"] },
 ];
 
 async function runWith(m: Mutation, mutated: boolean): Promise<SuiteSummary> {
@@ -65,6 +72,7 @@ async function runWith(m: Mutation, mutated: boolean): Promise<SuiteSummary> {
     if (m.suite === "official") return await runOfficialSuite({ groups: m.classes, quiet: true, label: m.name + (mutated ? "" : "_control") });
     if (m.suite === "registration") return await runRegistrationSuite({ groups: m.classes, quiet: true, label: m.name + (mutated ? "" : "_control") });
     if (m.suite === "whop") return await runWhopSuite({ groups: m.classes, quiet: true, label: m.name + (mutated ? "" : "_control") });
+    if (m.suite === "reveal") return await runRevealSuite({ groups: m.classes, quiet: true, label: m.name + (mutated ? "" : "_control") });
     return await runSuite({ mode: "replay", maxCostUsd: 0, skipMissing: false, classes: m.classes, report: false, quiet: true, mutateExpect: mutated ? m.mutateExpect : undefined, label: m.name + (mutated ? "" : "_control"), mutationStub: m.stub ?? "fooled", stubAlways: m.stubAlways });
   } finally {
     __setRailsForMutationTesting([]);

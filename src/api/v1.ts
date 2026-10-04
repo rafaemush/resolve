@@ -18,11 +18,12 @@ import type { MarketRow } from "../ingest/types";
 import { alert } from "../ops/alerts";
 import { redact } from "../ops/redact";
 import { mintKey, rotationExpiry } from "./keys";
-import { followBlock, followCap, followEntitlements, followMarket, followRefusal, onlyMatch, parseMarketRef, Plan, shapeShadow, EARLY_REVEAL_LABEL, MARKET_REF_HINT, type FollowAnswer, type FollowTarget, type MarketRef, type ShadowCommitRow, type ShadowMarket } from "../shadow/follows";
+import { followBlock, followCap, followEntitlements, followEvent, followMarket, followRefusal, hasResolvedCommit, onlyMatch, parseMarketRef, FollowBody, Plan, shapeShadow, EARLY_REVEAL_LABEL, MARKET_REF_HINT, type FollowAnswer, type FollowEventAnswer, type FollowTarget, type MarketRef, type ShadowCommitRow, type ShadowMarket, type ShadowReveal } from "../shadow/follows";
 import { subscribes } from "../webhooks/deliver";
-import { chunks, entitledFollows, exportCsv, exportRows, EXPORT_COLUMNS, EXPORT_ROW_CAP, EXPORT_VIEW_COLUMNS, ExportQuery, type ExportFollow, type ExportViewRow } from "../shadow/export";
+import { chunks, entitledFollows, exportCsv, exportRows, pricedRow, selectRows, EXPORT_COLUMNS, EXPORT_ROW_CAP, EXPORT_VIEW_COLUMNS, ExportQuery, type ExportFollow, type ExportViewRow } from "../shadow/export";
+import { lockedReveal, revealAccess, revealEntitlements, revealReleased, revealRequestId, revealTerms, REVEAL_EVENT_CAP_CREDITS, REVEAL_PRICE_CREDITS, type RevealAnswer } from "../shadow/reveal";
 import { DISCLAIMER } from "../bot/commit";
-import { noteCharge } from "../billing/events";
+import { noteCharge, noteCrossings, type Crossing } from "../billing/events";
 import { effectiveTiers, packQuotes, paygRate } from "../billing/tiers";
 import { publicBase, topUp, topUpText, usdcDepositsOffered, USDC_NOT_OFFERED } from "../billing/top-up";
 import { publicBasis, publicRoute, publicText, publicVerdictRecord, publicWatchSummary, toPublicVerdict } from "./public-names";
@@ -301,12 +302,48 @@ const SHADOW_EVENTS = ["shadow.committed", "shadow.revealed"] as const;
 const FOLLOWS_PAGE = 1000;
 const storeDown = (c: Parameters<typeof ok>[0], what: string) => err(c, "UPSTREAM_UNAVAILABLE", `${what} unavailable; retry shortly.`, 503);
 
-/** The tenant's plan as tenants.plan says now (auth caches the key for up to 60 s; a plan change applies at once). */
-async function tenantPlan(client: Db, tenantId: string): Promise<{ plan: Plan } | { error: string }> {
-  const { data, error } = await client.from("tenants").select("plan").eq("id", tenantId).single();
+/**
+ * The tenant's plan as tenants.plan says now (auth caches the key for up to 60 s; a plan change applies at once), and
+ * when the tenant was created (the priced reveal's cut-over, src/shadow/reveal.ts revealTerms).
+ */
+async function tenantPlan(client: Db, tenantId: string): Promise<{ plan: Plan; createdAt: string | null } | { error: string }> {
+  const { data, error } = await client.from("tenants").select("plan, created_at").eq("id", tenantId).single();
   if (error) return { error: error.message };
   const plan = Plan.safeParse(data?.plan);
-  return plan.success ? { plan: plan.data } : { error: `unknown plan ${JSON.stringify(data?.plan)}` };
+  return plan.success ? { plan: plan.data, createdAt: typeof data?.created_at === "string" ? data.created_at : null } : { error: `unknown plan ${JSON.stringify(data?.plan)}` };
+}
+
+/** What a reveal costs this tenant (src/shadow/reveal.ts), as the follow answers state it. */
+function revealPrice(plan: Plan, createdAt: string | null) {
+  const terms = revealTerms(plan, createdAt);
+  return {
+    terms, credits_per_resolved_leg: terms === "pays" ? REVEAL_PRICE_CREDITS : 0, event_cap_credits: terms === "pays" ? REVEAL_EVENT_CAP_CREDITS : 0,
+    note: terms === "pays"
+      ? `Each RESOLVED verdict revealed to you costs ${REVEAL_PRICE_CREDITS} credits, charged once per market when it is first delivered or read, at most ${REVEAL_EVENT_CAP_CREDITS} credits per event; UNRESOLVED and ERROR verdicts are free. At a short balance the reveal is locked (the commitment and a top-up pointer, no verdict) and nothing is charged.`
+      : terms === "included_plan" ? "Early reveals are included in this plan." : "Early reveals stay free for this evaluation key until it expires (it was issued before reveals were priced).",
+  };
+}
+
+/** Low-credit crossings a reveal charge claimed (charge_reveals, migration 023), for noteCrossings. */
+const crossingsOf = (answers: readonly RevealAnswer[]): Crossing[] => answers
+  .filter((a) => a.low_credit === true && a.low_credit_threshold !== null && a.balance !== null)
+  .map((a) => ({ tenantId: a.tenant_id, plan: a.plan, balance: a.balance!, threshold: a.low_credit_threshold!, requestId: revealRequestId(a.tenant_id, a.market_id) }));
+
+/**
+ * After a read's reveal charge: credits.low for a crossing it claimed, and the operator's alert when charge_reveals
+ * failed (the reveal was answered locked, billing_unavailable) or could not claim the low-credit notice. Off the response
+ * path when the request has waitUntil.
+ */
+async function afterRevealRead(c: Parameters<typeof ok>[0], answers: readonly RevealAnswer[], error: string | null, where: string): Promise<void> {
+  const auth = c.get("auth");
+  const unclaimed = answers.filter((a) => a.charged > 0 && a.low_credit === null);
+  const work = (async () => {
+    if (error) await alert(c.env, "shadow_reveal_billing_unavailable", `charge_reveals failed on ${where} (tenant ${auth.tenantId}): ${error}. The read answered the RESOLVED verdicts locked (reason billing_unavailable), nothing charged; included plans read them in full. Check the charge_reveals RPC (migration 023).`, { dedupMinutes: 60, meta: { tenant_id: auth.tenantId } });
+    if (unclaimed.length) await alert(c.env, "low_credit_check_failed", `charge_reveals charged tenant ${auth.tenantId} on ${where} but could not claim its low-credit notice (is app_config low_credit_threshold a whole number?); credits.low waits for the next charge.`, { dedupMinutes: 60, meta: { tenant_id: auth.tenantId } });
+    await noteCrossings(c.env, crossingsOf(answers), publicBase(c.env, c.req.url));
+  })().catch((e) => { console.error(JSON.stringify({ level: "error", job: "reveal_read_notes", tenant_id: auth.tenantId, error: redact(String(e)).slice(0, 200) })); });
+  const wu = waitUntilOf(c);
+  if (wu) wu(work); else await work;
 }
 
 /**
@@ -332,14 +369,23 @@ async function marketIdOf(client: Db, ref: MarketRef): Promise<{ id: string | nu
 /**
  * Follow a public shadow market: private early reveals by webhook (shadow.committed, shadow.revealed) and GET /v1/shadow/:id.
  * The market is named by its uuid or its venue id, "<platform>:<external_id>" as /record prints it (the same one read).
+ * An optional JSON body {"scope":"event"} follows every open public leg of that market's event (markets.event_key: an
+ * official release's legs on every venue, a Polymarket event's legs) in one transaction, all or nothing against the
+ * follow limit (follow_event, migration 023); without a body, or with {"scope":"market"}, the one market (follow_market).
  * The answer counts the tenant's endpoints that will receive shadow.committed: an endpoint registered before these events
  * existed was subscribed to the old defaults, and a follow with no subscribed endpoint must say so rather than deliver
- * nothing silently.
+ * nothing silently. It also states what a RESOLVED reveal costs this account (src/shadow/reveal.ts).
  */
 v1.post("/markets/:id/follow", async (c) => {
   const auth = c.get("auth");
   const ref = parseMarketRef(c.req.param("id"));
   if (!ref) return err(c, "validation_error", MARKET_REF_HINT, 400);
+  // no body (or only whitespace) is the one market, as before the event scope existed
+  const raw = (await c.req.text().catch(() => "")).trim();
+  let json: unknown = {};
+  if (raw) { try { json = JSON.parse(raw); } catch { return err(c, "validation_error", 'body must be JSON: {"scope":"event"} or {"scope":"market"}, or no body', 400); } }
+  const body = FollowBody.safeParse(json);
+  if (!body.success) return err(c, "validation_error", `body: ${body.error.issues.map((i) => `${i.path.join(".") || "body"}: ${i.message}`).join("; ").slice(0, 300)}`, 400);
   const client = db(c.env);
   const [{ data: rows, error: me }, plan, { data: eps, error: ee }] = await Promise.all([
     readMarketRef(client, ref, "id, tenant_id, is_test, status, deleted_at, platform, external_id"),
@@ -355,15 +401,34 @@ v1.post("/markets/:id/follow", async (c) => {
   if (refusal) return err(c, refusal.code, refusal.message, refusal.status);
   const cap = followCap(plan.plan);
   const subscribed = ((eps ?? []) as Array<{ events: string[] | null }>).filter((e) => subscribes(e, "shadow.committed")).length;
+  const delivery = (read: string) => ({
+    events: SHADOW_EVENTS, read, endpoints_subscribed: subscribed, reveal_price: revealPrice(plan.plan, plan.createdAt),
+    note: "Verdicts arrive as shadow.committed on every active endpoint subscribed to it (POST /v1/webhooks) and at the read URL. Private early reveal, excluded from the public record.",
+    ...(subscribed === 0 ? { warning: `No active webhook endpoint of this account is subscribed to shadow.committed, so no webhook will arrive for this follow; read ${read}, or register an endpoint whose events include ${SHADOW_EVENTS.join(" and ")} (POST /v1/webhooks). An endpoint's events are fixed when it is registered.` } : {}),
+  });
+  if (body.data.scope === "event") {
+    let e: FollowEventAnswer;
+    // follow_event is one transaction: an error means no follow was recorded.
+    try { e = await followEvent(client, auth.tenantId, m.id, cap); }
+    catch { return storeDown(c, "follow store (no follow was recorded)"); }
+    switch (e.result) {
+      case "followed": return ok(c, {
+        scope: "event", event_key: e.event_key, market_id: m.id, market: `${m.platform}:${m.external_id}`, following: true,
+        legs: e.legs, followed: e.followed, already_following: e.already_following, follows_counted: e.active, follow_limit: cap,
+        ...delivery("/v1/shadow/export"),
+      }, e.followed > 0 ? 201 : 200);
+      case "cap_reached": return err(c, "validation_error", `follow limit (${e.cap} follows of open markets) reached for this plan: this event has ${e.legs} open legs, ${e.already_following} already followed, so following it needs ${e.legs - e.already_following} more follows and this account has ${e.active} of ${e.cap}. Nothing was followed. A follow stops counting when its market settles; unfollow markets (DELETE /v1/markets/:id/follow), follow single legs, or change plans`, 403, { extra: { follow_limit: e.cap, follows_counted: e.active, legs: e.legs, already_following: e.already_following, event_key: e.event_key } });
+      case "not_followable": return err(c, "validation_error", `market cannot be followed: ${e.reason}`, 400);
+      default: { const never: never = e; throw new Error(`unhandled follow_event answer ${JSON.stringify(never)}`); }
+    }
+  }
   let a: FollowAnswer;
   // follow_market is one transaction: an error means no follow was recorded.
   try { a = await followMarket(client, auth.tenantId, m.id, cap); }
   catch { return storeDown(c, "follow store (no follow was recorded)"); }
   const followed = (following: { follow_id: string; active: number }, created: boolean) => ok(c, {
     follow_id: following.follow_id, market_id: m.id, market: `${m.platform}:${m.external_id}`, following: true, already_following: !created, follows_counted: following.active, follow_limit: cap,
-    events: SHADOW_EVENTS, read: `/v1/shadow/${m.id}`, endpoints_subscribed: subscribed,
-    note: "Verdicts arrive as shadow.committed on every active endpoint subscribed to it (POST /v1/webhooks) and at the read URL. Private early reveal, excluded from the public record.",
-    ...(subscribed === 0 ? { warning: `No active webhook endpoint of this account is subscribed to shadow.committed, so no webhook will arrive for this follow; read /v1/shadow/${m.id}, or register an endpoint whose events include ${SHADOW_EVENTS.join(" and ")} (POST /v1/webhooks). An endpoint's events are fixed when it is registered.` } : {}),
+    ...delivery(`/v1/shadow/${m.id}`),
   }, created ? 201 : 200);
   switch (a.result) {
     case "followed": return followed(a, true);
@@ -415,8 +480,11 @@ v1.get("/follows", async (c) => {
 
 /**
  * Bulk export of the tenant's followed markets (plan §17.3 P7-lite): one row per entitled follow, from v_venue_report
- * (migration 021). Registered before /shadow/:market_id so "export" is never read as a market id. Subrequests:
- * EXPORT_SUBREQUESTS (src/shadow/export.ts). CSV (RFC 4180, header row) or the JSON envelope.
+ * (migration 021). Registered before /shadow/:market_id so "export" is never read as a market id. A RESOLVED latest
+ * verdict is priced like every reveal (src/shadow/reveal.ts): one charge_reveals() call for every exported RESOLVED row
+ * (source read: once per tenant and market, a replay free, never refunded); a row the tenant has not received is exported
+ * locked (committed_status and committed_outcome empty, reveal naming why) and the answer carries the top-up pointer, never
+ * a 402. Subrequests: EXPORT_SUBREQUESTS (src/shadow/export.ts). CSV (RFC 4180, header row) or the JSON envelope.
  */
 v1.get("/shadow/export", async (c) => {
   const q = ExportQuery.safeParse({ platform: c.req.query("platform") || undefined, since: c.req.query("since") || undefined, format: c.req.query("format") || undefined });
@@ -439,25 +507,43 @@ v1.get("/shadow/export", async (c) => {
   const ids = entitledFollows(follows, plan.plan, true).filter((f) => !q.data.platform || f.markets?.platform === q.data.platform).map((f) => f.market_id);
   const reads = await Promise.all(chunks(ids).map((part) => client.from("v_venue_report").select(EXPORT_VIEW_COLUMNS.join(", ")).in("market_id", part)));
   if (reads.some((r) => r.error)) return storeDown(c, "report store");
-  const rows = exportRows(reads.flatMap((r) => (r.data ?? []) as unknown as ExportViewRow[]), q.data);
+  const view = reads.flatMap((r) => (r.data ?? []) as unknown as ExportViewRow[]);
+  // the priced rows: those this export prints whose latest verdict is RESOLVED, in one charge_reveals() call
+  const priced = selectRows(view, q.data).filter(pricedRow).map((v) => String(v.market_id));
+  const ent = await revealEntitlements(client, priced.map((market_id) => ({ tenant_id: auth.tenantId, market_id, plan: plan.plan })), { resolved: true, source: "read" });
+  if (ent.answers.length) await afterRevealRead(c, ent.answers, ent.error, "GET /v1/shadow/export");
+  const rows = exportRows(view, q.data, new Map(ent.answers.map((a) => [a.market_id, a])));
+  const charged = ent.answers.reduce((n, a) => n + a.charged, 0);
+  const locked = ent.answers.filter((a) => !revealReleased(a));
+  // balances only fall within one call, so the lowest is the balance after it
+  const balances = ent.answers.map((a) => a.balance).filter((b): b is number => b !== null);
+  const balance = balances.length ? Math.min(...balances) : null;
+  const top = locked.some((a) => a.reason === "insufficient_credits") ? topUp(c.env, publicBase(c.env, c.req.url)) : null;
   if (q.data.format === "csv") {
     c.header("X-Request-Id", requestId(c));
     c.header("Content-Type", "text/csv; charset=utf-8");
     c.header("Content-Disposition", 'attachment; filename="resolve-shadow-export.csv"');
     c.header("X-Resolve-Truncated", truncated ? "true" : "false");
+    c.header("X-Resolve-Credits-Charged", String(charged));
+    c.header("X-Resolve-Locked", String(locked.length));
     return c.body(exportCsv(rows), 200);
   }
   return ok(c, {
     rows, count: rows.length, columns: EXPORT_COLUMNS, truncated, filters: { platform: q.data.platform ?? null, since: q.data.since ?? null },
+    credits_charged: charged, locked: locked.length, balance,
+    ...(top ? { top_up: top, locked_note: `${locked.length} RESOLVED verdict(s) are locked: each costs ${REVEAL_PRICE_CREDITS} credits (at most ${REVEAL_EVENT_CAP_CREDITS} per event) and the balance is ${balance ?? "unknown"}. Nothing was charged for them. ${topUpText(top)} Then export again: they are charged and released then.` } : {}),
     label: EARLY_REVEAL_LABEL,
-    note: `One row per followed market you are entitled to (the oldest ${EXPORT_ROW_CAP} follows are read${truncated ? "; newer follows are not in this export" : ""}): the latest commitment, its verdict and evidence hashes, and once the platform resolves the market, the official outcome, its time and source, the agreement and lead_seconds. Never the nonce or the preimage: those appear only in the public reveal, and sha256(preimage) = commitment_sha256 at GET /v1/track-record/verify?hash=.`,
+    note: `One row per followed market you are entitled to (the oldest ${EXPORT_ROW_CAP} follows are read${truncated ? "; newer follows are not in this export" : ""}): the latest commitment, its verdict and evidence hashes, and once the platform resolves the market, the official outcome, its time and source, the agreement and lead_seconds. A RESOLVED verdict is charged ${REVEAL_PRICE_CREDITS} credits the first time it reaches you (by webhook, GET /v1/shadow/{market_id} or this export; never twice), unless your plan includes reveals; the reveal column says why each row is shown or locked. Never the nonce or the preimage: those appear only in the public reveal, and sha256(preimage) = commitment_sha256 at GET /v1/track-record/verify?hash=.`,
     disclaimer: DISCLAIMER,
   });
 });
 
 /**
  * The private early reveal of one followed market (its uuid or venue id): its committed verdicts, never the nonce or the
- * preimage. A venue id costs one read more.
+ * preimage. A venue id costs one read more. When a commit is RESOLVED the read is priced (src/shadow/reveal.ts): one
+ * charge_reveals() call (source read: charged once per tenant and market, a replay free, never refunded); a tenant that
+ * cannot pay reads every RESOLVED commit locked (its commitment and hashes, verdict null) with the top-up pointer, and a
+ * 200, never a 402: the next read after a top-up releases and charges it.
  */
 v1.get("/shadow/:market_id", async (c) => {
   const ref = parseMarketRef(c.req.param("market_id"));
@@ -485,7 +571,17 @@ v1.get("/shadow/:market_id", async (c) => {
   ]);
   if (me || !market) return storeDown(c, "market store");
   if (ce) return storeDown(c, "commit store");
-  return ok(c, shapeShadow(market as ShadowMarket, (commits ?? []) as ShadowCommitRow[]));
+  const rows = (commits ?? []) as ShadowCommitRow[];
+  let reveal: ShadowReveal | null = null;
+  let balance: number | null = null;
+  if (hasResolvedCommit(rows)) {
+    const r = await revealEntitlements(client, [{ tenant_id: follow.tenant_id, market_id: id.id, plan: follow.plan }], { resolved: true, source: "read" });
+    const a = r.answers[0]!;
+    reveal = { access: revealAccess(a), locked: lockedReveal(a, topUp(c.env, publicBase(c.env, c.req.url)), id.id) };
+    balance = a.balance;
+    await afterRevealRead(c, r.answers, r.error, `GET /v1/shadow/${id.id}`);
+  }
+  return ok(c, { ...shapeShadow(market as ShadowMarket, rows, reveal), credits_charged: reveal?.access.credits_charged ?? 0, balance });
 });
 
 v1.get("/resolutions/:id", async (c) => {

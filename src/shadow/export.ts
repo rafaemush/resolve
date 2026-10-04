@@ -5,10 +5,15 @@
  * commitment, verdict and evidence hashes (the private early reveal the tenant already receives), and once the platform
  * has resolved the market, the official outcome, its time and source, the agreement and lead_seconds. Never the nonce or
  * the preimage (the view has neither): a commitment stays checkable by anyone at GET /v1/track-record/verify.
+ * Since migration 023 a RESOLVED latest verdict is priced like every other reveal (src/shadow/reveal.ts): the export asks
+ * charge_reveals() once for every exported market whose latest commit is RESOLVED (source read: charged once per tenant
+ * and market, a replay free, never refunded), and a market the tenant has not received is exported locked: its commitment,
+ * times and hashes, with committed_status and committed_outcome empty and the reveal column naming why.
  * The rules and shapes here are pure; the route (src/api/v1.ts) does the reads.
  */
 import { z } from "zod";
 import { followBlock, type Plan } from "./follows";
+import { revealReleased, type RevealAnswer } from "./reveal";
 import { toCsv, type CsvValue } from "../ops/csv";
 import { COST } from "../ops/budget";
 
@@ -18,12 +23,14 @@ export const EXPORT_ROW_CAP = 1000;
 /** Market ids per v_venue_report read: 100 uuids keep the PostgREST URL near 4 KB. */
 export const EXPORT_CHUNK = 100;
 /**
- * Subrequests of one export after authentication: the plan read, the follows read, and one v_venue_report read per
- * EXPORT_CHUNK entitled markets = 2 + 10 = 12. With the middleware (key lookup through the Cache API: match, database
- * read and put; the daily-cap RPC; the rate-limit RPC; the request log insert and, if that fails, one alert) the
- * request stays near 23 of Workers Free's 50.
+ * Subrequests of one export after authentication: the plan read, the follows read, one v_venue_report read per
+ * EXPORT_CHUNK entitled markets, and one charge_reveals() call for every exported market whose latest verdict is RESOLVED
+ * = 2 + 10 + 1 = 13; after a charge that crossed the low-credit threshold, credits.low under waitUntil (the endpoint read,
+ * the insert and one alert: 7). With the middleware (key lookup through the Cache API: match, database read and put; the
+ * daily-cap RPC; the rate-limit RPC; the request log insert and, if that fails, one alert) the request stays near 31 of
+ * Workers Free's 50.
  */
-export const EXPORT_SUBREQUESTS = 2 * COST.db + Math.ceil(EXPORT_ROW_CAP / EXPORT_CHUNK) * COST.db;
+export const EXPORT_SUBREQUESTS = 2 * COST.db + Math.ceil(EXPORT_ROW_CAP / EXPORT_CHUNK) * COST.db + COST.db;
 
 const DAY = /^\d{4}-\d{2}-\d{2}$/;
 /** A real calendar day ("2026-02-30" is not one), or an ISO 8601 time that parses. */
@@ -81,32 +88,52 @@ export type ExportViewRow = Record<(typeof EXPORT_VIEW_COLUMNS)[number], CsvValu
 export const EXPORT_COLUMNS = [
   "market_id", "platform", "external_id", "event_key", "venue_slug", "status",
   "committed_at", "commitment_sha256", "committed_status", "committed_outcome", "evidence_raw_sha256", "evidence_canonical_sha256", "n_commits",
-  "official_outcome", "official_at", "official_at_source", "agreement", "lead_seconds",
+  "official_outcome", "official_at", "official_at_source", "agreement", "lead_seconds", "reveal",
 ] as const;
 export type ExportRow = Record<(typeof EXPORT_COLUMNS)[number], CsvValue>;
 
-/** Pure. One export row: the latest commit (the verdict the market stands on) and the final reconciliation. */
-export function exportRow(v: ExportViewRow): ExportRow {
+/** Pure. Whether the latest commit is RESOLVED: only such a row is priced (charge_reveals()). */
+export const pricedRow = (v: Pick<ExportViewRow, "committed_status">): boolean => v.committed_status === "RESOLVED";
+
+/**
+ * Pure. One export row: the latest commit (the verdict the market stands on) and the final reconciliation. A RESOLVED
+ * latest verdict shows only when `reveal` releases it to this tenant; otherwise (locked, or no answer at all: never
+ * released by default) committed_status and committed_outcome are empty and `reveal` names why. reveal is the answer's
+ * reason for a RESOLVED row, not_resolved for a commit that is not, empty for a market with no commit yet.
+ */
+export function exportRow(v: ExportViewRow, reveal: RevealAnswer | null = null): ExportRow {
+  const priced = pricedRow(v);
+  const hidden = priced && !(reveal !== null && revealReleased(reveal));
   return {
     market_id: v.market_id, platform: v.platform, external_id: v.external_id, event_key: v.event_key, venue_slug: v.venue_slug, status: v.status,
-    committed_at: v.latest_committed_at, commitment_sha256: v.latest_commitment_sha256, committed_status: v.committed_status, committed_outcome: v.committed_outcome,
+    committed_at: v.latest_committed_at, commitment_sha256: v.latest_commitment_sha256,
+    committed_status: hidden ? null : v.committed_status, committed_outcome: hidden ? null : v.committed_outcome,
     evidence_raw_sha256: v.evidence_raw_sha256, evidence_canonical_sha256: v.evidence_canonical_sha256, n_commits: v.n_commits,
     official_outcome: v.official_outcome, official_at: v.official_at, official_at_source: v.official_at_source, agreement: v.agreement,
     lead_seconds: v.lead_seconds === null || v.lead_seconds === undefined ? null : Number(v.lead_seconds),
+    reveal: priced ? (reveal?.reason ?? "billing_unavailable") : v.latest_commitment_sha256 ? "not_resolved" : null,
   };
 }
 
 /**
- * Pure. Rows for the query: the platform filter, then `since` (a row whose latest commit or final reconciliation was
- * recorded at or after it: what changed since a previous export), ordered by platform, event_key, external_id.
+ * Pure. The view rows the query exports: the platform filter, then `since` (a row whose latest commit or final
+ * reconciliation was recorded at or after it: what changed since a previous export). Only these are priced.
  */
-export function exportRows(view: readonly ExportViewRow[], q: Pick<ExportQuery, "platform" | "since">): ExportRow[] {
+export function selectRows(view: readonly ExportViewRow[], q: Pick<ExportQuery, "platform" | "since">): ExportViewRow[] {
   const since = q.since ? Date.parse(q.since) : null;
   const at = (v: CsvValue) => (typeof v === "string" ? Date.parse(v) : NaN);
   return view
     .filter((v) => !q.platform || v.platform === q.platform)
-    .filter((v) => since === null || at(v.latest_committed_at) >= since || at(v.reconciled_at) >= since)
-    .map(exportRow)
+    .filter((v) => since === null || at(v.latest_committed_at) >= since || at(v.reconciled_at) >= since);
+}
+
+/**
+ * Pure. Rows for the query (selectRows), each with its reveal answer by market id, ordered by platform, event_key,
+ * external_id.
+ */
+export function exportRows(view: readonly ExportViewRow[], q: Pick<ExportQuery, "platform" | "since">, reveals: ReadonlyMap<string, RevealAnswer> = new Map()): ExportRow[] {
+  return selectRows(view, q)
+    .map((v) => exportRow(v, reveals.get(String(v.market_id)) ?? null))
     .sort((a, b) => String(a.platform).localeCompare(String(b.platform)) || String(a.event_key).localeCompare(String(b.event_key)) || String(a.external_id).localeCompare(String(b.external_id)));
 }
 

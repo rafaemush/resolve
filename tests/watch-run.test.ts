@@ -380,7 +380,7 @@ describe("publishing a verdict that looked (plan §18 (a): first delivery attemp
     const [, market, commit, opts] = vi.mocked(publishShadowCommitted).mock.calls[0]!;
     expect(market).toMatchObject({ id: MARKET_ID, tenant_id: null });
     expect(commit).toBe(COMMIT);
-    expect(opts).toEqual({ waitUntil });
+    expect(opts).toEqual({ waitUntil, base: undefined });
     expect(r.detail).toContain("shadow.committed queued for 1 endpoint(s) of 1 follower(s)");
     expect(publishEvent).not.toHaveBeenCalled();
   });

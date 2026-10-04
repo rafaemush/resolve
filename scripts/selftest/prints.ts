@@ -189,7 +189,8 @@ export const PRINTS_EXPECT: Record<string, unknown> = {
   old_settled_excerpt: null, old_settled_row_kept: true, recent_settled_excerpt: "recent excerpt of a settled market",
   old_open_excerpt: "old excerpt of an open market", old_deleted_excerpt: null,
   purge_counted: true, purge_run_row: ["success", true, 30],
-  storage_size_is_pg_database_size: true, storage_last_purge: true, storage_scheduled: true, storage_keys: ["database_bytes", "last_purge", "purge_scheduled"],
+  // migration 023 replaces storage_status() and adds last_refund and refund_scheduled (scripts/selftest/reveal.ts checks them)
+  storage_size_is_pg_database_size: true, storage_last_purge: true, storage_scheduled: true, storage_keys: ["database_bytes", "last_purge", "last_refund", "purge_scheduled", "refund_scheduled"],
   anon_charge: "denied", anon_purge: "denied", anon_storage: "denied", service_charge: 1, service_storage: true,
   authenticated_denied: true, public_execute: 0, definer_search_path: true, uncommented: 0, cron_job: true,
 };

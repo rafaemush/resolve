@@ -10,7 +10,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
 import type { Verdict } from "../src/resolve/schema";
 import { fakeDb, type FakeDb, type Row } from "./lib/fake-db";
-import { followEntitlements as followEntitlementsStandIn, followMarket as followMarketStandIn } from "./lib/fake-rpcs";
+import { followEntitlements as followEntitlementsStandIn, followMarket as followMarketStandIn, REVEAL_RPCS } from "./lib/fake-rpcs";
 
 const h = vi.hoisted(() => ({ db: null as unknown as FakeDb, plan: "free" as string }));
 vi.mock("../src/db/supabase", () => ({
@@ -27,7 +27,7 @@ vi.mock("../src/api/auth", () => ({
   extractApiKey: () => null,
   invalidateKeyCache: async () => undefined,
 }));
-vi.mock("../src/ops/alerts", () => ({ alert: vi.fn(async () => ({ sent: true, deduped: false })) }));
+vi.mock("../src/ops/alerts", () => ({ alert: vi.fn(async () => ({ sent: true, deduped: false })), alertMany: vi.fn(async () => ({ sent: [], deduped: [] })) }));
 
 import { v1 } from "../src/api/v1";
 import { followBlock, followCap, followEntitlements, followerTenants, followRefusal, onlyMatch, parseMarketRef, shadowVerdict, shapeShadow, shapeShadowCommit, venueBasis, EARLY_REVEAL_LABEL, PLANS, type FollowEntitlement, type FollowTarget, type ShadowCommitRow } from "../src/shadow/follows";
@@ -50,8 +50,8 @@ function committed(over: Partial<Verdict> = {}): CommittedVerdict {
 }
 
 describe("followCap (plan §17.3 P7-lite)", () => {
-  it("50 by default, 500 on Growth, unlimited on Platform", () => {
-    expect(Object.fromEntries(PLANS.map((p) => [p, followCap(p)]))).toEqual({ free: 50, payg: 50, builder: 50, growth: 500, platform: null });
+  it("an evaluation key 50, pay as you go 500 (since the priced reveal), Builder 50 as published, Growth 500, unlimited on Platform", () => {
+    expect(Object.fromEntries(PLANS.map((p) => [p, followCap(p)]))).toEqual({ free: 50, payg: 500, builder: 50, growth: 500, platform: null });
   });
 });
 
@@ -130,8 +130,10 @@ describe("shadow response and event payloads never carry the nonce or the preima
     expect(out.latest).toEqual({
       commitment_sha256: "e".repeat(64), committed_at: "2026-10-02T00:00:00.000Z", posted: false, posted_at: null,
       verdict: { resolution_status: "RESOLVED", winning_outcome: "OPTION_A", confidence_score: 0.95, caveats: ["claimed_at_display_only"], determination_basis: "structured", thresholds_version: "v1" },
+      locked: false,
       evidence: { raw_sha256: "d".repeat(64), canonical_sha256: "c".repeat(64) },
     });
+    expect(out).toMatchObject({ reveal: null, locked: null });
     expect((out.commits as Row[]).map((c) => c.committed_at)).toEqual(["2026-10-02T00:00:00.000Z", "2026-10-01T00:00:00.000Z"]);
     const json = JSON.stringify(out);
     expect(json).not.toContain(NONCE);
@@ -154,6 +156,7 @@ describe("shadow response and event payloads never carry the nonce or the preima
       verdict: { resolution_status: "RESOLVED", winning_outcome: "OPTION_A", confidence_score: 0.95, caveats: ["claimed_at_display_only"], determination_basis: "structured", thresholds_version: "v1" },
       evidence: { raw_sha256: "d".repeat(64), canonical_sha256: "c".repeat(64) },
       venue: { platform: "polymarket", condition_id: CID, slug: "cpi-above-3", event_id: "60182", proposed_outcome_label: "Yes" },
+      reveal: null, locked: null,
       label: EARLY_REVEAL_LABEL, disclaimer: DISCLAIMER,
     });
     expect(JSON.stringify(p)).not.toContain(NONCE);
@@ -195,12 +198,13 @@ describe("POST/DELETE /v1/markets/:id/follow, GET /v1/follows, GET /v1/shadow/:m
     h.plan = "free";
     caps = [];
     h.db = fakeDb({
-      tenants: [{ id: "t1", plan: "free", deleted_at: null }, { id: "t2", plan: "free", deleted_at: null }],
+      // created after the priced reveal's cut-over, with credits: a RESOLVED read is charged 25 (tests/reveal.test.ts prices it)
+      tenants: [{ id: "t1", plan: "free", deleted_at: null, created_at: "2026-10-20T00:00:00.000Z", credits_balance: 300 }, { id: "t2", plan: "free", deleted_at: null, created_at: "2026-10-20T00:00:00.000Z", credits_balance: 300 }],
       // the calling key (the auth mock's k1): an authenticated tenant holds a live key
       api_keys: [{ id: "k1", tenant_id: "t1", revoked_at: null, deleted_at: null, expires_at: null }],
       markets: [market(M), market(uuid(1), { tenant_id: "t2" }), market(uuid(2), { is_test: true }), market(uuid(3), { status: "resolved" }), market(uuid(4), { tenant_id: "t1" })],
       market_follows: [], bot_posts: [], api_request_log: [], webhook_endpoints: [],
-    }, {}, { rpc: { follow_market: async (db, a) => { caps.push(a.p_cap); return followMarketStandIn(db, a); }, follow_entitlements: followEntitlementsStandIn } });
+    }, {}, { rpc: { ...REVEAL_RPCS, follow_market: async (db, a) => { caps.push(a.p_cap); return followMarketStandIn(db, a); }, follow_entitlements: followEntitlementsStandIn } });
   });
   const hook = (id: string, events: string[], over: Row = {}): Row => ({ id, tenant_id: "t1", url: `https://hooks.example/${id}`, active: true, deleted_at: null, events, ...over });
   /** n follows by t1 of open markets that exist, older than anything the test creates. */

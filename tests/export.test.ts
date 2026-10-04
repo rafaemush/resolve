@@ -23,12 +23,14 @@ vi.mock("../src/api/auth", () => ({
   extractApiKey: () => null,
   invalidateKeyCache: async () => undefined,
 }));
-vi.mock("../src/ops/alerts", () => ({ alert: vi.fn(async () => ({ sent: true, deduped: false })) }));
+vi.mock("../src/ops/alerts", () => ({ alert: vi.fn(async () => ({ sent: true, deduped: false })), alertMany: vi.fn(async () => ({ sent: [], deduped: [] })) }));
 
 import { v1 } from "../src/api/v1";
 import { chunks, entitledFollows, exportCsv, exportRows, EXPORT_COLUMNS, EXPORT_SUBREQUESTS, ExportQuery, type ExportFollow, type ExportViewRow } from "../src/shadow/export";
 import { csvField, toCsv } from "../src/ops/csv";
 import { EARLY_REVEAL_LABEL } from "../src/shadow/follows";
+import type { RevealAnswer } from "../src/shadow/reveal";
+import { REVEAL_RPCS } from "./lib/fake-rpcs";
 
 const env = { JEV_MODEL: "jev-1.13.0", JEV_RPM_LIMIT: "60", SPOTLIGHT_SECRET: "s", SUPABASE_URL: "https://neutralized.invalid", SUPABASE_SERVICE_ROLE_KEY: "neutralized", INTERNAL_HMAC_SECRET: "x", ADMIN_API_KEY: "x", EVAL_REPORT_KEY: "x" } as unknown as Env;
 const ctx = { waitUntil: () => undefined, passThroughOnException: () => undefined } as unknown as ExecutionContext;
@@ -39,6 +41,9 @@ const follow = (n: number, over: Partial<ExportFollow> & { status?: string; plat
   id: `f${String(n).padStart(4, "0")}`, market_id: uuid(n), created_at: at(n),
   markets: { platform: over.platform ?? "polymarket", status: over.status ?? "open", deleted_at: null }, ...over,
 });
+
+/** A reveal answer that releases market n's verdict to the reader (an included plan). */
+const revealed = (n: number): RevealAnswer => ({ tenant_id: "t1", market_id: uuid(n), plan: "builder", entitled_full: true, replayed: false, charged: 0, price: 0, balance: 0, reason: "included_plan", low_credit: null, low_credit_threshold: null });
 
 const viewRow = (n: number, over: Partial<ExportViewRow> = {}): ExportViewRow => ({
   market_id: uuid(n), platform: "polymarket", external_id: `ext-${n}`, event_key: `polymarket:event:${n}`, venue_slug: `slug-${n}`, status: "open",
@@ -128,18 +133,18 @@ describe("exportRows, the query and the CSV", () => {
     expect(csvField("2026-10-01T00:00:00.000Z")).toBe("2026-10-01T00:00:00.000Z");
   });
   it("formula injection through exportCsv: platform identifiers are neutralised, lead_seconds stays numeric", () => {
-    const csv = exportCsv(exportRows([viewRow(1, { external_id: "=cmd|' /C calc'!A0", venue_slug: "@SUM(A1)", event_key: "+evt", lead_seconds: -120, agreement: "agree" })], {}));
+    const csv = exportCsv(exportRows([viewRow(1, { external_id: "=cmd|' /C calc'!A0", venue_slug: "@SUM(A1)", event_key: "+evt", lead_seconds: -120, agreement: "agree" })], {}, new Map([[uuid(1), revealed(1)]])));
     const line = csv.split("\r\n")[1]!;
     expect(line).toContain(`"'=cmd|' /C calc'!A0"`);
     expect(line).toContain(`"'@SUM(A1)"`);
     expect(line).toContain(`"'+evt"`);
-    expect(line.endsWith(",agree,-120")).toBe(true);
+    expect(line.endsWith(",agree,-120,included_plan")).toBe(true);
     for (const cell of line.split(",")) expect(cell).not.toMatch(/^[=+@]/);
   });
   it("chunks of 100", () => {
     expect(chunks(Array.from({ length: 250 }, (_, i) => i)).map((c) => c.length)).toEqual([100, 100, 50]);
     expect(chunks([])).toEqual([]);
-    expect(EXPORT_SUBREQUESTS).toBe(12);
+    expect(EXPORT_SUBREQUESTS).toBe(13); // plan, follows, 10 view chunks, one charge_reveals
   });
 });
 
@@ -163,7 +168,7 @@ describe("GET /v1/shadow/export", () => {
         viewRow(3), viewRow(4),
       ],
       api_request_log: [],
-    });
+    }, {}, { rpc: REVEAL_RPCS });
   });
   const reads = () => h.db.calls.filter((x) => x.table !== "api_request_log");
 
@@ -175,7 +180,7 @@ describe("GET /v1/shadow/export", () => {
     expect(body.data).toMatchObject({ count: 2, truncated: false, label: EARLY_REVEAL_LABEL, filters: { platform: null, since: null } });
     expect(body.data.rows[1]).toMatchObject({ commitment_sha256: "e".repeat(64), committed_status: "RESOLVED", official_outcome: "OPTION_A", agreement: "agree", lead_seconds: 380 });
     expect(r.text).not.toMatch(/preimage"|nonce"/);
-    expect(reads().length).toBeLessThanOrEqual(EXPORT_SUBREQUESTS); // plan, follows, one view chunk
+    expect(reads().length).toBeLessThanOrEqual(EXPORT_SUBREQUESTS); // plan, follows, one view chunk, charge_reveals
   });
 
   it("CSV: header row and one line per market, served as text/csv", async () => {

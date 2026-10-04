@@ -92,6 +92,54 @@ export async function queuePaymentsCredited(env: Env, credited: readonly Credite
   return { queued: q.rows.length, error: problems.length ? problems.join("; ") : null };
 }
 
+// ---- credits.low for crossings claimed inside a charge (charge_reveals, migration 023) --------------------------------
+
+/** A low-credit crossing a charge already claimed (charge_reveals() calls claim_low_credit_notice() itself). */
+export interface Crossing { tenantId: string; plan: string | null; balance: number; threshold: number; requestId: string }
+
+/**
+ * Pure. What noteCharge sends at a crossing, for crossings already claimed: one credits.low event per tenant (the same
+ * payload, the same top_up) and the operator's alert per crossing (creditsLowAlert, keyed by the charge, so each crossing
+ * alerts once). The publish of a priced reveal puts the events in its own insert and the alerts in its one alertMany(),
+ * instead of one claim RPC per charged follower.
+ */
+export function crossingItems(crossings: readonly Crossing[], top: TopUp): { events: EventItem[]; alerts: AlertItem[] } {
+  return {
+    events: crossings.map((c) => ({ tenant: c.tenantId, eventType: "credits.low" as const, payload: creditsLowPayload({ balance: c.balance, threshold: c.threshold, request_id: c.requestId, top_up: top }) })),
+    alerts: crossings.map((c) => creditsLowAlert({ tenantId: c.tenantId, plan: c.plan, balance: c.balance, threshold: c.threshold, requestId: c.requestId, topUp: top })),
+  };
+}
+
+/**
+ * credits.low for crossings a read's charge already claimed (GET /v1/shadow/:market_id, GET /v1/shadow/export): queue the
+ * events (endpoint read and insert) and tell the operator, everything in one alertMany(). An event that could not be
+ * queued gives each claim back (release_low_credit_notice: the next charge claims it again) and the crossing reaches the
+ * operator inside the failure alert, keyed per tenant for an hour, as noteCharge does. Never throws. Subrequests: 2 + one
+ * alert (5), + 1 per crossing given back.
+ */
+export async function noteCrossings(env: Env, crossings: readonly Crossing[], base: string | null): Promise<void> {
+  if (!crossings.length) return;
+  const top = topUp(env, base);
+  const { events, alerts } = crossingItems(crossings, top);
+  // alertMany never throws; this keeps even a broken one from making this throw
+  const tell = async (items: AlertItem[]) => { try { await alertMany(env, items); } catch (e) { console.error(JSON.stringify({ level: "error", job: "credits_low_alert", error: redact(String(e)).slice(0, 200) })); } };
+  try {
+    const q = await queueEvents(env, events);
+    if (!q.error) { await tell(alerts); return; }
+    const client = db(env);
+    const failed: AlertItem[] = [];
+    for (const [i, c] of crossings.entries()) {
+      let released = "given back: the next charge queues it again";
+      try { await rpc(client, "release_low_credit_notice", { p_tenant: c.tenantId }); }
+      catch (e) { released = `not given back either (${redact(String(e)).slice(0, 120)}): no credits.low until the next purchase or grant`; }
+      failed.push({ key: `low_credit_event_failed_${c.tenantId}`, text: `credits.low for tenant ${c.tenantId} (balance ${c.balance} < ${c.threshold}) was not queued: ${q.error}. The notice was ${released}.\n\n${alerts[i]!.text}`, dedupMinutes: 60, meta: { ...alerts[i]!.meta } });
+    }
+    await tell(failed);
+  } catch (e) {
+    await tell([{ key: "low_credit_check_failed", dedupMinutes: 60, text: `credits.low for ${crossings.length} crossing(s) after a reveal charge could not be sent: ${redact(String(e)).slice(0, 200)}. Tenants: ${crossings.map((c) => c.tenantId).join(", ")}`, meta: { tenant_ids: crossings.map((c) => c.tenantId) } }]);
+  }
+}
+
 // ---- credits.low after a charge -------------------------------------------------------------------------------------
 
 const LowCreditClaim = z.union([

@@ -81,6 +81,17 @@ const rails = {
    * any request that claims to be from Whop is believed, so anyone could grant credits with a forged payment).
    */
   whop_signature: true,
+  // Priced reveal rails (src/shadow/reveal.ts). Off = the failure each one exists for; evals/reveal.ts proves both.
+  /**
+   * A RESOLVED verdict reaches a free or pay-as-you-go follower only through charge_reveals()'s answer, one ledger charge
+   * per tenant and market (off: the behaviour before the price, every entitled follower gets it free, nothing charged).
+   */
+  reveal_charge: true,
+  /**
+   * A reveal whose charge was refused (a short balance, billing unavailable) is locked: the market, the commitment and the
+   * evidence hashes with the card pointer, never the verdict or a proposal (off: the verdict goes out unpaid).
+   */
+  reveal_lock: true,
 };
 export type Rail = keyof typeof rails;
 export function railEnabled(r: Rail): boolean { return rails[r]; }

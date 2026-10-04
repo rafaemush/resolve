@@ -9,9 +9,11 @@
  *                                                        is a child process, its PASS/FAIL lines are aggregated) and the
  *                                                        official_release block; --psql is passed on to them
  *   npx tsx scripts/selftest-db.ts --concurrency-probe   also the PERSISTING tests: 10 parallel begin_resolution calls
- *                                                        with one Idempotency-Key, and 10 parallel charge_read calls
- *                                                        with one request id at the last credit, each against its own
- *                                                        __selftest__ tenant (soft-deleted afterwards; ledger rows are
+ *                                                        with one Idempotency-Key, 10 parallel charge_read calls with
+ *                                                        one request id at the last credit, and 10 parallel
+ *                                                        charge_reveals calls for one (tenant, market) at the last 25
+ *                                                        credits, each against its own __selftest__ tenant (and market,
+ *                                                        for the reveal; both soft-deleted afterwards; ledger rows are
  *                                                        append-only by design).
  *                                                        Refused unless SUPABASE_PROJECT_REF equals STAGING_SUPABASE_PROJECT_REF.
  *   npx tsx scripts/selftest-db.ts --official            only the official_release block (migration 016)
@@ -493,6 +495,31 @@ async function chargeReadProbe(): Promise<number> {
 }
 
 /**
+ * The same for charge_reveals (migration 023; the priced reveal): 10 parallel calls for one (tenant, market) against a
+ * tenant holding exactly one leg's price. One charges, the nine others are replays (they wait on the tenant row lock,
+ * then find the charge); none is locked as short (a reveal already paid for answered locked). The market is a public
+ * custom market of its own, soft-deleted afterwards with the tenant.
+ */
+async function chargeRevealsProbe(): Promise<number> {
+  const [t] = await sql<{ id: string }>("insert into tenants (display_name, plan, credits_balance) values ('__selftest_concurrency_reveal__', 'payg', 25) returning id");
+  const tid = t!.id;
+  const [m] = await sql<{ id: string }>(`insert into markets (platform, external_id, condition, event_statement, option_a, option_b, positive_option, open_at, deadline_utc) values ('custom', '__selftest_concurrency_reveal_${tid}__', 'selftest condition', 'selftest statement', 'Yes', 'No', 'OPTION_A', now(), now() + interval '1 day') returning id`);
+  const mid = m!.id;
+  const calls = Array.from({ length: 10 }, () => sql<{ entitled_full: boolean; replayed: boolean; charged: number; reason: string }>(`select * from charge_reveals(array['${tid}']::uuid[], array['${mid}']::uuid[], 25, 2000, now(), array['builder','growth','platform'], 'read')`));
+  const results = (await Promise.allSettled(calls)).map((x) => (x.status === "fulfilled" ? x.value[0] : { error: String(x.reason).slice(0, 80) }));
+  const [cnt] = await sql<{ charges: number; balance: number }>(`select (select count(*)::int from credit_ledger where tenant_id='${tid}' and reason='charge') as charges, (select credits_balance from tenants where id='${tid}') as balance`);
+  const charged = results.filter((x: any) => x.reason === "charged" && x.charged === 25).length;
+  const replayed = results.filter((x: any) => x.reason === "replay" && x.replayed === true && x.entitled_full === true).length;
+  const locked = results.filter((x: any) => x.entitled_full === false).length;
+  const errors = results.filter((x: any) => x.error).length;
+  const ok = cnt!.charges === 1 && cnt!.balance === 0 && charged === 1 && replayed === 9;
+  console.log(`${ok ? "PASS" : "FAIL"} concurrency charge_reveals: 10 parallel calls at the last 25 credits -> charge_rows=${cnt!.charges} balance=${cnt!.balance} charged=${charged} replayed=${replayed} locked=${locked} errors=${errors}`);
+  await sql(`update markets set deleted_at = now() where id='${mid}'`);
+  await sql(`update tenants set deleted_at = now() where id='${tid}'`);
+  return ok ? 0 : 1;
+}
+
+/**
  * --all: every scripts/selftest/*.ts as a child process (each applies its own target guard), with --psql passed on.
  * A child's PASS/FAIL lines are counted; a child that exits non-zero, or prints no PASS line, fails the run: a refusal
  * or a crash is "could not look", never green.
@@ -539,7 +566,7 @@ async function main(): Promise<number> {
     if (!targetIsStaging()) { console.error("--concurrency-probe refused: it persists rows, and SUPABASE_PROJECT_REF is not STAGING_SUPABASE_PROJECT_REF"); return 2; }
   }
   let bad = await rollbackBlocks(runner.run);
-  if (argv.includes("--concurrency-probe")) bad += await concurrencyProbe() + await chargeReadProbe();
+  if (argv.includes("--concurrency-probe")) bad += await concurrencyProbe() + await chargeReadProbe() + await chargeRevealsProbe();
   if (argv.includes("--all")) {
     bad += await officialSelftest(runner.run);
     bad += selftestFiles(psqlArgs);

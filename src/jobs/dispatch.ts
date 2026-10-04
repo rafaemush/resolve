@@ -9,9 +9,11 @@
  * The same job reads the storage status (storage_status(), migration 022; plan §22.5): the database cannot DM the
  * operator, so the Worker alerts once the database passes 300 MB and again past 400 MB of the Supabase Free plan's
  * 500 MB, where the project turns read-only, and when the daily retention purge that keeps it small failed, has not run
- * for PURGE_STALE_HOURS, or lost its cron job: a purge that stopped would otherwise be heard of only at 300 MB. Both
- * reads run in parallel and every alert of the run goes out in one alertMany(), so the job costs
- * DISPATCH_CHECK_SUBREQUESTS (src/ops/budget.ts): two reads and one alert.
+ * for PURGE_STALE_HOURS, or lost its cron job: a purge that stopped would otherwise be heard of only at 300 MB. Since
+ * migration 023 the same answer carries the refund rule of the priced reveal (refund_late_reveals, every 5 minutes from
+ * pg_cron): its newest run failed, is older than REFUND_STALE_MINUTES, or its cron job is gone, and charged reveals that
+ * were never delivered stay charged, so each of those alerts too. Both reads run in parallel and every alert of the run
+ * goes out in one alertMany(), so the job costs DISPATCH_CHECK_SUBREQUESTS (src/ops/budget.ts): two reads and one alert.
  */
 import { z } from "zod";
 import type { Env } from "../env";
@@ -35,11 +37,22 @@ export const PURGE_STALE_HOURS = 26;
 /** A purge alert repeats daily while it holds: the purge itself runs once a day. */
 export const PURGE_ALERT_DEDUP_MINUTES = 1440;
 
-/** storage_status()'s answer (migration 022): jsonb, so database_bytes is a JSON number. */
+/** refund_late_reveals runs every 5 minutes (migration 023): a newest run older than this is a refund rule that stopped. */
+export const REFUND_STALE_MINUTES = 30;
+/** A refund alert repeats hourly while it holds: charged reveals that were not delivered wait for it. */
+export const REFUND_ALERT_DEDUP_MINUTES = 60;
+
+const LastRun = z.object({ started_at: z.string(), outcome: z.string(), error: z.string().nullable() }).nullable();
+/**
+ * storage_status()'s answer (migration 022; last_refund and refund_scheduled since 023): jsonb, so database_bytes is a
+ * JSON number. The two refund keys are absent only where migration 023 is not applied, which refundAlert reports.
+ */
 export const StorageStatus = z.object({
   database_bytes: z.number().int().min(0).refine(Number.isSafeInteger),
   purge_scheduled: z.boolean().nullable(),
-  last_purge: z.object({ started_at: z.string(), outcome: z.string(), error: z.string().nullable() }).nullable(),
+  last_purge: LastRun,
+  refund_scheduled: z.boolean().nullable().optional(),
+  last_refund: LastRun.optional(),
 });
 export type StorageStatus = z.infer<typeof StorageStatus>;
 
@@ -47,6 +60,7 @@ export interface DispatchCheck {
   ok: boolean; failures: number | null; error: string | null; alert: string | null;
   db_size: { bytes: number | null; error: string | null; alert: string | null };
   retention: { last_purge: StorageStatus["last_purge"]; scheduled: boolean | null; alert: string | null };
+  refunds: { last_refund: StorageStatus["last_purge"]; scheduled: boolean | null; alert: string | null };
 }
 
 /** The alert (key + text) one check raises, or null (pure). "Could not count" is never "counted zero". */
@@ -109,6 +123,33 @@ export function purgeAlert(s: Pick<StorageStatus, "purge_scheduled" | "last_purg
   return null;
 }
 
+/**
+ * The priced reveal's refund rule alert, or null (pure): storage_status() without its refund keys (migration 023 not
+ * applied: "could not look", never "fine"), the refund_late_reveals cron job missing or inactive, its newest run older
+ * than REFUND_STALE_MINUTES or missing while the job is scheduled for longer, or a failure (a refund that failed, or a run
+ * that rolled back). Each of those leaves charged reveals that were never delivered charged.
+ */
+export function refundAlert(s: Pick<StorageStatus, "refund_scheduled" | "last_refund">, now: number): AlertItem | null {
+  const runs = "select started_at, outcome, error, meta from loop_runs where loop_name = 'reveal_refund' order by started_at desc limit 5;";
+  const base = { dedupMinutes: REFUND_ALERT_DEDUP_MINUTES, meta: { refund_scheduled: s.refund_scheduled ?? null, last_refund: s.last_refund ?? null } };
+  if (s.refund_scheduled === undefined || s.last_refund === undefined) {
+    return { ...base, key: "reveal_refund_unobserved", text: "storage_status() carries no refund status: migration 023 (priced reveal) is not applied, or storage_status() was replaced. The refund rule of charged reveals (refund_late_reveals) cannot be observed. Apply 023: npx tsx scripts/migrate.ts" };
+  }
+  if (s.refund_scheduled === false) {
+    return { ...base, key: "reveal_refund_unscheduled", text: "The pg_cron job refund_late_reveals (migration 023) is missing or inactive: charged reveals whose webhook was not delivered within 10 minutes are no longer refunded. Schedule it again: select cron.schedule('refund_late_reveals', '*/5 * * * *', 'select public.refund_late_reveals(10)');" };
+  }
+  const r = s.last_refund;
+  if (!r) return null; // scheduled, no run yet: the first runs within 5 minutes of the migration
+  // an unreadable time is a stale run, never a fresh one
+  if (!(now - Date.parse(r.started_at) <= REFUND_STALE_MINUTES * 60_000)) {
+    return { ...base, key: "reveal_refund_stale", text: `The refund rule of charged reveals (refund_late_reveals, every 5 minutes, migration 023) last ran ${r.started_at} (${r.outcome}), more than ${REFUND_STALE_MINUTES} min ago: is pg_cron running? Undelivered charged reveals stay charged until it runs. Its runs: ${runs} Run it by hand: select public.refund_late_reveals(10);` };
+  }
+  if (r.outcome === "failure") {
+    return { ...base, key: "reveal_refund_failed", text: `The refund rule of charged reveals failed at ${r.started_at}: ${r.error ?? "no error text"}. A refund that failed stays owed (the next run retries it while the charge is under 3 days old). Its runs: ${runs}` };
+  }
+  return null;
+}
+
 /** storage_status() parsed; anything else (an error, another shape) is an error, never "small" or "purged". */
 async function storageStatus(env: Env): Promise<{ status: StorageStatus | null; error: string | null }> {
   try {
@@ -126,15 +167,18 @@ export async function checkDispatchFailures(env: Env): Promise<DispatchCheck> {
   const bytes = storage.status?.database_bytes ?? null;
   const s = dbSizeAlert(bytes, storage.error);
   const p = storage.status ? purgeAlert(storage.status, Date.now()) : null;
+  const rf = storage.status ? refundAlert(storage.status, Date.now()) : null;
   const items: AlertItem[] = [
     ...(a ? [{ ...a, dedupMinutes: DISPATCH_FAILURE_DEDUP_MINUTES, meta: { failures, window_minutes: DISPATCH_WINDOW_MINUTES } }] : []),
     ...(s ? [s] : []),
     ...(p ? [p] : []),
+    ...(rf ? [rf] : []),
   ];
   if (items.length) await alertMany(env, items);
   return {
     ok: items.length === 0, failures, error, alert: a?.key ?? null,
     db_size: { bytes, error: storage.error, alert: s?.key ?? null },
     retention: { last_purge: storage.status?.last_purge ?? null, scheduled: storage.status?.purge_scheduled ?? null, alert: p?.key ?? null },
+    refunds: { last_refund: storage.status?.last_refund ?? null, scheduled: storage.status?.refund_scheduled ?? null, alert: rf?.key ?? null },
   };
 }

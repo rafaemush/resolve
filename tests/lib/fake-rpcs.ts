@@ -117,3 +117,116 @@ export async function followEntitlements(db: FakeDb, a: Record<string, any>): Pr
 }
 
 export const FOLLOW_RPCS: NonNullable<FakeDbOptions["rpc"]> = { follow_market: followMarket, follow_entitlements: followEntitlements };
+
+/**
+ * Stand-in for migration 023's charge_reveals(), step for step in the SQL's order, over tenants (plan, credits_balance,
+ * created_at, deleted_at, low_credit_notified_at), markets (event_key, tenant_id, is_test) and credit_ledger. Per pair, in
+ * (tenant, event_key, market) order: unknown_tenant, included_plan, grandfathered, replay, event_cap_reached,
+ * insufficient_credits, else one debit and one 'charge' row (note "reveal <source>") with the low-credit notice claimed
+ * (threshold 500, as app_config's default). Errors exactly where the SQL raises.
+ */
+export async function chargeReveals(db: FakeDb, a: Record<string, any>): Promise<{ data: any; error: any }> {
+  const tenants: string[] = a.p_tenants ?? [], markets: string[] = a.p_markets ?? [];
+  if (!(a.p_price >= 1) || !(a.p_event_cap >= a.p_price)) return { data: null, error: { code: "22023", message: "charge_reveals: a positive price and an event cap of at least the price are required" } };
+  if (!["webhook", "read"].includes(a.p_source)) return { data: null, error: { code: "22023", message: `charge_reveals: p_source must be webhook or read, got ${a.p_source}` } };
+  if (!a.p_pricing_from || !Array.isArray(a.p_included_plans)) return { data: null, error: { code: "22023", message: "charge_reveals: the pricing cut-over and the included plans are required" } };
+  if (tenants.length !== markets.length || tenants.length > 1000) return { data: null, error: { code: "22023", message: "charge_reveals: p_tenants and p_markets are pairs, at most 1000" } };
+  const ledger = (db.tables.credit_ledger ??= []);
+  const mk = (id: string) => (db.tables.markets ?? []).find((m) => m.id === id);
+  const pairs = [...new Map(tenants.map((t, i) => [`${t}|${markets[i]}`, { t, m: markets[i]!, ek: String(mk(markets[i]!)?.event_key ?? "") }])).values()]
+    .sort((x, y) => (x.t < y.t ? -1 : x.t > y.t ? 1 : x.ek < y.ek ? -1 : x.ek > y.ek ? 1 : x.m < y.m ? -1 : x.m > y.m ? 1 : 0));
+  const out: Row[] = [];
+  const row = (p: { t: string; m: string }, o: Partial<Row>) => ({ tenant_id: p.t, market_id: p.m, plan: null, entitled_full: false, replayed: false, charged: 0, price: 0, balance: 0, reason: "", low_credit: null, low_credit_threshold: null, ...o });
+  for (const p of pairs) {
+    const m = mk(p.m);
+    if (!m || m.tenant_id !== null || m.is_test) return { data: null, error: { code: "22023", message: `charge_reveals: market ${p.m} is not a public shadow market` } };
+    const t = (db.tables.tenants ?? []).find((x) => x.id === p.t);
+    if (!t || t.deleted_at) { out.push(row(p, { price: a.p_price, reason: "unknown_tenant" })); continue; }
+    const bal = Number(t.credits_balance ?? 0);
+    if (a.p_included_plans.includes(t.plan)) { out.push(row(p, { plan: t.plan, entitled_full: true, balance: bal, reason: "included_plan" })); continue; }
+    if (t.plan === "free" && t.created_at && Date.parse(t.created_at) < Date.parse(a.p_pricing_from)) { out.push(row(p, { plan: t.plan, entitled_full: true, balance: bal, reason: "grandfathered" })); continue; }
+    const id = `reveal:${p.t}:${p.m}`;
+    const prior = ledger.find((l) => l.reason === "charge" && l.request_id === id);
+    if (prior) {
+      if (prior.tenant_id !== p.t) return { data: null, error: { code: "RS003", message: "charge_reveals: this request id was charged to another tenant" } };
+      out.push(row(p, { plan: t.plan, entitled_full: true, replayed: true, balance: bal, reason: "replay" })); continue;
+    }
+    const legs = (db.tables.markets ?? []).filter((x) => x.event_key === m.event_key).map((x) => `reveal:${p.t}:${x.id}`);
+    const spent = ledger.filter((l) => l.reason === "charge" && legs.includes(l.request_id))
+      .reduce((n, l) => n - Number(l.delta) - Number(ledger.find((r) => r.reason === "refund" && r.request_id === l.request_id)?.delta ?? 0), 0);
+    const due = Math.min(a.p_price, Math.max(a.p_event_cap - spent, 0));
+    if (due === 0) { out.push(row(p, { plan: t.plan, entitled_full: true, balance: bal, reason: "event_cap_reached" })); continue; }
+    if (bal < due) { out.push(row(p, { plan: t.plan, price: due, balance: bal, reason: "insufficient_credits" })); continue; }
+    t.credits_balance = bal - due;
+    ledger.push({ id: ledger.length + 1, tenant_id: p.t, delta: -due, reason: "charge", request_id: id, balance_after: t.credits_balance, note: `reveal ${a.p_source}`, created_at: new Date().toISOString() });
+    const crossed = !t.low_credit_notified_at && t.credits_balance < 500;
+    if (crossed) t.low_credit_notified_at = new Date().toISOString();
+    out.push(row(p, { plan: t.plan, entitled_full: true, charged: due, price: due, balance: t.credits_balance, reason: "charged", low_credit: crossed, low_credit_threshold: 500 }));
+  }
+  return { data: out, error: null };
+}
+
+/** Stand-in for refund_credits() (migration 004): the charge of a request id refunded once. */
+export async function refundCredits(db: FakeDb, a: Record<string, any>): Promise<{ data: any; error: any }> {
+  const ledger = (db.tables.credit_ledger ??= []);
+  const c = ledger.find((l) => l.reason === "charge" && l.request_id === a.p_request_id);
+  if (!c || ledger.some((l) => l.reason === "refund" && l.request_id === a.p_request_id)) return { data: 0, error: null };
+  const t = (db.tables.tenants ?? []).find((x) => x.id === c.tenant_id)!;
+  t.credits_balance = Number(t.credits_balance) - Number(c.delta);
+  ledger.push({ id: ledger.length + 1, tenant_id: c.tenant_id, delta: -c.delta, reason: "refund", request_id: a.p_request_id, balance_after: t.credits_balance, created_at: new Date().toISOString() });
+  return { data: -c.delta, error: null };
+}
+
+/**
+ * Stand-in for migration 023's refund_late_reveals(), in the SQL's order: every 'reveal webhook' charge not refunded yet,
+ * past its deadline (its deliveries' reveal_due_at, else the charge time + p_late_minutes), none of whose deliveries was
+ * delivered at or before reveal_due_at, refunded through refundCredits. Returns {refunded, credits, failed}.
+ */
+export async function refundLateReveals(db: FakeDb, a: Record<string, any>): Promise<{ data: any; error: any }> {
+  const late = a.p_late_minutes ?? 10;
+  const now = Date.now();
+  const ledger = (db.tables.credit_ledger ??= []);
+  const deliveries = db.tables.webhook_deliveries ?? [];
+  let refunded = 0, credits = 0;
+  for (const c of ledger.filter((l) => l.reason === "charge" && l.note === "reveal webhook" && Date.parse(l.created_at) > now - 3 * 86_400_000)) {
+    if (ledger.some((l) => l.reason === "refund" && l.request_id === c.request_id)) continue;
+    const mine = deliveries.filter((d) => d.reveal_charge_id === c.request_id);
+    const due = mine.length ? Math.min(...mine.map((d) => Date.parse(d.reveal_due_at))) : Date.parse(c.created_at) + late * 60_000;
+    if (now < due) continue;
+    if (mine.some((d) => d.status === "delivered" && Date.parse(d.delivered_at) <= Date.parse(d.reveal_due_at))) continue;
+    const r = await refundCredits(db, { p_request_id: c.request_id });
+    if (r.data > 0) { refunded++; credits += r.data; }
+  }
+  return { data: { refunded, credits, failed: 0 }, error: null };
+}
+
+/**
+ * Stand-in for migration 023's follow_event(), step for step: the tenant, the market (an open, non-test public shadow
+ * market), its event's open public legs read once, all or nothing against p_cap (active follows of open markets), each
+ * leg not yet followed inserted. Rows carry the market embedded like followMarket's.
+ */
+export async function followEvent(db: FakeDb, a: Record<string, any>): Promise<{ data: any; error: any }> {
+  if (a.p_cap !== null && a.p_cap < 0) return fail(`follow_event: p_cap must be >= 0 or null (unlimited), got ${a.p_cap}`);
+  if (!(db.tables.tenants ?? []).some((t) => t.id === a.p_tenant && !t.deleted_at)) return fail(`follow_event: no tenant ${a.p_tenant}`);
+  const m = (db.tables.markets ?? []).find((x) => x.id === a.p_market);
+  if (!m || m.deleted_at || m.tenant_id !== null || m.is_test) return { data: { result: "not_followable", reason: "not a public shadow market" }, error: null };
+  if (m.status !== "open") return { data: { result: "not_followable", reason: `market is ${m.status}` }, error: null };
+  const legs = (db.tables.markets ?? []).filter((x) => x.event_key === m.event_key && x.tenant_id === null && !x.is_test && !x.deleted_at && x.status === "open").map((x) => x.id).sort();
+  const follows = (db.tables.market_follows ??= []);
+  const active = follows.filter((f) => f.tenant_id === a.p_tenant && !f.deleted_at);
+  const already = active.filter((f) => legs.includes(f.market_id)).length;
+  const counted = active.filter((f) => openMarket(db, f.market_id)).length;
+  const fresh = legs.length - already;
+  if (a.p_cap !== null && fresh > 0 && counted + fresh > a.p_cap) return { data: { result: "cap_reached", event_key: m.event_key, legs: legs.length, already_following: already, active: counted, cap: a.p_cap }, error: null };
+  let n = 0;
+  for (const id of legs) {
+    if (active.some((f) => f.market_id === id)) continue;
+    const x = (db.tables.markets ?? []).find((y) => y.id === id)!;
+    follows.push({ id: `follow-${follows.length + 1}`, tenant_id: a.p_tenant, market_id: id, created_at: new Date(Date.now() + follows.length).toISOString(), deleted_at: null,
+      markets: { id, platform: x.platform, external_id: x.external_id, status: x.status, deadline_utc: x.deadline_utc, deleted_at: null } });
+    n++;
+  }
+  return { data: { result: "followed", event_key: m.event_key, legs: legs.length, followed: n, already_following: already, active: counted + n }, error: null };
+}
+
+export const REVEAL_RPCS: NonNullable<FakeDbOptions["rpc"]> = { charge_reveals: chargeReveals, refund_credits: refundCredits, refund_late_reveals: refundLateReveals, follow_event: followEvent };

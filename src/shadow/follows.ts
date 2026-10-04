@@ -7,8 +7,10 @@
  * key, and every plan only for its oldest follows of open markets up to the plan's cap, so an expired evaluation key or
  * a lowered plan stops the early reveal instead of leaving it on forever. The routes name a market by its uuid or by
  * the venue id /record prints, "<platform>:<external_id>" (plan §22.3 #4, parseMarketRef).
- * Pure rules here (tested in tests/follows.test.ts); the atomic cap + insert is follow_market() and the facts the rules
- * read are follow_entitlements() (migration 014).
+ * Pure rules here (tested in tests/follows.test.ts); the atomic cap + insert is follow_market() (one market) or
+ * follow_event() (every open leg of the market's event, migration 023), and the facts the rules read are
+ * follow_entitlements() (migration 014). Since migration 023 a RESOLVED verdict is priced (src/shadow/reveal.ts): an
+ * entitled follow is what may receive it, and the reveal's answer says whether this tenant receives it now.
  */
 import { z } from "zod";
 import type { Db } from "../db/supabase";
@@ -16,6 +18,7 @@ import { CommittedVerdict, DISCLAIMER, marketRef, type CommittedFields } from ".
 import type { MarketRow } from "../ingest/types";
 import { Platform } from "../resolve/schema";
 import { venueBasis } from "../api/public-names";
+import type { LockedReveal, RevealAccess } from "./reveal";
 
 export const PLANS = ["free", "payg", "builder", "growth", "platform"] as const;
 export const Plan = z.enum(PLANS);
@@ -24,14 +27,16 @@ export type Plan = z.infer<typeof Plan>;
 export const EARLY_REVEAL_LABEL = "private early reveal — excluded from the public record";
 
 /**
- * Active follows of open markets per tenant (plan §17.3 P7-lite): 50 by default, 500 on Growth, unlimited (null) on
- * Platform. A follow of a settled market does not count: it can produce no further event.
+ * Active follows of open markets per tenant (plan §17.3 P7-lite; pay as you go raised to 500 with the priced reveal,
+ * 2026-10-05: a paying account follows whole events, and a Québec event has 135 legs): an evaluation key 50, pay as you
+ * go 500, Builder 50 (as published), Growth 500, unlimited (null) on Platform. A follow of a settled market does not
+ * count: it can produce no further event.
  */
 export function followCap(plan: Plan): number | null {
   switch (plan) {
     case "platform": return null;
-    case "growth": return 500;
-    case "free": case "payg": case "builder": return 50;
+    case "payg": case "growth": return 500;
+    case "free": case "builder": return 50;
     default: { const never: never = plan; throw new Error(`unknown plan ${String(never)}`); }
   }
 }
@@ -123,6 +128,26 @@ export function followBlock(e: FollowEntitlement): FollowBlock | null {
   return cap !== null && e.open_rank > cap ? "over_follow_limit" : null;
 }
 
+/** follow_event()'s answer (migration 023): every open leg of the market's event, all or nothing against the cap. */
+export const FollowEventAnswer = z.discriminatedUnion("result", [
+  z.object({ result: z.literal("followed"), event_key: z.string(), legs: z.number().int(), followed: z.number().int(), already_following: z.number().int(), active: z.number().int() }),
+  z.object({ result: z.literal("cap_reached"), event_key: z.string(), legs: z.number().int(), already_following: z.number().int(), active: z.number().int(), cap: z.number().int() }),
+  z.object({ result: z.literal("not_followable"), reason: z.string() }),
+]);
+export type FollowEventAnswer = z.infer<typeof FollowEventAnswer>;
+
+/** Follow every open leg of the market's event through follow_event(): one transaction. Throws on a DB error. */
+export async function followEvent(client: Db, tenantId: string, marketId: string, cap: number | null): Promise<FollowEventAnswer> {
+  const { data, error } = await client.rpc("follow_event", { p_tenant: tenantId, p_market: marketId, p_cap: cap });
+  if (error) throw new Error(`follow_event: ${error.message}`);
+  const parsed = FollowEventAnswer.safeParse(data);
+  if (!parsed.success) throw new Error(`follow_event answered ${JSON.stringify(data).slice(0, 200)}`);
+  return parsed.data;
+}
+
+/** The body POST /v1/markets/:id/follow accepts (optional): scope "event" follows every open leg of the market's event. */
+export const FollowBody = z.strictObject({ scope: z.enum(["market", "event"]).default("market") });
+
 /** follow_entitlements() for a market (one tenant's follow only, when tenantId is given); error when it could not be read. */
 export async function followEntitlements(client: Db, marketId: string, tenantId?: string): Promise<{ rows: FollowEntitlement[]; error: string | null }> {
   const { data, error } = await client.rpc("follow_entitlements", tenantId ? { p_market: marketId, p_tenant: tenantId } : { p_market: marketId });
@@ -137,9 +162,17 @@ export async function followEntitlements(client: Db, marketId: string, tenantId?
  * be read. A follow that is blocked is not an error: its tenant simply gets no event.
  */
 export async function followerTenants(client: Db, marketId: string): Promise<{ tenants: string[]; error: string | null }> {
+  const r = await entitledFollowers(client, marketId);
+  return { tenants: r.followers.map((f) => f.tenant_id), error: r.error };
+}
+
+/** The same, with each tenant's plan (the priced reveal asks charge_reveals() about them, and orders their deliveries). */
+export async function entitledFollowers(client: Db, marketId: string): Promise<{ followers: Array<{ tenant_id: string; plan: Plan }>; error: string | null }> {
   const r = await followEntitlements(client, marketId);
-  if (r.error) return { tenants: [], error: r.error };
-  return { tenants: [...new Set(r.rows.filter((e) => followBlock(e) === null).map((e) => e.tenant_id))], error: null };
+  if (r.error) return { followers: [], error: r.error };
+  const seen = new Map<string, Plan>();
+  for (const e of r.rows) if (followBlock(e) === null && !seen.has(e.tenant_id)) seen.set(e.tenant_id, e.plan);
+  return { followers: [...seen].map(([tenant_id, plan]) => ({ tenant_id, plan })), error: null };
 }
 
 /**
@@ -162,33 +195,56 @@ const sha = (v: unknown): string | null => (typeof v === "string" && /^[0-9a-f]{
 export interface ShadowCommitRow { id: string; commitment_sha256: string; created_at: string; channel: string; telegram_date: string | null; payload: Record<string, unknown> }
 export type ShadowMarket = Pick<MarketRow, "id" | "platform" | "external_id" | "status" | "deadline_utc">;
 
+/** Pure: the commit's committed verdict, when its payload carries one (migration 012 on). */
+const committedOfRow = (row: ShadowCommitRow): CommittedFields | null => {
+  const c = CommittedVerdict.safeParse(row.payload?.committed);
+  return c.success ? c.data : null;
+};
+
+/** Pure. Whether any commit of the market is RESOLVED: only then does reading it need the priced reveal (src/shadow/reveal.ts). */
+export const hasResolvedCommit = (commits: readonly ShadowCommitRow[]): boolean => commits.some((r) => committedOfRow(r)?.resolution_status === "RESOLVED");
+
 /**
  * Pure: one commit as a follower reads it. A commit recorded before migration 012 has no payload.committed; its
  * verdict is null (it is readable after the reveal through /v1/track-record/verify) and its hashes come from the payload.
+ * `locked`: the tenant has not received this market's RESOLVED verdict (src/shadow/reveal.ts), so a RESOLVED commit
+ * shows its commitment and hashes with verdict null and locked true; a commit that is not RESOLVED is shown in full.
  */
-export function shapeShadowCommit(row: ShadowCommitRow): Record<string, unknown> {
-  const committed = CommittedVerdict.safeParse(row.payload?.committed);
+export function shapeShadowCommit(row: ShadowCommitRow, locked = false): Record<string, unknown> {
+  const committed = committedOfRow(row);
+  const hidden = locked && committed?.resolution_status === "RESOLVED";
   return {
     commitment_sha256: row.commitment_sha256,
     committed_at: row.created_at,
     posted: row.channel === "telegram",
     posted_at: row.telegram_date,
-    verdict: committed.success ? shadowVerdict(committed.data) : null,
+    verdict: committed && !hidden ? shadowVerdict(committed) : null,
+    locked: hidden,
     evidence: {
-      raw_sha256: committed.success ? committed.data.raw_sha256 : sha(row.payload?.evidence_raw_sha256),
-      canonical_sha256: committed.success ? committed.data.canonical_sha256 : sha(row.payload?.canonical_sha256),
+      raw_sha256: committed ? committed.raw_sha256 : sha(row.payload?.evidence_raw_sha256),
+      canonical_sha256: committed ? committed.canonical_sha256 : sha(row.payload?.canonical_sha256),
     },
   };
 }
 
-/** Pure: GET /v1/shadow/:market_id. Commits newest first; latest is the verdict the market stands on now. */
-export function shapeShadow(m: ShadowMarket, commits: ShadowCommitRow[]): Record<string, unknown> {
+/** The priced reveal of one market for the reading tenant: why it is released or locked (src/shadow/reveal.ts). */
+export interface ShadowReveal { access: RevealAccess; locked: LockedReveal | null }
+
+/**
+ * Pure: GET /v1/shadow/:market_id. Commits newest first; latest is the verdict the market stands on now. One charge per
+ * tenant and market covers every commit of it, so `reveal` applies to every RESOLVED commit at once (null: no commit is
+ * RESOLVED, nothing is priced).
+ */
+export function shapeShadow(m: ShadowMarket, commits: ShadowCommitRow[], reveal: ShadowReveal | null = null): Record<string, unknown> {
+  const locked = reveal?.locked != null;
   const shaped = [...commits]
     .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at) || b.id.localeCompare(a.id))
-    .map(shapeShadowCommit);
+    .map((r) => shapeShadowCommit(r, locked));
   return {
     market_id: m.id, platform: m.platform, external_id: m.external_id, market: marketRef(m), status: m.status, deadline_utc: m.deadline_utc,
     label: EARLY_REVEAL_LABEL,
+    reveal: reveal?.access ?? null,
+    locked: reveal?.locked ?? null,
     latest: shaped[0] ?? null,
     commits: shaped,
     how_to_verify: "Each commitment_sha256 is public in the channel from the moment it is posted; after the platform resolves, the reveal prints the preimage, and sha256(preimage) = commitment_sha256 (GET /v1/track-record/verify?hash=).",

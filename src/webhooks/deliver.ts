@@ -45,7 +45,10 @@ export const drainSubrequests = (max: number): number => 2 * COST.db + max * DEL
 /** A dead endpoint DLQs one delivery per event; one DM per endpoint per 6 h is enough to act on. */
 export const DLQ_DEDUP_MINUTES = 360;
 
-/** Inline first attempts per publish; queued rows beyond them wait for the drain (at most 5 minutes). */
+/**
+ * Inline first attempts per publish; queued rows beyond them wait for the drain (at most 5 minutes). Both take the
+ * highest priority first, so a reveal a tenant paid for is among the inline attempts before any free or locked one.
+ */
 export const INLINE_MAX = 2;
 /** claim_webhook_deliveries()'s lease (migration 009): an inline claim holds a row exactly as long as the drain's would. */
 export const LEASE_SECONDS = 60;
@@ -59,10 +62,49 @@ export type WaitUntil = (p: Promise<unknown>) => void;
 
 type Row = Record<string, unknown>;
 
-/** One event for one tenant (queueEvents). */
-export interface EventItem { tenant: string; eventType: WebhookEvent; payload: Record<string, unknown> }
+/**
+ * One event for one tenant (queueEvents). priority orders the claim (webhook_deliveries.priority, migration 023: paid
+ * reveals first; 0 when absent); a shadow.committed whose reveal was charged as it was queued carries the charge's
+ * request id and its refund deadline (refund_late_reveals()).
+ */
+export interface EventItem { tenant: string; eventType: WebhookEvent; payload: Record<string, unknown>; priority?: number; revealCharge?: { requestId: string; dueAt: string } | null }
 /** Queued rows, or why nothing was queued. "No subscribed endpoint" is not an error: rows [] and error null. */
 export interface QueueOutcome { rows: Row[]; error: string | null }
+/** An active endpoint of a tenant, as the queue reads it. */
+export interface Endpoint { id: string; tenant_id: string; events: string[] | null }
+
+/** The active endpoints of these tenants, in one read; error when they could not be read (never "none"). 1 subrequest. */
+export async function readEndpoints(env: Env, tenants: readonly string[]): Promise<{ endpoints: Endpoint[]; error: string | null }> {
+  const ids = [...new Set(tenants)];
+  if (!ids.length) return { endpoints: [], error: null };
+  const { data, error } = await db(env).from("webhook_endpoints").select("id, tenant_id, events").in("tenant_id", ids).eq("active", true).is("deleted_at", null);
+  if (error) return { endpoints: [], error: `the endpoint read failed (${redact(error.message)})` };
+  return { endpoints: (data ?? []) as Endpoint[], error: null };
+}
+
+/**
+ * Insert one delivery ('pending', attempt 0) per event and endpoint of `endpoints` (already read, readEndpoints) of its
+ * tenant that subscribes to its type, in one insert. The priority and reveal-charge columns (migration 023) are written
+ * only when an item of the batch sets one, so every other event inserts exactly the columns it did before 023. 1
+ * subrequest, none when no endpoint subscribes.
+ */
+export async function insertEvents(env: Env, endpoints: readonly Endpoint[], items: readonly EventItem[]): Promise<QueueOutcome> {
+  const extra = items.some((i) => (i.priority ?? 0) !== 0 || i.revealCharge);
+  const rows: Row[] = [];
+  const shas = new Map<Record<string, unknown>, string>(); // one hash per payload: enqueueEvent fans one out to many tenants
+  for (const i of items) {
+    const targets = endpoints.filter((e) => e.tenant_id === i.tenant && subscribes(e, i.eventType));
+    if (!targets.length) continue;
+    const sha = shas.get(i.payload) ?? await sha256Hex(JSON.stringify(i.payload));
+    shas.set(i.payload, sha);
+    const columns = extra ? { priority: i.priority ?? 0, reveal_charge_id: i.revealCharge?.requestId ?? null, reveal_due_at: i.revealCharge?.dueAt ?? null } : {};
+    for (const e of targets) rows.push({ endpoint_id: e.id, tenant_id: e.tenant_id, event_type: i.eventType, payload: i.payload, payload_sha256: sha, status: "pending", attempt: 0, ...columns });
+  }
+  if (!rows.length) return { rows: [], error: null };
+  const { data, error } = await db(env).from("webhook_deliveries").insert(rows).select("*");
+  if (error) return { rows: [], error: `the insert of ${rows.length} deliver${rows.length === 1 ? "y" : "ies"} failed (${redact(error.message)})` };
+  return { rows: (data ?? []) as Row[], error: null };
+}
 
 /**
  * Queue events in one endpoint read and one insert whatever their number: one delivery ('pending', attempt 0) per event
@@ -72,23 +114,9 @@ export interface QueueOutcome { rows: Row[]; error: string | null }
 export async function queueEvents(env: Env, items: readonly EventItem[]): Promise<QueueOutcome> {
   const tenants = [...new Set(items.map((i) => i.tenant))];
   if (!tenants.length) return { rows: [], error: null };
-  const client = db(env);
-  const { data: eps, error: readError } = await client.from("webhook_endpoints").select("id, tenant_id, events").in("tenant_id", tenants).eq("active", true).is("deleted_at", null);
-  if (readError) return { rows: [], error: `the endpoint read failed (${redact(readError.message)})` };
-  const endpoints = (eps ?? []) as Array<{ id: string; tenant_id: string; events: string[] | null }>;
-  const rows: Row[] = [];
-  const shas = new Map<Record<string, unknown>, string>(); // one hash per payload: enqueueEvent fans one out to many tenants
-  for (const i of items) {
-    const targets = endpoints.filter((e) => e.tenant_id === i.tenant && subscribes(e, i.eventType));
-    if (!targets.length) continue;
-    const sha = shas.get(i.payload) ?? await sha256Hex(JSON.stringify(i.payload));
-    shas.set(i.payload, sha);
-    for (const e of targets) rows.push({ endpoint_id: e.id, tenant_id: e.tenant_id, event_type: i.eventType, payload: i.payload, payload_sha256: sha, status: "pending", attempt: 0 });
-  }
-  if (!rows.length) return { rows: [], error: null };
-  const { data, error } = await client.from("webhook_deliveries").insert(rows).select("*");
-  if (error) return { rows: [], error: `the insert of ${rows.length} deliver${rows.length === 1 ? "y" : "ies"} failed (${redact(error.message)})` };
-  return { rows: (data ?? []) as Row[], error: null };
+  const r = await readEndpoints(env, tenants);
+  if (r.error) return { rows: [], error: r.error };
+  return insertEvents(env, r.endpoints, items);
 }
 
 /**
@@ -264,11 +292,16 @@ export function claimPatch(nowMs: number): { status: "delivering"; lease_until: 
   return { status: "delivering", lease_until: new Date(nowMs + LEASE_SECONDS * 1000).toISOString() };
 }
 
-/** Pure: the queued rows an inline attempt takes: still 'pending', in queue order (created_at, then id), at most max. */
+/**
+ * Pure: the queued rows an inline attempt takes: still 'pending', highest priority first (migration 023: a paid reveal
+ * before an included plan, a grandfathered key and a locked reveal), then in queue order (created_at, then id), at most
+ * max: claim_webhook_deliveries()'s order. The rows of one insert share created_at, so without the priority the order
+ * among followers would be their random ids.
+ */
 export function inlineCandidates(rows: Row[], max: number): Row[] {
   return rows
     .filter((r) => r.status === "pending")
-    .sort((a, b) => String(a.created_at ?? "").localeCompare(String(b.created_at ?? "")) || String(a.id).localeCompare(String(b.id)))
+    .sort((a, b) => Number(b.priority ?? 0) - Number(a.priority ?? 0) || String(a.created_at ?? "").localeCompare(String(b.created_at ?? "")) || String(a.id).localeCompare(String(b.id)))
     .slice(0, Math.max(0, max));
 }
 

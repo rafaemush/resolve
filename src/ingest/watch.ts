@@ -343,10 +343,11 @@ export async function runWatch(env: Env, cfg: Config, watchId: string, opts: Wat
     } else if (mode === "shadow") {
       const cm = await commitVerdict(env, market, rt.resolutionId, v);
       summary.detail += ` | commit: ${cm.reason}`;
-      // The private early reveal: followers get the committed verdict as soon as the commitment exists.
+      // The private early reveal: followers get the committed verdict as soon as the commitment exists (priced since
+      // migration 023: locked payloads carry the card pointer at the public origin of the request that started this run).
       if (cm.commit) {
-        const f = await publishShadowCommitted(env, market, cm.commit, { waitUntil: opts.waitUntil });
-        if (f.rows.length) summary.detail += ` | shadow.committed queued for ${f.rows.length} endpoint(s) of ${f.followers} follower(s)`;
+        const f = await publishShadowCommitted(env, market, cm.commit, { waitUntil: opts.waitUntil, base: opts.base });
+        if (f.rows.length) summary.detail += ` | shadow.committed queued for ${f.rows.length} endpoint(s) of ${f.followers} follower(s)${f.charged > 0 ? `, ${f.charged} credit(s) charged` : ""}${f.locked > 0 ? `, ${f.locked} locked` : ""}`;
       }
     } else if (market.tenant_id) {
       const type = v.resolution_status === "RESOLVED" ? "market.resolved" : v.resolution_status === "ERROR" ? "market.error" : "market.unresolved_update";
