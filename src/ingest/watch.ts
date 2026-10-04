@@ -161,6 +161,13 @@ export interface WatchRunOptions {
    */
   webhooks?: Budget;
   /**
+   * When this run's webhook first attempts must have finished (epoch ms): the end of the waitUntil the inline commit runs
+   * in. An attempt that could not finish by then is not started (attemptInline's deadlineMs): a POST cut off mid-flight
+   * leaves its row 'delivering' for the drain's 15-minute stale sweep, past the reveal refund rule's 10 minutes, while a
+   * row left 'pending' is the drain's at its next 5-minute run.
+   */
+  webhookDeadlineMs?: number;
+  /**
    * The site's public origin for the credits.low pointers of a charge this run makes (src/billing/top-up.ts publicBase
    * of the request that started it: RESOLVE_PUBLIC_URL, else that request's origin, which for a pg_net dispatch is
    * app_config worker_base_url). Without it, RESOLVE_PUBLIC_URL alone, and a relative page when that is unset.
@@ -213,7 +220,7 @@ export async function runWatch(env: Env, cfg: Config, watchId: string, opts: Wat
       // run: their request's subrequests are the ones the inline budget counts (HOLDER_REQUEST_SUBREQUESTS); a tenant's
       // /v1/resolve fetch spends its own on authentication first, so it captures as before.
       const inline = opts.waitUntil && (opts.dispatch === "pg_net" || opts.dispatch === "admin")
-        ? { requestDone, run: (webhooks: Budget) => runWatch(env, cfg, watchId, { waitUntil: opts.waitUntil, base: opts.base, dispatch: "inline_commit", webhooks }) }
+        ? { requestDone, run: (webhooks: Budget, webhookDeadlineMs: number) => runWatch(env, cfg, watchId, { waitUntil: opts.waitUntil, base: opts.base, dispatch: "inline_commit", webhooks, webhookDeadlineMs }) }
         : undefined;
       out = await fetchOfficial(env, watch, market, { waitUntil: opts.waitUntil, ...(inline ? { inline } : {}) });
       break;
@@ -366,18 +373,22 @@ export async function runWatch(env: Env, cfg: Config, watchId: string, opts: Wat
     } else if (awaiting) {
       // a "not yet" is not a verdict to publish; the re-check publishes
     } else if (mode === "shadow") {
-      const cm = await commitVerdict(env, market, rt.resolutionId, v);
-      summary.detail += ` | commit: ${cm.reason}`;
       // The private early reveal: followers get the committed verdict as soon as the commitment exists (priced since
       // migration 023: locked payloads carry the card pointer at the public origin of the request that started this run).
-      if (cm.commit) {
-        const f = await publishShadowCommitted(env, market, cm.commit, { waitUntil: opts.waitUntil, base: opts.base, ...(opts.webhooks ? { budget: opts.webhooks } : {}) });
-        if (f.rows.length) summary.detail += ` | shadow.committed queued for ${f.rows.length} endpoint(s) of ${f.followers} follower(s)${f.charged > 0 ? `, ${f.charged} credit(s) charged` : ""}${f.locked > 0 ? `, ${f.locked} locked` : ""}`;
-      }
+      // commitVerdict runs it right after the bot_posts insert and before its inline Telegram post, so an invocation
+      // that ends during the post (the inline commit of an official release runs late in its waitUntil) has queued it.
+      let published = "";
+      const cm = await commitVerdict(env, market, rt.resolutionId, v, {
+        recorded: async (commit) => {
+          const f = await publishShadowCommitted(env, market, commit, { waitUntil: opts.waitUntil, base: opts.base, ...(opts.webhooks ? { budget: opts.webhooks } : {}), ...(opts.webhookDeadlineMs !== undefined ? { deadlineMs: opts.webhookDeadlineMs } : {}) });
+          if (f.rows.length) published = ` | shadow.committed queued for ${f.rows.length} endpoint(s) of ${f.followers} follower(s)${f.charged > 0 ? `, ${f.charged} credit(s) charged` : ""}${f.locked > 0 ? `, ${f.locked} locked` : ""}`;
+        },
+      });
+      summary.detail += ` | commit: ${cm.reason}${published}`;
     } else if (market.tenant_id) {
       const type = v.resolution_status === "RESOLVED" ? "market.resolved" : v.resolution_status === "ERROR" ? "market.error" : "market.unresolved_update";
       // The tenant's verdict in its public shape (engine_version, web_evidence; src/api/public-names.ts).
-      await publishEvent(env, market.tenant_id, type, { market_id: market.id, external_id: market.external_id, request_id: rt.resolutionId, verdict: toPublicVerdict(v) }, { waitUntil: opts.waitUntil, ...(opts.webhooks ? { budget: opts.webhooks } : {}) });
+      await publishEvent(env, market.tenant_id, type, { market_id: market.id, external_id: market.external_id, request_id: rt.resolutionId, verdict: toPublicVerdict(v) }, { waitUntil: opts.waitUntil, ...(opts.webhooks ? { budget: opts.webhooks } : {}), ...(opts.webhookDeadlineMs !== undefined ? { deadlineMs: opts.webhookDeadlineMs } : {}) });
     }
     // A charge that looked stands (only a could-not-look verdict is refunded): credits.low (its pointers at the public
     // origin of the request that started this run) and the operator's alert once per crossing. noteCharge never throws;

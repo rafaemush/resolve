@@ -76,7 +76,8 @@ internal.post("/watch/:id", async (c) => {
     const denied = await dispatchDenied(c, id, { seconds: true });
     if (denied) return denied;
     const minute = c.req.header("x-internal-minute") ?? "";
-    // Only select_due_watches() signs, and it signs real watch ids; anything else never reaches the database.
+    // Only select_due_watches() and redispatch_official_legs() (migration 024) sign, and they sign real watch ids;
+    // anything else never reaches the database.
     if (!z.uuid().safeParse(id).success) return err(c, "validation_error", "watch id is not a uuid", 400);
     let claim: z.infer<typeof DispatchClaim>;
     try { claim = DispatchClaim.parse(await rpc(db(c.env), "claim_watch_dispatch", { p_watch: id, p_minute: minute })); }

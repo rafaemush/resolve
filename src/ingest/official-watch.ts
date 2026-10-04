@@ -54,10 +54,15 @@
  *     anything starts: the redispatch 1 + the inline poll INLINE_RUN_SUBREQUESTS 24 (its commit counted at 10, an inline
  *     post; a ladder's is 2) + the deferred siblings and their redispatch (siblingSubrequests: 8 for the CPI page, 4 for
  *     the Employment Situation) + one alert 5, within INVOCATION_SUBREQUESTS or not inline at all; the publish's webhook
- *     first attempts get what is left (attemptInline fits whole deliveries of 4 into it). A CPI page read on its first
- *     fetch: 6 + 4 + 38 = 48 reserved, nothing left for a webhook attempt (the drain delivers within 5 minutes, inside the
- *     refund rule's 10); measured 34 (tests/official-inline-commit.test.ts). A release without siblings: 6 + 4 + 30 = 40,
- *     two webhook first attempts. Not reserved, as on every watch run: the alerts the inline poll and the siblings raise
+ *     first attempts get what is left (attemptInline fits whole deliveries of 4 into it, and only those that can finish
+ *     by the capture's hardStop: withinDeadline, an endpoint's rows being sequential). A CPI page read on its first
+ *     fetch: 6 + 4 + 38 = 48 reserved, nothing left for a webhook attempt: the drain delivers them, DRAIN_MAX = 5 rows per
+ *     5-minute run across every pending row, paid reveals first, so past about 5 queued rows (this leg's followers with
+ *     endpoints, plus whatever else is pending) some are attempted after the refund rule's 10 minutes and their charges
+ *     are refunded (a known exposure, docs/runbooks/venue-pilot.md states the drain's ceiling); measured 34
+ *     (tests/official-inline-commit.test.ts). A release without siblings: 6 + 4 + 30 = 40, two webhook first attempts.
+ *     The publish is queued right after the bot_posts insert, before commitVerdict's inline Telegram post (whose seconds
+ *     could outlast waitUntil). Not reserved, as on every watch run: the alerts the inline poll and the siblings raise
  *     themselves (a prior-level mismatch, an R2 failure, a resolution or a commit not recorded, a sibling's disagreement
  *     or revision; 5 each). Past 50 the last subrequests fail: the sibling records and their redispatch (those siblings
  *     are recorded by the next minute's holder, as before 024) or a webhook attempt in flight (requeued by the drain's
@@ -175,9 +180,10 @@ async function confirmRead(env: Env, slot: string, period: string, c: ConfirmRea
 /**
  * The release-minute capture commits the holder's own leg in its own invocation when the first print it recorded was
  * recorded (official_observations.observed_at, the database's clock) at most this long after release_at (rail
- * inline_commit_window). Later in the burst, the inline poll and the deferred siblings after it (their corroboration
- * alone may take 8 s) might not finish inside waitUntil's 30 s after the response, so those legs are left to their next
- * minute poll, as before.
+ * inline_commit_window). Later in the burst, the inline poll and the deferred siblings' records after it might not
+ * finish inside waitUntil's 30 s after the response, so those legs are left to their next minute poll, as before. (The
+ * siblings' corroboration, up to 8 s, starts when the first print is recorded and runs beside the inline poll:
+ * prepareSiblings.)
  */
 export const INLINE_COMMIT_WINDOW_S = 15;
 /**
@@ -208,8 +214,11 @@ export const REQUEST_DONE_WAIT_MS = 5000;
  * first print: the same runWatch (store, resolve, commitVerdict, publishShadowCommitted), never a copy of it.
  */
 export interface InlineCommit {
-  /** runWatch of the holder's own watch, dispatch inline_commit, its webhook first attempts held to `webhooks`. */
-  run(webhooks: SubrequestBudget): Promise<{ outcome: string; detail: string; verdict?: string }>;
+  /**
+   * runWatch of the holder's own watch, dispatch inline_commit, its webhook first attempts held to `webhooks` and to what
+   * can finish by `webhookDeadlineMs` (the capture's hardStop: inside waitUntil's 30 s after the response).
+   */
+  run(webhooks: SubrequestBudget, webhookDeadlineMs: number): Promise<{ outcome: string; detail: string; verdict?: string }>;
   /** Settles once the holder's request has written its watches update and loop_runs row. */
   requestDone: Promise<void>;
 }
@@ -235,8 +244,9 @@ export type InlinePlan = { fits: true; spent: number; reserved: number; webhooks
  * poll (INLINE_RUN_SUBREQUESTS), the deferred siblings and their redispatch, and one alert (the publish's alerts, which
  * ride in its webhook attempt's alertMany or go out on their own when nothing was queued, or a failed redispatch's). The
  * publish's webhook first attempts get what is left plus that alert (attemptInline fits as many deliveries as it can,
- * none below one delivery's worth, and the drain takes the rest within 5 minutes). When the reservation does not fit,
- * the leg is not committed inline: it is redispatched with the others.
+ * none below one delivery's worth, none that could not finish by the capture's hardStop; the drain takes the rest, 5 rows
+ * per 5-minute run, paid first). When the reservation does not fit, the leg is not committed inline: it is redispatched
+ * with the others.
  */
 export function inlinePlan(captureSubrequests: number, siblings: number): InlinePlan {
   const b = new SubrequestBudget(INVOCATION_SUBREQUESTS);
@@ -335,16 +345,21 @@ async function safeAlert(env: Env, key: string, text: string, dedupMinutes: numb
   catch (e) { console.error(JSON.stringify({ level: "error", job: "official_alert", key, error: String(e).slice(0, 200) })); }
 }
 
-/** Siblings a capture left for its caller to record after the inline commit (mode.deferSiblings): how many, and the call that records them. */
+/**
+ * Siblings a capture left for its caller to record after the inline commit (mode.deferSiblings): how many, and the call
+ * that records them. Their read and corroboration already started when the capture returned (prepareSiblings); record()
+ * waits for them and writes the first prints.
+ */
 export interface DeferredSiblings { count: number; record(): Promise<SiblingsRecorded> }
 export interface SiblingsRecorded { notes: string[]; inserted: OfficialSeriesId[] }
 
 export type Capture =
   /**
    * subrequests: what the capture spent as counted (upstream requests, corroboration 1, R2 put 1, the record 1, COST.alert
-   * per alert it raised), for the inline commit's budget (inlinePlan). later: the siblings left to the caller.
+   * per alert it raised), for the inline commit's budget (inlinePlan). later: the siblings left to the caller. hardStop:
+   * the capture's deadline (epoch ms, its start + BURST_HARD_STOP_MS in the burst), the end of the time its waitUntil has.
    */
-  | { kind: "recorded"; stored: OfficialObservationDoc; fetched: OfficialObservationDoc; inserted: boolean; revision: boolean; ownCapture: boolean; requests: number; siblings: string[]; subrequests: number; later?: DeferredSiblings }
+  | { kind: "recorded"; stored: OfficialObservationDoc; fetched: OfficialObservationDoc; inserted: boolean; revision: boolean; ownCapture: boolean; requests: number; siblings: string[]; subrequests: number; hardStop: number; later?: DeferredSiblings }
   | { kind: "pending"; detail: string; requests: number; siblings?: string[] }
   | { kind: "error"; error: string; retryable: boolean; drift: boolean; httpStatus?: number; deferSeconds?: number; requests: number; siblings?: string[] };
 
@@ -370,28 +385,52 @@ const corroborate = async (obs: FetchedObservation, period: string, deps: Pick<O
   catch (e) { return { status: "unavailable", source_url: null, value: null, value_text: null, detail: `corroboration threw: ${String(e).slice(0, 200)}`, checked_at: iso(deps.now()) }; }
 };
 
+/** Siblings read and corroborated, not yet recorded: the ones not stored yet, each with its corroboration. */
+interface PreparedSiblings { notes: string[]; todo: Array<{ obs: FetchedObservation; corroboration: OfficialCorroboration }> }
+
+/**
+ * The first half of recording the siblings: which ones are not stored yet (1 read) and each one's corroboration (1
+ * request each, under the capture's own deadline: at most 8 s and never past hardStop). A capture that defers its
+ * siblings starts this the moment it records its own first print, so their corroboration runs beside the inline commit
+ * with the same time it always had, and only the records wait for it (a corroboration started after a slow inline run
+ * would find the deadline gone and record a first print as corroboration "unavailable", which resolves). Never throws.
+ */
+async function prepareSiblings(env: Env, r: OfficialResolver, siblings: FetchedObservation[], deps: Pick<OfficialDeps, "now">, hardStop: number): Promise<PreparedSiblings> {
+  if (!siblings.length) return { notes: [], todo: [] };
+  try {
+    const { data, error } = await db(env).from("official_observations").select("series").eq("period", r.period).in("series", siblings.map((s) => s.series));
+    if (error) return { notes: siblings.map((s) => `${s.series}: not recorded (official_observations read: ${error.message.slice(0, 120)})`), todo: [] };
+    const stored = new Set(((data ?? []) as Array<{ series: string }>).map((x) => x.series));
+    const todo = siblings.filter((s) => !stored.has(s.series));
+    const notes = siblings.filter((s) => stored.has(s.series)).map((s) => `${s.series}: already stored`);
+    const corr = await Promise.all(todo.map((s) => corroborate(s, r.period, deps, hardStop)));
+    return { notes, todo: todo.map((obs, i) => ({ obs, corroboration: corr[i]! })) };
+  } catch (e) {
+    return { notes: siblings.map((s) => `${s.series}: not recorded (${String(e).slice(0, 120)})`), todo: [] };
+  }
+}
+
+/** The second half: record_official_observation per prepared sibling. Never throws. */
+async function recordPrepared(env: Env, r: OfficialResolver, marketId: string, p: PreparedSiblings, upstream: number, extraMeta: Record<string, unknown> = {}): Promise<SiblingsRecorded> {
+  const notes = [...p.notes];
+  const inserted: OfficialSeriesId[] = [];
+  for (const { obs: s, corroboration } of p.todo) {
+    try {
+      const row = await recordObservation(env, s, r.period, corroboration, { upstream_requests: upstream + 1, captured_by_market: marketId, sibling_of: r.series, ...extraMeta });
+      if (row.inserted) inserted.push(s.series);
+      notes.push(`${s.series}: ${row.inserted ? "recorded" : "already stored"} ${row.value_text}`);
+    } catch (e) { notes.push(`${s.series}: record_official_observation: ${String(e).slice(0, 160)}`); }
+  }
+  return { notes, inserted };
+}
+
 /**
  * The other series of the fetch group that the holder's page states for the period: each one not yet stored gets its
  * own corroboration and first print from the same bytes (already in R2). Never throws; returns one note per sibling and
  * the series whose first print this call inserted.
  */
 async function recordSiblings(env: Env, r: OfficialResolver, marketId: string, siblings: FetchedObservation[], upstream: number, deps: Pick<OfficialDeps, "now">, hardStop: number, extraMeta: Record<string, unknown> = {}): Promise<SiblingsRecorded> {
-  if (!siblings.length) return { notes: [], inserted: [] };
-  const { data, error } = await db(env).from("official_observations").select("series").eq("period", r.period).in("series", siblings.map((s) => s.series));
-  if (error) return { notes: siblings.map((s) => `${s.series}: not recorded (official_observations read: ${error.message.slice(0, 120)})`), inserted: [] };
-  const stored = new Set(((data ?? []) as Array<{ series: string }>).map((x) => x.series));
-  const todo = siblings.filter((s) => !stored.has(s.series));
-  const notes = siblings.filter((s) => stored.has(s.series)).map((s) => `${s.series}: already stored`);
-  const inserted: OfficialSeriesId[] = [];
-  const corr = await Promise.all(todo.map((s) => corroborate(s, r.period, deps, hardStop)));
-  for (const [i, s] of todo.entries()) {
-    try {
-      const row = await recordObservation(env, s, r.period, corr[i]!, { upstream_requests: upstream + 1, captured_by_market: marketId, sibling_of: r.series, ...extraMeta });
-      if (row.inserted) inserted.push(s.series);
-      notes.push(`${s.series}: ${row.inserted ? "recorded" : "already stored"} ${row.value_text}`);
-    } catch (e) { notes.push(`${s.series}: record_official_observation: ${String(e).slice(0, 160)}`); }
-  }
-  return { notes, inserted };
+  return recordPrepared(env, r, marketId, await prepareSiblings(env, r, siblings, deps, hardStop), upstream, extraMeta);
 }
 
 /**
@@ -484,13 +523,17 @@ export async function captureOfficial(env: Env, r: OfficialResolver, marketId: s
   const subrequests = b.used + COST.http + COST.db + COST.db + alerts * COST.alert;
   const stored = docFromRow(row);
   const fetched = docFromFetch(obs, corroboration);
-  const base = { kind: "recorded" as const, stored, fetched, inserted: row.inserted === true, revision: row.revision_differs === true, ownCapture: row.meta?.captured_by_market === marketId, requests: b.used, subrequests };
-  const recordAll = async (): Promise<SiblingsRecorded> => {
-    const done = await recordSiblings(env, r, marketId, pageSiblings, b.used, deps, hardStop, confirmedMeta);
+  const base = { kind: "recorded" as const, stored, fetched, inserted: row.inserted === true, revision: row.revision_differs === true, ownCapture: row.meta?.captured_by_market === marketId, requests: b.used, subrequests, hardStop };
+  const recordAll = async (prepared: Promise<PreparedSiblings>): Promise<SiblingsRecorded> => {
+    const done = await recordPrepared(env, r, marketId, await prepared, b.used, confirmedMeta);
     return { notes: [...done.notes, ...siblingNotes], inserted: done.inserted };
   };
-  if (mode.siblings && mode.deferSiblings) return { ...base, siblings: [], later: { count: pageSiblings.length, record: recordAll } };
-  return { ...base, siblings: mode.siblings ? (await recordAll()).notes : [] };
+  if (mode.siblings && mode.deferSiblings) {
+    // the siblings' read and corroboration start now, under this capture's deadline; only their records are deferred
+    const prepared = prepareSiblings(env, r, pageSiblings, deps, hardStop);
+    return { ...base, siblings: [], later: { count: pageSiblings.length, record: () => recordAll(prepared) } };
+  }
+  return { ...base, siblings: mode.siblings ? (await recordAll(prepareSiblings(env, r, pageSiblings, deps, hardStop))).notes : [] };
 }
 
 /** Resolves when p settles or after ms, whichever comes first (a real timer, cleared: the burst's injected sleep is not used). */
@@ -573,7 +616,7 @@ async function holderCapture(env: Env, r: OfficialResolver, market: MarketRow, w
   const first = await rd;
   line.redispatch = first.detail;
   try {
-    const run = await inline.run(new SubrequestBudget(plan.webhooks - (first.alerted ? COST.alert : 0)));
+    const run = await inline.run(new SubrequestBudget(plan.webhooks - (first.alerted ? COST.alert : 0)), c.hardStop);
     line.inline = { ...(line.inline as object), outcome: run.outcome, verdict: run.verdict ?? null, detail: run.detail.slice(0, 300) };
   } catch (e) {
     // runWatch records every failure itself; a throw past it is alerted here, and the leg resolves on its next poll

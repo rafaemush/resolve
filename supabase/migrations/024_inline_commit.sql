@@ -19,9 +19,15 @@
 --     in the release minute, so a second dispatch signed with that minute would be refused as signature_used. A
 --     redispatch therefore signs its stamp to the second ("YYYY-MM-DDTHH:MI:SS"): a stamp the scheduled dispatch never
 --     uses, so it is its own single-use row. The Worker accepts it within the same +-3 minutes
---     (src/api/dispatch-auth.ts), and claim_watch_dispatch() checks the lease against the stamp's own time: the lease a
---     redispatch takes ends 30 s after its stamp, long before the stamp + 180 s that marks a lease as taken by a later
---     run. used_dispatch_signatures.minute accepts both forms; nothing else in 019 changes.
+--     (src/api/dispatch-auth.ts), and claim_watch_dispatch() checks the lease against the stamp's own time, with a
+--     threshold per stamp form. A minute stamp keeps 019's: a lease at or after the minute + 180 s was taken by a later
+--     run. A second stamp S uses S + 60 s: the lease a redispatch takes ends before S + 31 s (to_char truncates the
+--     second), and the holder's kept lease ends at the release minute's second 59 (< S + 60, since S is in or after
+--     that minute), while any lease taken after the redispatch's lease expired starts at S + 30 s or later and runs
+--     120 s (select_due_watches, lease_watch_now, a claim's extension), so it ends at S + 150 s or later. With 019's
+--     180 s for a second stamp, a redispatch POST that pg_net delivered late would be claimed beside the minute tick's
+--     run or a tenant fetch whose lease ends between S + 150 s and S + 180 s: two runs of one leg at once, the double
+--     charge 019 exists to prevent. used_dispatch_signatures.minute accepts both forms; nothing else in 019 changes.
 --   * The lease a redispatch takes is 30 s, not 120: claim_watch_dispatch() extends it to now + 120 s when the POST
 --     arrives (pg_net gives up after 30 s), and a POST that never arrives frees the leg in 30 s, before the next minute
 --     tick (the redispatch runs at most about 30 s after release_at), so a lost redispatch costs nothing against today.
@@ -71,18 +77,22 @@ begin
   if v_lease <= now() then return 'lease_expired'; end if;
   -- The signed time: the minute's start, or the second a redispatch signed.
   v_signed := case when length(p_minute) = 19 then (p_minute || '+00')::timestamptz else (p_minute || ':00+00')::timestamptz end;
-  -- select_due_watches() signs minute M and sets lease_until = now() + 120 s inside M, and redispatch_official_legs()
-  -- signs second S and sets now() + 30 s, so the lease the signed dispatch took ends before the signed time + 180 s. A
-  -- lease past that was taken later (a later dispatch or a tenant fetch, possible only once that lease ended): this
-  -- request is late, and that run is the current one.
-  if v_lease >= v_signed + interval '180 seconds' then return 'lease_superseded'; end if;
+  -- select_due_watches() signs minute M and sets lease_until = now() + 120 s inside M, so the lease it took ends before
+  -- M + 180 s. redispatch_official_legs() signs second S and sets now() + 30 s (< S + 31 s; the holder's kept lease ends
+  -- by second 59 of the release minute, < S + 60 s), and a lease taken once that one expired ends at S + 30 + 120 s or
+  -- later, so a second stamp's threshold is S + 60 s, never 180 (a lease ending between S + 150 and S + 180 s would pass).
+  -- A lease at or past the threshold was taken later (a later dispatch or a tenant fetch, possible only once the signed
+  -- dispatch's lease ended): this request is late, and that run is the current one.
+  if v_lease >= v_signed + case when length(p_minute) = 19 then interval '60 seconds' else interval '180 seconds' end then
+    return 'lease_superseded';
+  end if;
   -- Hold the lease for the whole run: claimed near its end, the run would otherwise outlive it and overlap the next
   -- dispatch. runWatch releases it (lease_until null) when the run is recorded.
   update watches set lease_until = greatest(lease_until, now() + interval '120 seconds') where id = p_watch;
   return 'claimed';
 end $$;
 comment on function public.claim_watch_dispatch(uuid, text) is
-  'Called by POST /internal/watch/:id after the HMAC check, before any work. Inserts (p_watch, p_minute) into used_dispatch_signatures first; p_minute is the signed stamp, to the minute (select_due_watches) or to the second (redispatch_official_legs, migration 024). Returns signature_used when it was already there (a replay or duplicate: the Worker answers 409), watch_not_found, lease_missing (lease_until null: the watch was already polled and released, or never leased), lease_expired (lease_until at or before now: the request came after the lease its dispatch took), lease_superseded (lease_until at or after the signed time + 180 s: the lease was taken after the one the signed dispatch took, by a later dispatch or a tenant fetch, so this late request must not run beside it), or claimed (run the poll; the lease is extended to at least now + 120 s so it covers the run). The signature stays used whatever the answer. service_role only.';
+  'Called by POST /internal/watch/:id after the HMAC check, before any work. Inserts (p_watch, p_minute) into used_dispatch_signatures first; p_minute is the signed stamp, to the minute (select_due_watches) or to the second (redispatch_official_legs, migration 024). Returns signature_used when it was already there (a replay or duplicate: the Worker answers 409), watch_not_found, lease_missing (lease_until null: the watch was already polled and released, or never leased), lease_expired (lease_until at or before now: the request came after the lease its dispatch took), lease_superseded (lease_until at or after the signed time + 180 s for a minute stamp, + 60 s for a second stamp, whose own lease is 30 s: the lease was taken after the one the signed dispatch took, by a later dispatch or a tenant fetch, so this late request must not run beside it), or claimed (run the poll; the lease is extended to at least now + 120 s so it covers the run). The signature stays used whatever the answer. service_role only.';
 revoke all on function public.claim_watch_dispatch(uuid, text) from public, anon, authenticated;
 grant execute on function public.claim_watch_dispatch(uuid, text) to service_role;
 

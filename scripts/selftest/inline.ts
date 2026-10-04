@@ -10,8 +10,9 @@
  *     dispatched with the sibling series given. No worker_base_url: skipped with a loop_runs row, nothing leased. No
  *     series: failure with the error text and a loop_runs row, nothing leased.
  *   - claim_watch_dispatch(): a second-stamped dispatch is claimed once (the replay is signature_used), and is a row of
- *     its own beside the same minute's stamp; its lease is checked against the stamp's own second (170 s claimed, 181 s
- *     lease_superseded); a malformed stamp is refused by the widened check (check_violation).
+ *     its own beside the same minute's stamp; its lease is checked against the stamp's own second with a threshold of its
+ *     own (59 s claimed; 60 s and the 151 s of a later 120 s lease taken at S + 31 s lease_superseded, where a minute stamp
+ *     would still claim it: 179 s claimed, 180 s lease_superseded for the minute form); a malformed stamp is refused by the widened check (check_violation).
  *   - least privilege: anon and authenticated cannot execute redispatch_official_legs, PUBLIC holds no EXECUTE,
  *     service_role can; SECURITY DEFINER with a pinned search_path; commented, as is the minute column.
  * Supabase only (vault and pg_net). Refused unless SUPABASE_PROJECT_REF equals STAGING_SUPABASE_PROJECT_REF or
@@ -28,7 +29,7 @@ export const INLINE_BLOCK = `
 do $$
 declare out jsonb := '{}'::jsonb; r jsonb; v_stamp text; v_bool boolean;
   m_a uuid; m_b uuid; m_sib uuid; m_other uuid; m_shut uuid;
-  w_holder uuid; w_free uuid; w_late uuid; w_busy uuid; w_sib uuid; w_other uuid; w_shut uuid; w_off uuid; w_170 uuid; w_181 uuid;
+  w_holder uuid; w_free uuid; w_late uuid; w_busy uuid; w_sib uuid; w_other uuid; w_shut uuid; w_off uuid; w_59 uuid; w_60 uuid; w_151 uuid; w_m179 uuid; w_m180 uuid;
   mk constant text := 'insert into markets (platform, external_id, condition, event_statement, option_a, option_b, positive_option, open_at, deadline_utc, resolver, status) values (''custom'', $1, ''selftest condition'', ''selftest statement'', ''Yes'', ''No'', ''OPTION_A'', now() - interval ''1 day'', now() + interval ''1 day'', $2, $3) returning id';
   wk constant text := 'insert into watches (market_id, source_kind, source_ref, lease_until, active) values ($1, ''official_release'', ''{"ref":"official:selftest"}'', $2, $3) returning id';
   cpi constant jsonb := '{"kind":"official_release","series":"us_cpi_u_nsa_yoy","period":"2099-01"}';
@@ -94,10 +95,17 @@ begin
   out := out || jsonb_build_object('claim_second', claim_watch_dispatch(w_late, v_stamp),
     'claim_second_replay', claim_watch_dispatch(w_late, v_stamp),
     'claim_minute_beside', claim_watch_dispatch(w_late, to_char(now() at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI')));
-  execute wk into w_170 using m_b, '2099-01-01T00:00:09+00'::timestamptz + interval '170 seconds', true;
-  execute wk into w_181 using m_b, '2099-01-01T00:00:09+00'::timestamptz + interval '181 seconds', true;
-  out := out || jsonb_build_object('claim_second_170s', claim_watch_dispatch(w_170, '2099-01-01T00:00:09'),
-    'claim_second_181s', claim_watch_dispatch(w_181, '2099-01-01T00:00:09'));
+  execute wk into w_59 using m_b, '2099-01-01T00:00:09+00'::timestamptz + interval '59 seconds', true;
+  execute wk into w_60 using m_b, '2099-01-01T00:00:09+00'::timestamptz + interval '60 seconds', true;
+  -- the redispatch's 30 s lease expired and the minute tick (or a tenant fetch) leased the leg at S + 31 s for 120 s
+  execute wk into w_151 using m_b, '2099-01-01T00:00:09+00'::timestamptz + interval '151 seconds', true;
+  execute wk into w_m179 using m_b, '2099-01-01T00:00:00+00'::timestamptz + interval '179 seconds', true;
+  execute wk into w_m180 using m_b, '2099-01-01T00:00:00+00'::timestamptz + interval '180 seconds', true;
+  out := out || jsonb_build_object('claim_second_59s', claim_watch_dispatch(w_59, '2099-01-01T00:00:09'),
+    'claim_second_60s', claim_watch_dispatch(w_60, '2099-01-01T00:00:09'),
+    'claim_second_later_lease', claim_watch_dispatch(w_151, '2099-01-01T00:00:09'),
+    'claim_minute_179s', claim_watch_dispatch(w_m179, '2099-01-01T00:00'),
+    'claim_minute_180s', claim_watch_dispatch(w_m180, '2099-01-01T00:00'));
   begin perform claim_watch_dispatch(w_late, '2099-01-01T00:00:9'); out := out || '{"claim_bad_stamp":"allowed"}';
   exception when check_violation then out := out || '{"claim_bad_stamp":"refused"}'; end;
   begin perform claim_watch_dispatch(w_late, '2099-01-01T00:00:09Z'); out := out || '{"claim_bad_stamp_z":"allowed"}';
@@ -133,7 +141,8 @@ export const INLINE_EXPECT: Record<string, unknown> = {
   handover_counts: [5, 2, 3], handover_leased: true, handover_other_period_untouched: true,
   no_series: ["failure", true], no_url: ["skipped", 0], no_url_nothing_leased: true, no_url_loop_run: "skipped",
   claim_second: "claimed", claim_second_replay: "signature_used", claim_minute_beside: "claimed",
-  claim_second_170s: "claimed", claim_second_181s: "lease_superseded", claim_bad_stamp: "refused", claim_bad_stamp_z: "refused",
+  claim_second_59s: "claimed", claim_second_60s: "lease_superseded", claim_second_later_lease: "lease_superseded",
+  claim_minute_179s: "claimed", claim_minute_180s: "lease_superseded", claim_bad_stamp: "refused", claim_bad_stamp_z: "refused",
   service_role_call: "skipped", anon_call: "denied",
   authenticated_denied: true, public_execute: 0, definer_search_path: true, uncommented: 0,
 };

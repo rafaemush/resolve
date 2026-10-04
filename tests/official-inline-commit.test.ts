@@ -9,7 +9,10 @@
  * bot_posts insert-first with its unique dedup_key) and the real priced publish (follow_entitlements, charge_reveals);
  * fetch is stubbed with the saved BLS bodies (the September CPI page is SYNTHETIC: the August page with its month edited).
  * Counted here: every subrequest of the holder's invocation (inside Workers Free's 50 by construction), the window as a
- * rail (red when switched off), and the races with the poll path (one commit row either way).
+ * rail (red when switched off), the races with the poll path (one commit row either way), the alert counted in the
+ * capture's spend, the siblings corroborated when the first print is recorded (not after a slow inline commit), the
+ * reveal queued before the Telegram post, webhook first attempts started only when they can finish inside waitUntil,
+ * and a redispatch answered skipped or failure alerting as "not dispatched".
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env, Config } from "../src/env";
@@ -54,6 +57,7 @@ import { buildLegRegistration } from "../src/markets/official-legs";
 import { alert, alertMany } from "../src/ops/alerts";
 import { COST, INVOCATION_SUBREQUESTS, type Budget } from "../src/ops/budget";
 import { __setRailsForMutationTesting } from "../src/resolve/rails";
+import { withinDeadline, INLINE_AWAIT_MS } from "../src/webhooks/deliver";
 import type { MarketRow, WatchRow } from "../src/ingest/types";
 
 const env = () => ({ RAW: { put: r2 } }) as unknown as Env; // no TELEGRAM_*: commits stay pending for the channel poster
@@ -158,9 +162,9 @@ const alertCalls = () => vi.mocked(alert).mock.calls.length + vi.mocked(alertMan
 const subrequests = () => h.db.calls.length + fetches.length + r2.mock.calls.length + alertCalls() * COST.alert;
 
 /** One holder poll under a waitUntil, as POST /internal/watch/:id runs it; waits for everything handed to waitUntil. */
-async function holderPoll(watchId: string): Promise<Awaited<ReturnType<typeof runWatch>>> {
+async function holderPoll(watchId: string, e: Env = env()): Promise<Awaited<ReturnType<typeof runWatch>>> {
   const pending: Array<Promise<unknown>> = [];
-  const s = await runWatch(env(), cfg, watchId, { waitUntil: (p) => pending.push(p), dispatch: "pg_net" });
+  const s = await runWatch(e, cfg, watchId, { waitUntil: (p) => pending.push(p), dispatch: "pg_net" });
   for (let i = 0; i < pending.length; i++) await pending[i]; // the list grows while it is awaited (the publish's inline attempt)
   return s;
 }
@@ -205,6 +209,8 @@ describe("the window and the budget (pure)", () => {
     expect(inlinePlan(4, 3)).toEqual({ fits: true, spent: 10, reserved: 38, webhooks: 7 });
     // a capture that spent 12 (4 page fetches and an R2 alert) on a CPI page: 18 + 38 > 50, not inline
     expect(inlinePlan(12, 3)).toEqual({ fits: false, spent: 18, reserved: 38 });
+    // 3 page fetches: 6 fits exactly (12 + 38 = 50); with the R2 alert counted, 11 does not (17 + 38 = 55)
+    expect([inlinePlan(6, 3).fits, inlinePlan(11, 3).fits]).toEqual([true, false]);
     expect(inlinePlan(INVOCATION_SUBREQUESTS, 0).fits).toBe(false);
   });
 });
@@ -258,7 +264,8 @@ describe("a first print recorded at +3 s: the holder's leg commits in the same i
     expect(counted).toBeLessThanOrEqual(plan.spent + plan.reserved);
     expect(counted).toBeLessThanOrEqual(INVOCATION_SUBREQUESTS);
     // the two followers were charged and queued; no webhook first attempt fit the budget the siblings left, so the drain
-    // delivers them (within 5 minutes, inside the refund rule's 10)
+    // delivers them (5 rows per 5-minute run across every pending row, paid first: inside the refund rule's 10 minutes
+    // only while few rows are pending)
     expect(h.db.tables.credit_ledger!.map((l) => l.tenant_id).sort()).toEqual(["t_a", "t_b"]);
     expect(h.db.tables.webhook_deliveries!.filter((d) => d.event_type === "shadow.committed").map((d) => d.status)).toEqual(["pending", "pending"]);
     expect(fetches.filter((u) => u.startsWith("https://hooks.example/"))).toEqual([]);
@@ -332,25 +339,132 @@ describe("outside the window: exactly as before", () => {
 });
 
 describe("over budget: no inline commit, every leg (the holder's own included) is dispatched with one call", () => {
-  it("four page fetches and a failed R2 put (an alert) before the first print: 18 + 38 > 50, so the holder hands its lease to the redispatch", async () => {
-    const [h1, l2] = [H(), L2()];
-    h.db = world([h1, l2]);
-    at("2026-10-14T12:30:01Z");
-    serve(3);
-    r2 = vi.fn(async () => { throw new Error("R2 unavailable"); });
+  /** The holder's capture under a stepped clock (each burst sleep advances it), with an inline stand-in that counts its runs. */
+  async function steppedCapture(h1: Leg) {
     let t = Date.parse("2026-10-14T12:30:01Z");
     h.clockMs = t;
     const deps = { now: () => t, sleep: async (ms: number) => { t += ms; h.clockMs = t; } };
-    let done!: () => void;
-    const inline: InlineCommit = { requestDone: new Promise<void>((r) => { done = r; }), run: async () => { throw new Error("the inline poll must not run over budget"); } };
+    let ran = 0;
+    const inline: InlineCommit = { requestDone: Promise.resolve(), run: async () => { ran++; return { outcome: "success", detail: "stand-in" }; } };
     const pending: Array<Promise<unknown>> = [];
-    done();
     await fetchOfficial(env(), h1.watch as unknown as WatchRow, h1.market, { ...deps, waitUntil: (p) => pending.push(p), inline });
     for (let i = 0; i < pending.length; i++) await pending[i];
-    expect(fetches.filter((u) => u.endsWith("cpi.nr0.htm"))).toHaveLength(4);
+    return { ran: () => ran };
+  }
+
+  it("three page fetches and a failed R2 put (an alert counted at 5) before the first print: 6 + 11 + 38 = 55 > 50, so the holder hands its lease to the redispatch", async () => {
+    const [h1, l2] = [H(), L2()];
+    h.db = world([h1, l2]);
+    at("2026-10-14T12:30:01Z");
+    serve(2);
+    r2 = vi.fn(async () => { throw new Error("R2 unavailable"); });
+    const c = await steppedCapture(h1);
+    expect(fetches.filter((u) => u.endsWith("cpi.nr0.htm"))).toHaveLength(3);
+    expect(c.ran()).toBe(0);
     expect(h.db.tables.official_observations).toHaveLength(4); // the siblings first, as before
     expect(h.redispatchCalls).toEqual([{ p_series: ["us_cpi_u_nsa_yoy", "us_cpi_u_sa_mom", "us_core_cpi_nsa_yoy", "us_core_cpi_sa_mom"], p_period: "2026-09", p_holder: h1.watch.id, p_holder_too: true }]);
     expect(h.dispatched.sort()).toEqual([h1.watch.id, l2.watch.id].sort());
+  });
+
+  it("the same three page fetches with R2 up (no alert): 6 + 6 + 38 = 50 fits, so the test above turns on the alert being counted", async () => {
+    const [h1, l2] = [H(), L2()];
+    h.db = world([h1, l2]);
+    at("2026-10-14T12:30:01Z");
+    serve(2);
+    const c = await steppedCapture(h1);
+    expect(fetches.filter((u) => u.endsWith("cpi.nr0.htm"))).toHaveLength(3);
+    expect(c.ran()).toBe(1);
+    expect(h.redispatchCalls[0]).toEqual({ p_series: ["us_cpi_u_nsa_yoy"], p_period: "2026-09", p_holder: h1.watch.id, p_holder_too: false });
+  });
+});
+
+describe("the deferred siblings keep the corroboration they always had", () => {
+  it("a slow inline commit (the clock past the capture's hardStop when it returns): the siblings were corroborated when the first print was recorded, never 'unavailable' for lack of time", async () => {
+    const h1 = H();
+    h.db = world([h1, L2()]);
+    at("2026-10-14T12:30:01Z");
+    serve();
+    let t = Date.parse("2026-10-14T12:30:01Z");
+    h.clockMs = t;
+    const deps = { now: () => t, sleep: async (ms: number) => { t += ms; h.clockMs = t; } };
+    const inline: InlineCommit = {
+      requestDone: Promise.resolve(),
+      run: async () => {
+        await new Promise((r) => setTimeout(r, 20)); // a real turn: whatever the capture started is under way
+        t += 30_000; h.clockMs = t; // the inline poll took 30 s (a slow database, a slow publish)
+        return { outcome: "success", detail: "slow stand-in" };
+      },
+    };
+    const pending: Array<Promise<unknown>> = [];
+    await fetchOfficial(env(), h1.watch as unknown as WatchRow, h1.market, { ...deps, waitUntil: (p) => pending.push(p), inline });
+    for (let i = 0; i < pending.length; i++) await pending[i];
+    const sibs = h.db.tables.official_observations!.filter((o) => o.series !== "us_cpi_u_nsa_yoy");
+    expect(sibs.map((o) => o.series).sort()).toEqual(["us_core_cpi_nsa_yoy", "us_core_cpi_sa_mom", "us_cpi_u_sa_mom"]);
+    // each sibling's second source was asked, at the time the first print was recorded (the saved API bodies end in
+    // August, so the answer itself is "no 2026-09 index yet": what matters is that it looked, with its full 8 s)
+    expect(fetches.filter((u) => u.startsWith("https://api.bls.gov/")).sort()).toEqual([
+      "https://api.bls.gov/publicAPI/v1/timeseries/data/CUSR0000SA0", "https://api.bls.gov/publicAPI/v1/timeseries/data/CUSR0000SA0L1E",
+      "https://api.bls.gov/publicAPI/v1/timeseries/data/CUUR0000SA0", "https://api.bls.gov/publicAPI/v1/timeseries/data/CUUR0000SA0L1E",
+    ]);
+    for (const o of sibs) {
+      expect(String(o.corroboration.detail), o.series).not.toContain("time budget exhausted");
+      expect(o.corroboration.checked_at, o.series).toBe("2026-10-14T12:30:01.000Z");
+    }
+    // recorded after the inline commit (their records were deferred, not their corroboration)
+    expect(sibs.every((o) => Date.parse(o.observed_at) >= Date.parse("2026-10-14T12:30:31Z"))).toBe(true);
+  });
+});
+
+describe("the reveal is queued before the Telegram post, and webhook first attempts only start when they can finish", () => {
+  it("withinDeadline (pure): an endpoint's rows are sequential, so it gets as many as whole INLINE_AWAIT_MS spans fit, none below one", () => {
+    const rows = [{ id: "d1", endpoint_id: "e1" }, { id: "d2", endpoint_id: "e1" }, { id: "d3", endpoint_id: "e2" }];
+    const ids = (left: number) => withinDeadline(rows, 1_000_000 + left, 1_000_000).map((r) => r.id);
+    expect(INLINE_AWAIT_MS).toBe(12_000);
+    expect([ids(11_999), ids(12_000), ids(23_999), ids(24_000), ids(-5)]).toEqual([[], ["d1", "d3"], ["d1", "d3"], ["d1", "d2", "d3"], []]);
+  });
+
+  const envTg = () => ({ RAW: { put: r2 }, TELEGRAM_BOT_TOKEN: "test-token", TELEGRAM_CHANNEL_ID: "@test" }) as unknown as Env;
+
+  it("Telegram configured, an event with no other open leg (posted inline): while the post hangs, the commit's reveal is already charged and queued", async () => {
+    const h1 = H();
+    h.db = world([h1], { [h1.market.id]: ["t_a"] });
+    at("2026-10-14T12:30:03Z");
+    serve();
+    const upstream = globalThis.fetch;
+    let posts = 0;
+    let answer!: () => void;
+    const hang = new Promise<void>((r) => { answer = r; });
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (!url.startsWith("https://api.telegram.org/")) return upstream(input, init);
+      posts++;
+      await hang; // the send outlives the invocation's waitUntil
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 77, date: 1760445004 } }), { status: 200, headers: { "content-type": "application/json" } });
+    });
+    const run = holderPoll(h1.watch.id as string, envTg());
+    await vi.waitFor(() => expect(posts).toBe(1));
+    expect(commitsOf(h1.market.id)).toHaveLength(1);
+    expect(h.db.tables.webhook_deliveries!.filter((d) => d.event_type === "shadow.committed").map((d) => d.tenant_id)).toEqual(["t_a"]);
+    expect(h.db.tables.credit_ledger!.map((l) => l.tenant_id)).toEqual(["t_a"]);
+    answer();
+    await run;
+    expect(commitsOf(h1.market.id)[0]!.channel).toBe("telegram");
+  });
+
+  it("an inline commit whose publish starts less than one webhook attempt (12 s) before the capture's hardStop: no attempt starts, the rows stay pending for the drain", async () => {
+    const p = leg(5, "us_ppi_fd_nsa_yoy", "2026-08", "2026-09-10T12:30:00Z", "5.4%");
+    const p2 = leg(6, "us_ppi_fd_nsa_yoy", "2026-08", "2026-09-10T12:30:00Z", "5.6%");
+    h.db = world([p, p2], { [p.market.id]: ["t_a", "t_b"] });
+    at("2026-09-10T12:30:02Z");
+    serve();
+    // the inline poll's resolve takes 20 s: its publish starts 8 s before hardStop (capture start + 28 s)
+    const gates = h.db.options.rpc!.check_gates!;
+    h.db.options.rpc!.check_gates = async (db, a) => { vi.setSystemTime(new Date(Date.now() + 20_000)); return gates(db, a); };
+    await holderPoll(p.watch.id as string);
+    expect(commitsOf(p.market.id)).toHaveLength(1);
+    expect(h.db.tables.webhook_deliveries!.filter((d) => d.event_type === "shadow.committed").map((d) => d.status)).toEqual(["pending", "pending"]);
+    expect(fetches.filter((u) => u.startsWith("https://hooks.example/"))).toEqual([]);
+    expect(h.db.tables.credit_ledger!.map((l) => l.tenant_id).sort()).toEqual(["t_a", "t_b"]); // charged and queued all the same
   });
 });
 
@@ -421,6 +535,32 @@ describe("never inline outside the release-minute burst", () => {
     expect(h.redispatchCalls).toEqual([]);
     expect(watchOf(h1.watch.id as string).lease_until).toBeNull();
   });
+
+  for (const [label, answer, why] of [
+    ["skipped (watch_daily_cap reached)", { outcome: "skipped", reason: "watch_daily_cap reached: 50000", dispatched: 0 }, "skipped: watch_daily_cap reached: 50000"],
+    ["failure (an error the function caught)", { outcome: "failure", error: "permission denied for table watches", sqlstate: "42501", dispatched: 0 }, "failure: permission denied for table watches"],
+  ] as const) {
+    it(`a redispatch answered ${label}: alerted per call and logged as not dispatched, never as 0 legs dispatched`, async () => {
+      const [h1, l2] = [H(), L2()];
+      h.db = world([h1, l2]);
+      h.db.options.rpc!.redispatch_official_legs = async (_db, a) => { h.redispatchCalls.push(a); return { data: { ...answer, series: a.p_series, period: a.p_period }, error: null }; };
+      at("2026-10-14T12:30:03Z");
+      serve();
+      const logs = vi.spyOn(console, "log").mockImplementation(() => {});
+      try {
+        await holderPoll(h1.watch.id as string);
+        expect(commitsOf(h1.market.id)).toHaveLength(1); // the inline commit does not depend on it
+        expect(h.redispatchCalls).toHaveLength(2);
+        const calls = vi.mocked(alert).mock.calls;
+        expect(calls.map((c) => c[1])).toEqual(["official_redispatch_us_cpi_u_nsa_yoy_2026-09", "official_redispatch_us_cpi_u_nsa_yoy_2026-09"]);
+        expect(String(calls[0]![2])).toContain(why);
+        const line = logs.mock.calls.map((c) => String(c[0])).map((l) => { try { return JSON.parse(l) as Record<string, unknown>; } catch { return null; } }).find((l) => l?.job === "official_capture")!;
+        expect(line.redispatch).toBe(`not dispatched: ${why}`);
+        expect(line.redispatch_siblings).toBe(`not dispatched: ${why}`);
+        expect(h.dispatched).toEqual([]);
+      } finally { logs.mockRestore(); }
+    });
+  }
 
   it("a redispatch that could not run alerts once and says so: the legs resolve on their next minute poll", async () => {
     const [h1, l2] = [H(), L2()];

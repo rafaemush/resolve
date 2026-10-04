@@ -371,8 +371,12 @@ describe("publishing a verdict that looked (plan §18 (a): first delivery attemp
   const waitUntil = vi.fn();
   const COMMIT = { id: "c1", commitment_sha256: "a".repeat(64), committed_at: "2026-09-24T12:00:00.000Z", committed: { preimage_version: "v2" } };
 
-  it("shadow market: the recorded commit goes to its followers as shadow.committed, with the caller's waitUntil", async () => {
-    vi.mocked(commitVerdict).mockResolvedValueOnce({ committed: true, posted: true, reason: "posted", commit: COMMIT } as never);
+  it("shadow market: the recorded commit goes to its followers as shadow.committed, with the caller's waitUntil (through commitVerdict's recorded hook: after the insert, before the post)", async () => {
+    // commitVerdict runs the hook once the bot_posts row exists and before its inline Telegram post (src/bot/commit.ts)
+    vi.mocked(commitVerdict).mockImplementationOnce((async (_e: unknown, _m: unknown, _r: unknown, _v: unknown, o?: { recorded?: (c: typeof COMMIT) => Promise<void> }) => {
+      await o?.recorded?.(COMMIT);
+      return { committed: true, posted: true, reason: "posted", commit: COMMIT };
+    }) as never);
     serve(200, JSON.stringify(pr(1)));
     const r = await runWatch(env(), cfg, WATCH_ID, { waitUntil });
     expect(r.outcome).toBe("success");

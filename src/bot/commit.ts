@@ -170,11 +170,15 @@ const COMMIT_ATTEMPTS = 2;
  * event with another open leg is left pending for the channel poster (src/bot/post.ts), which posts an event's legs as
  * one message; a single-market commit is posted inline under the channel lease, or left pending when the channel is
  * busy or at its pacing ceiling. Test markets are recorded with channel 'none' and never posted. `commit` is set
- * whenever a row was recorded.
+ * whenever a row was recorded. opts.recorded (runWatch: the private early reveal, publishShadowCommitted) runs once the
+ * row exists and before any post: an inline post can take seconds (the channel's 1.2 s gap, up to 3 attempts of 8 s,
+ * 429 waits), and an invocation that ends inside it (an official release's inline commit runs late in waitUntil's 30 s)
+ * must not leave a commit whose reveal was never queued, since a later run finds the commit and does not publish again.
+ * It must never throw (publishShadowCommitted never does). Its subrequests are its own.
  * Subrequests: commit_context 1 + insert 1 (both again after a dedup collision) + inline post 6 (lease claim, send 3,
  * receipt, release), plus one alert on a failure.
  */
-export async function commitVerdict(env: Env, market: MarketRow, resolutionId: string, v: Verdict): Promise<CommitResult> {
+export async function commitVerdict(env: Env, market: MarketRow, resolutionId: string, v: Verdict, opts: { recorded?: (commit: RecordedCommit) => Promise<void> } = {}): Promise<CommitResult> {
   const client = db(env);
   const isTest = market.is_test === true;
   for (let attempt = 0; attempt < COMMIT_ATTEMPTS; attempt++) {
@@ -207,6 +211,8 @@ export async function commitVerdict(env: Env, market: MarketRow, resolutionId: s
       return { committed: false, posted: false, reason: `bot_posts insert: ${error?.message ?? "no row"}` };
     }
     const commit: RecordedCommit = { id: row.id as string, commitment_sha256: commitment, committed_at: String(row.created_at), committed };
+    // the reveal is queued before the post, never after it (see above)
+    if (opts.recorded) await opts.recorded(commit);
     if (isTest) return { committed: true, posted: false, reason: "test market: recorded, never posted", commit };
     if (!telegramConfigured(env)) return { committed: true, posted: false, reason: "pending: telegram not configured", commit };
     if (batched) return { committed: true, posted: false, reason: `pending: event ${ctx.event_key} has ${ctx.event_open_markets} other open market(s); the channel poster posts its legs as one message`, commit };

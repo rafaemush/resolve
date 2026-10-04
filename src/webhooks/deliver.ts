@@ -60,6 +60,25 @@ export const inlineSubrequests = (n: number): number => COST.db + n * DELIVERY_C
 /** A caller without waitUntil waits this long for its inline attempt: one POST timeout (10 s) plus its writes. */
 export const INLINE_AWAIT_MS = 12_000;
 
+/**
+ * Pure: the rows an inline attempt with a deadline may take. One endpoint's rows are delivered one after another (each
+ * POST up to 10 s, plus its writes: INLINE_AWAIT_MS), so an endpoint gets at most as many rows as whole INLINE_AWAIT_MS
+ * spans fit before the deadline, none when not one does. A row skipped stays 'pending' for the drain's next 5-minute
+ * run; a row started and cut off when the invocation ends would stay 'delivering' until the drain's 15-minute stale
+ * sweep, past the reveal refund rule's 10 minutes, so a charge a 5-minute drain would have delivered in time is refunded.
+ */
+export function withinDeadline(picks: Row[], deadlineMs: number, nowMs: number): Row[] {
+  const depth = Math.floor((deadlineMs - nowMs) / INLINE_AWAIT_MS);
+  if (!(depth >= 1)) return [];
+  const per = new Map<string, number>();
+  return picks.filter((r) => {
+    const k = String(r.endpoint_id);
+    const n = (per.get(k) ?? 0) + 1;
+    per.set(k, n);
+    return n <= depth;
+  });
+}
+
 /** ExecutionContext.waitUntil of the invocation that publishes: work under it outlives the response. */
 export type WaitUntil = (p: Promise<unknown>) => void;
 
@@ -332,19 +351,23 @@ export interface InlineSummary { queued: number; attempted: number; delivered: n
  * is left to it), and a claimed row is invisible to the drain's claim until its outcome is written. Rows not taken, and
  * failed attempts (back to 'pending' at the next backoff step), are the drain's. `alerts` are the publisher's own (its
  * billing and low-credit alerts): they ride in this attempt's one alertMany(), so a publish and its inline attempt spend
- * one alert between them. Never throws.
+ * one alert between them. With deadlineMs (the inline commit of an official release, late in its waitUntil) only the rows
+ * that can finish by then are taken (withinDeadline); the rest stay 'pending' for the drain. Never throws.
  */
-export async function attemptInline(env: Env, rows: Row[], budget: Budget, max = INLINE_MAX, alerts: readonly AlertItem[] = []): Promise<InlineSummary> {
+export async function attemptInline(env: Env, rows: Row[], budget: Budget, max = INLINE_MAX, alerts: readonly AlertItem[] = [], deadlineMs?: number): Promise<InlineSummary> {
   const out: InlineSummary = { queued: rows.length, attempted: 0, delivered: 0, failed: 0, dlq: 0, left_for_drain: rows.length, errors: 0, alerts: [] };
   const fixed = COST.db + COST.alert;
-  const n = Math.min(inlineCandidates(rows, max).length, Math.floor((budget.left - fixed) / DELIVERY_COST));
+  const n0 = Math.min(inlineCandidates(rows, max).length, Math.floor((budget.left - fixed) / DELIVERY_COST));
+  // with a deadline (the end of the waitUntil an official release's inline commit runs in): only what can finish by then
+  const timed = deadlineMs === undefined ? null : withinDeadline(inlineCandidates(rows, rows.length), deadlineMs, Date.now()).slice(0, Math.max(0, n0));
+  const n = timed ? timed.length : n0;
   if (n < 1 || !budget.take(fixed + n * DELIVERY_COST)) {
     // no attempt fits (or none is pending): the publisher's alerts still go out, on the alert this budget holds
     if (alerts.length && budget.take(COST.alert)) { await alertMany(env, [...alerts]); out.alerts = alerts.map((i) => i.key); }
     else if (alerts.length) console.error(JSON.stringify({ level: "error", job: "webhook_inline", unsent_alerts: alerts.map((i) => ({ key: i.key, text: i.text.slice(0, 300) })) }));
     return out;
   }
-  const pick = inlineCandidates(rows, n);
+  const pick = timed ?? inlineCandidates(rows, n);
   const client = db(env);
   const t = newTally();
   const { data, error } = await client.from("webhook_deliveries").update(claimPatch(Date.now())).in("id", pick.map((r) => r.id)).eq("status", "pending").select("*");
@@ -379,10 +402,10 @@ export async function settleWithin(p: Promise<unknown>, ms: number): Promise<"se
  * INLINE_AWAIT_MS (an attempt cut short leaves its rows 'delivering'; the drain's stale sweep requeues them). `alerts`
  * (the publisher's) go out in the attempt's one alertMany(), or on their own when no row was queued; never lost.
  */
-export async function deliverInline(env: Env, rows: Row[], opts: { waitUntil?: WaitUntil; budget?: Budget; alerts?: readonly AlertItem[] } = {}): Promise<void> {
+export async function deliverInline(env: Env, rows: Row[], opts: { waitUntil?: WaitUntil; budget?: Budget; alerts?: readonly AlertItem[]; deadlineMs?: number } = {}): Promise<void> {
   const alerts = opts.alerts ?? [];
   if (!rows.length) { if (alerts.length) await alertMany(env, [...alerts]); return; }
-  const run = attemptInline(env, rows, opts.budget ?? new Budget(inlineSubrequests(INLINE_MAX)), INLINE_MAX, alerts).catch(async (e) => {
+  const run = attemptInline(env, rows, opts.budget ?? new Budget(inlineSubrequests(INLINE_MAX)), INLINE_MAX, alerts, opts.deadlineMs).catch(async (e) => {
     const text = `inline webhook attempt threw; the rows stay queued for the drain: ${redact(String(e)).slice(0, 300)}`;
     if (alerts.length) await alertMany(env, [...alerts, { key: "webhook_inline_errors", dedupMinutes: 60, text }]);
     else await alert(env, "webhook_inline_errors", text, { dedupMinutes: 60 });
@@ -396,7 +419,7 @@ export async function deliverInline(env: Env, rows: Row[], opts: { waitUntil?: W
  * is awaited in every case: a queued row is the durable part, delivered by the drain whatever happens to the inline
  * attempt. Never throws (a queueing failure is alerted by enqueueEvent).
  */
-export async function publishEvent(env: Env, tenants: string | readonly string[], eventType: WebhookEvent, payload: Record<string, unknown>, opts: { waitUntil?: WaitUntil; budget?: Budget } = {}): Promise<{ queued: number }> {
+export async function publishEvent(env: Env, tenants: string | readonly string[], eventType: WebhookEvent, payload: Record<string, unknown>, opts: { waitUntil?: WaitUntil; budget?: Budget; deadlineMs?: number } = {}): Promise<{ queued: number }> {
   let rows: Row[] = [];
   try { rows = await enqueueEvent(env, tenants, eventType, payload); }
   catch (e) {

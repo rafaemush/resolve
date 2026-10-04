@@ -86,11 +86,14 @@ describe("migration 024 (static lint; never applied from here)", () => {
     for (const k of ["'outcome', 'skipped'", "'outcome', 'failure'", "'outcome', 'dispatched'"]) expect(f, k).toContain(k);
   });
 
-  it("claim_watch_dispatch: every answer of 019, the signed time read from either stamp, the 180 s rule unchanged", () => {
+  it("claim_watch_dispatch: every answer of 019, the signed time read from either stamp, 019's 180 s for a minute stamp and 60 s for a second stamp", () => {
     const f = flat(fnBody("claim_watch_dispatch"));
     for (const a of ["signature_used", "watch_not_found", "lease_missing", "lease_expired", "lease_superseded", "claimed"]) expect(f, a).toContain(`'${a}'`);
     expect(f).toContain("case when length(p_minute) = 19 then (p_minute || '+00')::timestamptz else (p_minute || ':00+00')::timestamptz end");
-    expect(f).toContain("if v_lease >= v_signed + interval '180 seconds' then return 'lease_superseded'; end if;");
+    // A second stamp's threshold is its own: 180 s would let a late redispatch POST run beside a later 120 s lease
+    // (taken at S + 30 s or after, ending at S + 150 s or after), the double run 019 refuses.
+    expect(f).toContain("if v_lease >= v_signed + case when length(p_minute) = 19 then interval '60 seconds' else interval '180 seconds' end then return 'lease_superseded'; end if;");
+    expect(f).not.toMatch(/v_lease >= v_signed \+ interval '180 seconds'/);
     expect(f).toContain("update watches set lease_until = greatest(lease_until, now() + interval '120 seconds') where id = p_watch;");
     // INSERT first, before any read
     expect(f.indexOf("insert into used_dispatch_signatures")).toBeLessThan(f.indexOf("select lease_until into v_lease"));

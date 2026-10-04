@@ -155,9 +155,10 @@ export interface PublishResult extends QueueResult { charged: number; locked: nu
  * followers by construction and are skipped without a read. At most COMMITTED_QUEUE_SUBREQUESTS before the inline
  * attempt, which runs on opts.budget when given (the inline commit of an official release: what its invocation's
  * reservation leaves, src/ingest/official-watch.ts inlinePlan; whole deliveries only, the rest left to the drain), else
- * on its own inlineSubrequests(INLINE_MAX). Never throws.
+ * on its own inlineSubrequests(INLINE_MAX), and only as many as can finish before opts.deadlineMs when given (the end
+ * of that waitUntil). Never throws.
  */
-export async function publishShadowCommitted(env: Env, market: MarketRow, commit: RecordedCommit, opts: { waitUntil?: WaitUntil; base?: string | null; budget?: Budget } = {}): Promise<PublishResult> {
+export async function publishShadowCommitted(env: Env, market: MarketRow, commit: RecordedCommit, opts: { waitUntil?: WaitUntil; base?: string | null; budget?: Budget; deadlineMs?: number } = {}): Promise<PublishResult> {
   const none: PublishResult = { followers: 0, rows: [], error: null, charged: 0, locked: 0 };
   if (market.is_test === true || market.tenant_id !== null) return none;
   const alerts: AlertItem[] = [];
@@ -203,7 +204,7 @@ export async function publishShadowCommitted(env: Env, market: MarketRow, commit
     out.rows = q.rows;
     // the publish's alerts ride in the inline attempt's one alertMany() (sent on their own when nothing was queued)
     const handed = alerts.splice(0);
-    await deliverInline(env, q.rows, { waitUntil: opts.waitUntil, alerts: handed, ...(opts.budget ? { budget: opts.budget } : {}) });
+    await deliverInline(env, q.rows, { waitUntil: opts.waitUntil, alerts: handed, ...(opts.budget ? { budget: opts.budget } : {}), ...(opts.deadlineMs !== undefined ? { deadlineMs: opts.deadlineMs } : {}) });
     return out;
   } catch (e) {
     const error = redact(String(e)).slice(0, 200);
