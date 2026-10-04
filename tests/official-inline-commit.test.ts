@@ -410,8 +410,9 @@ describe("the deferred siblings keep the corroboration they always had", () => {
       expect(String(o.corroboration.detail), o.series).not.toContain("time budget exhausted");
       expect(o.corroboration.checked_at, o.series).toBe("2026-10-14T12:30:01.000Z");
     }
-    // recorded after the inline commit (their records were deferred, not their corroboration)
-    expect(sibs.every((o) => Date.parse(o.observed_at) >= Date.parse("2026-10-14T12:30:31Z"))).toBe(true);
+    // recorded beside the inline run, not after it: a slow channel post inside the inline commit cannot spend waitUntil's
+    // 30 s before the siblings' first prints exist (the 30 s this stand-in takes had not passed when they were written)
+    expect(sibs.every((o) => Date.parse(o.observed_at) < Date.parse("2026-10-14T12:30:31Z"))).toBe(true);
   });
 });
 

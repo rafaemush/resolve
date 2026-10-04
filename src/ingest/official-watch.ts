@@ -615,6 +615,14 @@ async function holderCapture(env: Env, r: OfficialResolver, market: MarketRow, w
   await settleWithin(inline.requestDone, REQUEST_DONE_WAIT_MS);
   const first = await rd;
   line.redispatch = first.detail;
+  // The siblings' first prints and the dispatch of their legs run beside the inline run, not after it: the inline run
+  // awaits commitVerdict's channel post (a 1.2 s gap, up to 3 x 8 s attempts and 429 waits), and waiting for it could
+  // spend waitUntil's 30 s before the siblings are recorded. Both shares are reserved in inlinePlan, so running them at
+  // the same time spends nothing more; never throws (recordPrepared and redispatchLegs report, they do not throw).
+  const siblings = later.record().then(async (sib) => {
+    if (sib.notes.length) line.siblings = sib.notes;
+    if (sib.inserted.length) line.redispatch_siblings = (await redispatchLegs(env, r, sib.inserted, watchId, false)).detail;
+  });
   try {
     const run = await inline.run(new SubrequestBudget(plan.webhooks - (first.alerted ? COST.alert : 0)), c.hardStop);
     line.inline = { ...(line.inline as object), outcome: run.outcome, verdict: run.verdict ?? null, detail: run.detail.slice(0, 300) };
@@ -623,9 +631,7 @@ async function holderCapture(env: Env, r: OfficialResolver, market: MarketRow, w
     line.inline = { ...(line.inline as object), outcome: "threw", detail: String(e).slice(0, 300) };
     await safeAlert(env, `official_inline_commit_${r.series}_${r.period}`, `${r.series} ${r.period}: the inline commit of market ${market.id} threw (${String(e).slice(0, 200)}); the leg resolves from the stored first print on its next minute poll.`, 60, { series: r.series, period: r.period, market_id: market.id });
   }
-  const sib = await later.record();
-  if (sib.notes.length) line.siblings = sib.notes;
-  if (sib.inserted.length) line.redispatch_siblings = (await redispatchLegs(env, r, sib.inserted, watchId, false)).detail;
+  await siblings;
   return log();
 }
 
