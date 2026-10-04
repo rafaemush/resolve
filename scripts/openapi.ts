@@ -16,7 +16,7 @@ import { CHALLENGE_TTL_MINUTES, SIGNATURE, WALLET_ADDRESS } from "../src/billing
 import { EXPORT_COLUMNS, EXPORT_PLATFORMS, EXPORT_ROW_CAP } from "../src/shadow/export";
 import { EVALUATION_KEY_DAYS, EVALUATION_WATCH_LIMIT, FREE_EVALUATION_CREDITS } from "../src/api/keys";
 import { AUTO_KEY_DAILY_CAP_DEFAULT, AUTO_KEYS_PER_NETWORK_PER_DAY } from "../src/api/evaluation-key";
-import { CARD_PACKS, PACK_IDS, WHOP_SIGNATURE_TOLERANCE_S, isOptionalPack } from "../src/billing/whop";
+import { CARD_PACKS, PACK_IDS, WHOP_SIGNATURE_TOLERANCE_S, isOptionalPack, packLabel } from "../src/billing/whop";
 import { PRINT_PRICE_CREDITS } from "../src/api/prints";
 import { OFFICIAL_SERIES } from "../src/resolve/official";
 import { CHECKOUT_ROUTE, CONTACT_PATH, PAY_BY_CARD_PATH, USDC_NOT_OFFERED } from "../src/billing/top-up";
@@ -37,8 +37,9 @@ const schemas = {
 const sec = [{ bearerAuth: [] }, { apiKeyAuth: [] }];
 const r = (desc: string, schema: unknown = { $ref: "#/components/schemas/SuccessEnvelope" }) => ({ description: desc, content: { "application/json": { schema } } });
 const E = { $ref: "#/components/schemas/ErrorEnvelope" };
-// a dark pack (optional: its Whop plan id may be empty) is in the enum, and the contract says it opens only once offered
-const packs = PACK_IDS.map((p) => `"${p}": $${CARD_PACKS[p].priceCents / 100} for ${CARD_PACKS[p].credits.toLocaleString("en-US")} credits${isOptionalPack(p) ? " (only once offered; until then 400, not offered)" : ""}`).join(", ");
+// a dark pack (optional: its Whop plan id may be empty) is in the enum, and the contract says it opens only once offered;
+// the price is packLabel's ("$1,000"), the same string the 400, the /pricing form and docs/pricing.md print
+const packs = PACK_IDS.map((p) => `"${p}": ${packLabel(p)} for ${CARD_PACKS[p].credits.toLocaleString("en-US")} credits${isOptionalPack(p) ? " (only once offered; until then 400, not offered)" : ""}`).join(", ");
 const html = (desc: string) => ({ description: desc, content: { "text/html": { schema: { type: "string" } } } });
 const topUp = `top_up: {method: "card", checkout: "${CHECKOUT_ROUTE}", page: "<site>${PAY_BY_CARD_PATH}", packs[] {pack, price, currency, credits}} while card checkout is offered, else {method: "contact_support", page: "<site>${CONTACT_PATH}"}; never a USDC address`;
 /** The path parameter of the follow and early-reveal routes: a uuid or a venue id (src/shadow/follows.ts parseMarketRef). */

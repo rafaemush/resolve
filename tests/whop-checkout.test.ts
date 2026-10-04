@@ -32,6 +32,8 @@ vi.mock("../src/ops/alerts", () => ({
 import { app } from "../src/index";
 import { SITE_CSP } from "../src/api/site";
 import { sha256Hex } from "../src/resolve/text";
+import openapi from "../src/generated/openapi.json";
+import { CARD_PACKS, PACK_IDS, packLabel } from "../src/billing/whop";
 
 /** PostgREST's embed of tenants(plan, strict_v0, deleted_at) on the api_keys read of src/api/auth.ts. */
 function embedTenants(q: any): any {
@@ -409,6 +411,12 @@ describe("the $1,000 pack, built dark (WHOP_PLAN_ID_1000)", () => {
     expect(whopCalls).toEqual([]);
     expect((await apiCheckout({ pack: "50" }, bad)).status).toBe(200);
     expect(await (await app.request("/pricing", {}, bad, ctx)).text()).not.toContain('<option value="1000">');
+  });
+  it("the published contract prices every pack as the 400, the form and docs/pricing.md do (\"$1,000\", never \"$1000\"), and says the dark pack opens only once offered", () => {
+    const summary = (openapi as { paths: Record<string, Record<string, { summary: string }>> }).paths["/v1/billing/checkout"]!.post!.summary;
+    for (const p of PACK_IDS) expect(summary, p).toContain(`"${p}": ${packLabel(p)} for ${CARD_PACKS[p].credits.toLocaleString("en-US")} credits`);
+    expect(summary).toContain('"1000": $1,000 for 120,000 credits (only once offered; until then 400, not offered)');
+    expect(summary).not.toMatch(/\$\d{4,}/);
   });
 });
 

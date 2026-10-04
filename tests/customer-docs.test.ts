@@ -95,6 +95,12 @@ describe("customer-facing documents", () => {
     const t = texts["docs/pricing.md"]!;
     expect(t).toContain("The $1,000 pack (120,000 credits) can be paid by card once it is offered");
     expect(t).toMatch(/until then that request answers `400` \(the pack is not offered by card\)/);
+    // before it is offered by card the page names how the $1,000 pack is paid (an invoice in USD, reviewed before
+    // payment), and never says every pack is paid by card or that a USDC address takes it
+    expect(t).toContain("the $1,000 pack is sold on request against an invoice in USD: ask us (`/terms#contact`) for payment options, and you review the invoice before anything is paid.");
+    expect(t).toContain("Packs offered by card are paid by card; a $1,000 pack bought on request before it is offered by card is invoiced in USD (above)");
+    expect(t).not.toMatch(/available on request\./);
+    expect(t).not.toMatch(/(^|[.] )Packs are paid by card/m);
     // the packs card checkout sells today are still the three; the $1,000 pack is never listed among them
     expect(t).toMatch(/The \$20, \$50 and \$250 packs can be paid by card through Whop/);
     expect(t).not.toMatch(/\$250 and \$1,000 packs can be paid by card|\$1,000 packs? (is|are) (now )?(offered|sold|available) by card/);
