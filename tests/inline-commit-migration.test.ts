@@ -92,7 +92,7 @@ describe("migration 024 (static lint; never applied from here)", () => {
     expect(f).toContain("case when length(p_minute) = 19 then (p_minute || '+00')::timestamptz else (p_minute || ':00+00')::timestamptz end");
     // A second stamp's threshold is its own: 180 s would let a late redispatch POST run beside a later 120 s lease
     // (taken at S + 30 s or after, ending at S + 150 s or after), the double run 019 refuses.
-    expect(f).toContain("if v_lease >= v_signed + case when length(p_minute) = 19 then interval '60 seconds' else interval '180 seconds' end then return 'lease_superseded'; end if;");
+    expect(f).toContain("if v_lease >= v_signed + (case when length(p_minute) = 19 then interval '60 seconds' else interval '180 seconds' end) then return 'lease_superseded'; end if;");
     expect(f).not.toMatch(/v_lease >= v_signed \+ interval '180 seconds'/);
     expect(f).toContain("update watches set lease_until = greatest(lease_until, now() + interval '120 seconds') where id = p_watch;");
     // INSERT first, before any read

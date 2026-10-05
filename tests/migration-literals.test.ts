@@ -28,8 +28,37 @@ describe("COMMENT ON literals in every migration", () => {
       expect(bad, `a lone ' inside a comment text (write '' for an apostrophe): ${JSON.stringify(bad)}`).toEqual([]);
     });
   }
-  it("catches the defect it exists for", () => {
+  it("catches the defect it exists for (comment literals)", () => {
     expect(commentLiteralEnds("comment on column t.c is 'the tenant''s own';").map((c) => c.next)).toEqual([";"]);
     expect(commentLiteralEnds("comment on column t.c is 'the tenant's own removal is not Resolve's lateness.';").map((c) => c.next)).toEqual(["s"]);
+  });
+});
+
+/**
+ * PL/pgSQL reads an IF (or ELSIF) condition up to its first THEN, so a CASE WHEN ... THEN inside the condition must be
+ * parenthesised, or the condition ends at the CASE's THEN and Postgres refuses the whole file ("syntax error at end of
+ * input"; migration 024's first staging apply, 2026-10-05). Every CASE inside an IF condition starts right after "(".
+ */
+function bareCaseInIf(sql: string): string[] {
+  const out: string[] = [];
+  // up to the first THEN, as PL/pgSQL reads it; never across a ";" (a condition has none); DDL's "if [not] exists" is not a condition
+  const re = /(?:^|[\s;])(?:if|elsif)\s+(?!(?:not\s+)?exists\b)([^;]*?)\bthen\b/gi;
+  for (let m = re.exec(sql); m; m = re.exec(sql)) {
+    const cond = m[1]!;
+    for (const c of cond.matchAll(/\bcase\b/gi)) if (!/\(\s*$/.test(cond.slice(0, c.index))) out.push(cond.trim().slice(0, 100));
+  }
+  return out;
+}
+
+describe("PL/pgSQL IF conditions in every migration", () => {
+  for (const f of files) {
+    it(`${f}: a CASE inside an IF condition is parenthesised`, () => {
+      expect(bareCaseInIf(readFileSync(resolve(DIR, f), "utf8"))).toEqual([]);
+    });
+  }
+  it("catches the defect it exists for (a bare CASE in an IF condition)", () => {
+    expect(bareCaseInIf("if v_lease >= v_signed + case when length(p) = 19 then interval '60 seconds' else interval '180 seconds' end then")).toHaveLength(1);
+    expect(bareCaseInIf("if v_lease >= v_signed + (case when length(p) = 19 then interval '60 seconds' else interval '180 seconds' end) then")).toEqual([]);
+    expect(bareCaseInIf("alter table t drop constraint if exists c; v := case when a then b else c end;")).toEqual([]);
   });
 });

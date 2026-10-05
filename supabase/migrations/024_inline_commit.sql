@@ -83,7 +83,9 @@ begin
   -- later, so a second stamp's threshold is S + 60 s, never 180 (a lease ending between S + 150 and S + 180 s would pass).
   -- A lease at or past the threshold was taken later (a later dispatch or a tenant fetch, possible only once the signed
   -- dispatch's lease ended): this request is late, and that run is the current one.
-  if v_lease >= v_signed + case when length(p_minute) = 19 then interval '60 seconds' else interval '180 seconds' end then
+  -- The CASE is parenthesised: PL/pgSQL reads an IF condition up to its first THEN, so a bare CASE WHEN ... THEN would
+  -- end the condition early (the first staging apply of this file failed on it).
+  if v_lease >= v_signed + (case when length(p_minute) = 19 then interval '60 seconds' else interval '180 seconds' end) then
     return 'lease_superseded';
   end if;
   -- Hold the lease for the whole run: claimed near its end, the run would otherwise outlive it and overlap the next
